@@ -822,9 +822,8 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
   return env->NewStringUTF(payload.c_str());
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_royale_nativehost_JniHost_nativeObserve(
-    JNIEnv* env, jclass, jstring libg_path) {
+static jstring observe_state_json(
+    JNIEnv* env, jstring libg_path, bool compact_training) {
   const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
   if (path_chars == nullptr) {
     return nullptr;
@@ -873,13 +872,16 @@ Java_royale_nativehost_JniHost_nativeObserve(
   capture_episode_state(memory, battle);
 
   std::string result;
-  result.reserve(512 + static_cast<size_t>(count) * 256);
+  result.reserve(
+      512 + static_cast<size_t>(count) * (compact_training ? 112 : 256));
   char header[320];
+  const char* header_format = compact_training
+      ? "{\"schema_version\":1,\"kind\":\"libg_native_train_state_v1\","
+        "\"tick\":%d,\"applied_replay_tick\":%d,\"entities\":["
+      : "{\"schema_version\":1,\"kind\":\"libg_native_state\","
+        "\"tick\":%d,\"applied_replay_tick\":%d,\"entities\":[";
   std::snprintf(
-      header, sizeof(header),
-      "{\"schema_version\":1,\"kind\":\"libg_native_state\","
-      "\"tick\":%d,\"applied_replay_tick\":%d,\"entities\":[",
-      tick_before, replay_tick);
+      header, sizeof(header), header_format, tick_before, replay_tick);
   result.append(header);
   uint64_t state_hash = 1469598103934665603ULL;
   auto hash_value = [&state_hash](uint64_t value) {
@@ -979,6 +981,9 @@ Java_royale_nativehost_JniHost_nativeObserve(
     const int32_t direction_y = raw_i32(0xFC);
     const int32_t level = raw_i32(0x120) + 1;
     if (category >= 4000000 && category < 5000000) {
+      if (compact_training) {
+        continue;
+      }
       const uint64_t vtable = raw_u64(0x00);
       const uint64_t vtable_rva = vtable >= base ? vtable - base : 0;
       if (vtable_rva == 0 || vtable_rva >= 0x3000000 ||
@@ -1023,7 +1028,7 @@ Java_royale_nativehost_JniHost_nativeObserve(
     unsigned char path_node_consumed = 0;
     bool attack_component_valid = false, move_component_valid = false;
     std::array<int32_t, kMaxPathNodes> path_nodes = {};
-    if (components[0] != 0) {
+    if (!compact_training && components[0] != 0) {
       unsigned char attack_raw[0x68] = {};
       if (memory.read_bytes(
               components[0], attack_raw, sizeof(attack_raw))) {
@@ -1044,7 +1049,7 @@ Java_royale_nativehost_JniHost_nativeObserve(
         }
       }
     }
-    if (components[1] != 0) {
+    if (!compact_training && components[1] != 0) {
       unsigned char move_raw[0x220] = {};
       if (memory.read_bytes(components[1], move_raw, sizeof(move_raw))) {
         auto move_i32 = [&move_raw](size_t offset) {
@@ -1121,6 +1126,20 @@ Java_royale_nativehost_JniHost_nativeObserve(
   }
   size_t emitted = 0;
   for (const ObservedEntity& entity : observed) {
+    if (compact_training) {
+      char compact_row[384];
+      std::snprintf(
+          compact_row, sizeof(compact_row),
+          "%s{\"category\":%d,\"side\":%d,\"x\":%d,\"y\":%d,"
+          "\"card_id\":%d,\"hp\":%d,\"max_hp\":%d,"
+          "\"behavior_state\":%d}",
+          emitted == 0 ? "" : ",", entity.category, entity.side,
+          entity.x, entity.y, entity.card_id, entity.hp, entity.max_hp,
+          entity.behavior);
+      result.append(compact_row);
+      ++emitted;
+      continue;
+    }
     char target_json[32];
     if (entity.target == 0) {
       std::snprintf(target_json, sizeof(target_json), "null");
@@ -1233,6 +1252,7 @@ Java_royale_nativehost_JniHost_nativeObserve(
     }
   }
   hash_value(static_cast<uint64_t>(emitted));
+  if (!compact_training) {
   result.append("],\"effects\":[");
   std::sort(
       observed_effects.begin(), observed_effects.end(),
@@ -1343,6 +1363,9 @@ Java_royale_nativehost_JniHost_nativeObserve(
   result.append(",\"effects_classified\":");
   result.append(
       observed_effects.size() == projectile_count ? "true" : "false");
+  } else {
+    result.append("]");
+  }
   result.append(",\"players\":[");
   auto player_at_index = reinterpret_cast<BattlePlayerAtIndex>(
       base + kBattlePlayerAtIndexRva);
@@ -1458,6 +1481,17 @@ Java_royale_nativehost_JniHost_nativeObserve(
       }
     }
     const int32_t elixir = player_elixir(player);
+    if (compact_training) {
+      char compact_player[256];
+      std::snprintf(
+          compact_player, sizeof(compact_player),
+          "%s{\"side\":%d,\"elixir\":%d,\"elixir_raw\":%d,"
+          "\"hand_deck_indices\":[%d,%d,%d,%d]}",
+          side == 0 ? "" : ",", side, elixir, elixir_raw,
+          hand_deck_indices[0], hand_deck_indices[1],
+          hand_deck_indices[2], hand_deck_indices[3]);
+      result.append(compact_player);
+    } else {
     char player_header[384];
     std::snprintf(
         player_header, sizeof(player_header),
@@ -1492,6 +1526,7 @@ Java_royale_nativehost_JniHost_nativeObserve(
       result.append(value);
     }
     result.append("]}");
+    }
     for (uint64_t value : {
              static_cast<uint64_t>(static_cast<uint32_t>(side)),
              static_cast<uint64_t>(static_cast<uint32_t>(elixir)),
@@ -1501,17 +1536,25 @@ Java_royale_nativehost_JniHost_nativeObserve(
              static_cast<uint64_t>(static_cast<uint32_t>(hand_size)),
              static_cast<uint64_t>(static_cast<uint32_t>(cycle_size)),
              static_cast<uint64_t>(static_cast<uint32_t>(deck_count))}) {
-      hash_value(value);
+      if (!compact_training) {
+        hash_value(value);
+      }
     }
     for (int32_t value : hand_deck_indices) {
-      hash_value(static_cast<uint64_t>(static_cast<uint32_t>(value)));
+      if (!compact_training) {
+        hash_value(static_cast<uint64_t>(static_cast<uint32_t>(value)));
+      }
     }
     for (int32_t index = 0; index < cycle_size; ++index) {
-      hash_value(static_cast<uint64_t>(
-          static_cast<uint32_t>(cycle_deck_indices[index])));
+      if (!compact_training) {
+        hash_value(static_cast<uint64_t>(
+            static_cast<uint32_t>(cycle_deck_indices[index])));
+      }
     }
   }
-  hash_value(static_cast<uint64_t>(battle_rng_state));
+  if (!compact_training) {
+    hash_value(static_cast<uint64_t>(battle_rng_state));
+  }
   memory.read(battle + 0x60, &tick_after);
   result.append("],\"entity_count\":");
   result.append(std::to_string(emitted));
@@ -1519,21 +1562,36 @@ Java_royale_nativehost_JniHost_nativeObserve(
   result.append(tick_before == tick_after ? "true" : "false");
   result.append(",\"tick_after\":");
   result.append(std::to_string(tick_after));
-  result.append(",\"rng_algorithm\":\"libg_xorshift32_v150535029\"");
-  result.append(",\"rng_state\":");
-  result.append(std::to_string(battle_rng_state));
-  char hash_json[32];
-  std::snprintf(
-      hash_json, sizeof(hash_json), "\"%016llx\"",
-      static_cast<unsigned long long>(state_hash));
-  result.append(",\"state_hash\":");
-  result.append(hash_json);
-  result.append(",\"state_hash_scope\":\"public-observe-v5\"");
-  result.append(",\"state_hash_certificate\":false,\"episode\":");
+  if (!compact_training) {
+    result.append(",\"rng_algorithm\":\"libg_xorshift32_v150535029\"");
+    result.append(",\"rng_state\":");
+    result.append(std::to_string(battle_rng_state));
+    char hash_json[32];
+    std::snprintf(
+        hash_json, sizeof(hash_json), "\"%016llx\"",
+        static_cast<unsigned long long>(state_hash));
+    result.append(",\"state_hash\":");
+    result.append(hash_json);
+    result.append(",\"state_hash_scope\":\"public-observe-v5\"");
+    result.append(",\"state_hash_certificate\":false");
+  }
+  result.append(",\"episode\":");
   result.append(episode_json());
   result.push_back('}');
   dlclose(handle);
   return env->NewStringUTF(result.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeObserve(
+    JNIEnv* env, jclass, jstring libg_path) {
+  return observe_state_json(env, libg_path, false);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeObserveTrain(
+    JNIEnv* env, jclass, jstring libg_path) {
+  return observe_state_json(env, libg_path, true);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

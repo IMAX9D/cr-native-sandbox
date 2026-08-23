@@ -17,7 +17,9 @@ TRACE_SCHEMA_VERSION = 1
 MAX_TRACE_STEPS = 64
 MIN_TRACE_RESPONSE_BYTES = 64 * 1024
 MAX_TRACE_RESPONSE_BYTES = 32 * 1024 * 1024
-IDEMPOTENT_OPS = {"ping", "status", "observe", "probe_grid"}
+IDEMPOTENT_OPS = {
+    "ping", "status", "observe", "observe_train_v1", "probe_grid"
+}
 
 
 class JsonLineClient:

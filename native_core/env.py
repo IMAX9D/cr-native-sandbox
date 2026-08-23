@@ -163,6 +163,23 @@ class NativeRoyaleEnv:
         state = self._request({"op": "observe"})["state"]
         return self._enrich_state(state)
 
+    def observe_train(self) -> dict[str, Any]:
+        state = self._request({"op": "observe_train_v1"})["state"]
+        return self._enrich_training_state(state)
+
+    def _enrich_training_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        if (
+            state.get("schema_version") != 1
+            or state.get("kind") != "libg_native_train_state_v1"
+            or state.get("coherent") is not True
+            or not isinstance(state.get("entities"), list)
+            or not isinstance(state.get("players"), list)
+            or len(state["players"]) != 2
+            or not isinstance(state.get("episode"), Mapping)
+        ):
+            raise NativeHostError("compact training observation contract mismatch")
+        return self._enrich_state(state)
+
     def _enrich_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(dict(state))
         result["elapsed_seconds"] = round(int(result["tick"]) * 0.05, 3)
@@ -280,6 +297,54 @@ class NativeRoyaleEnv:
             self.last_episode = deepcopy(native_step["episode"])
         if isinstance(result.get("state"), Mapping):
             result["state"] = self._enrich_state(result["state"])
+        return result
+
+    def joint_training_transition(
+        self, actions: list[Mapping[str, int]], *, steps: int = 1
+    ) -> dict[str, Any]:
+        """One compact RPC for joint actions, one native Tick and next state."""
+        payload: list[dict[str, int | bool]] = []
+        seen: set[int] = set()
+        for value in actions:
+            side = int(value["side"])
+            if side not in (0, 1) or side in seen:
+                raise ValueError("joint actions require unique sides 0 and/or 1")
+            seen.add(side)
+            account_hi, account_lo = self.accounts[side]
+            payload.append(
+                {
+                    "side": side,
+                    "deck_index": int(value["deck_index"]),
+                    "x": int(value["x"]),
+                    "y": int(value["y"]),
+                    "account_hi": account_hi,
+                    "account_lo": account_lo,
+                    "dry_run": False,
+                }
+            )
+        raw = self._request(
+            {
+                "op": "joint_training_transition_v1",
+                "actions": payload,
+                "steps": steps,
+            }
+        )["result"]
+        episode = raw.get("episode")
+        if not isinstance(episode, Mapping):
+            raise NativeHostError("compact transition episode is missing")
+        enriched_episode = self._enrich_episode(episode)
+        self.last_episode = deepcopy(enriched_episode)
+        result: dict[str, Any] = {
+            "joint_action": raw["joint_action"],
+            "step": {"episode": enriched_episode},
+        }
+        if isinstance(raw.get("state"), Mapping):
+            result["state"] = self._enrich_training_state(raw["state"])
+        elif not (
+            enriched_episode.get("terminated")
+            or enriched_episode.get("truncated")
+        ):
+            raise NativeHostError("compact transition next state is missing")
         return result
 
     def probe(

@@ -247,7 +247,7 @@ class NativeSelfPlayCollector:
                         "y": y,
                     }
             stage_started = time.perf_counter()
-            transition = self.env.joint_transition(chosen, steps=1)
+            transition = self.env.joint_training_transition(chosen, steps=1)
             record_time("transition_seconds", stage_started)
             native_action = transition["joint_action"]
             accepted_sides = {

@@ -66,6 +66,7 @@ public final class JniHost {
         int maxResponseBytes
     );
     private static native String nativeObserve(String libgPath);
+    private static native String nativeObserveTrain(String libgPath);
     private static native String nativeAct(
         String libgPath, int side, int deckIndex, int x, int y,
         int accountHi, int accountLo, boolean dryRun
@@ -680,6 +681,12 @@ public final class JniHost {
                                     nativeObserve(root + "/libg.so")
                                 )
                             );
+                        } else if ("observe_train_v1".equals(op)) {
+                            response.put(
+                                "state", new JSONObject(
+                                    nativeObserveTrain(root + "/libg.so")
+                                )
+                            );
                         } else if ("probe_grid".equals(op)) {
                             JSONObject action = request.getJSONObject("action");
                             int side = action.getInt("side");
@@ -701,6 +708,33 @@ public final class JniHost {
                                     root, request.getJSONArray("actions")
                                 )
                             );
+                        } else if ("joint_training_transition_v1".equals(op)) {
+                            JSONObject result = new JSONObject();
+                            result.put(
+                                "joint_action",
+                                executeJointActions(
+                                    root, request.getJSONArray("actions")
+                                )
+                            );
+                            int steps = request.optInt("steps", 1);
+                            JSONObject stepResult = new JSONObject(
+                                nativeStep(root + "/libg.so", steps)
+                            );
+                            JSONObject episode = stepResult.getJSONObject("episode");
+                            result.put("episode", episode);
+                            terminalEpisodeLatched = episode.optBoolean(
+                                "terminated", false
+                            );
+                            if (!terminalEpisodeLatched
+                                && !episode.optBoolean("truncated", false)) {
+                                result.put(
+                                    "state",
+                                    new JSONObject(
+                                        nativeObserveTrain(root + "/libg.so")
+                                    )
+                                );
+                            }
+                            response.put("result", result);
                         } else if ("joint_transition".equals(op)) {
                             JSONObject result = new JSONObject();
                             result.put(
