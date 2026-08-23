@@ -27,6 +27,12 @@ Rider, Cannon, and Arrows. Evolution/elite/champion/hero variants are excluded.
 10. Complete trajectories feed recurrent PPO. Run files and checkpoints are
     written atomically under `D:\AI_data`.
 
+The hot path uses persistent `TCP_NODELAY` JSON-line connections,
+`joint_training_transition_v1` compact observations, exact layered deployment
+mask caches, and one global policy batch across all active Worker sides. Full
+`observe`, trace and GUI contracts remain separate and lossless. Measured
+Before/After results are in `docs/throughput-optimization-20260823.md`.
+
 Cold initialization is paid once per Worker, not once per episode. The reset
 stress gate completed 1,200 same-process resets with a single deterministic
 hash and no monotonic RSS growth; the 1,000-reset block averaged 11.475 ms,

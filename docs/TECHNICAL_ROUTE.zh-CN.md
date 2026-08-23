@@ -409,7 +409,9 @@ bootstrap replay 位于 `examples/eight-card-bootstrap.json`，包含：
 ## 12. JSON-line 外部协议
 
 服务绑定 Android guest 的 `127.0.0.1:<port>`，通过 `adb forward` 暴露到
-Windows host。同一 TCP 连接传入一行 UTF-8 JSON，返回一行 UTF-8 JSON。
+Windows host。同一持久 TCP 连接可以连续传入多行 UTF-8 JSON，每个请求严格
+返回一行 JSON。Python 客户端用连接内锁保证不串包；只读请求断线后允许自动
+重连一次，变更状态的请求在不确定失败后禁止重放。两端均启用`TCP_NODELAY`。
 
 边界：
 
@@ -426,6 +428,7 @@ Windows host。同一 TCP 连接传入一行 UTF-8 JSON，返回一行 UTF-8 JSO
 | `ping` | 服务存活检查 | 否 |
 | `status` | manager、state、battle 运行时探针 | 否 |
 | `observe` | 完整公开原生状态 | 否 |
+| `observe_train_v1` | 训练所需紧凑状态 | 否 |
 | `reset` | 新 seed/replay 的进程内 4→4 替换 | 是 |
 | `step` | 推进 N 次 50 ms 原生核心更新 | 是 |
 | `step_trace` | 推进并返回每个 tick 的完整帧 | 是 |
@@ -433,6 +436,7 @@ Windows host。同一 TCP 连接传入一行 UTF-8 JSON，返回一行 UTF-8 JSO
 | `act` | 单方原生下牌，可 dry-run | 可选 |
 | `joint_act` | 双方按固定顺序提交动作 | 是 |
 | `joint_transition` | 联合动作 + step + next observe | 是 |
+| `joint_training_transition_v1` | 联合动作 + step + 紧凑状态 | 是 |
 | `joint_transition_trace` | 联合动作 + 多 tick 全帧 trace | 是 |
 | `shutdown` | 关闭对应服务进程 | 是 |
 
@@ -749,7 +753,7 @@ Actor。代码把两条路径分开，防止训练时的信息优势进入部署
 1. 从同一原生状态编码双方视角；
 2. 为双方读取当前手牌的原生网格；
 3. 构建 card/position masks；
-4. 策略同时选择双方动作；
+4. 汇总所有 active Worker 的双方视角，执行一次全局 batch 推理；
 5. 生成一个 canonical `joint_transition`；
 6. 原生按 side 0、side 1 顺序执行；
 7. 原生推进一个 tick；
@@ -784,7 +788,7 @@ Actor。代码把两条路径分开，防止训练时的信息优势进入部署
 - 1 个无窗口 Android AVD；
 - 2 个独立 `app_process/libg` Worker；
 - 每个 Worker 同时只运行 1 场；
-- Python 用线程并行等待各 Worker RPC；
+- Python 用 vector collector 汇总 `2×Worker` 视角并并行等待 Worker RPC；
 - 同一轮收集完成后统一更新。
 
 理论上 Worker 配置允许 1..8，但可用数量受主机 CPU、AVD 内存、单进程 RSS、
@@ -798,6 +802,9 @@ JSON 序列化和 GPU 推理共同限制。不能只按原生 tick microbenchmar
 - 该短路径约 `7,618 validated tick/s`；
 - 进程内 reset 平均约 `11.475 ms`；
 - 双 Worker 的短采样/更新闭环已通过。
+- 固定2×1000步真实闭环约 `289–291 environment steps/s`；
+- 4场完整终局环境采样约 `211.96 environment steps/s`；
+- 完整阶段profile见 `docs/throughput-optimization-20260823.md`。
 
 这些数字分别测量不同层次，不应互相替代：训练每 tick 还包括完整观测 JSON、
 掩码、推理、轨迹保存和优化器更新。
@@ -1089,6 +1096,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 
 | `training/schema.py` | 卡表、部署掩码、状态编码、奖励 schema |
 | `training/model.py` | 策略/价值网络接口，不含权重 |
 | `training/rollout.py` | 双方同 tick 自博弈采样 |
+| `training/vector_rollout.py` | 跨 Worker 全局 batch 自博弈采样 |
 | `training/ppo.py` | recurrent PPO 更新器 |
 | `training/train.py` | 运行编排和持久化 |
 | `scripts/start_direct_service.ps1` | 单 Slot 部署和启动 |
@@ -1097,6 +1105,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 
 | `scripts/accept_direct_core.ps1` | 直接核心十进程证书 |
 | `scripts/accept_eight_cards.py` | 八卡动作证书 |
 | `scripts/accept_match_rules.py` | 时间、圣水、拼血证书 |
+| `scripts/accept_training_fast_path.py` | compact/vector 语义差分证书 |
 
 ## 30. 结论
 

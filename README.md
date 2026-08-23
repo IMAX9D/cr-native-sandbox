@@ -2,6 +2,9 @@
 
 完整中文技术路线：[`docs/TECHNICAL_ROUTE.zh-CN.md`](docs/TECHNICAL_ROUTE.zh-CN.md)
 
+Self-Play 吞吐优化报告：
+[`docs/throughput-optimization-20260823.md`](docs/throughput-optimization-20260823.md)
+
 Isolated feasibility project for driving the original Clash Royale `libg.so`
 as a headless battle oracle and, if the experiment succeeds, as a high-speed
 self-play kernel.
