@@ -315,6 +315,7 @@ def main() -> int:
                 "--device", "cuda",
                 "--skip-worker-start",
                 "--keep-vms",
+                "--resume",
             ]
             evaluation = subprocess.run(
                 evaluation_command,

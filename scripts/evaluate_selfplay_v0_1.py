@@ -68,7 +68,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-worker-start", action="store_true")
     parser.add_argument("--keep-vms", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     return parser
+
+
+def _resume_matchup(
+    path: Path,
+    *,
+    seeds: list[int],
+    policy_seed: int,
+    candidate_path: Path,
+    opponent_path: Path | None,
+    random_seed: int | None = None,
+) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    expected_candidate = str(candidate_path.resolve())
+    actual_opponent = value.get("opponent", {})
+    valid_opponent = (
+        str(actual_opponent.get("path")) == str(opponent_path.resolve())
+        if opponent_path is not None
+        else (
+            actual_opponent.get("kind") == "random_legal_v1"
+            and int(actual_opponent.get("seed", -1)) == int(random_seed)
+        )
+    )
+    if not (
+        value.get("kind") == "native_paired_side_swapped_evaluation"
+        and value.get("environment_seeds") == seeds
+        and int(value.get("policy_rng_seed", -1)) == policy_seed
+        and str(value.get("candidate", {}).get("path")) == expected_candidate
+        and valid_opponent
+        and value.get("summary", {}).get("passed_integrity") is True
+    ):
+        raise RuntimeError(f"existing matchup cannot be safely resumed: {path}")
+    return dict(value["summary"])
 
 
 def main() -> int:
@@ -134,14 +169,36 @@ def main() -> int:
             for opponent_index in range(candidate_index):
                 candidate_path = candidates[candidate_index]
                 opponent_path = candidates[opponent_index]
+                policy_seed = args.policy_seed + matchup_index
+                matchup_index += 1
+                name = f"{candidate_path.stem}-vs-{opponent_path.stem}"
+                matchup_path = matchups_root / f"{name}.json"
+                existing = _resume_matchup(
+                    matchup_path,
+                    seeds=seeds,
+                    policy_seed=policy_seed,
+                    candidate_path=candidate_path,
+                    opponent_path=opponent_path,
+                ) if args.resume else None
+                if existing is not None:
+                    pair_summaries[name] = existing
+                    matrix[candidate_path.stem][opponent_path.stem] = existing[
+                        "score_rate"
+                    ]
+                    matrix[opponent_path.stem][candidate_path.stem] = (
+                        1.0 - existing["score_rate"]
+                    )
+                    print(json.dumps({
+                        "event": "evaluation_matchup_resumed",
+                        "matchup": name,
+                    }), flush=True)
+                    continue
                 candidate, candidate_meta = load_neural_policy(
                     candidate_path, device=device, cuda_graph=cuda_graph
                 )
                 opponent, opponent_meta = load_neural_policy(
                     opponent_path, device=device, cuda_graph=cuda_graph
                 )
-                policy_seed = args.policy_seed + matchup_index
-                matchup_index += 1
                 _reset_policy_rng(policy_seed)
                 summary, records = evaluate_pair(
                     envs=envs,
@@ -152,7 +209,6 @@ def main() -> int:
                     device=device,
                     max_ticks=args.max_ticks,
                 )
-                name = f"{candidate_path.stem}-vs-{opponent_path.stem}"
                 value = {
                     "schema_version": 1,
                     "kind": "native_paired_side_swapped_evaluation",
@@ -164,7 +220,7 @@ def main() -> int:
                     "summary": summary,
                     "matches": records,
                 }
-                RunStore._atomic_json(matchups_root / f"{name}.json", value)
+                RunStore._atomic_json(matchup_path, value)
                 pair_summaries[name] = summary
                 matrix[candidate_path.stem][opponent_path.stem] = summary[
                     "score_rate"
@@ -176,11 +232,28 @@ def main() -> int:
                 _release()
 
         for candidate_path in candidates:
+            policy_seed = args.policy_seed + matchup_index
+            matchup_index += 1
+            name = f"{candidate_path.stem}-vs-RandomLegal"
+            matchup_path = matchups_root / f"{name}.json"
+            existing = _resume_matchup(
+                matchup_path,
+                seeds=seeds,
+                policy_seed=policy_seed,
+                candidate_path=candidate_path,
+                opponent_path=None,
+                random_seed=policy_seed + 1,
+            ) if args.resume else None
+            if existing is not None:
+                random_summaries[candidate_path.stem] = existing
+                print(json.dumps({
+                    "event": "evaluation_matchup_resumed",
+                    "matchup": name,
+                }), flush=True)
+                continue
             candidate, candidate_meta = load_neural_policy(
                 candidate_path, device=device, cuda_graph=cuda_graph
             )
-            policy_seed = args.policy_seed + matchup_index
-            matchup_index += 1
             _reset_policy_rng(policy_seed)
             random_policy = RandomLegalPolicy(policy_seed + 1)
             summary, records = evaluate_pair(
@@ -192,7 +265,6 @@ def main() -> int:
                 device=device,
                 max_ticks=args.max_ticks,
             )
-            name = f"{candidate_path.stem}-vs-RandomLegal"
             value = {
                 "schema_version": 1,
                 "kind": "native_paired_side_swapped_evaluation",
@@ -208,7 +280,7 @@ def main() -> int:
                 "summary": summary,
                 "matches": records,
             }
-            RunStore._atomic_json(matchups_root / f"{name}.json", value)
+            RunStore._atomic_json(matchup_path, value)
             random_summaries[candidate_path.stem] = summary
             del candidate, random_policy
             _release()
