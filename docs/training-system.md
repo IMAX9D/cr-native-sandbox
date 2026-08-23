@@ -46,6 +46,17 @@ Bounded acceptance:
 .\scripts\start_training.ps1 -Smoke
 ```
 
+Interactive battle-logic acceptance:
+
+```powershell
+.\scripts\start_logic_gui.ps1
+```
+
+The GUI can switch between `libg`'s raw per-cell validator output and the final
+training action mask. It also exposes target links, path nodes, collision and
+attack timers, RNG/state hash, both hands/elixir pools, and snapshot export to
+`D:\AI_data\cr-native-core\gui-sessions`.
+
 Custom run:
 
 ```powershell

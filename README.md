@@ -76,6 +76,12 @@ For a bounded end-to-end check, double-click
 native episode, a PPO backward/update pass, and a loadable checkpoint—not just
 a responsive launcher.
 
+To inspect battle logic manually, double-click
+[`GAME_LOGIC_GUI.cmd`](GAME_LOGIC_GUI.cmd). The GUI exposes both sides, current
+hand cards, raw/native versus final training deployment masks, single/batched
+ticks, target links, path nodes, entity-native fields, state hash/RNG, terminal
+state, and JSON snapshot export.
+
 The same entry was verified from a fully stopped VM/service and with two
 concurrent native workers on 2026-08-23. See
 [`docs/training-system.md`](docs/training-system.md).
@@ -110,6 +116,7 @@ call-chain boundaries.
   self-play collection, PPO update, and atomic run storage.
 - `START_TRAINING.cmd`: normal long-running two-worker training entry.
 - `SMOKE_TEST_TRAINING.cmd`: bounded one-iteration acceptance entry.
+- `GAME_LOGIC_GUI.cmd`: interactive native battle-logic acceptance entry.
 - `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).
 
 The Worker consumes frozen APK/runtime inputs from the production repository
