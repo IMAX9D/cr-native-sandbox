@@ -17,13 +17,13 @@ import torch
 
 from native_core.client import JsonLineClient
 from native_core.env import NativeRoyaleEnv
-from native_core.worker import HeadlessWorkerPool, WorkerConfig
+from native_core.worker import MultiAvdWorkerPool
 
 from .model import RecurrentPolicyValueNet
 from .ppo import PPOConfig, PPOTrainer
 from .rollout import EpisodeResult, save_episode
 from .schema import RunStore
-from .vector_rollout import VectorNativeSelfPlayCollector
+from .vector_rollout import VectorNativeSelfPlayCollector, summarize_barrier
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,11 +45,45 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
         stream.flush()
 
 
+def _atomic_barrier_save(
+    path: Path,
+    rows: list[tuple[int, int, int, float, float, float]],
+    waves: list[int],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    values = np.asarray(rows, dtype=np.float64).reshape(-1, 6)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        np.savez_compressed(
+            stream,
+            schema_version=np.asarray(1, dtype=np.int32),
+            wave=np.asarray(waves, dtype=np.int32),
+            round_index=values[:, 0].astype(np.int64),
+            active_workers=values[:, 1].astype(np.int16),
+            policy_batch_size=values[:, 2].astype(np.int16),
+            fastest_seconds=values[:, 3],
+            median_seconds=values[:, 4],
+            slowest_seconds=values[:, 5],
+        )
+    temporary.replace(path)
+
+
+def _emit_phase(enabled: bool, phase: str, iteration: int) -> None:
+    if enabled:
+        print(json.dumps({
+            "event": "training_phase",
+            "phase": phase,
+            "iteration": iteration,
+        }), flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=1000000)
-    parser.add_argument("--episodes-per-iteration", type=int, default=4)
+    parser.add_argument("--episodes-per-iteration", type=int)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--avds", type=int, default=1)
+    parser.add_argument("--workers-per-avd", type=int)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-ticks", type=int, default=7200)
     parser.add_argument("--base-port", type=int, default=37031)
@@ -64,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-worker-start", action="store_true")
     parser.add_argument("--profile-native", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--emit-phase-events", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -74,14 +109,32 @@ def main() -> int:
         args.iterations = 1
         args.episodes_per_iteration = 1
         args.workers = 1
+        args.avds = 1
+        args.workers_per_avd = 1
         args.max_ticks = 128
         args.run_id = args.run_id or "smoke-" + datetime.now(timezone.utc).strftime(
             "%Y%m%dT%H%M%SZ"
         ) + "-" + uuid.uuid4().hex[:8]
-    if min(args.iterations, args.episodes_per_iteration, args.workers) < 1:
+    if args.episodes_per_iteration is None:
+        args.episodes_per_iteration = args.workers
+    if args.workers_per_avd is None:
+        if args.workers % args.avds:
+            raise ValueError("workers must divide evenly across avds")
+        args.workers_per_avd = args.workers // args.avds
+    if min(
+        args.iterations,
+        args.episodes_per_iteration,
+        args.workers,
+        args.avds,
+        args.workers_per_avd,
+    ) < 1:
         raise ValueError("iterations, episodes-per-iteration and workers must be positive")
-    if args.workers > 8:
-        raise ValueError("workers must be in 1..8")
+    if args.workers != args.avds * args.workers_per_avd:
+        raise ValueError("workers must equal avds * workers-per-avd")
+    if args.workers_per_avd > 4:
+        raise ValueError("each AVD may host at most 4 workers")
+    if args.workers > 32:
+        raise ValueError("workers must be in 1..32")
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -95,18 +148,28 @@ def main() -> int:
 
     replay = json.loads(args.replay.read_text(encoding="utf-8-sig"))
     ppo_config = PPOConfig()
+    environment_ports = [
+        (
+            args.direct_base_port + worker
+            if args.transport == "direct"
+            else args.base_port
+            + (worker // args.workers_per_avd) * 100
+            + worker % args.workers_per_avd
+        )
+        for worker in range(args.workers)
+    ]
     config = {
         "schema_version": 1,
         "algorithm": "persistent_native_recurrent_ppo",
         "iterations": args.iterations,
         "episodes_per_iteration": args.episodes_per_iteration,
         "workers": args.workers,
+        "avds": args.avds,
+        "workers_per_avd": args.workers_per_avd,
         "seed": args.seed,
         "max_ticks": args.max_ticks,
         "base_port": args.base_port,
-        "environment_base_port": (
-            args.direct_base_port if args.transport == "direct" else args.base_port
-        ),
+        "environment_ports": environment_ports,
         "transport": args.transport,
         "device": str(device),
         "torch": torch.__version__,
@@ -127,17 +190,19 @@ def main() -> int:
         "config": config,
     })
 
-    pool = HeadlessWorkerPool(WorkerConfig(
+    pool = MultiAvdWorkerPool(
+        avds=args.avds,
+        workers_per_avd=args.workers_per_avd,
         service_base_port=args.base_port,
         direct_base_port=args.direct_base_port,
-    ))
+    )
     if not args.skip_worker_start:
         worker_state = pool.ensure_ready(
-            args.workers, configure_direct=args.transport == "direct"
+            configure_direct=args.transport == "direct"
         )
         _append_jsonl(events, {"event": "workers_ready", "state": worker_state})
     elif args.transport == "direct":
-        direct_state = pool.configure_direct_ports(args.workers)
+        direct_state = pool.configure_direct_ports()
         _append_jsonl(events, {"event": "direct_transport_ready", "state": direct_state})
 
     model = RecurrentPolicyValueNet().to(device)
@@ -157,16 +222,15 @@ def main() -> int:
         starting_iteration = int(checkpoint.get("iteration", 0))
 
     next_seed = args.seed
-    environment_base_port = (
-        args.direct_base_port if args.transport == "direct" else args.base_port
-    )
+    if environment_ports != pool.environment_ports(args.transport):
+        raise RuntimeError("manifest environment ports do not match Worker pool")
     envs = [
         NativeRoyaleEnv(
-            port=environment_base_port + slot,
+            port=port,
             timeout=30,
             profile_native=args.profile_native,
         )
-        for slot in range(args.workers)
+        for port in environment_ports
     ]
     for offset in range(1, args.iterations + 1):
         iteration = starting_iteration + offset
@@ -174,7 +238,11 @@ def main() -> int:
         results: list[EpisodeResult] = []
         rpc_total_latency: list[float] = []
         rpc_receive_latency: list[float] = []
+        barrier_rows: list[tuple[int, int, int, float, float, float]] = []
+        barrier_waves: list[int] = []
+        wave_index = 0
         iteration_started = time.perf_counter()
+        _emit_phase(args.emit_phase_events, "sampling", iteration)
         while pending:
             wave = pending[: args.workers]
             del pending[: len(wave)]
@@ -188,6 +256,9 @@ def main() -> int:
             collected = collector.collect(seeds)
             rpc_total_latency.extend(collector.rpc_latency_samples["total"])
             rpc_receive_latency.extend(collector.rpc_latency_samples["receive"])
+            barrier_rows.extend(collector.barrier_rows)
+            barrier_waves.extend([wave_index] * len(collector.barrier_rows))
+            wave_index += 1
             for result in collected:
                 save_episode(paths.trajectories, result, full_debug=args.smoke)
                 results.append(result)
@@ -206,9 +277,14 @@ def main() -> int:
             attempts=sampling_profile.get("rpc_attempts", 0.0),
             failures=sampling_profile.get("rpc_failures", 0.0),
         ))
+        sampling_profile.update(summarize_barrier(barrier_rows))
+        barrier_path = paths.evaluations / f"barrier-{iteration:06d}.npz"
+        _atomic_barrier_save(barrier_path, barrier_rows, barrier_waves)
+        _emit_phase(args.emit_phase_events, "learner", iteration)
         update_started = time.perf_counter()
         metrics = trainer.update(trajectories)
         metrics["learner_wall_seconds"] = time.perf_counter() - update_started
+        _emit_phase(args.emit_phase_events, "finalize", iteration)
         metrics["iteration_wall_seconds"] = time.perf_counter() - iteration_started
         metrics["environment_steps"] = float(
             sum(len(item.rewards) for item in trajectories) // 2
@@ -229,6 +305,7 @@ def main() -> int:
             "metrics": metrics,
             "episode_summaries": [item.summary() for item in results],
             "sampling_profile": sampling_profile,
+            "barrier_profile": str(barrier_path),
         }
         numbered = paths.checkpoints / f"checkpoint-{iteration:06d}.pt"
         _atomic_torch_save(numbered, checkpoint)
@@ -250,6 +327,7 @@ def main() -> int:
             "native_ticks": native_ticks, "episodes": completed_episodes,
             "metrics": metrics, "checkpoint": str(numbered),
             "sampling_profile": sampling_profile,
+            "barrier_profile": str(barrier_path),
         }
         _append_jsonl(events, event)
         RunStore._atomic_json(args.data_root / "latest_run.json", {

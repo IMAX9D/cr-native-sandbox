@@ -1,8 +1,9 @@
 param(
     [switch]$Smoke,
     [ValidateRange(1, 8)] [int]$Workers = 4,
+    [ValidateRange(1, 4)] [int]$Avds = 1,
     [ValidateRange(1, 1000000000)] [int]$Iterations = 1000000,
-    [ValidateRange(1, 1024)] [int]$EpisodesPerIteration = 4,
+    [ValidateRange(0, 1024)] [int]$EpisodesPerIteration = 0,
     [ValidateRange(101, 20000)] [int]$MaxTicks = 7200,
     [int]$Seed = 1,
     [string]$Device = "auto",
@@ -14,6 +15,9 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $ProjectRoot
+if ($EpisodesPerIteration -eq 0) {
+    $EpisodesPerIteration = $Workers
+}
 
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     $ResolvedPython = Get-Command python.exe -ErrorAction SilentlyContinue
@@ -56,6 +60,7 @@ Invoke-BuildScript (Join-Path $PSScriptRoot "build_bridge.ps1") "native-bridge"
 $Arguments = @(
     "-m", "training.train",
     "--workers", "$Workers",
+    "--avds", "$Avds",
     "--iterations", "$Iterations",
     "--episodes-per-iteration", "$EpisodesPerIteration",
     "--max-ticks", "$MaxTicks",

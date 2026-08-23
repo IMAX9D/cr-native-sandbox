@@ -8,7 +8,8 @@ param(
     [string]$AssetDirectory = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\extracted\assets",
     [string]$AssetPackApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\split_install_time_asset_pack.apk",
     [string]$BootstrapReplayJson = "",
-    [string]$DataRoot = "D:\AI_data\cr-native-core"
+    [string]$DataRoot = "D:\AI_data\cr-native-core",
+    [ValidateRange(30, 900)] [int]$ReadyTimeoutSeconds = 300
 )
 
 $ErrorActionPreference = "Stop"
@@ -145,7 +146,7 @@ $LaunchCommand = "cd '$RemoteRoot' && exec env CLASSPATH='$ClassPath' LD_LIBRARY
 $Launch = "nohup sh -c `"$LaunchCommand`" >'$RemoteRoot/service.log' 2>&1 </dev/null &"
 Invoke-Adb @("shell", $Launch) | Out-Null
 
-$Deadline = [DateTime]::UtcNow.AddSeconds(120)
+$Deadline = [DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
 $LastError = ""
 while ([DateTime]::UtcNow -lt $Deadline) {
     try {

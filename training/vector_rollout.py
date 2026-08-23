@@ -21,6 +21,38 @@ from .schema import (
 )
 
 
+def summarize_barrier(
+    rows: list[tuple[int, int, int, float, float, float]],
+) -> dict[str, float]:
+    """Summarize raw per-round fastest/median/slowest transition latency."""
+    if not rows:
+        return {}
+    values = np.asarray(rows, dtype=np.float64)
+    summary: dict[str, float] = {
+        "vector_round_count": float(len(rows)),
+        "active_workers_mean": float(values[:, 1].mean()),
+        "policy_batch_size_mean": float(values[:, 2].mean()),
+        "policy_batch_size_max": float(values[:, 2].max()),
+    }
+    for column, label in ((3, "fastest"), (4, "median"), (5, "slowest")):
+        milliseconds = values[:, column] * 1000.0
+        summary[f"worker_transition_{label}_mean_ms"] = float(
+            milliseconds.mean()
+        )
+        for percentile in (50, 95, 99):
+            summary[f"worker_transition_{label}_p{percentile}_ms"] = float(
+                np.percentile(milliseconds, percentile)
+            )
+    barrier_wait = (values[:, 5] - values[:, 3]) * 1000.0
+    summary["worker_transition_barrier_wait_mean_ms"] = float(
+        barrier_wait.mean()
+    )
+    summary["worker_transition_barrier_wait_p95_ms"] = float(
+        np.percentile(barrier_wait, 95)
+    )
+    return summary
+
+
 @dataclass
 class _Cursor:
     env: NativeRoyaleEnv
@@ -78,6 +110,8 @@ class VectorNativeSelfPlayCollector:
             "total": [],
             "receive": [],
         }
+        self.barrier_rows: list[tuple[int, int, int, float, float, float]] = []
+        self._round_index = 0
 
     def _record_vector(self, name: str, started_at: float) -> None:
         self.vector_profile[name] = self.vector_profile.get(name, 0.0) + (
@@ -278,6 +312,19 @@ class VectorNativeSelfPlayCollector:
                 transitions = {
                     key: future.result() for key, future in futures.items()
                 }
+                transition_latencies = np.asarray(
+                    [transitions[id(cursor)][1] for cursor in active],
+                    dtype=np.float64,
+                )
+                self.barrier_rows.append((
+                    self._round_index,
+                    len(active),
+                    len(row_owners),
+                    float(transition_latencies.min()),
+                    float(np.median(transition_latencies)),
+                    float(transition_latencies.max()),
+                ))
+                self._round_index += 1
                 self._record_vector(
                     "vector_transition_wall_seconds", transition_wall_started
                 )
@@ -424,5 +471,6 @@ class VectorNativeSelfPlayCollector:
                 self.vector_profile[f"cuda_graph_{name}"] = (
                     value - self._cuda_graph_stats_before.get(name, 0.0)
                 )
+            self.vector_profile.update(summarize_barrier(self.barrier_rows))
             results[0].profile.update(self.vector_profile)
         return results

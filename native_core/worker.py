@@ -27,6 +27,12 @@ DEFAULT_DATA = Path(r"D:\AI_data\cr-native-core")
 DEFAULT_APKS = Path(
     r"D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks"
 )
+DEFAULT_AVD_NAMES = (
+    "royale_worker_api31",
+    "royale_worker_api31_b",
+    "royale_worker_api31_c",
+    "royale_worker_api31_d",
+)
 
 
 class WorkerError(RuntimeError):
@@ -73,7 +79,7 @@ class WorkerConfig:
 
     @property
     def logs(self) -> Path:
-        return self.data_root / "android" / "logs"
+        return self.data_root / "android" / "logs" / self.serial
 
 
 class HeadlessWorkerPool:
@@ -273,7 +279,7 @@ class HeadlessWorkerPool:
         ]
         result = subprocess.run(
             command, cwd=PROJECT_ROOT, text=True, encoding="utf-8", errors="replace",
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=420,
             creationflags=_creation_flags(), check=False,
         )
         if result.returncode:
@@ -341,6 +347,125 @@ class HeadlessWorkerPool:
                 time.sleep(0.5)
             vm_stopped = not self.vm_ready()
         return {"services": services, "vm_stopped": vm_stopped}
+
+
+class MultiAvdWorkerPool:
+    """Horizontal AVD pool with four isolated libg Workers per VM."""
+
+    def __init__(
+        self,
+        *,
+        avds: int,
+        workers_per_avd: int = 4,
+        avd_names: tuple[str, ...] = DEFAULT_AVD_NAMES,
+        emulator_base_port: int = 5554,
+        service_base_port: int = 37031,
+        service_port_stride: int = 100,
+        direct_base_port: int = 38031,
+        cores_per_avd: int = 4,
+        memory_mb_per_avd: int = 4096,
+    ) -> None:
+        if avds < 1 or avds > len(avd_names):
+            raise ValueError(f"avds must be in 1..{len(avd_names)}")
+        if workers_per_avd < 1 or workers_per_avd > 4:
+            raise ValueError("workers_per_avd must be in 1..4")
+        self.avds = avds
+        self.workers_per_avd = workers_per_avd
+        self.pools = [
+            HeadlessWorkerPool(WorkerConfig(
+                avd_name=avd_names[index],
+                emulator_port=emulator_base_port + 2 * index,
+                service_base_port=service_base_port + service_port_stride * index,
+                direct_base_port=(
+                    direct_base_port + workers_per_avd * index
+                ),
+                cores=cores_per_avd,
+                memory_mb=memory_mb_per_avd,
+            ))
+            for index in range(avds)
+        ]
+
+    @property
+    def workers(self) -> int:
+        return self.avds * self.workers_per_avd
+
+    def environment_ports(self, transport: str) -> list[int]:
+        if transport not in ("direct", "adb"):
+            raise ValueError("transport must be direct or adb")
+        ports: list[int] = []
+        for pool in self.pools:
+            base = (
+                pool.config.direct_base_port
+                if transport == "direct"
+                else pool.config.service_base_port
+            )
+            ports.extend(base + slot for slot in range(self.workers_per_avd))
+        return ports
+
+    def ensure_ready(self, *, configure_direct: bool = True) -> dict[str, Any]:
+        instances = []
+        for avd_index, pool in enumerate(self.pools):
+            avd_ini = pool.config.avd_home / f"{pool.config.avd_name}.ini"
+            if not avd_ini.is_file():
+                raise WorkerError(f"AVD is not provisioned: {avd_ini}")
+            state = pool.ensure_ready(
+                self.workers_per_avd,
+                configure_direct=configure_direct,
+            )
+            state["avd_index"] = avd_index
+            state["avd_name"] = pool.config.avd_name
+            state["serial"] = pool.config.serial
+            instances.append(state)
+        return {
+            "avds": self.avds,
+            "workers_per_avd": self.workers_per_avd,
+            "workers": self.workers,
+            "instances": instances,
+        }
+
+    def configure_direct_ports(self) -> dict[str, Any]:
+        return {
+            "avds": [
+                {
+                    "avd_index": index,
+                    "serial": pool.config.serial,
+                    **pool.configure_direct_ports(self.workers_per_avd),
+                }
+                for index, pool in enumerate(self.pools)
+            ]
+        }
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "instances": [
+                {
+                    "avd_index": index,
+                    "avd_name": pool.config.avd_name,
+                    "serial": pool.config.serial,
+                    "vm_ready": pool.vm_ready(),
+                    "services": [
+                        pool.service_ready(slot)
+                        for slot in range(self.workers_per_avd)
+                    ],
+                }
+                for index, pool in enumerate(self.pools)
+            ]
+        }
+
+    def stop(self, *, keep_vms: bool = True) -> dict[str, Any]:
+        return {
+            "instances": [
+                {
+                    "avd_index": index,
+                    "serial": pool.config.serial,
+                    **pool.stop(
+                        self.workers_per_avd,
+                        keep_vm=keep_vms,
+                    ),
+                }
+                for index, pool in enumerate(self.pools)
+            ]
+        }
 
 
 def main() -> int:
