@@ -14,7 +14,6 @@ try:
         MIN_TRACE_RESPONSE_BYTES,
         TRACE_SCHEMA_VERSION,
         JsonLineClient,
-        request,
     )
 except ImportError:  # direct ``python native_core/env.py`` consumers
     from client import (  # type: ignore[no-redef]
@@ -23,7 +22,6 @@ except ImportError:  # direct ``python native_core/env.py`` consumers
         MIN_TRACE_RESPONSE_BYTES,
         TRACE_SCHEMA_VERSION,
         JsonLineClient,
-        request,
     )
 
 
