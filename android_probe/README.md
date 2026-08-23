@@ -21,8 +21,12 @@ Profiles, from most coupled to least coupled:
    presentation shim, and attest every prerequisite before replay creation.
    It exits with `blocked_data_tables` instead of entering battle while the
    native table array is empty.
+8. `serve-direct`: retain the same strict no-Surface initialization as
+   `probe-direct`, then expose the JSON-line battle API. Its `reset` operation
+   performs the original native `BattleGameState` 4-to-4 replacement so one
+   process can execute many seeded episodes.
 
 The first six profiles attempt the same replay and exactly 100 native logic
-steps. `probe-direct` has an earlier readiness gate: it may attempt the replay
-only after native DataTables are populated. Failure is evidence; no profile
-falls back to another profile.
+steps. The direct profiles have an earlier readiness gate: they may attempt the
+replay only after native DataTables are populated. Failure is evidence; no
+profile falls back to another profile.

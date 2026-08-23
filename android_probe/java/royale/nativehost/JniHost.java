@@ -76,7 +76,7 @@ public final class JniHost {
 
     public static void main(String[] args) {
         if (args.length < 1 || args.length > 3) {
-            System.err.println("usage: royale.nativehost.JniHost /absolute/runtime/root [load|context|create|lifecycle|replay|serve|probe-baseline|probe-detach-surface|probe-null-surface|probe-no-surface|probe-create-only|probe-minimal|probe-direct] [replay.json|port]");
+            System.err.println("usage: royale.nativehost.JniHost /absolute/runtime/root [load|context|create|lifecycle|replay|serve|serve-direct|probe-baseline|probe-detach-surface|probe-null-surface|probe-no-surface|probe-create-only|probe-minimal|probe-direct] [replay.json|port]");
             System.exit(64);
         }
         String mode = args.length >= 2 ? args[1] : "load";
@@ -124,6 +124,7 @@ public final class JniHost {
             }
             if (!"create".equals(mode) && !"lifecycle".equals(mode)
                 && !"replay".equals(mode) && !"serve".equals(mode)
+                && !"serve-direct".equals(mode)
                 && !isProbeMode(mode)) {
                 throw new IllegalArgumentException("unknown mode: " + mode);
             }
@@ -185,7 +186,8 @@ public final class JniHost {
                         nativeProbePrerequisites(args[0] + "/libg.so") + "}"
                 );
                 System.out.flush();
-                if ("probe-direct".equals(mode)) {
+                if ("probe-direct".equals(mode)
+                    || "serve-direct".equals(mode)) {
                     System.out.println(
                         "{\"schema_version\":1,\"stage\":\"direct_platform_init\"," +
                             "\"event\":\"after_call\",\"value\":" +
@@ -282,7 +284,7 @@ public final class JniHost {
                         System.exit(0);
                     }
                 }
-                if ("serve".equals(mode)) {
+                if ("serve".equals(mode) || "serve-direct".equals(mode)) {
                     String bootstrapReplay = readUtf8(
                         new File(args[0], "bootstrap-replay.json")
                     );
@@ -295,10 +297,15 @@ public final class JniHost {
                     );
                     emitStage("service_bootstrap", "before");
                     nativeLoadReplay(args[0] + "/libg.so", bootstrapReplay);
+                    if ("serve-direct".equals(mode)) {
+                        nativePumpManager(args[0] + "/libg.so");
+                    }
                     waitForBattle(args[0], 5000L, null, 0);
                     emitStage("service_bootstrap", "after");
-                    GameApp.nOnPause();
-                    Thread.sleep(100L);
+                    if (!"serve-direct".equals(mode)) {
+                        GameApp.nOnPause();
+                        Thread.sleep(100L);
+                    }
                     JSONObject bootstrapStep = new JSONObject(
                         nativeStep(args[0] + "/libg.so", 10)
                     );
@@ -394,7 +401,8 @@ public final class JniHost {
                     );
                     System.out.flush();
                     emitRuntimeProbe(args[0], "after_replay_input");
-                } else if ("serve".equals(mode)) {
+                } else if ("serve".equals(mode)
+                    || "serve-direct".equals(mode)) {
                     int port = args.length == 3 ? Integer.parseInt(args[2]) : 37031;
                     serveJson(args[0], port);
                 }
@@ -431,15 +439,15 @@ public final class JniHost {
             nativeProbeRuntime(root + "/libg.so")
         );
         int currentTick = current.optInt("tick", -1);
-        if (!terminalEpisodeLatched && currentTick >= 0 && currentTick < 1000) {
+        if (currentTick < 0) {
             throw new IllegalStateException(
-                "native replay restart requires tick >= 1000; recycle the "
-                    + "host for an opening-countdown reset"
+                "native replay restart requires an active BattleGameState"
             );
         }
         JSONObject loaded = new JSONObject(
             nativeRestartReplay(root + "/libg.so", replay)
         );
+        nativePumpManager(root + "/libg.so");
         // CE7810 synchronously constructs and enters the replacement native
         // BattleGameState.  The service clock is already paused; resuming the
         // Android lifecycle here creates a second manager and falls back to
@@ -486,7 +494,8 @@ public final class JniHost {
 
     private static boolean isLifecycleMode(String mode) {
         return "lifecycle".equals(mode) || "replay".equals(mode)
-            || "serve".equals(mode) || isProbeMode(mode);
+            || "serve".equals(mode) || "serve-direct".equals(mode)
+            || isProbeMode(mode);
     }
 
     private static boolean isProbeMode(String mode) {
@@ -504,12 +513,14 @@ public final class JniHost {
     }
 
     private static boolean usesSurface(String mode) {
-        return !isProbeMode(mode) || "probe-baseline".equals(mode)
+        return (!isProbeMode(mode) && !"serve-direct".equals(mode))
+            || "probe-baseline".equals(mode)
             || "probe-detach-surface".equals(mode);
     }
 
     private static boolean usesStartResume(String mode) {
-        return !isProbeMode(mode) || "probe-baseline".equals(mode)
+        return (!isProbeMode(mode) && !"serve-direct".equals(mode))
+            || "probe-baseline".equals(mode)
             || "probe-detach-surface".equals(mode)
             || "probe-null-surface".equals(mode)
             || "probe-no-surface".equals(mode);
@@ -548,10 +559,18 @@ public final class JniHost {
                             response.put(
                                 "state", new JSONObject(nativeProbeRuntime(root + "/libg.so"))
                             );
-                        } else if ("restart_replay".equals(op)) {
-                            throw new UnsupportedOperationException(
-                                "restart_replay is disabled; start a fresh "
-                                    + "native service with a seeded bootstrap"
+                        } else if ("restart_replay".equals(op)
+                            || "reset".equals(op)) {
+                            String replay = request.getJSONObject(
+                                "replay"
+                            ).toString();
+                            response.put(
+                                "result", restartBattleLifecycle(root, replay)
+                            );
+                            response.put(
+                                "state", new JSONObject(
+                                    nativeObserve(root + "/libg.so")
+                                )
                             );
                         } else if ("load_replay".equals(op)) {
                             if (terminalEpisodeLatched) {

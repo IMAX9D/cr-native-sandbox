@@ -1900,26 +1900,13 @@ Java_royale_nativehost_JniHost_nativeRestartReplay(
       base + kSetReplayDataRva);
   auto manager_update = reinterpret_cast<GameStateManagerUpdate>(
       base + kGameStateManagerUpdateRva);
-  // A terminal BattleGameState leaves result/tiebreak singletons owned by the
-  // normal route back through HomeState.  Perform that same native transition
-  // before queueing the next replay; direct 4 -> 4 replacement is sufficient
-  // mid-battle but leaves terminal-only owners stale.
-  __atomic_store_n(
-      reinterpret_cast<int32_t*>(manager + 0x54), -1, __ATOMIC_RELEASE);
-  __atomic_store_n(
-      reinterpret_cast<int32_t*>(manager + 0x34), 1, __ATOMIC_RELEASE);
-  __atomic_store_n(
-      reinterpret_cast<int32_t*>(manager + 0x10), 3, __ATOMIC_RELEASE);
-  manager_update(reinterpret_cast<void*>(manager), 0.05f);
-  for (int frame = 0; frame < 5; ++frame) {
-    manager_update(reinterpret_cast<void*>(manager), 0.05f);
-  }
   // CE7C40 forwards replacement replay data to an already-running battle
   // controller when manager+0x20 is non-null.  That path is useful for the
-  // live client, but it consumes the replay before CE7810 can construct the
-  // replacement BattleGameState.  The service is paused here, so temporarily
-  // detach HomeState from the manager while queueing the replay, then put it
-  // back for the native state manager to release through its own vtable.
+  // live client, but it consumes the replay before CE7810 can construct a
+  // replacement BattleGameState.  The service is controlled by nativeStep,
+  // so temporarily detach the current state while queueing the replay.  The
+  // original CE7C40 tail selects state 4; CE7810 then performs the native
+  // BattleGameState 4 -> 4 replacement and releases the old state itself.
   auto* state_slot = reinterpret_cast<void**>(manager + 0x20);
   void* detached_state = __atomic_exchange_n(
       state_slot, nullptr, __ATOMIC_ACQ_REL);
@@ -1930,10 +1917,10 @@ Java_royale_nativehost_JniHost_nativeRestartReplay(
           base + kSkipCoreAndPresentationFlagRva),
       1, __ATOMIC_RELEASE);
   manager_update(reinterpret_cast<void*>(manager), 0.0f);
-  // BattleGameState::onEnter creates the battle graph in stages.  Let the
-  // verified battle state frame finish native ownership before nativeStep
-  // calls the authoritative core. Do not run the generic manager frame here:
-  // it enters the UI-backed loading state, which is absent in this host.
+  // BattleGameState::onEnter has created the outer graph. The strict direct
+  // host completes replay/map initialization through nativePumpManager after
+  // this JNI call; running the renderer-facing BattleGameState frame here is
+  // both unnecessary and invalid without its presentation controller.
   uint64_t initialization_state = 0;
   if (!memory.read(manager + 0x20, &initialization_state) ||
       initialization_state == 0) {
@@ -1941,16 +1928,6 @@ Java_royale_nativehost_JniHost_nativeRestartReplay(
     throw_state(env, "replacement BattleGameState was not created");
     return nullptr;
   }
-  auto state_update = reinterpret_cast<BattleStateUpdate>(
-      base + kBattleStateUpdateRva);
-  for (int frame = 0; frame < 10; ++frame) {
-    __atomic_store_n(
-        reinterpret_cast<unsigned char*>(
-            base + kSkipCoreAndPresentationFlagRva),
-        1, __ATOMIC_RELEASE);
-    state_update(reinterpret_cast<void*>(initialization_state), 0.05f);
-  }
-
   int32_t next_type = -1;
   int32_t pending_type = -1;
   uint64_t next_state = 0;

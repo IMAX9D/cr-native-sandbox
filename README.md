@@ -50,7 +50,37 @@ All six conditions passed on 2026-08-23. The certificate is reproducible with:
 .\scripts\accept_direct_core.ps1 -Runs 10
 ```
 
-## Current status
+## One-click training: passed
+
+Double-click [`START_TRAINING.cmd`](START_TRAINING.cmd), or run:
+
+```powershell
+.\scripts\start_training.ps1
+```
+
+The entry point builds the Java host and JNI bridge, starts the no-window
+Android x86_64 ABI container when necessary, launches two persistent
+Surface-free `app_process` workers, attests the original battle state, and
+runs recurrent PPO self-play. It does not start MuMu or the visual game.
+
+All mutable output is under `D:\AI_data\cr-native-core`:
+
+- `training\runs\<run-id>\manifest.json`: immutable run configuration;
+- `training\runs\<run-id>\trajectories`: replayable episode tensors/metadata;
+- `training\runs\<run-id>\logs\events.jsonl`: append-only progress events;
+- `training\runs\<run-id>\checkpoints\latest.pt`: resumable model/optimizer;
+- `training\latest_run.json`: atomic pointer to the newest checkpoint.
+
+For a bounded end-to-end check, double-click
+[`SMOKE_TEST_TRAINING.cmd`](SMOKE_TEST_TRAINING.cmd). The acceptance requires a
+native episode, a PPO backward/update pass, and a loadable checkpoint—not just
+a responsive launcher.
+
+The same entry was verified from a fully stopped VM/service and with two
+concurrent native workers on 2026-08-23. See
+[`docs/training-system.md`](docs/training-system.md).
+
+## Native-core status
 
 - Strict no-Surface cold start is proven. No Surface is created, attached, or
   borrowed at any point in `probe-direct`.
@@ -64,8 +94,8 @@ All six conditions passed on 2026-08-23. The certificate is reproducible with:
   ticks/s for one process. Cold wall time includes deployment orchestration and
   a deliberate 5-second platform initialization fence.
 
-See `docs/experiment-0002-results.md` for exact evidence, native call-chain
-boundaries, and remaining work before this becomes a reusable training worker.
+See `docs/experiment-0002-results.md` for exact direct-core evidence and native
+call-chain boundaries.
 
 ## Experiment layout
 
@@ -75,11 +105,16 @@ boundaries, and remaining work before this becomes a reusable training worker.
 - `scripts/`: build/deploy/measurement entry points owned by this repository.
 - `scripts/accept_direct_core.ps1`: fresh-process determinism and baseline
   certificate.
+- `native_core/`: persistent Worker lifecycle plus stable JSON-line client/env.
+- `training/`: observation schema, action masks, recurrent actor/critic,
+  self-play collection, PPO update, and atomic run storage.
+- `START_TRAINING.cmd`: normal long-running two-worker training entry.
+- `SMOKE_TEST_TRAINING.cmd`: bounded one-iteration acceptance entry.
 - `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).
 
-The probe consumes the frozen APK, packaged libraries, and JNI observation
-bridge from the production repository by explicit absolute input paths. It
-does not write to that repository and does not import its Python sandbox.
+The Worker consumes frozen APK/runtime inputs from the production repository
+through explicit read-only paths. The Java host, JNI bridge, Python environment,
+training stack, and all writes are owned by this repository or `D:\AI_data`.
 
 ## Upstream reference
 
