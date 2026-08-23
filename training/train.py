@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
@@ -21,8 +20,9 @@ from native_core.worker import HeadlessWorkerPool, WorkerConfig
 
 from .model import RecurrentPolicyValueNet
 from .ppo import PPOConfig, PPOTrainer
-from .rollout import EpisodeResult, NativeSelfPlayCollector, save_episode
+from .rollout import EpisodeResult, save_episode
 from .schema import RunStore
+from .vector_rollout import VectorNativeSelfPlayCollector
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,18 +42,6 @@ def _append_jsonl(path: Path, value: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
         stream.flush()
-
-
-def _collect_one(
-    *, slot: int, port: int, seed: int, replay: dict[str, Any],
-    model: RecurrentPolicyValueNet, device: torch.device,
-    reward: str, max_ticks: int,
-) -> tuple[int, EpisodeResult]:
-    env = NativeRoyaleEnv(port=port, timeout=30)
-    collector = NativeSelfPlayCollector(
-        env, model, replay, device=device, reward_mode=reward, max_ticks=max_ticks
-    )
-    return slot, collector.collect(seed)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -145,6 +133,10 @@ def main() -> int:
         starting_iteration = int(checkpoint.get("iteration", 0))
 
     next_seed = args.seed
+    envs = [
+        NativeRoyaleEnv(port=args.base_port + slot, timeout=30)
+        for slot in range(args.workers)
+    ]
     for offset in range(1, args.iterations + 1):
         iteration = starting_iteration + offset
         pending = list(range(args.episodes_per_iteration))
@@ -154,23 +146,18 @@ def main() -> int:
             wave = pending[: args.workers]
             del pending[: len(wave)]
             model.eval()
-            with ThreadPoolExecutor(max_workers=len(wave)) as executor:
-                futures = []
-                for slot, _episode_index in enumerate(wave):
-                    seed = next_seed
-                    next_seed += 1
-                    futures.append(executor.submit(
-                        _collect_one, slot=slot, port=args.base_port + slot, seed=seed,
-                        replay=replay, model=model, device=device,
-                        reward=args.reward, max_ticks=args.max_ticks,
-                    ))
-                for future in futures:
-                    _slot, result = future.result()
-                    save_episode(paths.trajectories, result, full_debug=args.smoke)
-                    results.append(result)
-                    _append_jsonl(events, {"event": "episode_complete", **result.summary()})
-                    native_ticks += sum(len(item.rewards) for item in result.trajectories) // 2
-                    completed_episodes += 1
+            seeds = list(range(next_seed, next_seed + len(wave)))
+            next_seed += len(wave)
+            collector = VectorNativeSelfPlayCollector(
+                envs[: len(wave)], model, replay, device=device,
+                reward_mode=args.reward, max_ticks=args.max_ticks,
+            )
+            for result in collector.collect(seeds):
+                save_episode(paths.trajectories, result, full_debug=args.smoke)
+                results.append(result)
+                _append_jsonl(events, {"event": "episode_complete", **result.summary()})
+                native_ticks += sum(len(item.rewards) for item in result.trajectories) // 2
+                completed_episodes += 1
 
         trajectories = [item for result in results for item in result.trajectories]
         sampling_profile: dict[str, float] = {}
