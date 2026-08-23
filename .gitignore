@@ -1,0 +1,13 @@
+/build/
+/target/
+/.idea/
+/.vscode/
+*.log
+*.tmp
+*.dmp
+*.so
+*.apk
+*.xapk
+local/
+artifacts/
+

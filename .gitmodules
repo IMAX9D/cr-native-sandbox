@@ -1,0 +1,3 @@
+[submodule "third_party/Scroll"]
+	path = third_party/Scroll
+	url = https://git.xeondev.com/Supercell/Scroll
