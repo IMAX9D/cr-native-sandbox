@@ -810,7 +810,11 @@ JSON 序列化和 GPU 推理共同限制。不能只按原生 tick microbenchmar
   含 PPO 为 `305.76 steps/s`，约 `187.76 episodes/hour`；
 - 第二阶段固定短跑受主机功耗/调度影响约 `380–535 steps/s`，因此不把峰值
   当作持续吞吐承诺；
+- 正式多AVD Sweep推荐2 AVD / 8 Worker / 最大batch 16：环境`526.99
+  steps/s`、含PPO`393.22 steps/s`；3 AVD只再提升6.1%且系统内存余量降至
+  约36 MiB，因此按停止条件未运行4 AVD；
 - 完整阶段profile见 `docs/throughput-optimization-20260823.md`。
+- 并发Sweep见 `docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`。
 
 这些数字分别测量不同层次，不应互相替代：训练每 tick 还包括完整观测 JSON、
 掩码、推理、轨迹保存和优化器更新。

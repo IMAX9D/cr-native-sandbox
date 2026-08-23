@@ -5,6 +5,9 @@
 Self-Play 吞吐优化报告：
 [`docs/throughput-optimization-20260823.md`](docs/throughput-optimization-20260823.md)
 
+正式训练并发 Scaling Sweep：
+[`docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`](docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md)
+
 Isolated feasibility project for driving the original Clash Royale `libg.so`
 as a headless battle oracle and, if the experiment succeeds, as a high-speed
 self-play kernel.
@@ -93,6 +96,15 @@ concurrent native workers on 2026-08-23. Training uses Emulator loopback TCP
 redirection (host ports 38031+) and CUDA Graph inference by default; the ADB
 ports 37031+ remain available for GUI/debug and fallback. See
 [`docs/training-system.md`](docs/training-system.md).
+
+The measured throughput sweet spot on the current machine is two 4-vCPU AVDs,
+four Workers per AVD, and policy batch 16. Launch it explicitly with:
+
+```powershell
+.\scripts\start_training.ps1 -Avds 2 -Workers 8
+```
+
+The one-AVD default remains the lower-memory safe profile.
 
 ## Native-core status
 

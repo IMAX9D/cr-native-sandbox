@@ -89,6 +89,18 @@ Custom run:
   -EpisodesPerIteration 8 -MaxTicks 7200 -Seed 100
 ```
 
+The formal concurrency sweep measured 2 AVD / 8 Worker as this machine's
+maximum-throughput sweet spot. Use:
+
+```powershell
+.\scripts\start_training.ps1 -Avds 2 -Workers 8
+```
+
+This profile reached 393.22 training steps/s including PPO, but PPO-stage
+system RAM headroom fell to about 0.30 GiB. The default remains 1 AVD / 4
+Worker for safer coexistence with desktop workloads. Exact evidence is in
+`docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`.
+
 The Python layer may also be invoked directly after the artifacts/services are
 ready:
 
