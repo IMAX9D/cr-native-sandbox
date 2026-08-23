@@ -47,6 +47,21 @@ can:
 Until all six conditions pass, this repository makes no claim that the current
 runtime has been separated into a reusable kernel.
 
+## Current status
+
+- Offscreen bootstrap followed by Surface destruction is proven: the original
+  battle core advances `0 -> 100` ticks after the Surface is gone and produces
+  the canonical idle hash `5594aa3c81dc52fa`.
+- A completely Surface-free call to the original `GameMain::init` now returns
+  normally and publishes the native loader, stage registry, helper, and state
+  manager.
+- The remaining direct-bootstrap blocker is earlier than battle logic: the
+  native DataTables owner is allocated, but its 219-entry table array is not
+  populated because the platform content-loader callback has not yet been
+  separated from the render lifecycle.
+
+See `docs/experiment-0002-results.md` for the exact evidence and next gate.
+
 ## Experiment layout
 
 - `android_probe/`: isolated Java lifecycle probe. It intentionally keeps the

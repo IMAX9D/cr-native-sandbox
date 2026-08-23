@@ -10,13 +10,19 @@ Profiles, from most coupled to least coupled:
 1. `probe-baseline`: create activity, create Surface, start, resume.
 2. `probe-detach-surface`: bootstrap through the baseline, pause, destroy and
    release the Surface, then advance 100 logic ticks with no active renderer.
-3. `probe-no-surface`: create activity, start, resume; no Surface object or
+3. `probe-null-surface`: issue native surface callbacks with `null` only to
+   test whether they are a Mainloop gate; no Surface object is constructed.
+4. `probe-no-surface`: create activity, start, resume; no Surface object or
    surface callback.
-4. `probe-create-only`: only `GameApp.nOnCreate()`.
-5. `probe-minimal`: stop after `CreateGameMain`.
-6. `probe-direct`: stop after `CreateGameMain`, call the native manager
-   singleton initializer at `0xCE65B0`, submit the replay, and pump the native
-   manager/state directly. It creates no Activity lifecycle and no Surface.
+5. `probe-create-only`: only `GameApp.nOnCreate()`.
+6. `probe-minimal`: stop after `CreateGameMain`.
+7. `probe-direct`: create the Java Activity shell without a Surface, invoke
+   the original `GameMain::init` (`0x727050`) through a version-guarded
+   presentation shim, and attest every prerequisite before replay creation.
+   It exits with `blocked_data_tables` instead of entering battle while the
+   native table array is empty.
 
-Every profile attempts the same native replay load and exactly 100 native logic
-steps. Failure is evidence; it must not fall back to another profile.
+The first six profiles attempt the same replay and exactly 100 native logic
+steps. `probe-direct` has an earlier readiness gate: it may attempt the replay
+only after native DataTables are populated. Failure is evidence; no profile
+falls back to another profile.

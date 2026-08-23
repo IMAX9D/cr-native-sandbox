@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("probe-baseline", "probe-detach-surface", "probe-no-surface", "probe-create-only", "probe-minimal", "probe-direct")]
+    [ValidateSet("probe-baseline", "probe-detach-surface", "probe-null-surface", "probe-no-surface", "probe-create-only", "probe-minimal", "probe-direct")]
     [string]$Profile = "probe-baseline",
     [string]$Adb = "D:\Codex\toolchains\android-sdk\platform-tools\adb.exe",
     [string]$Serial = "emulator-5554",
@@ -7,6 +7,7 @@ param(
     [string]$Bridge = "",
     [string]$BaseApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\base.apk",
     [string]$ReplayJson = "D:\Codex\E\AI ClashRoyale\examples\native_replay_probe.json",
+    [string]$AssetDirectory = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\extracted\assets",
     [string]$RemoteRoot = "/data/local/tmp/cr-native-core-probe",
     [string]$EvidenceRoot = "D:\AI_data\cr-native-core\experiment-0001"
 )
@@ -21,6 +22,9 @@ foreach ($Path in @($Adb, $Jar, $Bridge, $BaseApk, $ReplayJson, (Join-Path $Runt
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing probe input: $Path"
     }
+}
+if (-not (Test-Path -LiteralPath $AssetDirectory -PathType Container)) {
+    throw "Missing probe asset directory: $AssetDirectory"
 }
 
 function Invoke-Adb {
@@ -57,6 +61,14 @@ Push-Verified -LocalPath $Jar -RemotePath "$RemoteRoot/lifecycle-probe.jar"
 Push-Verified -LocalPath $Bridge -RemotePath "$RemoteRoot/libnative_host_bridge.so"
 Push-Verified -LocalPath $BaseApk -RemotePath "$RemoteRoot/base.apk"
 Push-Verified -LocalPath $ReplayJson -RemotePath "$RemoteRoot/input-replay.json"
+$AssetArchive = Join-Path $ProjectRoot "artifacts\runtime-assets.tar"
+& tar.exe -cf $AssetArchive -C $AssetDirectory .
+if ($LASTEXITCODE -ne 0) { throw "Failed to package runtime assets" }
+Push-Verified -LocalPath $AssetArchive -RemotePath "$RemoteRoot/runtime-assets.tar"
+Invoke-Adb -CommandArguments @(
+    "shell",
+    "mkdir -p '$RemoteRoot/assets' && tar -xf '$RemoteRoot/runtime-assets.tar' -C '$RemoteRoot/assets'"
+)
 
 New-Item -ItemType Directory -Path $EvidenceRoot -Force | Out-Null
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"

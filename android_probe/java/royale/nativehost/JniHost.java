@@ -52,6 +52,9 @@ public final class JniHost {
         String externalFilesDir
     );
     private static native String nativeProbeRuntime(String libgPath);
+    private static native String nativeProbePrerequisites(String libgPath);
+    private static native String nativeInitGameMain(String libgPath);
+    private static native String nativeInitResources(String libgPath);
     private static native String nativeInitManager(String libgPath);
     private static native String nativePumpManager(String libgPath);
     private static native String nativeLoadReplay(String libgPath, String replayJson);
@@ -72,7 +75,7 @@ public final class JniHost {
 
     public static void main(String[] args) {
         if (args.length < 1 || args.length > 3) {
-            System.err.println("usage: royale.nativehost.JniHost /absolute/runtime/root [load|context|create|lifecycle|replay|serve|probe-baseline|probe-detach-surface|probe-no-surface|probe-create-only|probe-minimal|probe-direct] [replay.json|port]");
+            System.err.println("usage: royale.nativehost.JniHost /absolute/runtime/root [load|context|create|lifecycle|replay|serve|probe-baseline|probe-detach-surface|probe-null-surface|probe-no-surface|probe-create-only|probe-minimal|probe-direct] [replay.json|port]");
             System.exit(64);
         }
         String mode = args.length >= 2 ? args[1] : "load";
@@ -138,15 +141,6 @@ public final class JniHost {
             invokeCreateGameMain(args[0], assets, packageContext);
             if (isLifecycleMode(mode)) {
                 emitRuntimeProbe(args[0], "after_create_game_main");
-                if ("probe-direct".equals(mode)) {
-                    System.out.println(
-                        "{\"schema_version\":1,\"stage\":\"direct_manager_init\"," +
-                            "\"event\":\"after_call\",\"value\":" +
-                            nativeInitManager(args[0] + "/libg.so") + "}"
-                    );
-                    System.out.flush();
-                    emitRuntimeProbe(args[0], "after_direct_manager_init");
-                }
                 if (usesActivityCreate(mode)) {
                     emitStage("activity_create", "before");
                     GameApp.nOnCreate();
@@ -163,6 +157,13 @@ public final class JniHost {
                     emitStage("surface_create", "after");
                     emitRuntimeProbe(args[0], "after_surface_create");
                 }
+                if ("probe-null-surface".equals(mode)) {
+                    emitStage("null_surface_callback", "before");
+                    GameApp.nOnSurfaceCreated(null);
+                    GameApp.nOnSurfaceChanged(null, 1080, 2400);
+                    emitStage("null_surface_callback", "after");
+                    emitRuntimeProbe(args[0], "after_null_surface_callback");
+                }
                 if (usesStartResume(mode)) {
                     emitStage("activity_start", "before");
                     GameApp.nOnStart();
@@ -177,6 +178,62 @@ public final class JniHost {
                 Thread.sleep(5000L);
                 emitStage("headless_hold", "after");
                 emitRuntimeProbe(args[0], "after_headless_hold");
+                System.out.println(
+                    "{\"schema_version\":1,\"stage\":\"prerequisite_probe\"," +
+                        "\"event\":\"after_headless_hold\",\"value\":" +
+                        nativeProbePrerequisites(args[0] + "/libg.so") + "}"
+                );
+                System.out.flush();
+                if ("probe-direct".equals(mode)) {
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_game_main_init\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            nativeInitGameMain(args[0] + "/libg.so") + "}"
+                    );
+                    System.out.flush();
+                    emitStage("direct_runtime_start", "before");
+                    GameApp.nOnStart();
+                    GameApp.nOnResume();
+                    Thread.sleep(1000L);
+                    GameApp.nOnPause();
+                    emitStage("direct_runtime_start", "after");
+                    String directReadinessJson =
+                        nativeProbePrerequisites(args[0] + "/libg.so");
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"prerequisite_probe\"," +
+                            "\"event\":\"after_direct_resources\",\"value\":" +
+                            directReadinessJson + "}"
+                    );
+                    System.out.flush();
+                    emitRuntimeProbe(args[0], "after_direct_manager_init");
+                    JSONObject directReadiness = new JSONObject(
+                        directReadinessJson
+                    );
+                    if ("0x0".equals(
+                            directReadiness.optString(
+                                "battle_data_content", "0x0"
+                            ))) {
+                        JSONObject blocked = new JSONObject();
+                        blocked.put("profile", mode);
+                        blocked.put("status", "blocked_data_tables");
+                        blocked.put("game_main_initialized", true);
+                        blocked.put("manager_initialized", true);
+                        blocked.put("surface_created", false);
+                        blocked.put(
+                            "blocker",
+                            "native DataTables container exists but its table " +
+                                "array has not been populated"
+                        );
+                        blocked.put("readiness", directReadiness);
+                        System.out.println(
+                            "{\"schema_version\":1,\"stage\":\"probe_result\"," +
+                                "\"event\":\"blocked\",\"value\":" +
+                                blocked.toString() + "}"
+                        );
+                        System.out.flush();
+                        System.exit(0);
+                    }
+                }
                 if ("serve".equals(mode)) {
                     String bootstrapReplay = readUtf8(
                         new File(args[0], "bootstrap-replay.json")
@@ -214,6 +271,15 @@ public final class JniHost {
                     }
                     String replayJson = readUtf8(new File(args[2]));
                     long startedNanos = System.nanoTime();
+                    JSONObject preLoadPumpResult = null;
+                    if ("probe-direct".equals(mode)) {
+                        for (int bootstrapFrame = 0;
+                             bootstrapFrame < 20; ++bootstrapFrame) {
+                            preLoadPumpResult = new JSONObject(
+                                nativePumpManager(args[0] + "/libg.so")
+                            );
+                        }
+                    }
                     JSONObject loadResult = new JSONObject(
                         nativeLoadReplay(args[0] + "/libg.so", replayJson)
                     );
@@ -247,6 +313,9 @@ public final class JniHost {
                     long elapsedNanos = System.nanoTime() - startedNanos;
                     JSONObject result = new JSONObject();
                     result.put("profile", mode);
+                    if (preLoadPumpResult != null) {
+                        result.put("pre_load_pump", preLoadPumpResult);
+                    }
                     result.put("load", loadResult);
                     if (pumpResult != null) {
                         result.put("pump", pumpResult);
@@ -387,6 +456,7 @@ public final class JniHost {
     private static boolean isProbeMode(String mode) {
         return "probe-baseline".equals(mode)
             || "probe-detach-surface".equals(mode)
+            || "probe-null-surface".equals(mode)
             || "probe-no-surface".equals(mode)
             || "probe-create-only".equals(mode)
             || "probe-minimal".equals(mode)
@@ -394,8 +464,7 @@ public final class JniHost {
     }
 
     private static boolean usesActivityCreate(String mode) {
-        return !"probe-minimal".equals(mode)
-            && !"probe-direct".equals(mode);
+        return !"probe-minimal".equals(mode);
     }
 
     private static boolean usesSurface(String mode) {
@@ -406,6 +475,7 @@ public final class JniHost {
     private static boolean usesStartResume(String mode) {
         return !isProbeMode(mode) || "probe-baseline".equals(mode)
             || "probe-detach-surface".equals(mode)
+            || "probe-null-surface".equals(mode)
             || "probe-no-surface".equals(mode);
     }
 

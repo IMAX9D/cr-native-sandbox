@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <jni.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <new>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -20,6 +22,39 @@ constexpr uintptr_t kCreateGameMainRva = 0x1458E00;
 constexpr uintptr_t kThreadOptionsMapRva = 0x1AB9910;
 constexpr uintptr_t kManagerGlobalRva = 0x1A85978;
 constexpr uintptr_t kInitManagerRva = 0xCE65B0;
+constexpr uintptr_t kResourceLoaderGlobalRva = 0x1AB9988;
+constexpr uintptr_t kResourceLoaderCtorRva = 0x11EC080;
+constexpr uintptr_t kResourceLoaderInitRva = 0x11E8F20;
+constexpr uintptr_t kResourceLoaderVtableRva = 0x1924680;
+constexpr uintptr_t kAssetSystemGlobalRva = 0x1AC1438;
+constexpr uintptr_t kAssetSystemInitRva = 0x1353750;
+constexpr uintptr_t kAssetSystemGetRva = 0x1353810;
+constexpr uintptr_t kAssetSystemPrepareRva = 0x1354F50;
+constexpr uintptr_t kAssetSystemSetRootRva = 0x1355060;
+constexpr uintptr_t kAssetSystemSetSecondaryRootRva = 0x1355110;
+constexpr uintptr_t kAssetSystemMountRva = 0x1355FD0;
+constexpr uintptr_t kSavePathGetterRva = 0x1424690;
+constexpr uintptr_t kSecondaryPathGetterRva = 0x14246B0;
+constexpr uintptr_t kCachePathGetterRva = 0x14246D0;
+constexpr uintptr_t kTempPathGetterRva = 0x1424700;
+constexpr uintptr_t kRuntimeClockInitRva = 0x1299150;
+constexpr uintptr_t kGameSingletonInitRva = 0x7259B0;
+constexpr uintptr_t kGameSingletonGlobalRva = 0x1A60FA0;
+constexpr uintptr_t kRuntimeClockGlobalRva = 0x1ABC008;
+constexpr uintptr_t kThreadOptionSetRva = 0x11E6DA0;
+constexpr uintptr_t kGameHelperCtorRva = 0x11E2030;
+constexpr uintptr_t kGameHelperConfigureRva = 0x11E3640;
+constexpr uintptr_t kStageRegistryInitRva = 0xB14270;
+constexpr uintptr_t kStageRegistryGlobalRva = 0x1A7C500;
+constexpr uintptr_t kBattleDataRootGlobalRva = 0x1A75E30;
+constexpr uintptr_t kGameMainInitRva = 0x727050;
+constexpr uintptr_t kRendererBootstrapCallRva = 0x727424;
+constexpr uintptr_t kRendererDeviceBlockRva = 0x727687;
+constexpr uintptr_t kRendererResolutionCallRva = 0x7276FC;
+constexpr uintptr_t kRendererObjectsBlockRva = 0x727726;
+constexpr uintptr_t kRendererLateConfigureCallRva = 0x7279D0;
+constexpr uintptr_t kGamePresentationToggleRva = 0x72C8C0;
+constexpr uintptr_t kHomePresentationConfigRva = 0xCE8D10;
 constexpr uintptr_t kSetReplayDataRva = 0xCE7C40;
 constexpr uintptr_t kGameStateManagerUpdateRva = 0xCE7810;
 constexpr uintptr_t kBattleReplayControllerRva = 0x10B8AD0;
@@ -64,6 +99,21 @@ using SubmitReplayToController = void (*)(void*, void*);
 using SetReplayData = void (*)(void*, void*);
 using GameStateManagerUpdate = void (*)(void*, float);
 using InitManager = void (*)();
+using ResourceLoaderCtor = void (*)(void*);
+using ResourceLoaderInit = void (*)(void*, const char*, const uint8_t*);
+using AssetSystemInit = void (*)();
+using AssetSystemGet = void* (*)();
+using AssetSystemPrepare = void (*)(void*);
+using NativePathGetter = void* (*)(void*);
+using AssetSystemSetPath = void (*)(void*, void*);
+using AssetSystemMount = void (*)(void*, void*, void*);
+using RuntimeClockInit = void (*)();
+using GameSingletonInit = void* (*)(void*, void*);
+using ThreadOptionSet = void (*)(int32_t, bool);
+using GameHelperCtor = void (*)(void*);
+using GameHelperConfigure = void (*)(void*, int32_t);
+using StageRegistryInit = void (*)();
+using GameMainInit = void (*)(void*, void*);
 using BattleStateUpdate = void (*)(void*, float);
 using DoSpellCommandCtor = void (*)(void*, void*);
 using DoSpellCommandExecute = int32_t (*)(void*, void*, int32_t, int32_t);
@@ -1858,6 +1908,679 @@ Java_royale_nativehost_JniHost_nativeRestartReplay(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeInitGameMain(
+    JNIEnv* env, jclass, jstring libg_path) {
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for direct GameMain init");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for direct GameMain init");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  if (reinterpret_cast<uintptr_t>(exported) - base != kExpectedJniOnLoadRva) {
+    dlclose(handle);
+    throw_state(env, "libg version guard rejected direct GameMain init");
+    return nullptr;
+  }
+  SafeMemoryReader memory;
+  uint64_t game = 0;
+  uint64_t context = 0;
+  uint64_t helper_before = 0;
+  uint64_t helper_after = 0;
+  uint64_t manager_after = 0;
+  memory.read(base + kGameSingletonGlobalRva, &game);
+  if (game != 0) {
+    memory.read(game + 8, &context);
+    memory.read(game + 0x148, &helper_before);
+  }
+  if (game == 0 || context == 0) {
+    dlclose(handle);
+    throw_state(env, "GameMain/context is not ready for direct init");
+    return nullptr;
+  }
+  if (helper_before == 0) {
+    // The original initializer interleaves core singleton construction with
+    // five presentation-only regions. In the strict no-Surface profile these
+    // receivers do not exist. Every byte sequence is build-ID guarded, all
+    // edits stay inside GameMain::init, and the original bytes are restored
+    // before returning. No battle or data-table routine is modified.
+    auto initialize = reinterpret_cast<GameMainInit>(base + kGameMainInitRva);
+    auto* patch_site = reinterpret_cast<uint8_t*>(
+        base + kRendererBootstrapCallRva);
+    auto* device_patch_site = reinterpret_cast<uint8_t*>(
+        base + kRendererDeviceBlockRva);
+    auto* resolution_patch_site = reinterpret_cast<uint8_t*>(
+        base + kRendererResolutionCallRva);
+    auto* objects_patch_site = reinterpret_cast<uint8_t*>(
+        base + kRendererObjectsBlockRva);
+    auto* late_configure_patch_site = reinterpret_cast<uint8_t*>(
+        base + kRendererLateConfigureCallRva);
+    const std::array<uint8_t, 5> expected = {0xE8, 0x27, 0x9C, 0x47, 0x00};
+    const std::array<uint8_t, 5> device_expected = {
+        0x31, 0xFF, 0xE8, 0x52, 0x3A};
+    const std::array<uint8_t, 5> device_bypass = {
+        0xE9, 0x65, 0x00, 0x00, 0x00};
+    const std::array<uint8_t, 5> resolution_expected = {
+        0xE8, 0x7F, 0x28, 0xB1, 0x00};
+    const std::array<uint8_t, 5> objects_expected = {
+        0xE8, 0x25, 0xF8, 0x11, 0x00};
+    const std::array<uint8_t, 5> objects_bypass = {
+        0xE9, 0x88, 0x01, 0x00, 0x00};
+    const std::array<uint8_t, 5> late_configure_expected = {
+        0xE8, 0x1B, 0x38, 0xB1, 0x00};
+    std::array<uint8_t, 5> original{};
+    std::array<uint8_t, 5> device_original{};
+    std::array<uint8_t, 5> resolution_original{};
+    std::array<uint8_t, 5> objects_original{};
+    std::array<uint8_t, 5> late_configure_original{};
+    std::memcpy(original.data(), patch_site, original.size());
+    std::memcpy(device_original.data(), device_patch_site,
+                device_original.size());
+    std::memcpy(resolution_original.data(), resolution_patch_site,
+                resolution_original.size());
+    std::memcpy(objects_original.data(), objects_patch_site,
+                objects_original.size());
+    std::memcpy(late_configure_original.data(), late_configure_patch_site,
+                late_configure_original.size());
+    if (original != expected || device_original != device_expected ||
+        resolution_original != resolution_expected ||
+        objects_original != objects_expected ||
+        late_configure_original != late_configure_expected) {
+      dlclose(handle);
+      throw_state(env, "renderer bootstrap patch guard rejected libg bytes");
+      return nullptr;
+    }
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+      dlclose(handle);
+      throw_state(env, "cannot resolve page size for guarded patch");
+      return nullptr;
+    }
+    const uintptr_t page = reinterpret_cast<uintptr_t>(patch_site) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    if (mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      dlclose(handle);
+      throw_state(env, "cannot open renderer bootstrap page for guarded patch");
+      return nullptr;
+    }
+    std::memset(patch_site, 0x90, original.size());
+    std::memcpy(device_patch_site, device_bypass.data(), device_bypass.size());
+    std::memset(resolution_patch_site, 0x90, resolution_original.size());
+    std::memcpy(objects_patch_site, objects_bypass.data(),
+                objects_bypass.size());
+    std::memset(late_configure_patch_site, 0x90,
+                late_configure_original.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(patch_site),
+        reinterpret_cast<char*>(late_configure_patch_site +
+                                late_configure_original.size()));
+    initialize(reinterpret_cast<void*>(game), reinterpret_cast<void*>(context));
+    std::memcpy(patch_site, original.data(), original.size());
+    std::memcpy(device_patch_site, device_original.data(),
+                device_original.size());
+    std::memcpy(resolution_patch_site, resolution_original.data(),
+                resolution_original.size());
+    std::memcpy(objects_patch_site, objects_original.data(),
+                objects_original.size());
+    std::memcpy(late_configure_patch_site, late_configure_original.data(),
+                late_configure_original.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(patch_site),
+        reinterpret_cast<char*>(late_configure_patch_site +
+                                late_configure_original.size()));
+    mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+             PROT_READ | PROT_EXEC);
+  }
+  memory.read(game + 0x148, &helper_after);
+  memory.read(base + kManagerGlobalRva, &manager_after);
+  __atomic_store_n(
+      reinterpret_cast<unsigned char*>(
+          base + kSkipCoreAndPresentationFlagRva),
+      1, __ATOMIC_RELEASE);
+  char payload[320];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"called\":true,\"game\":\"0x%llx\",\"context\":\"0x%llx\","
+      "\"helper_before\":\"0x%llx\",\"helper_after\":\"0x%llx\","
+      "\"manager_after\":\"0x%llx\",\"entry_rva\":\"0x%llx\"}",
+      static_cast<unsigned long long>(game),
+      static_cast<unsigned long long>(context),
+      static_cast<unsigned long long>(helper_before),
+      static_cast<unsigned long long>(helper_after),
+      static_cast<unsigned long long>(manager_after),
+      static_cast<unsigned long long>(kGameMainInitRva));
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeProbePrerequisites(
+    JNIEnv* env, jclass, jstring libg_path) {
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for prerequisite probe");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for prerequisite probe");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  SafeMemoryReader memory;
+  uint64_t manager = 0;
+  uint64_t loader = 0;
+  uint64_t asset_system = 0;
+  uint64_t game_singleton = 0;
+  uint64_t runtime_clock = 0;
+  uint64_t loader_vtable = 0;
+  uint64_t asset_system_vtable = 0;
+  uint64_t thread_first = 0;
+  uint64_t thread_size = 0;
+  uint64_t game_helper = 0;
+  uint64_t stage_registry = 0;
+  uint64_t game_vtable = 0;
+  uint64_t game_context = 0;
+  uint64_t battle_data_root = 0;
+  uint64_t battle_data_object = 0;
+  uint64_t battle_data_content = 0;
+  uint64_t battle_data_object_vtable = 0;
+  uint64_t battle_data_object_methods[12] = {};
+  uint64_t battle_data_loader = 0;
+  uint64_t battle_data_loader_vtable = 0;
+  uint64_t battle_data_loader_methods[12] = {};
+  uint64_t game_methods[24] = {};
+  uint64_t battle_data_root_vtable = 0;
+  uint64_t battle_data_root_methods[12] = {};
+  memory.read(base + kManagerGlobalRva, &manager);
+  memory.read(base + kResourceLoaderGlobalRva, &loader);
+  memory.read(base + kAssetSystemGlobalRva, &asset_system);
+  memory.read(base + kGameSingletonGlobalRva, &game_singleton);
+  memory.read(base + kRuntimeClockGlobalRva, &runtime_clock);
+  if (game_singleton != 0) {
+    memory.read(game_singleton, &game_vtable);
+    memory.read(game_singleton + 8, &game_context);
+    memory.read(game_singleton + 0x148, &game_helper);
+    if (game_vtable != 0) {
+      for (size_t index = 0; index < std::size(game_methods); ++index) {
+        memory.read(game_vtable + index * sizeof(uint64_t),
+                    &game_methods[index]);
+      }
+    }
+  }
+  memory.read(base + kStageRegistryGlobalRva, &stage_registry);
+  memory.read(base + kBattleDataRootGlobalRva, &battle_data_root);
+  if (battle_data_root != 0) {
+    memory.read(battle_data_root, &battle_data_root_vtable);
+    if (battle_data_root_vtable != 0) {
+      for (size_t index = 0;
+           index < std::size(battle_data_root_methods); ++index) {
+        memory.read(battle_data_root_vtable + index * sizeof(uint64_t),
+                    &battle_data_root_methods[index]);
+      }
+    }
+    memory.read(battle_data_root + 0x20, &battle_data_object);
+    if (battle_data_object != 0) {
+      memory.read(battle_data_object, &battle_data_object_vtable);
+      if (battle_data_object_vtable != 0) {
+        for (size_t index = 0;
+             index < std::size(battle_data_object_methods); ++index) {
+          memory.read(battle_data_object_vtable + index * sizeof(uint64_t),
+                      &battle_data_object_methods[index]);
+        }
+      }
+      memory.read(battle_data_object + 0x18, &battle_data_content);
+      memory.read(battle_data_object + 0xB58, &battle_data_loader);
+      if (battle_data_loader != 0) {
+        memory.read(battle_data_loader, &battle_data_loader_vtable);
+        for (size_t index = 0;
+             index < std::size(battle_data_loader_methods); ++index) {
+          memory.read(battle_data_loader_vtable + index * sizeof(uint64_t),
+                      &battle_data_loader_methods[index]);
+        }
+      }
+    }
+  }
+  if (loader != 0) {
+    memory.read(loader, &loader_vtable);
+  }
+  if (asset_system != 0) {
+    memory.read(asset_system, &asset_system_vtable);
+  }
+  memory.read(base + kThreadOptionsMapRva + 16, &thread_first);
+  memory.read(base + kThreadOptionsMapRva + 24, &thread_size);
+  char thread_payload[2048];
+  size_t thread_offset = 0;
+  thread_payload[thread_offset++] = '[';
+  uint64_t thread_node = thread_first;
+  for (size_t index = 0;
+       index < std::min<uint64_t>(thread_size, 12) && thread_node != 0;
+       ++index) {
+    uint64_t words[6] = {};
+    if (!memory.read_bytes(thread_node, words, sizeof(words))) {
+      break;
+    }
+    const int written = std::snprintf(
+        thread_payload + thread_offset,
+        sizeof(thread_payload) - thread_offset,
+        "%s[\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\","
+        "\"0x%llx\",\"0x%llx\"]",
+        index == 0 ? "" : ",",
+        static_cast<unsigned long long>(words[0]),
+        static_cast<unsigned long long>(words[1]),
+        static_cast<unsigned long long>(words[2]),
+        static_cast<unsigned long long>(words[3]),
+        static_cast<unsigned long long>(words[4]),
+        static_cast<unsigned long long>(words[5]));
+    if (written < 0 || static_cast<size_t>(written) >=
+        sizeof(thread_payload) - thread_offset) {
+      break;
+    }
+    thread_offset += static_cast<size_t>(written);
+    thread_node = words[0];
+  }
+  if (thread_offset < sizeof(thread_payload) - 1) {
+    thread_payload[thread_offset++] = ']';
+  }
+  thread_payload[thread_offset] = '\0';
+  char game_methods_payload[640];
+  size_t game_methods_offset = 0;
+  game_methods_payload[game_methods_offset++] = '[';
+  for (size_t index = 0; index < std::size(game_methods); ++index) {
+    const uint64_t method = game_methods[index];
+    const uint64_t rva = method >= base ? method - base : method;
+    const int written = std::snprintf(
+        game_methods_payload + game_methods_offset,
+        sizeof(game_methods_payload) - game_methods_offset,
+        "%s\"0x%llx\"", index == 0 ? "" : ",",
+        static_cast<unsigned long long>(rva));
+    if (written < 0 || static_cast<size_t>(written) >=
+        sizeof(game_methods_payload) - game_methods_offset) {
+      break;
+    }
+    game_methods_offset += static_cast<size_t>(written);
+  }
+  game_methods_payload[game_methods_offset++] = ']';
+  game_methods_payload[game_methods_offset] = '\0';
+  char data_methods_payload[384];
+  size_t data_methods_offset = 0;
+  data_methods_payload[data_methods_offset++] = '[';
+  for (size_t index = 0; index < std::size(battle_data_root_methods);
+       ++index) {
+    const uint64_t method = battle_data_root_methods[index];
+    const uint64_t rva = method >= base ? method - base : method;
+    const int written = std::snprintf(
+        data_methods_payload + data_methods_offset,
+        sizeof(data_methods_payload) - data_methods_offset,
+        "%s\"0x%llx\"", index == 0 ? "" : ",",
+        static_cast<unsigned long long>(rva));
+    if (written < 0 || static_cast<size_t>(written) >=
+        sizeof(data_methods_payload) - data_methods_offset) {
+      break;
+    }
+    data_methods_offset += static_cast<size_t>(written);
+  }
+  data_methods_payload[data_methods_offset++] = ']';
+  data_methods_payload[data_methods_offset] = '\0';
+  char data_object_methods_payload[384];
+  size_t data_object_methods_offset = 0;
+  data_object_methods_payload[data_object_methods_offset++] = '[';
+  for (size_t index = 0; index < std::size(battle_data_object_methods);
+       ++index) {
+    const uint64_t method = battle_data_object_methods[index];
+    const uint64_t rva = method >= base ? method - base : method;
+    const int written = std::snprintf(
+        data_object_methods_payload + data_object_methods_offset,
+        sizeof(data_object_methods_payload) - data_object_methods_offset,
+        "%s\"0x%llx\"", index == 0 ? "" : ",",
+        static_cast<unsigned long long>(rva));
+    if (written < 0 || static_cast<size_t>(written) >=
+        sizeof(data_object_methods_payload) - data_object_methods_offset) {
+      break;
+    }
+    data_object_methods_offset += static_cast<size_t>(written);
+  }
+  data_object_methods_payload[data_object_methods_offset++] = ']';
+  data_object_methods_payload[data_object_methods_offset] = '\0';
+  char data_loader_methods_payload[384];
+  size_t data_loader_methods_offset = 0;
+  data_loader_methods_payload[data_loader_methods_offset++] = '[';
+  for (size_t index = 0; index < std::size(battle_data_loader_methods);
+       ++index) {
+    const uint64_t method = battle_data_loader_methods[index];
+    const uint64_t rva = method >= base ? method - base : method;
+    const int written = std::snprintf(
+        data_loader_methods_payload + data_loader_methods_offset,
+        sizeof(data_loader_methods_payload) - data_loader_methods_offset,
+        "%s\"0x%llx\"", index == 0 ? "" : ",",
+        static_cast<unsigned long long>(rva));
+    if (written < 0 || static_cast<size_t>(written) >=
+        sizeof(data_loader_methods_payload) - data_loader_methods_offset) {
+      break;
+    }
+    data_loader_methods_offset += static_cast<size_t>(written);
+  }
+  data_loader_methods_payload[data_loader_methods_offset++] = ']';
+  data_loader_methods_payload[data_loader_methods_offset] = '\0';
+  char payload[3072];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"manager\":\"0x%llx\",\"loader\":\"0x%llx\","
+      "\"asset_system\":\"0x%llx\",\"game_singleton\":\"0x%llx\","
+      "\"runtime_clock\":\"0x%llx\","
+      "\"game_vtable_rva\":\"0x%llx\",\"game_context\":\"0x%llx\","
+      "\"game_methods_rva\":%s,"
+      "\"game_helper\":\"0x%llx\",\"stage_registry\":\"0x%llx\","
+      "\"battle_data_root\":\"0x%llx\","
+      "\"battle_data_root_vtable_rva\":\"0x%llx\","
+      "\"battle_data_root_methods_rva\":%s,"
+      "\"battle_data_object\":\"0x%llx\","
+      "\"battle_data_object_vtable_rva\":\"0x%llx\","
+      "\"battle_data_object_methods_rva\":%s,"
+      "\"battle_data_content\":\"0x%llx\","
+      "\"battle_data_loader\":\"0x%llx\","
+      "\"battle_data_loader_vtable_rva\":\"0x%llx\","
+      "\"battle_data_loader_methods_rva\":%s,"
+      "\"loader_vtable_rva\":\"0x%llx\","
+      "\"asset_system_vtable_rva\":\"0x%llx\","
+      "\"thread_size\":%llu,\"thread_nodes\":%s}",
+      static_cast<unsigned long long>(manager),
+      static_cast<unsigned long long>(loader),
+      static_cast<unsigned long long>(asset_system),
+      static_cast<unsigned long long>(game_singleton),
+      static_cast<unsigned long long>(runtime_clock),
+      static_cast<unsigned long long>(
+          game_vtable >= base ? game_vtable - base : game_vtable),
+      static_cast<unsigned long long>(game_context),
+      game_methods_payload,
+      static_cast<unsigned long long>(game_helper),
+      static_cast<unsigned long long>(stage_registry),
+      static_cast<unsigned long long>(battle_data_root),
+      static_cast<unsigned long long>(
+          battle_data_root_vtable >= base
+              ? battle_data_root_vtable - base : battle_data_root_vtable),
+      data_methods_payload,
+      static_cast<unsigned long long>(battle_data_object),
+      static_cast<unsigned long long>(
+          battle_data_object_vtable >= base
+              ? battle_data_object_vtable - base : battle_data_object_vtable),
+      data_object_methods_payload,
+      static_cast<unsigned long long>(battle_data_content),
+      static_cast<unsigned long long>(battle_data_loader),
+      static_cast<unsigned long long>(
+          battle_data_loader_vtable >= base
+              ? battle_data_loader_vtable - base : battle_data_loader_vtable),
+      data_loader_methods_payload,
+      static_cast<unsigned long long>(
+          loader_vtable >= base ? loader_vtable - base : loader_vtable),
+      static_cast<unsigned long long>(
+          asset_system_vtable >= base
+              ? asset_system_vtable - base : asset_system_vtable),
+      static_cast<unsigned long long>(thread_size), thread_payload);
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeInitResources(
+    JNIEnv* env, jclass, jstring libg_path) {
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  std::string runtime_root(path_chars);
+  const size_t final_separator = runtime_root.find_last_of('/');
+  if (final_separator != std::string::npos) {
+    runtime_root.resize(final_separator);
+  }
+  const std::string direct_asset_root = runtime_root + "/assets";
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for direct manager init");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for direct manager init");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  if (reinterpret_cast<uintptr_t>(exported) - base != kExpectedJniOnLoadRva) {
+    dlclose(handle);
+    throw_state(env, "libg version guard rejected direct manager init");
+    return nullptr;
+  }
+  SafeMemoryReader memory;
+  uint64_t manager_before = 0;
+  memory.read(base + kManagerGlobalRva, &manager_before);
+  uint64_t loader_before = 0;
+  memory.read(base + kResourceLoaderGlobalRva, &loader_before);
+  uint64_t asset_system_before = 0;
+  memory.read(base + kAssetSystemGlobalRva, &asset_system_before);
+  if (asset_system_before == 0) {
+    auto asset_system_init = reinterpret_cast<AssetSystemInit>(
+        base + kAssetSystemInitRva);
+    asset_system_init();
+  }
+  uint64_t asset_system_after = 0;
+  memory.read(base + kAssetSystemGlobalRva, &asset_system_after);
+  if (asset_system_after == 0) {
+    dlclose(handle);
+    throw_state(env, "libg asset system initializer did not publish a root");
+    return nullptr;
+  }
+  if (asset_system_before == 0) {
+  auto asset_system_get = reinterpret_cast<AssetSystemGet>(
+      base + kAssetSystemGetRva);
+  auto asset_system_prepare = reinterpret_cast<AssetSystemPrepare>(
+      base + kAssetSystemPrepareRva);
+  auto set_root = reinterpret_cast<AssetSystemSetPath>(
+      base + kAssetSystemSetRootRva);
+  auto set_secondary_root = reinterpret_cast<AssetSystemSetPath>(
+      base + kAssetSystemSetSecondaryRootRva);
+  auto mount = reinterpret_cast<AssetSystemMount>(
+      base + kAssetSystemMountRva);
+  auto native_string_destroy = reinterpret_cast<NativeStringDestroy>(
+      base + kNativeStringDestroyRva);
+  auto asset_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
+  auto asset_free = reinterpret_cast<NativeFree>(base + kNativeFreeRva);
+  void* asset_system = asset_system_get();
+  asset_system_prepare(asset_system);
+  struct LibCppString {
+    alignas(8) std::array<uint8_t, 24> bytes{};
+  };
+  auto init_libcpp_string = [&](LibCppString* output, const char* value) {
+    const size_t length = std::strlen(value);
+    if (length < 23) {
+      output->bytes[0] = static_cast<uint8_t>(length * 2);
+      std::memcpy(output->bytes.data() + 1, value, length + 1);
+      return;
+    }
+    const size_t capacity = length | 15;
+    void* storage = asset_alloc(capacity + 1);
+    if (storage == nullptr) {
+      throw std::bad_alloc();
+    }
+    std::memcpy(storage, value, length + 1);
+    *reinterpret_cast<size_t*>(output->bytes.data()) = capacity + 2;
+    *reinterpret_cast<size_t*>(output->bytes.data() + 8) = length;
+    *reinterpret_cast<void**>(output->bytes.data() + 16) = storage;
+  };
+  auto destroy_libcpp_string = [&](LibCppString* value) {
+    if ((value->bytes[0] & 1) != 0) {
+      asset_free(*reinterpret_cast<void**>(value->bytes.data() + 16));
+    }
+  };
+  auto sc_string_chars = [](const std::array<uint8_t, 16>& value) {
+    const int32_t length = *reinterpret_cast<const int32_t*>(
+        value.data() + 4);
+    return length < 8
+        ? reinterpret_cast<const char*>(value.data() + 8)
+        : *reinterpret_cast<const char* const*>(value.data() + 8);
+  };
+  auto apply_path = [&](uintptr_t getter_rva, AssetSystemSetPath setter) {
+    alignas(8) std::array<uint8_t, 16> path{};
+    LibCppString native_path{};
+    auto getter = reinterpret_cast<NativePathGetter>(base + getter_rva);
+    getter(path.data());
+    const char* path_chars = sc_string_chars(path);
+    std::fprintf(stderr, "DIRECT_PATH rva=0x%llx value=%s\n",
+                 static_cast<unsigned long long>(getter_rva), path_chars);
+    std::fflush(stderr);
+    init_libcpp_string(&native_path, path_chars);
+    setter(asset_system, &native_path);
+    destroy_libcpp_string(&native_path);
+    native_string_destroy(path.data());
+  };
+  auto apply_literal_path = [&](const char* path_chars,
+                                AssetSystemSetPath setter) {
+    LibCppString native_path{};
+    std::fprintf(stderr, "DIRECT_PATH literal=%s\n", path_chars);
+    std::fflush(stderr);
+    init_libcpp_string(&native_path, path_chars);
+    setter(asset_system, &native_path);
+    destroy_libcpp_string(&native_path);
+  };
+  auto mount_path = [&](uintptr_t getter_rva, const char* scheme) {
+    alignas(8) std::array<uint8_t, 16> path{};
+    LibCppString native_path{};
+    LibCppString prefix{};
+    auto getter = reinterpret_cast<NativePathGetter>(base + getter_rva);
+    getter(path.data());
+    const char* path_chars = sc_string_chars(path);
+    std::fprintf(stderr, "DIRECT_MOUNT scheme=%s rva=0x%llx value=%s\n",
+                 scheme, static_cast<unsigned long long>(getter_rva),
+                 path_chars);
+    std::fflush(stderr);
+    init_libcpp_string(&native_path, path_chars);
+    init_libcpp_string(&prefix, scheme);
+    mount(asset_system, &native_path, &prefix);
+    destroy_libcpp_string(&prefix);
+    destroy_libcpp_string(&native_path);
+    native_string_destroy(path.data());
+  };
+  apply_literal_path(direct_asset_root.c_str(), set_root);
+  apply_path(kSecondaryPathGetterRva, set_secondary_root);
+  mount_path(kCachePathGetterRva, "cache:");
+  mount_path(kSavePathGetterRva, "save:");
+  mount_path(kTempPathGetterRva, "temp:");
+  }
+  auto runtime_clock_init = reinterpret_cast<RuntimeClockInit>(
+      base + kRuntimeClockInitRva);
+  auto game_singleton_init = reinterpret_cast<GameSingletonInit>(
+      base + kGameSingletonInitRva);
+  runtime_clock_init();
+  game_singleton_init(nullptr, nullptr);
+  auto thread_option_set = reinterpret_cast<ThreadOptionSet>(
+      base + kThreadOptionSetRva);
+  thread_option_set(5, true);
+  thread_option_set(3, true);
+  thread_option_set(10, true);
+  thread_option_set(12, true);
+  uint64_t game_singleton = 0;
+  memory.read(base + kGameSingletonGlobalRva, &game_singleton);
+  uint64_t game_helper = 0;
+  if (game_singleton != 0) {
+    memory.read(game_singleton + 0x148, &game_helper);
+  }
+  if (game_singleton != 0 && game_helper == 0) {
+    auto native_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
+    auto helper_ctor = reinterpret_cast<GameHelperCtor>(
+        base + kGameHelperCtorRva);
+    auto helper_configure = reinterpret_cast<GameHelperConfigure>(
+        base + kGameHelperConfigureRva);
+    game_helper = reinterpret_cast<uint64_t>(native_alloc(0x3C0));
+    if (game_helper == 0) {
+      dlclose(handle);
+      throw_state(env, "libg could not allocate the direct game helper");
+      return nullptr;
+    }
+    helper_ctor(reinterpret_cast<void*>(game_helper));
+    __atomic_store_n(
+        reinterpret_cast<uint64_t*>(game_singleton + 0x148),
+        game_helper, __ATOMIC_RELEASE);
+    helper_configure(reinterpret_cast<void*>(game_helper), 1);
+  }
+  uint64_t stage_registry = 0;
+  memory.read(base + kStageRegistryGlobalRva, &stage_registry);
+  if (stage_registry == 0) {
+    auto stage_registry_init = reinterpret_cast<StageRegistryInit>(
+        base + kStageRegistryInitRva);
+    stage_registry_init();
+  }
+  if (loader_before == 0) {
+    auto native_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
+    auto loader_ctor = reinterpret_cast<ResourceLoaderCtor>(
+        base + kResourceLoaderCtorRva);
+    auto loader_init = reinterpret_cast<ResourceLoaderInit>(
+        base + kResourceLoaderInitRva);
+    void* loader = native_alloc(8);
+    if (loader == nullptr) {
+      dlclose(handle);
+      throw_state(env, "libg could not allocate the direct resource loader");
+      return nullptr;
+    }
+    loader_ctor(loader);
+    *reinterpret_cast<uintptr_t*>(loader) = base + kResourceLoaderVtableRva;
+    const uint8_t options[2] = {1, 0};
+    loader_init(loader, "", options);
+  }
+  uint64_t loader_after = 0;
+  memory.read(base + kResourceLoaderGlobalRva, &loader_after);
+  std::fprintf(stderr,
+               "DIRECT_RESOURCES asset=0x%llx loader=0x%llx\n",
+               static_cast<unsigned long long>(asset_system_after),
+               static_cast<unsigned long long>(loader_after));
+  std::fflush(stderr);
+  uint64_t manager_after = 0;
+  memory.read(base + kManagerGlobalRva, &manager_after);
+  char payload[512];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"called\":true,\"manager_before\":\"0x%llx\","
+      "\"manager_after\":\"0x%llx\","
+      "\"loader_before\":\"0x%llx\",\"loader_after\":\"0x%llx\","
+      "\"asset_system_before\":\"0x%llx\","
+      "\"asset_system_after\":\"0x%llx\","
+      "\"entry_rva\":\"0x%llx\",\"loader_init_rva\":\"0x%llx\"}",
+      static_cast<unsigned long long>(manager_before),
+      static_cast<unsigned long long>(manager_after),
+      static_cast<unsigned long long>(loader_before),
+      static_cast<unsigned long long>(loader_after),
+      static_cast<unsigned long long>(asset_system_before),
+      static_cast<unsigned long long>(asset_system_after),
+      static_cast<unsigned long long>(kInitManagerRva),
+      static_cast<unsigned long long>(kResourceLoaderInitRva));
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativeInitManager(
     JNIEnv* env, jclass, jstring libg_path) {
   const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
@@ -1893,10 +2616,10 @@ Java_royale_nativehost_JniHost_nativeInitManager(
   }
   uint64_t manager_after = 0;
   memory.read(base + kManagerGlobalRva, &manager_after);
-  char payload[256];
+  char payload[224];
   std::snprintf(
       payload, sizeof(payload),
-      "{\"called\":true,\"manager_before\":\"0x%llx\"," 
+      "{\"called\":true,\"manager_before\":\"0x%llx\","
       "\"manager_after\":\"0x%llx\",\"entry_rva\":\"0x%llx\"}",
       static_cast<unsigned long long>(manager_before),
       static_cast<unsigned long long>(manager_after),
@@ -1945,7 +2668,62 @@ Java_royale_nativehost_JniHost_nativePumpManager(
       reinterpret_cast<unsigned char*>(
           base + kSkipCoreAndPresentationFlagRva),
       1, __ATOMIC_RELEASE);
+  auto* presentation_toggle = reinterpret_cast<uint8_t*>(
+      base + kGamePresentationToggleRva);
+  auto* home_presentation_config = reinterpret_cast<uint8_t*>(
+      base + kHomePresentationConfigRva);
+  const uint8_t presentation_original = *presentation_toggle;
+  const uint8_t home_config_original = *home_presentation_config;
+  if (presentation_original != 0x53 || home_config_original != 0x55) {
+    dlclose(handle);
+    throw_state(env, "presentation toggle patch guard rejected libg bytes");
+    return nullptr;
+  }
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve presentation toggle page size");
+    return nullptr;
+  }
+  const uintptr_t patch_page =
+      reinterpret_cast<uintptr_t>(presentation_toggle) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t home_config_page =
+      reinterpret_cast<uintptr_t>(home_presentation_config) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size),
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    dlclose(handle);
+    throw_state(env, "cannot open presentation toggle page for guarded patch");
+    return nullptr;
+  }
+  if (mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size),
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    mprotect(reinterpret_cast<void*>(patch_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    dlclose(handle);
+    throw_state(env, "cannot open home presentation page for guarded patch");
+    return nullptr;
+  }
+  *presentation_toggle = 0xC3;
+  *home_presentation_config = 0xC3;
+  __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
+                          reinterpret_cast<char*>(presentation_toggle + 1));
+  __builtin___clear_cache(reinterpret_cast<char*>(home_presentation_config),
+                          reinterpret_cast<char*>(home_presentation_config + 1));
   manager_update(reinterpret_cast<void*>(manager), 0.0f);
+  *presentation_toggle = presentation_original;
+  *home_presentation_config = home_config_original;
+  __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
+                          reinterpret_cast<char*>(presentation_toggle + 1));
+  __builtin___clear_cache(reinterpret_cast<char*>(home_presentation_config),
+                          reinterpret_cast<char*>(home_presentation_config + 1));
+  mprotect(reinterpret_cast<void*>(patch_page),
+           static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+  mprotect(reinterpret_cast<void*>(home_config_page),
+           static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
 
   int32_t current_type = -1;
   int32_t pending_type = -1;
