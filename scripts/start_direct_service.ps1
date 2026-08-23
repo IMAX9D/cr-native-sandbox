@@ -39,8 +39,12 @@ New-Item -ItemType Directory -Path $AssetOverlay -Force | Out-Null
 
 function Invoke-Adb {
     param([string[]]$CommandArguments, [switch]$AllowFailure)
+    $PreviousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $Output = & $Adb (@("-s", $Serial) + @($CommandArguments)) 2>&1
-    if ($LASTEXITCODE -ne 0 -and -not $AllowFailure) {
+    $ExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $PreviousErrorAction
+    if ($ExitCode -ne 0 -and -not $AllowFailure) {
         throw "adb failed: $($CommandArguments -join ' ')`n$($Output | Out-String)"
     }
     return $Output

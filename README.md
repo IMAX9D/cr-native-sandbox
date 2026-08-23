@@ -80,7 +80,8 @@ To inspect battle logic manually, double-click
 [`GAME_LOGIC_GUI.cmd`](GAME_LOGIC_GUI.cmd). The GUI exposes both sides, current
 hand cards, raw/native versus final training deployment masks, single/batched
 ticks, target links, path nodes, entity-native fields, state hash/RNG, terminal
-state, and JSON snapshot export.
+state, and JSON snapshot export. The top-right clock follows the certified
+3-minute regulation + 2-minute overtime schedule and labels ×1/×2/×3 elixir.
 
 The same entry was verified from a fully stopped VM/service and with two
 concurrent native workers on 2026-08-23. See

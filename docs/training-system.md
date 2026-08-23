@@ -57,6 +57,15 @@ training action mask. It also exposes target links, path nodes, collision and
 attack timers, RNG/state hash, both hands/elixir pools, and snapshot export to
 `D:\AI_data\cr-native-core\gui-sessions`.
 
+The frozen standard-1v1 match schedule has a separate machine certificate at
+`D:\AI_data\cr-native-core\acceptance-match-rules.json`. Direct measurement
+confirmed 3 minutes of regulation plus 2 minutes of overtime, ×2 elixir at
+tick 2400, and ×3 at tick 4800. At tick 6000 the original core performs its HP
+drain. The headless adapter now latches the first additional native crown as
+the tiebreak result; an exactly symmetric drain is exported as a draw. Both
+paths were tested through terminal reward export and a subsequent in-process
+reset.
+
 Custom run:
 
 ```powershell

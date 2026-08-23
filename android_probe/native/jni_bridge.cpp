@@ -249,6 +249,7 @@ struct EpisodeState {
   bool initialized = false;
   bool terminated = false;
   bool core_only_terminal_phase = false;
+  int32_t tiebreak_start_crowns[2] = {-1, -1};
   int32_t stalled_updates = 0;
   const char* termination_reason = nullptr;
 };
@@ -401,6 +402,17 @@ int episode_crowns(int32_t side) {
   return crowns;
 }
 
+int episode_lowest_living_tower_hp(int32_t side) {
+  int lowest = INT32_MAX;
+  for (size_t index = 0; index < g_episode.tower_count; ++index) {
+    const CrownTowerState& tower = g_episode.towers[index];
+    if (tower.side == side && tower.hp > 0) {
+      lowest = std::min(lowest, tower.hp);
+    }
+  }
+  return lowest;
+}
+
 std::string episode_json() {
   const int crowns0 = episode_crowns(0);
   const int crowns1 = episode_crowns(1);
@@ -439,7 +451,13 @@ std::string episode_json() {
                  : (std::strcmp(g_episode.termination_reason,
                                 "native_logic_clock_stopped") == 0
                         ? "\"native_logic_clock_stopped\""
-                        : "\"native_battle_state_transition\"")),
+                        : (std::strcmp(g_episode.termination_reason,
+                                      "native_tiebreak_hp_drain") == 0
+                               ? "\"native_tiebreak_hp_drain\""
+                               : (std::strcmp(g_episode.termination_reason,
+                                             "native_tiebreak_exact_draw") == 0
+                                      ? "\"native_tiebreak_exact_draw\""
+                                      : "\"native_battle_state_transition\"")))),
       g_episode.initialized ? "true" : "false");
   result.append(header);
   for (size_t index = 0; index < g_episode.tower_count; ++index) {
@@ -1589,6 +1607,14 @@ Java_royale_nativehost_JniHost_nativeStep(
       break;
     }
     const int32_t tick_before_update = g_episode.tick;
+    if (!g_episode.core_only_terminal_phase) {
+      // Preserve crowns already earned during regulation/overtime. A
+      // tiebreak ends only when libg's own HP drain destroys an additional
+      // tower; equal pre-existing crown counts must not be treated as a draw
+      // at the 5-minute boundary.
+      g_episode.tiebreak_start_crowns[0] = episode_crowns(0);
+      g_episode.tiebreak_start_crowns[1] = episode_crowns(1);
+    }
     core_update(reinterpret_cast<void*>(state), 0.05F);
     capture_episode_state(memory, battle);
     if (g_episode.tick >= 100 && g_episode.tick == tick_before_update) {
@@ -1632,6 +1658,30 @@ Java_royale_nativehost_JniHost_nativeStep(
       battle_active = false;
       g_episode.terminated = true;
       g_episode.termination_reason = "native_logic_terminal";
+      break;
+    }
+    if (g_episode.core_only_terminal_phase &&
+        g_episode.tiebreak_start_crowns[0] >= 0 &&
+        (episode_crowns(0) > g_episode.tiebreak_start_crowns[0] ||
+         episode_crowns(1) > g_episode.tiebreak_start_crowns[1])) {
+      // The original core has drained the lowest remaining tower(s) to zero.
+      // Presentation is intentionally absent, so surface that authoritative
+      // result directly instead of waiting for its missing result-page frame.
+      battle_active = false;
+      g_episode.terminated = true;
+      g_episode.termination_reason = "native_tiebreak_hp_drain";
+      break;
+    }
+    if (g_episode.core_only_terminal_phase &&
+        g_episode.stalled_updates >= 2 &&
+        episode_crowns(0) == episode_crowns(1) &&
+        episode_lowest_living_tower_hp(0) ==
+            episode_lowest_living_tower_hp(1)) {
+      // With no presentation frame, an exactly tied tiebreak leaves the
+      // authoritative core clock stopped after applying the symmetric drain.
+      battle_active = false;
+      g_episode.terminated = true;
+      g_episode.termination_reason = "native_tiebreak_exact_draw";
       break;
     }
     // The original inner battle core stops its 20 Hz clock after it has

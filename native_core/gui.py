@@ -6,6 +6,7 @@ import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -480,6 +481,21 @@ class NativeCoreGui:
             arena_height,
         )
 
+    @staticmethod
+    def _match_clock_info(tick: int, terminated: bool) -> tuple[str, str, int]:
+        """Frozen standard-1v1 schedule, independently measured in libg."""
+        if tick < 3600:
+            seconds = math.ceil(max(0, 3600 - tick) / 20)
+            phase = "常规时间"
+        elif tick < 6000:
+            seconds = math.ceil(max(0, 6000 - tick) / 20)
+            phase = "加时"
+        else:
+            seconds = 0
+            phase = "终局" if terminated else "决胜结算"
+        multiplier = 1 if tick < 2400 else 2 if tick < 4800 else 3
+        return f"{seconds // 60}:{seconds % 60:02d}", phase, multiplier
+
     @classmethod
     def _native_to_canvas(
         cls,
@@ -665,6 +681,22 @@ class NativeCoreGui:
             if self.entity_tree.exists(entity_id):
                 self.entity_tree.selection_add(entity_id)
 
+        episode = self.state.get("episode", {})
+        clock, phase, multiplier = self._match_clock_info(
+            int(self.state["tick"]), bool(episode.get("terminated"))
+        )
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas.create_text(
+            canvas_width - 14, 14, text=clock, anchor="ne",
+            fill="white", font=("Segoe UI", 26, "bold"), tags=("match_clock",),
+        )
+        canvas.create_text(
+            canvas_width - 14, 52,
+            text=f"{phase}  ·  ×{multiplier} 圣水",
+            anchor="ne", fill="#a9c9df", font=("Segoe UI", 10),
+            tags=("match_clock",),
+        )
+
         if self.last_deploy_marker is not None:
             marker_x, marker_y, valid = self.last_deploy_marker
             x, y = self._native_to_canvas(marker_x, marker_y, geometry)
@@ -682,7 +714,6 @@ class NativeCoreGui:
             f"{'蓝' if p['side'] == 0 else '红'}:{p['elixir']}"
             for p in players
         )
-        episode = self.state.get("episode", {})
         if episode.get("terminated"):
             winner = episode.get("winner")
             outcome = "平局" if winner is None else f"{'蓝' if winner == 0 else '红'}方胜"
@@ -736,8 +767,14 @@ def main() -> int:
             "canvas_items": len(gui.canvas.find_all()),
             "entity_rows": len(gui.entity_tree.get_children()),
             "valid_cells": sum(row.count("1") for row in gui.deployment_mask or []),
+            "clock": gui._match_clock_info(int(gui.state["tick"]), False),
+            "clock_items": len(gui.canvas.find_withtag("match_clock")),
         }
-        if result["tick"] != 100 or result["entities"] != 6:
+        if (
+            result["tick"] != 100 or result["entities"] != 6
+            or result["clock"] != ("2:55", "常规时间", 1)
+            or result["clock_items"] != 2
+        ):
             raise RuntimeError(f"GUI smoke opening mismatch: {result}")
         print(json.dumps(result, ensure_ascii=False))
         root.destroy()
