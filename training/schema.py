@@ -143,12 +143,134 @@ def deployment_mask(
     ]
 
 
+class ActionMaskCache:
+    """Cache static native terrain and tower-state-dependent common masks."""
+
+    def __init__(self) -> None:
+        self._static: dict[tuple[int, int, int, tuple[str, ...]], np.ndarray] = {}
+        self._dynamic: dict[tuple[int, tuple[tuple[int, ...], ...]], np.ndarray] = {}
+
+    @staticmethod
+    def _tower_signature(state: Mapping[str, Any]) -> tuple[tuple[int, ...], ...]:
+        values = []
+        for entity in state.get("entities", []):
+            role = _tower_role(entity)
+            if role is None:
+                continue
+            values.append((
+                int(entity.get("side", -1)),
+                1 if role == "king" else 0,
+                int(entity.get("x", 0)),
+                int(entity.get("y", 0)),
+                1 if int(entity.get("hp", 0)) > 0 else 0,
+            ))
+        return tuple(sorted(values))
+
+    def _static_mask(
+        self,
+        native_rows: list[str],
+        *,
+        side: int,
+        deck_index: int,
+        card_id: int,
+    ) -> np.ndarray:
+        rows_key = tuple(native_rows)
+        key = (side, deck_index, card_id, rows_key)
+        cached = self._static.get(key)
+        if cached is not None:
+            return cached
+        raw = np.asarray(
+            [[cell == "1" for cell in row] for row in native_rows],
+            dtype=np.bool_,
+        )
+        if raw.shape != (ARENA_ROWS, ARENA_COLUMNS):
+            raise ValueError("native deployment mask must be 18x32")
+        if card_id // 1_000_000 != 28:
+            raw = raw & raw[:, ::-1] & raw[::-1, :] & raw[::-1, ::-1]
+        result = np.ascontiguousarray(raw.reshape(-1))
+        result.setflags(write=False)
+        self._static[key] = result
+        return result
+
+    def _dynamic_mask(
+        self, state: Mapping[str, Any], *, side: int
+    ) -> np.ndarray:
+        signature = self._tower_signature(state)
+        key = (side, signature)
+        cached = self._dynamic.get(key)
+        if cached is not None:
+            return cached
+        allowed = np.zeros((ARENA_ROWS, ARENA_COLUMNS), dtype=np.bool_)
+        own_rows = slice(0, 15) if side == 0 else slice(17, 32)
+        allowed[own_rows, :] = True
+        living_enemy_princesses = [
+            entity
+            for entity in state.get("entities", [])
+            if int(entity.get("side", -1)) != side
+            and _tower_role(entity) == "princess"
+            and int(entity.get("hp", 0)) > 0
+        ]
+        left_alive = any(
+            int(entity.get("x", 0)) < 9000
+            for entity in living_enemy_princesses
+        )
+        right_alive = any(
+            int(entity.get("x", 0)) >= 9000
+            for entity in living_enemy_princesses
+        )
+        pocket_rows = (
+            slice(17, 17 + POCKET_DEPTH_CELLS)
+            if side == 0
+            else slice(15 - POCKET_DEPTH_CELLS, 15)
+        )
+        if not left_alive:
+            allowed[pocket_rows, :LANE_SPLIT_COLUMN] = True
+        if not right_alive:
+            allowed[pocket_rows, LANE_SPLIT_COLUMN:] = True
+        for entity in state.get("entities", []):
+            role = _tower_role(entity)
+            if role is None or int(entity.get("hp", 0)) <= 0:
+                continue
+            footprint = 4 if role == "king" else 3
+            half_extent = footprint * 1000 // 2
+            x, y = int(entity["x"]), int(entity["y"])
+            column_start = max(0, (x - half_extent) // 1000)
+            column_stop = min(18, (x + half_extent + 999) // 1000)
+            row_start = max(0, (y - half_extent) // 1000)
+            row_stop = min(32, (y + half_extent + 999) // 1000)
+            allowed[row_start:row_stop, column_start:column_stop] = False
+        result = np.ascontiguousarray(allowed.reshape(-1))
+        result.setflags(write=False)
+        self._dynamic[key] = result
+        return result
+
+    def position_mask(
+        self,
+        native_rows: list[str],
+        state: Mapping[str, Any],
+        *,
+        side: int,
+        deck_index: int,
+        card_id: int,
+    ) -> np.ndarray:
+        static = self._static_mask(
+            native_rows,
+            side=side,
+            deck_index=deck_index,
+            card_id=card_id,
+        )
+        if card_id // 1_000_000 == 28:
+            return static
+        return static & self._dynamic_mask(state, side=side)
+
+
 def build_action_masks(
     state: Mapping[str, Any],
     *,
     side: int,
     native_masks: Mapping[tuple[int, int], list[str]],
     decks: list[list[Mapping[str, int]]],
+    cache: ActionMaskCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
     """Return card mask, four position masks and current hand deck indices."""
     player = next(
@@ -165,14 +287,20 @@ def build_action_masks(
             continue
         card = decks[side][deck_index]
         card_id = int(card["card_id"])
-        rows = deployment_mask(
-            native_masks[(side, deck_index)], state, side=side, card_id=card_id
-        )
-        flat = np.fromiter(
-            (cell == "1" for row in rows for cell in row),
-            dtype=np.bool_,
-            count=ARENA_ROWS * ARENA_COLUMNS,
-        )
+        if cache is None:
+            rows = deployment_mask(
+                native_masks[(side, deck_index)], state, side=side, card_id=card_id
+            )
+            flat = np.fromiter(
+                (cell == "1" for row in rows for cell in row),
+                dtype=np.bool_,
+                count=ARENA_ROWS * ARENA_COLUMNS,
+            )
+        else:
+            flat = cache.position_mask(
+                native_masks[(side, deck_index)], state,
+                side=side, deck_index=deck_index, card_id=card_id,
+            )
         position_masks[hand_index] = flat
         card_mask[hand_index + 1] = (
             deployment_open

@@ -14,7 +14,9 @@ import torch
 from native_core.env import NativeRoyaleEnv
 
 from .model import RecurrentPolicyValueNet
-from .schema import ObservationEncoder, PotentialReward, build_action_masks
+from .schema import (
+    ActionMaskCache, ObservationEncoder, PotentialReward, build_action_masks,
+)
 
 
 @dataclass
@@ -109,6 +111,7 @@ class NativeSelfPlayCollector:
         self.encoder = ObservationEncoder()
         self.potential_reward = PotentialReward(gamma=0.99995)
         self.native_masks: dict[tuple[int, int], list[str]] = {}
+        self.mask_cache = ActionMaskCache()
 
     def _prepare_native_masks(self, state: Mapping[str, Any]) -> None:
         for player in state.get("players", []):
@@ -188,6 +191,7 @@ class NativeSelfPlayCollector:
                     side=side,
                     native_masks=self.native_masks,
                     decks=self.env.decks,
+                    cache=self.mask_cache,
                 )
                 position_masks = self._canonical_positions(position_masks, side)
                 record_time("mask_build_seconds", stage_started)
