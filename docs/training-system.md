@@ -14,7 +14,9 @@ Rider, Cannon, and Arrows. Evolution/elite/champion/hero variants are excluded.
 
 1. `scripts/start_training.ps1` rebuilds the local JAR/JNI bridge.
 2. `native_core.worker` starts the no-window AVD only if it is absent.
-3. Each slot launches a Surface-free `app_process` service on ports 37031+.
+3. Each slot launches a Surface-free `app_process` service on guest ports
+   37031+. ADB exposes the same host ports for debug/fallback; training normally
+   reaches them through Emulator loopback redirection on host ports 38031+.
 4. The service loads DataTables and creates one original `BattleGameState`.
 5. Episode reset performs an in-process native state transition `4 -> 4`.
 6. Python advances to tick 100, where native deployment becomes available.
@@ -33,6 +35,13 @@ mask caches, and one global policy batch across all active Worker sides. Full
 `observe`, trace and GUI contracts remain separate and lossless. Measured
 Before/After results are in `docs/throughput-optimization-20260823.md`.
 
+The default CUDA path captures one shape-specialized graph for each active
+policy batch size. Only the pure network forward is captured; categorical
+sampling, recurrent hidden ownership and PPO remain unchanged. Graph-backed
+hidden outputs are cloned before the next replay so one cursor cannot observe
+another round overwriting its state. CPU training and `--disable-cuda-graph`
+continue to use eager execution.
+
 Cold initialization is paid once per Worker, not once per episode. The reset
 stress gate completed 1,200 same-process resets with a single deterministic
 hash and no monotonic RSS growth; the 1,000-reset block averaged 11.475 ms,
@@ -40,7 +49,8 @@ p95 26.961 ms.
 
 ## Entry points
 
-Normal unattended training (defaults: two Workers, four episodes per update):
+Normal unattended training (defaults: four Workers, four episodes per update,
+direct Emulator transport and CUDA Graph inference):
 
 ```powershell
 .\scripts\start_training.ps1
@@ -75,7 +85,7 @@ reset.
 Custom run:
 
 ```powershell
-.\scripts\start_training.ps1 -Workers 2 -Iterations 1000 `
+.\scripts\start_training.ps1 -Workers 4 -Iterations 1000 `
   -EpisodesPerIteration 8 -MaxTicks 7200 -Seed 100
 ```
 
@@ -84,7 +94,7 @@ ready:
 
 ```powershell
 D:\AI_data\runtime\venv\Scripts\python.exe -m training.train `
-  --workers 2 --iterations 1000 --episodes-per-iteration 8
+  --workers 4 --iterations 1000 --episodes-per-iteration 8
 ```
 
 ## Acceptance evidence
@@ -130,3 +140,9 @@ full-match throughput forecast.
   storage, and PPO updates.
 - The AVD is an Android ABI container, not MuMu and not a rendered game client.
   No Android Surface is created by the direct service.
+- `-Transport adb` keeps the older ADB proxy path for diagnosis. Direct
+  redirection listens on Windows loopback only; the unauthenticated service is
+  not exposed to the LAN.
+- Four Workers occupy about 1.87 GiB guest RSS in the measured frozen runtime.
+  The 4-vCPU AVD retained about 1.32 GiB available memory with no swap use.
+  An 8-vCPU AVD was measured and rejected because tail latency became worse.

@@ -64,7 +64,7 @@ Double-click [`START_TRAINING.cmd`](START_TRAINING.cmd), or run:
 ```
 
 The entry point builds the Java host and JNI bridge, starts the no-window
-Android x86_64 ABI container when necessary, launches two persistent
+Android x86_64 ABI container when necessary, launches four persistent
 Surface-free `app_process` workers, attests the original battle state, and
 runs recurrent PPO self-play. It does not start MuMu or the visual game.
 
@@ -88,8 +88,10 @@ ticks, target links, path nodes, entity-native fields, state hash/RNG, terminal
 state, and JSON snapshot export. The top-right clock follows the certified
 3-minute regulation + 2-minute overtime schedule and labels ×1/×2/×3 elixir.
 
-The same entry was verified from a fully stopped VM/service and with two
-concurrent native workers on 2026-08-23. See
+The same entry was verified from a fully stopped VM/service and with four
+concurrent native workers on 2026-08-23. Training uses Emulator loopback TCP
+redirection (host ports 38031+) and CUDA Graph inference by default; the ADB
+ports 37031+ remain available for GUI/debug and fallback. See
 [`docs/training-system.md`](docs/training-system.md).
 
 ## Native-core status
@@ -120,7 +122,7 @@ call-chain boundaries.
 - `native_core/`: persistent Worker lifecycle plus stable JSON-line client/env.
 - `training/`: observation schema, action masks, recurrent actor/critic,
   self-play collection, PPO update, and atomic run storage.
-- `START_TRAINING.cmd`: normal long-running two-worker training entry.
+- `START_TRAINING.cmd`: normal long-running four-worker training entry.
 - `SMOKE_TEST_TRAINING.cmd`: bounded one-iteration acceptance entry.
 - `GAME_LOGIC_GUI.cmd`: interactive native battle-logic acceptance entry.
 - `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).

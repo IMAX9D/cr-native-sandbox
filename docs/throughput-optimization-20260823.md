@@ -182,10 +182,10 @@ JNI内部wall timer，因此两者的独立耗时为 **Unknown**。独立只读�
 最终完整profile中，全局batch推理约占vector round的47%，两Worker并行native
 transition约占40%；encoding、mask、reward和trajectory已是次要部分。
 
-值得做独立4 Worker基准，但暂不修改默认值。batch 4→8可能继续摊薄推理，
+这是第一阶段结束时的判断。batch 4→8可能继续摊薄推理，
 独立`app_process`也可并行transition；但当前AVD只有4 CPU core，每服务占数百
-MB RSS，扩展可能开始CPU/内存饱和。4 Worker实际吞吐为 **Unknown**，必须固定
-horizon测aggregate/per-worker steps/s、RSS、CPU、p95 RPC和失败率后再决定。
+MB RSS，扩展可能开始CPU/内存饱和。第二阶段已经完成4 Worker、资源、RPC分位
+和完整终局测量，结论见第10节。
 
 ## 8. 回归验收
 
@@ -216,3 +216,113 @@ horizon测aggregate/per-worker steps/s、RSS、CPU、p95 RPC和失败率后再�
 | `fc6fee4` | 精确部署mask分层缓存 |
 | `9921956` | 跨Worker全局策略batch |
 | `ad5d0de` | fast-path与持久连接回归测试 |
+| `6291a48` | RPC分位/JNI profile、Emulator直连、4 Worker与CUDA Graph |
+
+## 10. 第二阶段：4 Worker、直连与 CUDA Graph
+
+### 10.1 4 Worker扩展与资源
+
+同一代码、seed `424242`、tick 100→1100固定horizon下，ADB传输的暖机复测为：
+
+| Worker | 环境 steps/s | RPC p95 | 失败率 |
+|---:|---:|---:|---:|
+| 2 | 257.16–260.71 | 3.10–3.12 ms | 0% |
+| 4 | 330.66–332.74 | 4.24–4.63 ms | 0% |
+
+4 Worker聚合提升约28%，但单Worker效率约减半，确认4-vCPU AVD已经存在竞争。
+静止驻留测得两个`app_process`合计约936.6 MiB RSS，四个约1.87 GiB；QEMU
+Working Set从约3.87 GiB升到4.77 GiB。四Worker运行时guest仍有约1.32 GiB
+`MemAvailable`，swap为0，因此内存不是当时的首要瓶颈。
+
+把AVD改成8 vCPU并未改善：同一4 Worker短跑分别为502.51和368.51 steps/s，
+低于4-vCPU下的523–535高位复测且尾延迟更差。默认保留4 vCPU。
+
+### 10.2 JNI分段结论
+
+`--profile-native`只在训练compact transition上加入Java/JNI分段计时。2 Worker、
+2000 transition的聚合结果归一化后为：
+
+| Host阶段 | 每请求 |
+|---|---:|
+| joint native action | 0.009 ms |
+| `nativeStep(1)` JNI | 0.304 ms |
+| step JSON parse | 0.035 ms |
+| compact observe JNI | 0.165 ms |
+| observe JSON parse | 0.054 ms |
+| transition pre-response合计 | 0.568 ms |
+| response serialize探针 | 0.072 ms |
+
+原生step+compact observe合计约0.469 ms，并不是1.7 ms级客户端等待的全部。
+因此没有贸然把协议改成binary；JSON parse/serialize本身不足以解释剩余开销，
+更大的损失来自ADB proxy、跨系统调度和同步尾延迟。
+
+### 10.3 绕过ADB TCP proxy
+
+Java服务同时监听guest接口；Windows Emulator `redir`把guest 37031+映射到仅
+监听Windows loopback的38031+。ADB 37031+接口继续保留给GUI/debug和回退。
+
+相邻固定horizon A/B：
+
+| Worker | ADB | Emulator直连 | 变化 |
+|---:|---:|---:|---:|
+| 2 | 291.76 | 310.41 | +6.4% |
+| 4 | 323.95 | 484.79 | +49.6% |
+
+多Worker收益更大，说明ADB多路转发是并发串行点。短跑受CPU/GPU功耗状态影响
+明显，直连后其他复测分布约347–535 steps/s；484.79不是持续吞吐承诺。训练
+启动器默认使用直连，`-Transport adb`仍可回退。
+
+### 10.4 CUDA Graph推理
+
+每种活动batch shape只捕获纯网络forward；categorical采样、PPO、Reward和网络
+结构不变。graph输出hidden在下次replay前clone，避免静态buffer覆盖cursor状态。
+batch=8纯forward微基准从约0.98 ms降到0.22 ms且输出逐值相等。
+
+真实4 Worker相邻A/B中，eager为455.33 steps/s，CUDA Graph为523.31；再次复测
+为534.92。收益约15%–17.5%，1000轮只需一次约0.13 s capture。完整终局因Worker
+先后结束，实际捕获并使用了batch 8/6/4/2共4个graph。
+
+### 10.5 最终完整终局
+
+运行：`throughput-direct-graph-full`，4 Worker、4场、`max_ticks=7200`：
+
+| 指标 | 第一阶段2 Worker | 第二阶段4 Worker |
+|---|---:|---:|
+| 正常终局 / 截断 | 4 / 0 | 4 / 0 |
+| environment steps | 21,142 | 23,450 |
+| 环境墙钟 | 99.74 s | 63.67 s |
+| PPO update | 12.79 s | 13.02 s |
+| 迭代墙钟 | 112.54 s | 76.69 s |
+| 环境 steps/s | 211.96 | 368.28 |
+| 含PPO steps/s | 187.87 | 305.76 |
+| policy decisions/s | 423.93 | 736.56 |
+| episodes/hour（含PPO） | 127.96 | 187.76 |
+
+相对第一阶段最终版：环境`1.74×`、含PPO`1.63×`、episodes/hour`1.47×`。
+相对最初完整受控基线：环境`3.62×`、含PPO`3.19×`、episodes/hour`1.98×`。
+
+第二阶段完整profile：global inference 18.97 s（约3.17 ms/vector round），并行
+transition wall 22.34 s（约3.73 ms/round），RPC p95 3.83 ms、p99 6.84 ms、
+失败率0。当前最大项是transition尾延迟，其次是推理；encoding、mask、reward和
+trajectory仍是次要项。继续做binary protocol的预期上限较小，下一阶段若继续
+优化，应先评估去同步barrier的异步collector或多AVD隔离，而不是修改20 Hz规则。
+
+### 10.6 第二阶段失败实验
+
+- Emulator直连在Host仍只绑定guest loopback时会连接重置；改为guest全接口监听
+  后成功，Windows redir仍只监听127.0.0.1。
+- 8-vCPU AVD尾延迟更差，已回到4 vCPU。
+- `torch.compile`在当前Windows运行时缺少可用Triton，未进入主线。
+- 全batch位置采样在WAIT占多数时更慢；混合采样端到端也没有稳定收益，并改变
+  RNG消耗顺序，已撤回。
+
+### 10.7 第二阶段验收
+
+- RPC原始样本合并p50/p95/p99/max与失败率；多wave不会相加分位数；
+- CUDA Graph逐值动作/log-prob/value/hidden及静态hidden生命周期测试；
+- compact/full三状态差分与deterministic vector 400步/方；
+- 八卡动作、标准时间/圣水/拼血证书；
+- 4场4/4原生终局、0截断；
+- 8份轨迹finite、最终done、card/position mask逐步合法；
+- PPO模型finite、optimizer存在且checkpoint可重载；
+- direct transport + CUDA Graph一键smoke通过。

@@ -263,7 +263,8 @@ app_process /system/bin royale.nativehost.JniHost \
 - 独立远端目录；
 - 独立 `libg.so` 地址空间；
 - 独立 BattleGameState 和 RNG；
-- 独立 TCP 端口，默认从 37031 递增；
+- 独立 guest TCP 端口，默认从 37031 递增；ADB/GUI 沿用 host 37031+，训练
+  默认经 Emulator 直连映射使用 host 38031+；
 - 共享同一个无窗口 Android AVD 和只读 APK/content。
 
 DataTables 和 `libg` 冷初始化串行执行，战斗运行可以并行。这样避免多个软件
@@ -786,9 +787,10 @@ Actor。代码把两条路径分开，防止训练时的信息优势进入部署
 当前默认：
 
 - 1 个无窗口 Android AVD；
-- 2 个独立 `app_process/libg` Worker；
+- 4 个独立 `app_process/libg` Worker；
 - 每个 Worker 同时只运行 1 场；
 - Python 用 vector collector 汇总 `2×Worker` 视角并并行等待 Worker RPC；
+- CUDA 侧按活动 batch shape 复用 CUDA Graph；
 - 同一轮收集完成后统一更新。
 
 理论上 Worker 配置允许 1..8，但可用数量受主机 CPU、AVD 内存、单进程 RSS、
@@ -802,8 +804,12 @@ JSON 序列化和 GPU 推理共同限制。不能只按原生 tick microbenchmar
 - 该短路径约 `7,618 validated tick/s`；
 - 进程内 reset 平均约 `11.475 ms`；
 - 双 Worker 的短采样/更新闭环已通过。
-- 固定2×1000步真实闭环约 `289–291 environment steps/s`；
-- 4场完整终局环境采样约 `211.96 environment steps/s`；
+- 第一阶段固定2×1000步真实闭环约 `289–291 environment steps/s`；
+- 第一阶段2 Worker、4场完整终局环境采样约 `211.96 environment steps/s`；
+- 第二阶段4 Worker、直连和 CUDA Graph 的完整终局为 `368.28 steps/s`，
+  含 PPO 为 `305.76 steps/s`，约 `187.76 episodes/hour`；
+- 第二阶段固定短跑受主机功耗/调度影响约 `380–535 steps/s`，因此不把峰值
+  当作持续吞吐承诺；
 - 完整阶段profile见 `docs/throughput-optimization-20260823.md`。
 
 这些数字分别测量不同层次，不应互相替代：训练每 tick 还包括完整观测 JSON、
@@ -973,9 +979,9 @@ GAME_LOGIC_GUI.cmd
 ### 25.4 服务管理
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker status --workers 2
-D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 2
-D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 2 --stop-vm
+D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker status --workers 4
+D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 4
+D:\AI_data\runtime\venv\Scripts\python.exe -m native_core.worker stop --workers 4 --stop-vm
 ```
 
 ## 26. 失败保护
