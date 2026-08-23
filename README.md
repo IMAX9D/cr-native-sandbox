@@ -32,7 +32,7 @@ No feasibility experiment may modify either existing project. A successful
 prototype must expose its own manifest and explicit paths to external runtime
 artifacts.
 
-## First acceptance gate
+## First acceptance gate: passed
 
 The direct-native route is considered feasible only after one isolated command
 can:
@@ -44,23 +44,28 @@ can:
 5. reproduce the same canonical state hash across ten fresh runs; and
 6. report measured startup latency and sustained ticks per second.
 
-Until all six conditions pass, this repository makes no claim that the current
-runtime has been separated into a reusable kernel.
+All six conditions passed on 2026-08-23. The certificate is reproducible with:
+
+```powershell
+.\scripts\accept_direct_core.ps1 -Runs 10
+```
 
 ## Current status
 
-- Offscreen bootstrap followed by Surface destruction is proven: the original
-  battle core advances `0 -> 100` ticks after the Surface is gone and produces
-  the canonical idle hash `5594aa3c81dc52fa`.
-- A completely Surface-free call to the original `GameMain::init` now returns
-  normally and publishes the native loader, stage registry, helper, and state
-  manager.
-- The remaining direct-bootstrap blocker is earlier than battle logic: the
-  native DataTables owner is allocated, but its 219-entry table array is not
-  populated because the platform content-loader callback has not yet been
-  separated from the render lifecycle.
+- Strict no-Surface cold start is proven. No Surface is created, attached, or
+  borrowed at any point in `probe-direct`.
+- Original `libg` code loads all 158 DataTables resources, loads the standard
+  arena and tilemap through the native resource request list, creates the
+  standard 1v1 battle, and advances `0 -> 100` logic ticks.
+- Ten fresh processes produced the same RNG, hands, cycle, six tower entities,
+  tower HP, and canonical state hash `5594aa3c81dc52fa`.
+- Mean cold process wall time was `13.095 s`. The measured replay-injection to
+  100-tick observation path averaged `13.126 ms`, or about `7,618` validated
+  ticks/s for one process. Cold wall time includes deployment orchestration and
+  a deliberate 5-second platform initialization fence.
 
-See `docs/experiment-0002-results.md` for the exact evidence and next gate.
+See `docs/experiment-0002-results.md` for exact evidence, native call-chain
+boundaries, and remaining work before this becomes a reusable training worker.
 
 ## Experiment layout
 
@@ -68,6 +73,8 @@ See `docs/experiment-0002-results.md` for the exact evidence and next gate.
   JNI class name expected by the frozen bridge while varying only lifecycle
   calls around the original `libg.so`.
 - `scripts/`: build/deploy/measurement entry points owned by this repository.
+- `scripts/accept_direct_core.ps1`: fresh-process determinism and baseline
+  certificate.
 - `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).
 
 The probe consumes the frozen APK, packaged libraries, and JNI observation

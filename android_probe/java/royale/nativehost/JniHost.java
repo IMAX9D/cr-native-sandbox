@@ -57,6 +57,7 @@ public final class JniHost {
     private static native String nativeInitResources(String libgPath);
     private static native String nativeInitManager(String libgPath);
     private static native String nativePumpManager(String libgPath);
+    private static native String nativePumpDataTables(String libgPath);
     private static native String nativeLoadReplay(String libgPath, String replayJson);
     private static native String nativeRestartReplay(String libgPath, String replayJson);
     private static native String nativeStep(String libgPath, int steps);
@@ -186,17 +187,64 @@ public final class JniHost {
                 System.out.flush();
                 if ("probe-direct".equals(mode)) {
                     System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_platform_init\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            nativeInitResources(args[0] + "/libg.so") + "}"
+                    );
+                    System.out.flush();
+                    System.out.println(
                         "{\"schema_version\":1,\"stage\":\"direct_game_main_init\"," +
                             "\"event\":\"after_call\",\"value\":" +
                             nativeInitGameMain(args[0] + "/libg.so") + "}"
                     );
                     System.out.flush();
-                    emitStage("direct_runtime_start", "before");
-                    GameApp.nOnStart();
-                    GameApp.nOnResume();
-                    Thread.sleep(1000L);
-                    GameApp.nOnPause();
-                    emitStage("direct_runtime_start", "after");
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_loading_state\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            nativePumpManager(args[0] + "/libg.so") + "}"
+                    );
+                    System.out.flush();
+                    JSONObject directLoadingFrame = null;
+                    for (int loadingFrame = 0; loadingFrame < 8;
+                         ++loadingFrame) {
+                        directLoadingFrame = new JSONObject(
+                            nativePumpManager(args[0] + "/libg.so")
+                        );
+                    }
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_loading_frames\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            directLoadingFrame.toString() + "}"
+                    );
+                    String preDataTablesJson =
+                        nativeProbePrerequisites(args[0] + "/libg.so");
+                    JSONObject preDataTables = new JSONObject(
+                        preDataTablesJson
+                    );
+                    if ("0x0".equals(preDataTables.optString(
+                            "battle_data_content", "0x0")) &&
+                        !"0x0".equals(preDataTables.optString(
+                            "data_load_task", "0x0"))) {
+                        System.out.println(
+                            "{\"schema_version\":1,\"stage\":\"direct_data_tables\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                nativePumpDataTables(args[0] + "/libg.so") + "}"
+                        );
+                        JSONObject postDataTablesFrame = null;
+                        for (int finalizeFrame = 0; finalizeFrame < 4;
+                             ++finalizeFrame) {
+                            postDataTablesFrame = new JSONObject(
+                                nativePumpManager(args[0] + "/libg.so")
+                            );
+                        }
+                        System.out.println(
+                            "{\"schema_version\":1," +
+                                "\"stage\":\"direct_data_tables_finalize\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                postDataTablesFrame.toString() + "}"
+                        );
+                    }
+                    System.out.flush();
                     String directReadinessJson =
                         nativeProbePrerequisites(args[0] + "/libg.so");
                     System.out.println(
@@ -271,15 +319,6 @@ public final class JniHost {
                     }
                     String replayJson = readUtf8(new File(args[2]));
                     long startedNanos = System.nanoTime();
-                    JSONObject preLoadPumpResult = null;
-                    if ("probe-direct".equals(mode)) {
-                        for (int bootstrapFrame = 0;
-                             bootstrapFrame < 20; ++bootstrapFrame) {
-                            preLoadPumpResult = new JSONObject(
-                                nativePumpManager(args[0] + "/libg.so")
-                            );
-                        }
-                    }
                     JSONObject loadResult = new JSONObject(
                         nativeLoadReplay(args[0] + "/libg.so", replayJson)
                     );
@@ -313,9 +352,6 @@ public final class JniHost {
                     long elapsedNanos = System.nanoTime() - startedNanos;
                     JSONObject result = new JSONObject();
                     result.put("profile", mode);
-                    if (preLoadPumpResult != null) {
-                        result.put("pre_load_pump", preLoadPumpResult);
-                    }
                     result.put("load", loadResult);
                     if (pumpResult != null) {
                         result.put("pump", pumpResult);

@@ -8,8 +8,10 @@ param(
     [string]$BaseApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\base.apk",
     [string]$ReplayJson = "D:\Codex\E\AI ClashRoyale\examples\native_replay_probe.json",
     [string]$AssetDirectory = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\extracted\assets",
+    [string]$AssetPackApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\split_install_time_asset_pack.apk",
     [string]$RemoteRoot = "/data/local/tmp/cr-native-core-probe",
-    [string]$EvidenceRoot = "D:\AI_data\cr-native-core\experiment-0001"
+    [string]$EvidenceRoot = "D:\AI_data\cr-native-core\experiment-0001",
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,7 +20,7 @@ $Jar = Join-Path $ProjectRoot "artifacts\lifecycle-probe.jar"
 if (-not $Bridge) {
     $Bridge = Join-Path $ProjectRoot "artifacts\libnative_core_probe.so"
 }
-foreach ($Path in @($Adb, $Jar, $Bridge, $BaseApk, $ReplayJson, (Join-Path $RuntimeDirectory "libg.so"))) {
+foreach ($Path in @($Adb, $Jar, $Bridge, $BaseApk, $AssetPackApk, $ReplayJson, (Join-Path $RuntimeDirectory "libg.so"))) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing probe input: $Path"
     }
@@ -64,6 +66,14 @@ Push-Verified -LocalPath $ReplayJson -RemotePath "$RemoteRoot/input-replay.json"
 $AssetArchive = Join-Path $ProjectRoot "artifacts\runtime-assets.tar"
 & tar.exe -cf $AssetArchive -C $AssetDirectory .
 if ($LASTEXITCODE -ne 0) { throw "Failed to package runtime assets" }
+$AssetOverlay = Join-Path $EvidenceRoot "runtime-assets-overlay"
+New-Item -ItemType Directory -Path $AssetOverlay -Force | Out-Null
+& tar.exe -xf $AssetPackApk -C $AssetOverlay --strip-components 1 `
+    "assets/locations/training_arena.csv" "assets/tilemaps/tilemap.csv"
+if ($LASTEXITCODE -ne 0) { throw "Failed to extract native battle-map assets" }
+& tar.exe -rf $AssetArchive -C $AssetOverlay `
+    "locations/training_arena.csv" "tilemaps/tilemap.csv"
+if ($LASTEXITCODE -ne 0) { throw "Failed to append native battle-map assets" }
 Push-Verified -LocalPath $AssetArchive -RemotePath "$RemoteRoot/runtime-assets.tar"
 Invoke-Adb -CommandArguments @(
     "shell",
@@ -81,7 +91,7 @@ $Output = & $Adb -s $Serial shell "$Launch; status=`$?; echo __PROBE_EXIT__=`$st
 $ExitCode = $LASTEXITCODE
 $ErrorActionPreference = $PreviousErrorActionPreference
 $Output | Set-Content -LiteralPath $LogPath -Encoding utf8
-$Output | Out-Host
+if (-not $Quiet) { $Output | Out-Host }
 [pscustomobject]@{
     profile = $Profile
     exit_code = $ExitCode

@@ -23,9 +23,7 @@ constexpr uintptr_t kThreadOptionsMapRva = 0x1AB9910;
 constexpr uintptr_t kManagerGlobalRva = 0x1A85978;
 constexpr uintptr_t kInitManagerRva = 0xCE65B0;
 constexpr uintptr_t kResourceLoaderGlobalRva = 0x1AB9988;
-constexpr uintptr_t kResourceLoaderCtorRva = 0x11EC080;
 constexpr uintptr_t kResourceLoaderInitRva = 0x11E8F20;
-constexpr uintptr_t kResourceLoaderVtableRva = 0x1924680;
 constexpr uintptr_t kAssetSystemGlobalRva = 0x1AC1438;
 constexpr uintptr_t kAssetSystemInitRva = 0x1353750;
 constexpr uintptr_t kAssetSystemGetRva = 0x1353810;
@@ -42,9 +40,6 @@ constexpr uintptr_t kGameSingletonInitRva = 0x7259B0;
 constexpr uintptr_t kGameSingletonGlobalRva = 0x1A60FA0;
 constexpr uintptr_t kRuntimeClockGlobalRva = 0x1ABC008;
 constexpr uintptr_t kThreadOptionSetRva = 0x11E6DA0;
-constexpr uintptr_t kGameHelperCtorRva = 0x11E2030;
-constexpr uintptr_t kGameHelperConfigureRva = 0x11E3640;
-constexpr uintptr_t kStageRegistryInitRva = 0xB14270;
 constexpr uintptr_t kStageRegistryGlobalRva = 0x1A7C500;
 constexpr uintptr_t kBattleDataRootGlobalRva = 0x1A75E30;
 constexpr uintptr_t kGameMainInitRva = 0x727050;
@@ -54,13 +49,25 @@ constexpr uintptr_t kRendererResolutionCallRva = 0x7276FC;
 constexpr uintptr_t kRendererObjectsBlockRva = 0x727726;
 constexpr uintptr_t kRendererLateConfigureCallRva = 0x7279D0;
 constexpr uintptr_t kGamePresentationToggleRva = 0x72C8C0;
-constexpr uintptr_t kHomePresentationConfigRva = 0xCE8D10;
+constexpr uintptr_t kHomeResolutionBlockRva = 0xCE8E66;
+constexpr uintptr_t kHomeGraphicsCreateCallRva = 0xCE8F5F;
+constexpr uintptr_t kDataLoadTaskStartRva = 0xCDC5B0;
+constexpr uintptr_t kDataLoadTaskPumpRva = 0xCDC620;
+constexpr uintptr_t kDataLoadTaskCompleteRva = 0xCDC5A0;
+constexpr uintptr_t kDataTablesLoadRangeRva = 0xE74B40;
+constexpr uintptr_t kLoadingStateUpdateRva = 0xCE98F0;
+constexpr uintptr_t kLoadingStateCompleteRva = 0xCE9750;
+constexpr uintptr_t kLoadingPresentationCallRva = 0xCEA6BB;
+constexpr uintptr_t kLoadingPlatformUiCallRva = 0xCEA6C8;
+constexpr uintptr_t kResourceGateUpdateRva = 0xB11690;
+constexpr uintptr_t kHeadlessResourceVariantRva = 0x137F220;
 constexpr uintptr_t kSetReplayDataRva = 0xCE7C40;
 constexpr uintptr_t kGameStateManagerUpdateRva = 0xCE7810;
 constexpr uintptr_t kBattleReplayControllerRva = 0x10B8AD0;
 constexpr uintptr_t kSubmitReplayToControllerRva = 0x11ABC50;
 constexpr uintptr_t kBattleStateUpdateRva = 0xCE26D0;
 constexpr uintptr_t kBattleCoreUpdateRva = 0xCE2CC0;
+constexpr uintptr_t kBattleLoadReplayRva = 0x10B85B0;
 constexpr uintptr_t kSkipCoreAndPresentationFlagRva = 0x1A85930;
 constexpr uintptr_t kDoSpellCommandCtorRva = 0xD8D4D0;
 constexpr uintptr_t kDoSpellCommandExecuteRva = 0xD8D520;
@@ -85,6 +92,20 @@ constexpr uintptr_t kNativeFreeRva = 0x18B1630;
 constexpr uintptr_t kNativeStringFromUtf8Rva = 0x140F8F0;
 constexpr uintptr_t kNativeStringDestroyRva = 0x140F7D0;
 constexpr uintptr_t kParseJsonObjectRva = 0x127C450;
+constexpr uintptr_t kJsonGetObjectRva = 0x1279A60;
+constexpr uintptr_t kJsonGetDataRva = 0x11C79C0;
+constexpr uintptr_t kLocationBattlefieldRva = 0xE51C70;
+constexpr uintptr_t kLocationFieldPrimaryRva = 0xE51CA0;
+constexpr uintptr_t kLocationFieldSecondaryRva = 0xE51CB0;
+constexpr uintptr_t kDataStringResolveRva = 0x11EA4A0;
+constexpr uintptr_t kResourceLookupRva = 0x11E8860;
+constexpr uintptr_t kResourceRequestListCtorRva = 0x12B6FD0;
+constexpr uintptr_t kResourceRequestListAppendRva = 0x12B7320;
+constexpr uintptr_t kResourceRequestListLoadRva = 0x12B7480;
+constexpr uintptr_t kResourceRequestListDtorRva = 0x12B7050;
+constexpr uintptr_t kBattlefieldCacheRootRva = 0x7DB170;
+constexpr uintptr_t kDataRowInstanceIdRva = 0xE1D1F0;
+constexpr uintptr_t kBuildBattlefieldCacheRva = 0xE2AF80;
 
 using CreateGameMain = jstring (*)(
     JNIEnv*, jclass, jobject, jstring, jstring, jstring, jlong, jint, jint,
@@ -94,12 +115,24 @@ using NativeFree = void (*)(void*);
 using NativeStringFromUtf8 = void* (*)(void*, const char*);
 using NativeStringDestroy = void (*)(void*);
 using ParseJsonObject = void* (*)(void*, int, int);
+using JsonGetObject = void* (*)(void*, void*, bool);
+using JsonGetData = void* (*)(void*, void*, void*, int32_t, bool);
+using LocationBattlefield = void* (*)(void*);
+using PointerGetter = void* (*)(void*);
+using ResourceLookup = void* (*)(const char*, int32_t);
+using ResourceRequestListCtor = void (*)(void*);
+using ResourceRequestListAppend = void (*)(
+    void*, void*, int32_t, int32_t, int32_t, int32_t, bool);
+using ResourceRequestListLoad = void (*)(void*);
+using ResourceRequestListDtor = void (*)(void*);
+using GlobalPointerGetter = void* (*)();
+using DataRowInstanceId = int32_t (*)(void*);
+using BuildBattlefieldCache = void (*)(void*, void*, void*, int32_t);
 using BattleReplayController = void* (*)(void*);
 using SubmitReplayToController = void (*)(void*, void*);
 using SetReplayData = void (*)(void*, void*);
 using GameStateManagerUpdate = void (*)(void*, float);
 using InitManager = void (*)();
-using ResourceLoaderCtor = void (*)(void*);
 using ResourceLoaderInit = void (*)(void*, const char*, const uint8_t*);
 using AssetSystemInit = void (*)();
 using AssetSystemGet = void* (*)();
@@ -108,13 +141,20 @@ using NativePathGetter = void* (*)(void*);
 using AssetSystemSetPath = void (*)(void*, void*);
 using AssetSystemMount = void (*)(void*, void*, void*);
 using RuntimeClockInit = void (*)();
-using GameSingletonInit = void* (*)(void*, void*);
+using GameSingletonInit = void* (*)();
 using ThreadOptionSet = void (*)(int32_t, bool);
-using GameHelperCtor = void (*)(void*);
-using GameHelperConfigure = void (*)(void*, int32_t);
-using StageRegistryInit = void (*)();
 using GameMainInit = void (*)(void*, void*);
+using DataLoadTaskStart = void (*)(void*);
+using DataLoadTaskPump = bool (*)(void*);
+using DataLoadTaskComplete = bool (*)(void*);
+using DataTablesLoadRange = bool (*)(
+    void*, void*, int32_t, int32_t, int32_t, int32_t, int32_t);
+using LoadingStateUpdate = void (*)(void*, float);
+using LoadingStateComplete = bool (*)(void*);
+using ResourceGateUpdate = void (*)(void*, float);
+using ResourceVariantDecode = void* (*)(void*, void*, const uint8_t*);
 using BattleStateUpdate = void (*)(void*, float);
+using BattleLoadReplay = void (*)(void*, void*, void*, void*);
 using DoSpellCommandCtor = void (*)(void*, void*);
 using DoSpellCommandExecute = int32_t (*)(void*, void*, int32_t, int32_t);
 using BuildCanonicalSelection = void* (*)(void*, void*, void*, int32_t);
@@ -157,6 +197,34 @@ class SafeMemoryReader {
  private:
   int fd_;
 };
+
+const char* native_data_string_chars(const SafeMemoryReader& memory,
+                                     void* native_string,
+                                     int32_t* length) {
+  if (length != nullptr) {
+    *length = -1;
+  }
+  if (native_string == nullptr) {
+    return nullptr;
+  }
+  const uintptr_t address = reinterpret_cast<uintptr_t>(native_string);
+  int32_t native_length = -1;
+  if (!memory.read(address + 4, &native_length) || native_length < 0 ||
+      native_length > 4096) {
+    return nullptr;
+  }
+  uintptr_t chars = address + 8;
+  if (native_length >= 8 && !memory.read(address + 8, &chars)) {
+    return nullptr;
+  }
+  if (chars == 0) {
+    return nullptr;
+  }
+  if (length != nullptr) {
+    *length = native_length;
+  }
+  return reinterpret_cast<const char*>(chars);
+}
 
 struct CrownTowerState {
   uint64_t id = 0;
@@ -1842,7 +1910,7 @@ Java_royale_nativehost_JniHost_nativeRestartReplay(
       reinterpret_cast<int32_t*>(manager + 0x34), 1, __ATOMIC_RELEASE);
   __atomic_store_n(
       reinterpret_cast<int32_t*>(manager + 0x10), 3, __ATOMIC_RELEASE);
-  manager_update(reinterpret_cast<void*>(manager), 0.0f);
+  manager_update(reinterpret_cast<void*>(manager), 0.05f);
   for (int frame = 0; frame < 5; ++frame) {
     manager_update(reinterpret_cast<void*>(manager), 0.05f);
   }
@@ -2050,18 +2118,61 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
       reinterpret_cast<unsigned char*>(
           base + kSkipCoreAndPresentationFlagRva),
       1, __ATOMIC_RELEASE);
-  char payload[320];
+  alignas(16) std::array<uint8_t, 16> variant_output{};
+  std::array<uint8_t, 8> empty_variant{};
+  auto decode_variant = reinterpret_cast<ResourceVariantDecode>(
+      base + kHeadlessResourceVariantRva);
+  decode_variant(variant_output.data(), nullptr, empty_variant.data());
+  auto* variant_entry = reinterpret_cast<uint8_t*>(
+      base + kHeadlessResourceVariantRva);
+  const std::array<uint8_t, 10> variant_expected = {
+      0x53, 0x0F, 0xB6, 0x02, 0x83, 0xF8, 0x01, 0x74, 0x12, 0x83};
+  const std::array<uint8_t, 10> variant_bypass = {
+      0x0F, 0x57, 0xC0, 0x0F, 0x11, 0x07, 0x48, 0x89, 0xF8, 0xC3};
+  std::array<uint8_t, 10> variant_original{};
+  std::memcpy(variant_original.data(), variant_entry,
+              variant_original.size());
+  if (variant_original != variant_expected) {
+    dlclose(handle);
+    throw_state(env, "headless resource variant patch guard rejected bytes");
+    return nullptr;
+  }
+  const long variant_page_size = sysconf(_SC_PAGESIZE);
+  if (variant_page_size <= 0) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve resource variant page size");
+    return nullptr;
+  }
+  const uintptr_t variant_page =
+      reinterpret_cast<uintptr_t>(variant_entry) &
+      ~static_cast<uintptr_t>(variant_page_size - 1);
+  if (mprotect(reinterpret_cast<void*>(variant_page),
+               static_cast<size_t>(variant_page_size),
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    dlclose(handle);
+    throw_state(env, "cannot open resource variant page for guarded patch");
+    return nullptr;
+  }
+  std::memcpy(variant_entry, variant_bypass.data(), variant_bypass.size());
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(variant_entry),
+      reinterpret_cast<char*>(variant_entry + variant_bypass.size()));
+  mprotect(reinterpret_cast<void*>(variant_page),
+           static_cast<size_t>(variant_page_size), PROT_READ | PROT_EXEC);
+  char payload[416];
   std::snprintf(
       payload, sizeof(payload),
       "{\"called\":true,\"game\":\"0x%llx\",\"context\":\"0x%llx\","
       "\"helper_before\":\"0x%llx\",\"helper_after\":\"0x%llx\","
-      "\"manager_after\":\"0x%llx\",\"entry_rva\":\"0x%llx\"}",
+      "\"manager_after\":\"0x%llx\",\"entry_rva\":\"0x%llx\","
+      "\"headless_resource_variant_rva\":\"0x%llx\"}",
       static_cast<unsigned long long>(game),
       static_cast<unsigned long long>(context),
       static_cast<unsigned long long>(helper_before),
       static_cast<unsigned long long>(helper_after),
       static_cast<unsigned long long>(manager_after),
-      static_cast<unsigned long long>(kGameMainInitRva));
+      static_cast<unsigned long long>(kGameMainInitRva),
+      static_cast<unsigned long long>(kHeadlessResourceVariantRva));
   dlclose(handle);
   return env->NewStringUTF(payload);
 }
@@ -2110,10 +2221,23 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
   uint64_t battle_data_loader = 0;
   uint64_t battle_data_loader_vtable = 0;
   uint64_t battle_data_loader_methods[12] = {};
+  uint64_t loading_state = 0;
+  uint64_t data_load_task = 0;
+  uint64_t data_load_task_words[8] = {};
   uint64_t game_methods[24] = {};
   uint64_t battle_data_root_vtable = 0;
   uint64_t battle_data_root_methods[12] = {};
   memory.read(base + kManagerGlobalRva, &manager);
+  if (manager != 0) {
+    memory.read(manager + 0x20, &loading_state);
+    if (loading_state != 0) {
+      memory.read(loading_state + 0x10, &data_load_task);
+      if (data_load_task != 0) {
+        memory.read_bytes(data_load_task, data_load_task_words,
+                          sizeof(data_load_task_words));
+      }
+    }
+  }
   memory.read(base + kResourceLoaderGlobalRva, &loader);
   memory.read(base + kAssetSystemGlobalRva, &asset_system);
   memory.read(base + kGameSingletonGlobalRva, &game_singleton);
@@ -2283,7 +2407,7 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
   }
   data_loader_methods_payload[data_loader_methods_offset++] = ']';
   data_loader_methods_payload[data_loader_methods_offset] = '\0';
-  char payload[3072];
+  char payload[4096];
   std::snprintf(
       payload, sizeof(payload),
       "{\"manager\":\"0x%llx\",\"loader\":\"0x%llx\","
@@ -2302,6 +2426,11 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
       "\"battle_data_loader\":\"0x%llx\","
       "\"battle_data_loader_vtable_rva\":\"0x%llx\","
       "\"battle_data_loader_methods_rva\":%s,"
+      "\"loading_state\":\"0x%llx\","
+      "\"data_load_task\":\"0x%llx\","
+      "\"data_load_task_words\":[\"0x%llx\",\"0x%llx\","
+      "\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\","
+      "\"0x%llx\",\"0x%llx\"],"
       "\"loader_vtable_rva\":\"0x%llx\","
       "\"asset_system_vtable_rva\":\"0x%llx\","
       "\"thread_size\":%llu,\"thread_nodes\":%s}",
@@ -2332,6 +2461,16 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
           battle_data_loader_vtable >= base
               ? battle_data_loader_vtable - base : battle_data_loader_vtable),
       data_loader_methods_payload,
+      static_cast<unsigned long long>(loading_state),
+      static_cast<unsigned long long>(data_load_task),
+      static_cast<unsigned long long>(data_load_task_words[0]),
+      static_cast<unsigned long long>(data_load_task_words[1]),
+      static_cast<unsigned long long>(data_load_task_words[2]),
+      static_cast<unsigned long long>(data_load_task_words[3]),
+      static_cast<unsigned long long>(data_load_task_words[4]),
+      static_cast<unsigned long long>(data_load_task_words[5]),
+      static_cast<unsigned long long>(data_load_task_words[6]),
+      static_cast<unsigned long long>(data_load_task_words[7]),
       static_cast<unsigned long long>(
           loader_vtable >= base ? loader_vtable - base : loader_vtable),
       static_cast<unsigned long long>(
@@ -2494,64 +2633,26 @@ Java_royale_nativehost_JniHost_nativeInitResources(
       base + kRuntimeClockInitRva);
   auto game_singleton_init = reinterpret_cast<GameSingletonInit>(
       base + kGameSingletonInitRva);
-  runtime_clock_init();
-  game_singleton_init(nullptr, nullptr);
+  uint64_t runtime_clock = 0;
+  uint64_t game_singleton = 0;
+  memory.read(base + kRuntimeClockGlobalRva, &runtime_clock);
+  memory.read(base + kGameSingletonGlobalRva, &game_singleton);
+  if (runtime_clock == 0) {
+    runtime_clock_init();
+  }
+  if (game_singleton == 0) {
+    game_singleton_init();
+  }
   auto thread_option_set = reinterpret_cast<ThreadOptionSet>(
       base + kThreadOptionSetRva);
   thread_option_set(5, true);
   thread_option_set(3, true);
   thread_option_set(10, true);
   thread_option_set(12, true);
-  uint64_t game_singleton = 0;
-  memory.read(base + kGameSingletonGlobalRva, &game_singleton);
-  uint64_t game_helper = 0;
-  if (game_singleton != 0) {
-    memory.read(game_singleton + 0x148, &game_helper);
-  }
-  if (game_singleton != 0 && game_helper == 0) {
-    auto native_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
-    auto helper_ctor = reinterpret_cast<GameHelperCtor>(
-        base + kGameHelperCtorRva);
-    auto helper_configure = reinterpret_cast<GameHelperConfigure>(
-        base + kGameHelperConfigureRva);
-    game_helper = reinterpret_cast<uint64_t>(native_alloc(0x3C0));
-    if (game_helper == 0) {
-      dlclose(handle);
-      throw_state(env, "libg could not allocate the direct game helper");
-      return nullptr;
-    }
-    helper_ctor(reinterpret_cast<void*>(game_helper));
-    __atomic_store_n(
-        reinterpret_cast<uint64_t*>(game_singleton + 0x148),
-        game_helper, __ATOMIC_RELEASE);
-    helper_configure(reinterpret_cast<void*>(game_helper), 1);
-  }
-  uint64_t stage_registry = 0;
-  memory.read(base + kStageRegistryGlobalRva, &stage_registry);
-  if (stage_registry == 0) {
-    auto stage_registry_init = reinterpret_cast<StageRegistryInit>(
-        base + kStageRegistryInitRva);
-    stage_registry_init();
-  }
-  if (loader_before == 0) {
-    auto native_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
-    auto loader_ctor = reinterpret_cast<ResourceLoaderCtor>(
-        base + kResourceLoaderCtorRva);
-    auto loader_init = reinterpret_cast<ResourceLoaderInit>(
-        base + kResourceLoaderInitRva);
-    void* loader = native_alloc(8);
-    if (loader == nullptr) {
-      dlclose(handle);
-      throw_state(env, "libg could not allocate the direct resource loader");
-      return nullptr;
-    }
-    loader_ctor(loader);
-    *reinterpret_cast<uintptr_t*>(loader) = base + kResourceLoaderVtableRva;
-    const uint8_t options[2] = {1, 0};
-    loader_init(loader, "", options);
-  }
   uint64_t loader_after = 0;
   memory.read(base + kResourceLoaderGlobalRva, &loader_after);
+  uint64_t game_singleton_after = 0;
+  memory.read(base + kGameSingletonGlobalRva, &game_singleton_after);
   std::fprintf(stderr,
                "DIRECT_RESOURCES asset=0x%llx loader=0x%llx\n",
                static_cast<unsigned long long>(asset_system_after),
@@ -2567,6 +2668,7 @@ Java_royale_nativehost_JniHost_nativeInitResources(
       "\"loader_before\":\"0x%llx\",\"loader_after\":\"0x%llx\","
       "\"asset_system_before\":\"0x%llx\","
       "\"asset_system_after\":\"0x%llx\","
+      "\"game_singleton_after\":\"0x%llx\","
       "\"entry_rva\":\"0x%llx\",\"loader_init_rva\":\"0x%llx\"}",
       static_cast<unsigned long long>(manager_before),
       static_cast<unsigned long long>(manager_after),
@@ -2574,6 +2676,7 @@ Java_royale_nativehost_JniHost_nativeInitResources(
       static_cast<unsigned long long>(loader_after),
       static_cast<unsigned long long>(asset_system_before),
       static_cast<unsigned long long>(asset_system_after),
+      static_cast<unsigned long long>(game_singleton_after),
       static_cast<unsigned long long>(kInitManagerRva),
       static_cast<unsigned long long>(kResourceLoaderInitRva));
   dlclose(handle);
@@ -2629,6 +2732,299 @@ Java_royale_nativehost_JniHost_nativeInitManager(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativePumpDataTables(
+    JNIEnv* env, jclass, jstring libg_path) {
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for DataTables pump");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for DataTables pump");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  if (reinterpret_cast<uintptr_t>(exported) - base != kExpectedJniOnLoadRva) {
+    dlclose(handle);
+    throw_state(env, "libg version guard rejected DataTables pump");
+    return nullptr;
+  }
+
+  SafeMemoryReader memory;
+  uint64_t manager = 0;
+  uint64_t loading_state = 0;
+  uint64_t task = 0;
+  uint64_t task_tables = 0;
+  uint64_t root = 0;
+  uint64_t tables = 0;
+  if (!memory.read(base + kManagerGlobalRva, &manager) || manager == 0 ||
+      !memory.read(manager + 0x20, &loading_state) || loading_state == 0 ||
+      !memory.read(loading_state + 0x10, &task) || task == 0 ||
+      !memory.read(task, &task_tables) || task_tables == 0 ||
+      !memory.read(base + kBattleDataRootGlobalRva, &root) || root == 0 ||
+      !memory.read(root + 0x20, &tables) || tables == 0 ||
+      task_tables != tables) {
+    dlclose(handle);
+    throw_state(env, "native LoadingState DataLoadTask is not ready");
+    return nullptr;
+  }
+
+  uint64_t resource_collection = 0;
+  int32_t resource_count = 0;
+  memory.read(task + 8, &resource_collection);
+  if (resource_collection != 0) {
+    memory.read(resource_collection + 0x0C, &resource_count);
+  }
+
+  int32_t state_before = -1;
+  int32_t state_after = -1;
+  int32_t progress_before = -1;
+  int32_t progress_after = -1;
+  int32_t loading_phase_before = -1;
+  int32_t loading_phase_after = -1;
+  uint64_t loading_future_primary = 0;
+  uint64_t loading_future_secondary = 0;
+  uint8_t loading_ready_latch = 0;
+  uint64_t loading_gate = 0;
+  int32_t loading_gate_state = -1;
+  uint64_t game_singleton = 0;
+  uint64_t game_loading_coordinator = 0;
+  uint64_t first_table = 0;
+  memory.read(task + 0x10, &state_before);
+  memory.read(task + 0x1C, &progress_before);
+  memory.read(loading_state + 0x0C, &loading_phase_before);
+  auto pump = reinterpret_cast<DataLoadTaskPump>(
+      base + kDataLoadTaskPumpRva);
+  auto is_complete = reinterpret_cast<DataLoadTaskComplete>(
+      base + kDataLoadTaskCompleteRva);
+  auto start = reinterpret_cast<DataLoadTaskStart>(
+      base + kDataLoadTaskStartRva);
+  auto resource_gate_update_early = reinterpret_cast<ResourceGateUpdate>(
+      base + kResourceGateUpdateRva);
+  uint64_t resource_gate_early = 0;
+  memory.read(base + 0x1A7C210, &resource_gate_early);
+  for (int gate_iteration = 0;
+       resource_gate_early != 0 && gate_iteration < 512;
+       ++gate_iteration) {
+    int32_t resource_gate_state = -1;
+    memory.read(resource_gate_early + 8, &resource_gate_state);
+    if (resource_gate_state > 7) {
+      __atomic_store_n(
+          reinterpret_cast<int32_t*>(resource_gate_early + 8), 7,
+          __ATOMIC_RELEASE);
+    } else if (resource_gate_state < 7) {
+      resource_gate_update_early(
+          reinterpret_cast<void*>(resource_gate_early), 0.05f);
+    }
+    memory.read(resource_gate_early + 8, &resource_gate_state);
+    if (resource_gate_state >= 7) {
+      break;
+    }
+    usleep(5000);
+  }
+  int32_t native_task_state = 0;
+  memory.read(task + 0x10, &native_task_state);
+  if (native_task_state != 0) {
+    dlclose(handle);
+    throw_state(env, "DataLoadTask started before synchronous headless load");
+    return nullptr;
+  }
+  auto load_full_data_range = reinterpret_cast<DataTablesLoadRange>(
+      base + kDataTablesLoadRangeRva);
+  const bool full_range_loaded = load_full_data_range(
+      reinterpret_cast<void*>(tables),
+      reinterpret_cast<void*>(resource_collection), 0, 0, 0, 0,
+      resource_count);
+  if (!full_range_loaded) {
+    dlclose(handle);
+    throw_state(env, "native DataTables full-range load did not complete");
+    return nullptr;
+  }
+  start(reinterpret_cast<void*>(task));
+  bool completed = false;
+  int iterations = 0;
+  for (; iterations < 1024; ++iterations) {
+    if (is_complete(reinterpret_cast<void*>(task))) {
+      completed = true;
+      break;
+    }
+    pump(reinterpret_cast<void*>(task));
+    usleep(5000);
+  }
+  auto loading_update = reinterpret_cast<LoadingStateUpdate>(
+      base + kLoadingStateUpdateRva);
+  auto loading_complete = reinterpret_cast<LoadingStateComplete>(
+      base + kLoadingStateCompleteRva);
+  auto resource_gate_update = reinterpret_cast<ResourceGateUpdate>(
+      base + kResourceGateUpdateRva);
+  uint64_t resource_gate_for_update = 0;
+  memory.read(base + 0x1A7C210, &resource_gate_for_update);
+  auto* loading_presentation_call = reinterpret_cast<uint8_t*>(
+      base + kLoadingPresentationCallRva);
+  auto* loading_platform_ui_call = reinterpret_cast<uint8_t*>(
+      base + kLoadingPlatformUiCallRva);
+  const std::array<uint8_t, 5> loading_presentation_expected = {
+      0xE8, 0xC0, 0x3B, 0xA4, 0xFF};
+  std::array<uint8_t, 5> loading_presentation_original{};
+  const std::array<uint8_t, 5> loading_platform_ui_expected = {
+      0xE8, 0x53, 0xB4, 0xA3, 0xFF};
+  std::array<uint8_t, 5> loading_platform_ui_original{};
+  std::memcpy(loading_presentation_original.data(), loading_presentation_call,
+              loading_presentation_original.size());
+  std::memcpy(loading_platform_ui_original.data(), loading_platform_ui_call,
+              loading_platform_ui_original.size());
+  if (loading_presentation_original != loading_presentation_expected ||
+      loading_platform_ui_original != loading_platform_ui_expected) {
+    dlclose(handle);
+    throw_state(env, "loading presentation patch guard rejected libg bytes");
+    return nullptr;
+  }
+  const long loading_page_size = sysconf(_SC_PAGESIZE);
+  if (loading_page_size <= 0) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve loading presentation page size");
+    return nullptr;
+  }
+  const uintptr_t loading_page =
+      reinterpret_cast<uintptr_t>(loading_presentation_call) &
+      ~static_cast<uintptr_t>(loading_page_size - 1);
+  if (mprotect(reinterpret_cast<void*>(loading_page),
+               static_cast<size_t>(loading_page_size),
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    dlclose(handle);
+    throw_state(env, "cannot open loading presentation patch page");
+    return nullptr;
+  }
+  std::memset(loading_presentation_call, 0x90,
+              loading_presentation_original.size());
+  std::memset(loading_platform_ui_call, 0x90,
+              loading_platform_ui_original.size());
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(loading_presentation_call),
+      reinterpret_cast<char*>(loading_presentation_call +
+                              loading_presentation_original.size()));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(loading_platform_ui_call),
+      reinterpret_cast<char*>(loading_platform_ui_call +
+                              loading_platform_ui_original.size()));
+  int finalize_iterations = 0;
+  for (; completed && finalize_iterations < 512; ++finalize_iterations) {
+    if (loading_complete(reinterpret_cast<void*>(loading_state))) {
+      break;
+    }
+    if (resource_gate_for_update != 0) {
+      int32_t resource_gate_state = -1;
+      memory.read(resource_gate_for_update + 8, &resource_gate_state);
+      if (resource_gate_state < 7) {
+        resource_gate_update(
+            reinterpret_cast<void*>(resource_gate_for_update), 0.05f);
+      }
+    }
+    loading_update(reinterpret_cast<void*>(loading_state), 0.05f);
+    int32_t loading_phase = -1;
+    int32_t resource_gate_state = -1;
+    memory.read(loading_state + 0x0C, &loading_phase);
+    if (resource_gate_for_update != 0) {
+      memory.read(resource_gate_for_update + 8, &resource_gate_state);
+    }
+    if (loading_phase == 5) {
+      // The original frame loop samples the gate at state 7 before its next
+      // presentation update.  The headless loop has no renderer frame
+      // boundary, so keep that completed resource state stable and satisfy
+      // the presentation-only ready latch once both native futures reached
+      // the phase-5 branch above.
+      if (resource_gate_state > 7) {
+        __atomic_store_n(
+            reinterpret_cast<int32_t*>(resource_gate_for_update + 8), 7,
+            __ATOMIC_RELEASE);
+      }
+      __atomic_store_n(
+          reinterpret_cast<uint8_t*>(loading_state + 0xB0), 1,
+          __ATOMIC_RELEASE);
+      if (loading_complete(reinterpret_cast<void*>(loading_state))) {
+        ++finalize_iterations;
+        break;
+      }
+    }
+    usleep(5000);
+  }
+  std::memcpy(loading_presentation_call, loading_presentation_original.data(),
+              loading_presentation_original.size());
+  std::memcpy(loading_platform_ui_call, loading_platform_ui_original.data(),
+              loading_platform_ui_original.size());
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(loading_presentation_call),
+      reinterpret_cast<char*>(loading_presentation_call +
+                              loading_presentation_original.size()));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(loading_platform_ui_call),
+      reinterpret_cast<char*>(loading_platform_ui_call +
+                              loading_platform_ui_original.size()));
+  mprotect(reinterpret_cast<void*>(loading_page),
+           static_cast<size_t>(loading_page_size), PROT_READ | PROT_EXEC);
+  memory.read(task + 0x10, &state_after);
+  memory.read(task + 0x1C, &progress_after);
+  memory.read(loading_state + 0x0C, &loading_phase_after);
+  memory.read(loading_state + 0x68, &loading_future_primary);
+  memory.read(loading_state + 0x70, &loading_future_secondary);
+  memory.read(loading_state + 0xB0, &loading_ready_latch);
+  memory.read(base + 0x1A7C210, &loading_gate);
+  if (loading_gate != 0) {
+    memory.read(loading_gate + 8, &loading_gate_state);
+  }
+  memory.read(base + kGameSingletonGlobalRva, &game_singleton);
+  if (game_singleton != 0) {
+    memory.read(game_singleton + 0x390, &game_loading_coordinator);
+  }
+  memory.read(tables + 0x18, &first_table);
+  char payload[896];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"called\":true,\"completed\":%s,\"iterations\":%d,"
+      "\"manager\":\"0x%llx\",\"loading_state\":\"0x%llx\","
+      "\"task\":\"0x%llx\",\"tables\":\"0x%llx\","
+      "\"first_table\":\"0x%llx\",\"state_before\":%d,"
+      "\"state_after\":%d,\"progress_before\":%d,"
+      "\"progress_after\":%d,\"loading_phase_before\":%d,"
+      "\"loading_phase_after\":%d,\"finalize_iterations\":%d,"
+      "\"loading_complete\":%s,\"start_rva\":\"0x%llx\","
+      "\"future_primary\":\"0x%llx\","
+      "\"future_secondary\":\"0x%llx\","
+      "\"ready_latch\":%u,\"loading_gate\":\"0x%llx\","
+      "\"loading_gate_state\":%d,"
+      "\"game_loading_coordinator\":\"0x%llx\","
+      "\"pump_rva\":\"0x%llx\",\"complete_rva\":\"0x%llx\"}",
+      completed && first_table != 0 ? "true" : "false", iterations,
+      static_cast<unsigned long long>(manager),
+      static_cast<unsigned long long>(loading_state),
+      static_cast<unsigned long long>(task),
+      static_cast<unsigned long long>(tables),
+      static_cast<unsigned long long>(first_table), state_before, state_after,
+      progress_before, progress_after, loading_phase_before,
+      loading_phase_after, finalize_iterations,
+      loading_complete(reinterpret_cast<void*>(loading_state)) ? "true" : "false",
+      static_cast<unsigned long long>(kDataLoadTaskStartRva),
+      static_cast<unsigned long long>(loading_future_primary),
+      static_cast<unsigned long long>(loading_future_secondary),
+      static_cast<unsigned int>(loading_ready_latch),
+      static_cast<unsigned long long>(loading_gate), loading_gate_state,
+      static_cast<unsigned long long>(game_loading_coordinator),
+      static_cast<unsigned long long>(kDataLoadTaskPumpRva),
+      static_cast<unsigned long long>(kDataLoadTaskCompleteRva));
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativePumpManager(
     JNIEnv* env, jclass, jstring libg_path) {
   const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
@@ -2670,11 +3066,29 @@ Java_royale_nativehost_JniHost_nativePumpManager(
       1, __ATOMIC_RELEASE);
   auto* presentation_toggle = reinterpret_cast<uint8_t*>(
       base + kGamePresentationToggleRva);
-  auto* home_presentation_config = reinterpret_cast<uint8_t*>(
-      base + kHomePresentationConfigRva);
+  auto* home_resolution_block = reinterpret_cast<uint8_t*>(
+      base + kHomeResolutionBlockRva);
+  auto* home_graphics_create = reinterpret_cast<uint8_t*>(
+      base + kHomeGraphicsCreateCallRva);
   const uint8_t presentation_original = *presentation_toggle;
-  const uint8_t home_config_original = *home_presentation_config;
-  if (presentation_original != 0x53 || home_config_original != 0x55) {
+  const std::array<uint8_t, 17> resolution_expected = {
+      0x48, 0x8D, 0x05, 0xE3, 0x21, 0xDD, 0x00, 0x48, 0x8B,
+      0x00, 0xF3, 0x0F, 0x10, 0x05, 0xE4, 0x27, 0x5C};
+  const std::array<uint8_t, 17> resolution_bypass = {
+      0x41, 0xBE, 0x00, 0x08, 0x00, 0x00,
+      0x41, 0xBF, 0x00, 0x08, 0x00, 0x00,
+      0xE9, 0xB4, 0x00, 0x00, 0x00};
+  std::array<uint8_t, 17> resolution_original{};
+  const std::array<uint8_t, 5> graphics_create_expected = {
+      0xE8, 0x1C, 0xC3, 0x4F, 0x00};
+  std::array<uint8_t, 5> graphics_create_original{};
+  std::memcpy(resolution_original.data(), home_resolution_block,
+              resolution_original.size());
+  std::memcpy(graphics_create_original.data(), home_graphics_create,
+              graphics_create_original.size());
+  if (presentation_original != 0x53 ||
+      resolution_original != resolution_expected ||
+      graphics_create_original != graphics_create_expected) {
     dlclose(handle);
     throw_state(env, "presentation toggle patch guard rejected libg bytes");
     return nullptr;
@@ -2689,7 +3103,7 @@ Java_royale_nativehost_JniHost_nativePumpManager(
       reinterpret_cast<uintptr_t>(presentation_toggle) &
       ~static_cast<uintptr_t>(page_size - 1);
   const uintptr_t home_config_page =
-      reinterpret_cast<uintptr_t>(home_presentation_config) &
+      reinterpret_cast<uintptr_t>(home_resolution_block) &
       ~static_cast<uintptr_t>(page_size - 1);
   if (mprotect(reinterpret_cast<void*>(patch_page),
                static_cast<size_t>(page_size),
@@ -2708,18 +3122,33 @@ Java_royale_nativehost_JniHost_nativePumpManager(
     return nullptr;
   }
   *presentation_toggle = 0xC3;
-  *home_presentation_config = 0xC3;
+  std::memcpy(home_resolution_block, resolution_bypass.data(),
+              resolution_bypass.size());
+  std::memset(home_graphics_create, 0x90, graphics_create_original.size());
   __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
                           reinterpret_cast<char*>(presentation_toggle + 1));
-  __builtin___clear_cache(reinterpret_cast<char*>(home_presentation_config),
-                          reinterpret_cast<char*>(home_presentation_config + 1));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(home_resolution_block),
+      reinterpret_cast<char*>(home_resolution_block + resolution_bypass.size()));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(home_graphics_create),
+      reinterpret_cast<char*>(home_graphics_create +
+                              graphics_create_original.size()));
   manager_update(reinterpret_cast<void*>(manager), 0.0f);
   *presentation_toggle = presentation_original;
-  *home_presentation_config = home_config_original;
+  std::memcpy(home_resolution_block, resolution_original.data(),
+              resolution_original.size());
+  std::memcpy(home_graphics_create, graphics_create_original.data(),
+              graphics_create_original.size());
   __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
                           reinterpret_cast<char*>(presentation_toggle + 1));
-  __builtin___clear_cache(reinterpret_cast<char*>(home_presentation_config),
-                          reinterpret_cast<char*>(home_presentation_config + 1));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(home_resolution_block),
+      reinterpret_cast<char*>(home_resolution_block + resolution_original.size()));
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(home_graphics_create),
+      reinterpret_cast<char*>(home_graphics_create +
+                              graphics_create_original.size()));
   mprotect(reinterpret_cast<void*>(patch_page),
            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
   mprotect(reinterpret_cast<void*>(home_config_page),
@@ -2729,33 +3158,226 @@ Java_royale_nativehost_JniHost_nativePumpManager(
   int32_t pending_type = -1;
   uint64_t state = 0;
   uint64_t battle = 0;
+  uint64_t logic_battle = 0;
+  uint64_t replay = 0;
+  uint64_t left_player = 0;
+  uint64_t right_player = 0;
+  bool battle_json_loaded = false;
   memory.read(manager + 0x30, &current_type);
   memory.read(manager + 0x34, &pending_type);
   memory.read(manager + 0x20, &state);
-  if (current_type == 4 && state != 0) {
+  memory.read(manager + 0x78, &replay);
+  if (current_type == 4 && state != 0 && replay > 0x1000) {
     auto state_update = reinterpret_cast<BattleStateUpdate>(
         base + kBattleStateUpdateRva);
+    auto core_update = reinterpret_cast<BattleStateUpdate>(
+        base + kBattleCoreUpdateRva);
     for (int frame = 0; frame < 10; ++frame) {
+      memory.read(state + 0x90, &battle);
+      if (battle > 0x1000) {
+        memory.read(battle + 0xA8, &logic_battle);
+      }
+      if (logic_battle > 0x1000) {
+        memory.read(logic_battle + 0xE0, &left_player);
+        memory.read(logic_battle + 0xE8, &right_player);
+      }
+      if ((left_player == 0 || right_player == 0) &&
+          logic_battle > 0x1000) {
+        if (replay > 0x1000) {
+          alignas(8) std::array<uint8_t, 16> battle_key{};
+          auto native_string_from_utf8 =
+              reinterpret_cast<NativeStringFromUtf8>(
+                  base + kNativeStringFromUtf8Rva);
+          auto native_string_destroy = reinterpret_cast<NativeStringDestroy>(
+              base + kNativeStringDestroyRva);
+          auto json_get_object = reinterpret_cast<JsonGetObject>(
+              base + kJsonGetObjectRva);
+          auto battle_load_replay = reinterpret_cast<BattleLoadReplay>(
+              base + kBattleLoadReplayRva);
+          native_string_from_utf8(battle_key.data(), "battle");
+          void* battle_json = json_get_object(
+              reinterpret_cast<void*>(replay), battle_key.data(), true);
+          native_string_destroy(battle_key.data());
+          if (battle_json != nullptr) {
+            uint64_t data_tables = 0;
+            memory.read(battle + 0x208, &data_tables);
+            alignas(8) std::array<uint8_t, 16> location_key{};
+            native_string_from_utf8(location_key.data(), "location");
+            auto json_get_data = reinterpret_cast<JsonGetData>(
+                base + kJsonGetDataRva);
+            void* location_row = json_get_data(
+                battle_json, location_key.data(),
+                reinterpret_cast<void*>(data_tables), -1, false);
+            native_string_destroy(location_key.data());
+            auto location_battlefield =
+                reinterpret_cast<LocationBattlefield>(
+                    base + kLocationBattlefieldRva);
+            void* battlefield = location_row != nullptr
+                ? location_battlefield(location_row) : nullptr;
+            if (location_row != nullptr && battlefield == nullptr) {
+              auto location_field_primary = reinterpret_cast<PointerGetter>(
+                  base + kLocationFieldPrimaryRva);
+              auto location_field_secondary = reinterpret_cast<PointerGetter>(
+                  base + kLocationFieldSecondaryRva);
+              auto data_string_resolve = reinterpret_cast<PointerGetter>(
+                  base + kDataStringResolveRva);
+              auto resource_lookup = reinterpret_cast<ResourceLookup>(
+                  base + kResourceLookupRva);
+              auto resource_list_ctor =
+                  reinterpret_cast<ResourceRequestListCtor>(
+                      base + kResourceRequestListCtorRva);
+              auto resource_list_append =
+                  reinterpret_cast<ResourceRequestListAppend>(
+                      base + kResourceRequestListAppendRva);
+              auto resource_list_load =
+                  reinterpret_cast<ResourceRequestListLoad>(
+                      base + kResourceRequestListLoadRva);
+              auto resource_list_dtor =
+                  reinterpret_cast<ResourceRequestListDtor>(
+                      base + kResourceRequestListDtorRva);
+              auto battlefield_cache_root =
+                  reinterpret_cast<GlobalPointerGetter>(
+                      base + kBattlefieldCacheRootRva);
+              auto data_row_instance_id =
+                  reinterpret_cast<DataRowInstanceId>(
+                      base + kDataRowInstanceIdRva);
+              auto build_battlefield_cache =
+                  reinterpret_cast<BuildBattlefieldCache>(
+                      base + kBuildBattlefieldCacheRva);
+              void* primary_string = location_field_primary(location_row);
+              void* secondary_string = location_field_secondary(location_row);
+              int32_t primary_length = -1;
+              int32_t secondary_length = -1;
+              const char* primary_chars = native_data_string_chars(
+                  memory, primary_string, &primary_length);
+              const char* secondary_chars = native_data_string_chars(
+                  memory, secondary_string, &secondary_length);
+              alignas(16) std::array<uint8_t, 48> resource_requests{};
+              resource_list_ctor(resource_requests.data());
+              resource_list_append(resource_requests.data(), primary_string,
+                                   -1, -1, -1, -1, false);
+              resource_list_append(resource_requests.data(), secondary_string,
+                                   -1, -1, -1, -1, false);
+              resource_list_load(resource_requests.data());
+              void* primary_resource = primary_chars != nullptr
+                  ? resource_lookup(primary_chars, 0) : nullptr;
+              void* secondary_resource = secondary_chars != nullptr
+                  ? resource_lookup(secondary_chars, 0) : nullptr;
+              std::fprintf(
+                  stderr,
+                  "DIRECT_LOCATION_RESOURCES primary=%p len=%d name=%.*s "
+                  "loaded=%p secondary=%p len=%d name=%.*s loaded=%p\n",
+                  primary_string, primary_length,
+                  std::max(primary_length, 0),
+                  primary_chars != nullptr ? primary_chars : "",
+                  primary_resource, secondary_string, secondary_length,
+                  std::max(secondary_length, 0),
+                  secondary_chars != nullptr ? secondary_chars : "",
+                  secondary_resource);
+              void* primary = primary_resource != nullptr
+                  ? data_string_resolve(primary_string) : nullptr;
+              void* secondary = secondary_resource != nullptr
+                  ? data_string_resolve(secondary_string) : nullptr;
+              void* cache_root = battlefield_cache_root();
+              const int32_t instance_id = data_row_instance_id(location_row);
+              if (primary != nullptr && secondary != nullptr &&
+                  cache_root != nullptr && instance_id >= 0) {
+                build_battlefield_cache(cache_root, primary, secondary,
+                                        instance_id);
+                battlefield = location_battlefield(location_row);
+              }
+              resource_list_dtor(resource_requests.data());
+            }
+            uint64_t location_table = 0;
+            uint64_t battlefield_index = 0;
+            uint64_t battlefield_rows = 0;
+            uint64_t first_battlefield = 0;
+            int32_t battlefield_count = 0;
+            int32_t location_global_id = 0;
+            if (location_row != nullptr) {
+              memory.read(reinterpret_cast<uintptr_t>(location_row) + 0x10,
+                          &location_table);
+              memory.read(reinterpret_cast<uintptr_t>(location_row) + 0x40,
+                          &location_global_id);
+            }
+            if (location_table != 0) {
+              memory.read(location_table + 0x78, &battlefield_index);
+            }
+            if (battlefield_index != 0) {
+              memory.read(battlefield_index + 0xAA0, &battlefield_rows);
+              memory.read(battlefield_index + 0xAAC, &battlefield_count);
+              if (battlefield_rows != 0) {
+                memory.read(battlefield_rows, &first_battlefield);
+              }
+            }
+            std::fprintf(
+                stderr,
+                "DIRECT_LOCATION row=%p table=0x%llx id=%d "
+                "index=0x%llx rows=0x%llx count=%d first=0x%llx "
+                "battlefield=%p\n",
+                location_row,
+                static_cast<unsigned long long>(location_table),
+                location_global_id,
+                static_cast<unsigned long long>(battlefield_index),
+                static_cast<unsigned long long>(battlefield_rows),
+                battlefield_count,
+                static_cast<unsigned long long>(first_battlefield),
+                battlefield);
+            if (battlefield == nullptr) {
+              dlclose(handle);
+              throw_state(env,
+                          "native location battlefield index is not populated");
+              return nullptr;
+            }
+            battle_load_replay(reinterpret_cast<void*>(battle),
+                               reinterpret_cast<void*>(replay), nullptr,
+                               reinterpret_cast<void*>(state + 0x10));
+            battle_json_loaded = true;
+            memory.read(logic_battle + 0xE0, &left_player);
+            memory.read(logic_battle + 0xE8, &right_player);
+          }
+        }
+      }
+      if (left_player == 0 || right_player == 0) {
+        core_update(reinterpret_cast<void*>(state), 0.05f);
+        memory.read(state + 0x90, &battle);
+        if (battle > 0x1000) {
+          memory.read(battle + 0xA8, &logic_battle);
+        }
+        if (logic_battle > 0x1000) {
+          memory.read(logic_battle + 0xE0, &left_player);
+          memory.read(logic_battle + 0xE8, &right_player);
+        }
+      }
+      if (left_player == 0 || right_player == 0) {
+        continue;
+      }
       __atomic_store_n(
           reinterpret_cast<unsigned char*>(
               base + kSkipCoreAndPresentationFlagRva),
           1, __ATOMIC_RELEASE);
       state_update(reinterpret_cast<void*>(state), 0.05f);
-      memory.read(state + 0x90, &battle);
-      if (battle > 0x1000) {
-        break;
-      }
+      break;
     }
   }
-  char payload[320];
+  char payload[448];
   std::snprintf(
       payload, sizeof(payload),
       "{\"called\":true,\"manager\":\"0x%llx\"," 
       "\"state\":\"0x%llx\",\"battle\":\"0x%llx\"," 
+      "\"logic_battle\":\"0x%llx\","
+      "\"replay\":\"0x%llx\","
+      "\"left_player\":\"0x%llx\",\"right_player\":\"0x%llx\","
+      "\"battle_json_loaded\":%s,"
       "\"current_state_type\":%d,\"pending_state_type\":%d}",
       static_cast<unsigned long long>(manager),
       static_cast<unsigned long long>(state),
-      static_cast<unsigned long long>(battle), current_type, pending_type);
+      static_cast<unsigned long long>(battle),
+      static_cast<unsigned long long>(logic_battle),
+      static_cast<unsigned long long>(replay),
+      static_cast<unsigned long long>(left_player),
+      static_cast<unsigned long long>(right_player),
+      battle_json_loaded ? "true" : "false", current_type, pending_type);
   dlclose(handle);
   return env->NewStringUTF(payload);
 }
