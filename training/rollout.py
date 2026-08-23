@@ -66,6 +66,7 @@ class EpisodeResult:
     trajectories: tuple[AgentTrajectory, AgentTrajectory]
     action_log: list[dict[str, Any]]
     state_hash: str | None
+    profile: dict[str, float]
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -80,6 +81,7 @@ class EpisodeResult:
             "wall_seconds": self.wall_seconds,
             "actions": self.actions,
             "state_hash": self.state_hash,
+            "profile": self.profile,
         }
 
 
@@ -136,11 +138,19 @@ class NativeSelfPlayCollector:
         return column * 1000 + 500, row * 1000 + 500
 
     def collect(self, seed: int) -> EpisodeResult:
+        profile: dict[str, float] = {}
+        def record_time(name: str, started_at: float) -> None:
+            profile[name] = profile.get(name, 0.0) + (
+                time.perf_counter() - started_at
+            )
+
         replay = json.loads(json.dumps(self.replay))
         replay["rndSeed"] = seed
         # One persistent app_process owns libg. Every episode uses libg's
         # native BattleGameState 4->4 replacement; no Android or process boot.
+        stage_started = time.perf_counter()
         state = self.env.reset(replay, warmup_steps=100)
+        record_time("reset_seconds", stage_started)
         self.policy.eval()
         trajectories = (
             AgentTrajectory(side=0, seed=seed),
@@ -156,17 +166,23 @@ class NativeSelfPlayCollector:
         started = time.perf_counter()
         last_hash = state.get("state_hash")
         while int(state["tick"]) < self.max_ticks:
+            profile["decision_steps"] = profile.get("decision_steps", 0.0) + 1.0
+            stage_started = time.perf_counter()
             self._prepare_native_masks(state)
+            record_time("mask_probe_seconds", stage_started)
             samples: dict[int, Any] = {}
             chosen: list[dict[str, int]] = []
             encoded: dict[int, tuple[np.ndarray, ...]] = {}
             hands: dict[int, list[int]] = {}
             next_public: dict[int, dict[str, int] | None] = {0: None, 1: None}
             for side in (0, 1):
+                stage_started = time.perf_counter()
                 grid, scalars = self.encoder.encode(
                     state, side=side, public_actions=public_actions
                 )
                 privileged = self.encoder.privileged(state, side=side)
+                record_time("encoding_seconds", stage_started)
+                stage_started = time.perf_counter()
                 card_mask, position_masks, hand = build_action_masks(
                     state,
                     side=side,
@@ -174,6 +190,7 @@ class NativeSelfPlayCollector:
                     decks=self.env.decks,
                 )
                 position_masks = self._canonical_positions(position_masks, side)
+                record_time("mask_build_seconds", stage_started)
                 h_before = hidden[side]
                 hands[side] = hand
                 encoded[side] = (
@@ -189,6 +206,7 @@ class NativeSelfPlayCollector:
                 torch.cat((hidden[0][0], hidden[1][0]), dim=1),
                 torch.cat((hidden[0][1], hidden[1][1]), dim=1),
             )
+            stage_started = time.perf_counter()
             sampled = self.policy.sample_batch(
                 torch.from_numpy(
                     np.stack((encoded[0][0], encoded[1][0]))
@@ -207,6 +225,7 @@ class NativeSelfPlayCollector:
                 ).to(self.device),
                 hidden_batch,
             )
+            record_time("inference_seconds", stage_started)
             for side, sample in enumerate(sampled):
                 hidden[side] = sample.hidden
                 samples[side] = sample
@@ -227,7 +246,9 @@ class NativeSelfPlayCollector:
                         "x": x,
                         "y": y,
                     }
+            stage_started = time.perf_counter()
             transition = self.env.joint_transition(chosen, steps=1)
+            record_time("transition_seconds", stage_started)
             native_action = transition["joint_action"]
             accepted_sides = {
                 int(item["side"])
@@ -258,6 +279,7 @@ class NativeSelfPlayCollector:
             done = bool(episode["terminated"] or episode["truncated"])
             next_state = None if done else transition["state"]
             terminal_rewards = episode.get("rewards_by_side", {0: 0.0, 1: 0.0})
+            stage_started = time.perf_counter()
             if self.reward_mode == "potential":
                 rewards = self.potential_reward.transition(
                     state,
@@ -270,6 +292,8 @@ class NativeSelfPlayCollector:
                     0: float(terminal_rewards.get(0, 0.0)),
                     1: float(terminal_rewards.get(1, 0.0)),
                 }
+            record_time("reward_seconds", stage_started)
+            stage_started = time.perf_counter()
             for side in (0, 1):
                 record = trajectories[side]
                 grid, scalars, privileged, card_mask, position_masks, h, c = encoded[side]
@@ -295,6 +319,7 @@ class NativeSelfPlayCollector:
                     "state_hash": state.get("state_hash"),
                 }
             )
+            record_time("trajectory_seconds", stage_started)
             if done:
                 last_hash = state.get("state_hash")
                 break
@@ -310,6 +335,8 @@ class NativeSelfPlayCollector:
         if truncated and trajectories[0].dones:
             trajectories[0].dones[-1] = True
             trajectories[1].dones[-1] = True
+        for key, value in self.env.rpc_profile.items():
+            profile[key] = value
         return EpisodeResult(
             seed=seed,
             tick=int(episode.get("terminal_tick", state["tick"])),
@@ -322,6 +349,7 @@ class NativeSelfPlayCollector:
             trajectories=trajectories,
             action_log=action_log,
             state_hash=str(last_hash) if last_hash is not None else None,
+            profile=profile,
         )
 
 

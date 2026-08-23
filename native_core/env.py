@@ -13,6 +13,7 @@ try:
         MAX_TRACE_STEPS,
         MIN_TRACE_RESPONSE_BYTES,
         TRACE_SCHEMA_VERSION,
+        JsonLineClient,
         request,
     )
 except ImportError:  # direct ``python native_core/env.py`` consumers
@@ -21,6 +22,7 @@ except ImportError:  # direct ``python native_core/env.py`` consumers
         MAX_TRACE_STEPS,
         MIN_TRACE_RESPONSE_BYTES,
         TRACE_SCHEMA_VERSION,
+        JsonLineClient,
         request,
     )
 
@@ -59,20 +61,28 @@ class NativeRoyaleEnv:
         self.accounts: list[tuple[int, int]] = [(1, 1), (2, 2)]
         self.last_reset_attempts = 0
         self.last_episode: dict[str, Any] | None = None
+        self.rpc_profile: dict[str, float] = {}
+        self.client = JsonLineClient(
+            host=host, port=port, timeout=timeout, profile=self.rpc_profile
+        )
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        response = request(
-            payload,
-            host=self.host,
-            port=self.port,
-            timeout=self.timeout,
-        )
+        response = self.client.request(payload)
         if not response.get("ok"):
             raise NativeHostError(
                 f"{response.get('error_type', 'native error')}: "
                 f"{response.get('error', response)}"
             )
         return response
+
+    def close(self) -> None:
+        self.client.close()
+
+    def __enter__(self) -> "NativeRoyaleEnv":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
     @staticmethod
     def read_replay(source: Path | Mapping[str, Any]) -> dict[str, Any]:

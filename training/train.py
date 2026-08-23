@@ -173,12 +173,20 @@ def main() -> int:
                     completed_episodes += 1
 
         trajectories = [item for result in results for item in result.trajectories]
+        sampling_profile: dict[str, float] = {}
+        for result in results:
+            for key, value in result.profile.items():
+                sampling_profile[key] = sampling_profile.get(key, 0.0) + float(value)
         update_started = time.perf_counter()
         metrics = trainer.update(trajectories)
         metrics["learner_wall_seconds"] = time.perf_counter() - update_started
         metrics["iteration_wall_seconds"] = time.perf_counter() - iteration_started
         metrics["environment_steps"] = float(
             sum(len(item.rewards) for item in trajectories) // 2
+        )
+        metrics["environment_steps_per_second"] = (
+            metrics["environment_steps"]
+            / max(1e-9, metrics["iteration_wall_seconds"] - metrics["learner_wall_seconds"])
         )
         checkpoint = {
             "schema_version": 1,
@@ -191,6 +199,7 @@ def main() -> int:
             "config": config,
             "metrics": metrics,
             "episode_summaries": [item.summary() for item in results],
+            "sampling_profile": sampling_profile,
         }
         numbered = paths.checkpoints / f"checkpoint-{iteration:06d}.pt"
         _atomic_torch_save(numbered, checkpoint)
@@ -211,6 +220,7 @@ def main() -> int:
             "event": "iteration_complete", "iteration": iteration,
             "native_ticks": native_ticks, "episodes": completed_episodes,
             "metrics": metrics, "checkpoint": str(numbered),
+            "sampling_profile": sampling_profile,
         }
         _append_jsonl(events, event)
         RunStore._atomic_json(args.data_root / "latest_run.json", {

@@ -541,13 +541,18 @@ public final class JniHost {
                      BufferedReader reader = new BufferedReader(new InputStreamReader(
                          socket.getInputStream(), StandardCharsets.UTF_8
                      ));
-                     BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
-                         socket.getOutputStream(), StandardCharsets.UTF_8
-                     ))) {
-                    JSONObject response = new JSONObject();
-                    try {
+                      BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                          socket.getOutputStream(), StandardCharsets.UTF_8
+                      ))) {
+                    socket.setTcpNoDelay(true);
+                    while (running) {
                         String line = reader.readLine();
-                        if (line == null || line.length() > 32 * 1024 * 1024) {
+                        if (line == null) {
+                            break;
+                        }
+                        JSONObject response = new JSONObject();
+                        try {
+                        if (line.length() > 32 * 1024 * 1024) {
                             throw new IllegalArgumentException("invalid JSON line length");
                         }
                         JSONObject request = new JSONObject(line);
@@ -729,7 +734,7 @@ public final class JniHost {
                         } else if (!"ping".equals(op)) {
                             throw new IllegalArgumentException("unknown op: " + op);
                         }
-                    } catch (Throwable error) {
+                        } catch (Throwable error) {
                         response = new JSONObject();
                         response.put("schema_version", 1);
                         response.put("ok", false);
@@ -739,6 +744,7 @@ public final class JniHost {
                     writer.write(response.toString());
                     writer.newLine();
                     writer.flush();
+                    }
                 }
             }
         }
