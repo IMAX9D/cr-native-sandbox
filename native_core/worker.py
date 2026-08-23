@@ -50,6 +50,7 @@ class WorkerConfig:
     avd_name: str = "royale_worker_api31"
     emulator_port: int = 5554
     service_base_port: int = 37031
+    direct_base_port: int = 38031
     cores: int = 4
     memory_mb: int = 4096
 
@@ -183,6 +184,48 @@ class HeadlessWorkerPool:
         except Exception:
             return False
 
+    def configure_direct_ports(self, workers: int) -> dict[str, Any]:
+        """Map host TCP ports straight through Emulator NAT, bypassing ADB proxy."""
+        if workers < 1 or workers > 8:
+            raise ValueError("workers must be in 1..8")
+        mappings = []
+        for slot in range(workers):
+            host_port = self.config.direct_base_port + slot
+            guest_port = self.config.service_base_port + slot
+            self._adb(
+                "emu", "redir", "del", f"tcp:{host_port}",
+                timeout=5, check=False,
+            )
+            output = self._adb(
+                "emu", "redir", "add", f"tcp:{host_port}:{guest_port}",
+                timeout=5, check=False,
+            )
+            if "OK" not in output:
+                raise WorkerError(
+                    f"emulator redirection {host_port}->{guest_port} failed: "
+                    + output.strip()
+                )
+            try:
+                ready = bool(
+                    request({"op": "ping"}, port=host_port, timeout=2).get("ok")
+                )
+            except Exception as error:
+                raise WorkerError(
+                    f"direct worker transport did not answer on {host_port}: "
+                    + str(error)
+                ) from error
+            if not ready:
+                raise WorkerError(
+                    f"direct worker transport did not answer on {host_port}"
+                )
+            mappings.append({
+                "slot": slot,
+                "host_port": host_port,
+                "guest_port": guest_port,
+                "ready": True,
+            })
+        return {"kind": "emulator_tcp_redir", "mappings": mappings}
+
     @staticmethod
     def _sha256(path: Path) -> str:
         digest = hashlib.sha256()
@@ -254,7 +297,9 @@ class HeadlessWorkerPool:
             "state_hash": state.get("state_hash"), "tower_max_hp": maxima,
         }
 
-    def ensure_ready(self, workers: int) -> dict[str, Any]:
+    def ensure_ready(
+        self, workers: int, *, configure_direct: bool = True
+    ) -> dict[str, Any]:
         if workers < 1 or workers > 8:
             raise ValueError("workers must be in 1..8")
         self.config.data_root.mkdir(parents=True, exist_ok=True)
@@ -262,7 +307,14 @@ class HeadlessWorkerPool:
         package = self.ensure_package()
         # DataTables/libg cold initialization is intentionally serialized.
         services = [self.start_service(slot) for slot in range(workers)]
-        return {"vm": vm, "package": package, "services": services}
+        result = {
+            "vm": vm,
+            "package": package,
+            "services": services,
+        }
+        if configure_direct:
+            result["direct_transport"] = self.configure_direct_ports(workers)
+        return result
 
     def stop(self, workers: int, *, keep_vm: bool = True) -> dict[str, Any]:
         services = []
@@ -296,11 +348,14 @@ def main() -> int:
     parser.add_argument("action", choices=("start", "status", "stop"))
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--base-port", type=int, default=37031)
+    parser.add_argument("--transport", choices=("direct", "adb"), default="direct")
     parser.add_argument("--stop-vm", action="store_true")
     args = parser.parse_args()
     pool = HeadlessWorkerPool(WorkerConfig(service_base_port=args.base_port))
     if args.action == "start":
-        value = pool.ensure_ready(args.workers)
+        value = pool.ensure_ready(
+            args.workers, configure_direct=args.transport == "direct"
+        )
     elif args.action == "stop":
         value = pool.stop(args.workers, keep_vm=not args.stop_vm)
     else:

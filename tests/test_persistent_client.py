@@ -93,13 +93,27 @@ class PersistentClientTests(unittest.TestCase):
                 # Deliberately close after applying the mutation, before reply.
 
         server = _Server(handler)
-        client = JsonLineClient(port=server.port, timeout=2)
+        profile = {}
+        client = JsonLineClient(port=server.port, timeout=2, profile=profile)
         with self.assertRaises(ConnectionError):
             client.request({"op": "reset", "replay": {}})
         client.close()
         server.close()
         self.assertEqual(mutations, ["reset"])
         self.assertEqual(server.accepts, 1)
+        self.assertEqual(profile["rpc_attempts"], 1.0)
+        self.assertEqual(profile["rpc_failures"], 1.0)
+
+    def test_combined_latency_summary_uses_raw_samples(self):
+        summary = JsonLineClient.latency_summary(
+            [0.001, 0.002, 0.003, 0.100],
+            [0.0005, 0.001, 0.002, 0.090],
+            attempts=5,
+            failures=1,
+        )
+        self.assertAlmostEqual(summary["rpc_latency_p50_ms"], 2.5)
+        self.assertAlmostEqual(summary["rpc_latency_max_ms"], 100.0)
+        self.assertAlmostEqual(summary["rpc_failure_rate"], 0.2)
 
 
 if __name__ == "__main__":

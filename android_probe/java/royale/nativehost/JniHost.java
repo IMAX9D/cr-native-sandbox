@@ -528,11 +528,11 @@ public final class JniHost {
     }
 
     private static void serveJson(String root, int port) throws Exception {
-        InetAddress loopback = InetAddress.getByName("127.0.0.1");
-        try (ServerSocket server = new ServerSocket(port, 16, loopback)) {
+        InetAddress guestInterfaces = InetAddress.getByName("0.0.0.0");
+        try (ServerSocket server = new ServerSocket(port, 16, guestInterfaces)) {
             System.out.println(
                 "{\"schema_version\":1,\"stage\":\"json_server\","
-                    + "\"event\":\"ready\",\"address\":\"127.0.0.1\","
+                    + "\"event\":\"ready\",\"address\":\"0.0.0.0\","
                     + "\"port\":" + port + "}"
             );
             System.out.flush();
@@ -556,7 +556,9 @@ public final class JniHost {
                         if (line.length() > 32 * 1024 * 1024) {
                             throw new IllegalArgumentException("invalid JSON line length");
                         }
+                        long requestParseStartedNanos = System.nanoTime();
                         JSONObject request = new JSONObject(line);
+                        long requestParsedNanos = System.nanoTime();
                         String op = request.getString("op");
                         response.put("schema_version", 1);
                         response.put("ok", true);
@@ -709,30 +711,58 @@ public final class JniHost {
                                 )
                             );
                         } else if ("joint_training_transition_v1".equals(op)) {
+                            boolean profileNative = request.optBoolean(
+                                "profile_native", false
+                            );
+                            long transitionStartedNanos = System.nanoTime();
                             JSONObject result = new JSONObject();
+                            long actionStartedNanos = System.nanoTime();
                             result.put(
                                 "joint_action",
                                 executeJointActions(
                                     root, request.getJSONArray("actions")
                                 )
                             );
+                            long actionFinishedNanos = System.nanoTime();
                             int steps = request.optInt("steps", 1);
-                            JSONObject stepResult = new JSONObject(
-                                nativeStep(root + "/libg.so", steps)
-                            );
+                            long stepJniStartedNanos = System.nanoTime();
+                            String stepJson = nativeStep(root + "/libg.so", steps);
+                            long stepJniFinishedNanos = System.nanoTime();
+                            JSONObject stepResult = new JSONObject(stepJson);
+                            long stepParsedNanos = System.nanoTime();
                             JSONObject episode = stepResult.getJSONObject("episode");
                             result.put("episode", episode);
                             terminalEpisodeLatched = episode.optBoolean(
                                 "terminated", false
                             );
+                            long observeJniNanos = 0L;
+                            long observeJsonParseNanos = 0L;
                             if (!terminalEpisodeLatched
                                 && !episode.optBoolean("truncated", false)) {
-                                result.put(
-                                    "state",
-                                    new JSONObject(
-                                        nativeObserveTrain(root + "/libg.so")
-                                    )
+                                long observeJniStartedNanos = System.nanoTime();
+                                String stateJson = nativeObserveTrain(
+                                    root + "/libg.so"
                                 );
+                                long observeJniFinishedNanos = System.nanoTime();
+                                result.put("state", new JSONObject(stateJson));
+                                long observeParsedNanos = System.nanoTime();
+                                observeJniNanos = (
+                                    observeJniFinishedNanos - observeJniStartedNanos
+                                );
+                                observeJsonParseNanos = (
+                                    observeParsedNanos - observeJniFinishedNanos
+                                );
+                            }
+                            if (profileNative) {
+                                result.put("timing_v1", trainingTiming(
+                                    requestParsedNanos - requestParseStartedNanos,
+                                    actionFinishedNanos - actionStartedNanos,
+                                    stepJniFinishedNanos - stepJniStartedNanos,
+                                    stepParsedNanos - stepJniFinishedNanos,
+                                    observeJniNanos,
+                                    observeJsonParseNanos,
+                                    System.nanoTime() - transitionStartedNanos
+                                ));
                             }
                             response.put("result", result);
                         } else if ("joint_transition".equals(op)) {
@@ -774,6 +804,17 @@ public final class JniHost {
                         response.put("ok", false);
                         response.put("error_type", error.getClass().getName());
                         response.put("error", String.valueOf(error.getMessage()));
+                    }
+                    JSONObject profiledResult = response.optJSONObject("result");
+                    JSONObject timing = profiledResult == null
+                        ? null : profiledResult.optJSONObject("timing_v1");
+                    if (timing != null) {
+                        long serializationStartedNanos = System.nanoTime();
+                        response.toString();
+                        timing.put(
+                            "response_json_serialize_probe_ns",
+                            System.nanoTime() - serializationStartedNanos
+                        );
                     }
                     writer.write(response.toString());
                     writer.newLine();
@@ -882,6 +923,26 @@ public final class JniHost {
                 action.optBoolean("dry_run", false)
             )
         );
+    }
+
+    private static JSONObject trainingTiming(
+        long requestParseNanos,
+        long jointActionNanos,
+        long stepJniNanos,
+        long stepJsonParseNanos,
+        long observeJniNanos,
+        long observeJsonParseNanos,
+        long transitionPreResponseNanos
+    ) throws Exception {
+        JSONObject timing = new JSONObject();
+        timing.put("request_parse_ns", requestParseNanos);
+        timing.put("joint_action_ns", jointActionNanos);
+        timing.put("step_jni_ns", stepJniNanos);
+        timing.put("step_json_parse_ns", stepJsonParseNanos);
+        timing.put("observe_jni_ns", observeJniNanos);
+        timing.put("observe_json_parse_ns", observeJsonParseNanos);
+        timing.put("transition_pre_response_ns", transitionPreResponseNanos);
+        return timing;
     }
 
     private static JSONObject executeJointActions(

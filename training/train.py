@@ -15,6 +15,7 @@ import uuid
 import numpy as np
 import torch
 
+from native_core.client import JsonLineClient
 from native_core.env import NativeRoyaleEnv
 from native_core.worker import HeadlessWorkerPool, WorkerConfig
 
@@ -48,10 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=1000000)
     parser.add_argument("--episodes-per-iteration", type=int, default=4)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--max-ticks", type=int, default=7200)
     parser.add_argument("--base-port", type=int, default=37031)
+    parser.add_argument("--direct-base-port", type=int, default=38031)
+    parser.add_argument("--transport", choices=("direct", "adb"), default="direct")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--replay", type=Path, default=DEFAULT_REPLAY)
     parser.add_argument("--reward", choices=("terminal", "potential"), default="potential")
@@ -59,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--skip-worker-start", action="store_true")
+    parser.add_argument("--profile-native", action="store_true")
+    parser.add_argument("--disable-cuda-graph", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -99,6 +104,10 @@ def main() -> int:
         "seed": args.seed,
         "max_ticks": args.max_ticks,
         "base_port": args.base_port,
+        "environment_base_port": (
+            args.direct_base_port if args.transport == "direct" else args.base_port
+        ),
+        "transport": args.transport,
         "device": str(device),
         "torch": torch.__version__,
         "reward": args.reward,
@@ -106,6 +115,10 @@ def main() -> int:
         "episode_reset": "native_battle_game_state_4_to_4_in_process",
         "truth_source": "surface_free_original_libg_15.535.29_x86_64",
         "action_legality": "native_validate_deployment_18x32",
+        "profile_native": args.profile_native,
+        "cuda_graph_inference": (
+            args.device.startswith("cuda") and not args.disable_cuda_graph
+        ),
     }
     paths = RunStore(args.data_root).create(config, run_id=args.run_id)
     events = paths.logs / "events.jsonl"
@@ -114,12 +127,23 @@ def main() -> int:
         "config": config,
     })
 
-    pool = HeadlessWorkerPool(WorkerConfig(service_base_port=args.base_port))
+    pool = HeadlessWorkerPool(WorkerConfig(
+        service_base_port=args.base_port,
+        direct_base_port=args.direct_base_port,
+    ))
     if not args.skip_worker_start:
-        worker_state = pool.ensure_ready(args.workers)
+        worker_state = pool.ensure_ready(
+            args.workers, configure_direct=args.transport == "direct"
+        )
         _append_jsonl(events, {"event": "workers_ready", "state": worker_state})
+    elif args.transport == "direct":
+        direct_state = pool.configure_direct_ports(args.workers)
+        _append_jsonl(events, {"event": "direct_transport_ready", "state": direct_state})
 
     model = RecurrentPolicyValueNet().to(device)
+    model.enable_cuda_graph_inference(
+        device.type == "cuda" and not args.disable_cuda_graph
+    )
     trainer = PPOTrainer(model, device=device, config=ppo_config)
     native_ticks = 0
     completed_episodes = 0
@@ -133,14 +157,23 @@ def main() -> int:
         starting_iteration = int(checkpoint.get("iteration", 0))
 
     next_seed = args.seed
+    environment_base_port = (
+        args.direct_base_port if args.transport == "direct" else args.base_port
+    )
     envs = [
-        NativeRoyaleEnv(port=args.base_port + slot, timeout=30)
+        NativeRoyaleEnv(
+            port=environment_base_port + slot,
+            timeout=30,
+            profile_native=args.profile_native,
+        )
         for slot in range(args.workers)
     ]
     for offset in range(1, args.iterations + 1):
         iteration = starting_iteration + offset
         pending = list(range(args.episodes_per_iteration))
         results: list[EpisodeResult] = []
+        rpc_total_latency: list[float] = []
+        rpc_receive_latency: list[float] = []
         iteration_started = time.perf_counter()
         while pending:
             wave = pending[: args.workers]
@@ -152,7 +185,10 @@ def main() -> int:
                 envs[: len(wave)], model, replay, device=device,
                 reward_mode=args.reward, max_ticks=args.max_ticks,
             )
-            for result in collector.collect(seeds):
+            collected = collector.collect(seeds)
+            rpc_total_latency.extend(collector.rpc_latency_samples["total"])
+            rpc_receive_latency.extend(collector.rpc_latency_samples["receive"])
+            for result in collected:
                 save_episode(paths.trajectories, result, full_debug=args.smoke)
                 results.append(result)
                 _append_jsonl(events, {"event": "episode_complete", **result.summary()})
@@ -164,6 +200,12 @@ def main() -> int:
         for result in results:
             for key, value in result.profile.items():
                 sampling_profile[key] = sampling_profile.get(key, 0.0) + float(value)
+        sampling_profile.update(JsonLineClient.latency_summary(
+            rpc_total_latency,
+            rpc_receive_latency,
+            attempts=sampling_profile.get("rpc_attempts", 0.0),
+            failures=sampling_profile.get("rpc_failures", 0.0),
+        ))
         update_started = time.perf_counter()
         metrics = trainer.update(trajectories)
         metrics["learner_wall_seconds"] = time.perf_counter() - update_started

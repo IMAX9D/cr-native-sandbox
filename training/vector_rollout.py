@@ -11,6 +11,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+from native_core.client import JsonLineClient
 from native_core.env import NativeRoyaleEnv
 
 from .model import RecurrentPolicyValueNet, SampledAction
@@ -72,6 +73,11 @@ class VectorNativeSelfPlayCollector:
         self.encoder = ObservationEncoder()
         self.potential_reward = PotentialReward(gamma=0.99995)
         self.vector_profile: dict[str, float] = {}
+        self._cuda_graph_stats_before = dict(policy.cuda_graph_stats)
+        self.rpc_latency_samples: dict[str, list[float]] = {
+            "total": [],
+            "receive": [],
+        }
 
     def _record_vector(self, name: str, started_at: float) -> None:
         self.vector_profile[name] = self.vector_profile.get(name, 0.0) + (
@@ -128,7 +134,7 @@ class VectorNativeSelfPlayCollector:
             value["rndSeed"] = seed
             replays.append(value)
         for env in self.envs:
-            env.rpc_profile.clear()
+            env.reset_rpc_profile()
         with ThreadPoolExecutor(max_workers=len(self.envs)) as executor:
             futures = [
                 executor.submit(self._timed_reset, env, replay)
@@ -283,6 +289,14 @@ class VectorNativeSelfPlayCollector:
                         cursor.profile.get("transition_seconds", 0.0)
                         + transition_seconds
                     )
+                    native_timing = transition.get("timing_v1")
+                    if isinstance(native_timing, Mapping):
+                        for timing_name, nanoseconds in native_timing.items():
+                            profile_name = f"host_{timing_name[:-3]}_seconds"
+                            cursor.profile[profile_name] = (
+                                cursor.profile.get(profile_name, 0.0)
+                                + float(nanoseconds) / 1_000_000_000.0
+                            )
                     native_action = transition["joint_action"]
                     accepted_sides = {
                         int(item["side"])
@@ -386,5 +400,29 @@ class VectorNativeSelfPlayCollector:
                 profile=cursor.profile,
             ))
         if results:
+            total_latency: list[float] = []
+            receive_latency: list[float] = []
+            attempts = 0.0
+            failures = 0.0
+            for env in self.envs:
+                samples = env.rpc_latency_samples()
+                total_latency.extend(samples["total"])
+                receive_latency.extend(samples["receive"])
+                attempts += env.rpc_profile.get("rpc_attempts", 0.0)
+                failures += env.rpc_profile.get("rpc_failures", 0.0)
+            self.rpc_latency_samples = {
+                "total": total_latency,
+                "receive": receive_latency,
+            }
+            results[0].profile.update(JsonLineClient.latency_summary(
+                total_latency,
+                receive_latency,
+                attempts=attempts,
+                failures=failures,
+            ))
+            for name, value in self.policy.cuda_graph_stats.items():
+                self.vector_profile[f"cuda_graph_{name}"] = (
+                    value - self._cuda_graph_stats_before.get(name, 0.0)
+                )
             results[0].profile.update(self.vector_profile)
         return results

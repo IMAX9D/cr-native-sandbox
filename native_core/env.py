@@ -50,10 +50,12 @@ class NativeRoyaleEnv:
         host: str = "127.0.0.1",
         port: int = 37031,
         timeout: float = 15.0,
+        profile_native: bool = False,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.profile_native = profile_native
         self.replay: dict[str, Any] | None = None
         self.decks: list[list[dict[str, int]]] = [[], []]
         self.accounts: list[tuple[int, int]] = [(1, 1), (2, 2)]
@@ -75,6 +77,12 @@ class NativeRoyaleEnv:
 
     def close(self) -> None:
         self.client.close()
+
+    def reset_rpc_profile(self) -> None:
+        self.client.reset_profile()
+
+    def rpc_latency_samples(self) -> dict[str, list[float]]:
+        return self.client.latency_samples()
 
     def __enter__(self) -> "NativeRoyaleEnv":
         return self
@@ -325,6 +333,7 @@ class NativeRoyaleEnv:
                 "op": "joint_training_transition_v1",
                 "actions": payload,
                 "steps": steps,
+                "profile_native": self.profile_native,
             }
         )["result"]
         episode = raw.get("episode")
@@ -336,6 +345,8 @@ class NativeRoyaleEnv:
             "joint_action": raw["joint_action"],
             "step": {"episode": enriched_episode},
         }
+        if isinstance(raw.get("timing_v1"), Mapping):
+            result["timing_v1"] = dict(raw["timing_v1"])
         if isinstance(raw.get("state"), Mapping):
             result["state"] = self._enrich_training_state(raw["state"])
         elif not (

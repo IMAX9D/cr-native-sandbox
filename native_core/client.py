@@ -45,6 +45,70 @@ class JsonLineClient:
         self._socket: socket.socket | None = None
         self._reader: Any = None
         self._lock = threading.Lock()
+        self._latency_samples: dict[str, list[float]] = {
+            "total": [],
+            "receive": [],
+        }
+
+    @staticmethod
+    def _quantile(values: list[float], fraction: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * fraction
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    def reset_profile(self) -> None:
+        """Reset aggregate counters and exact per-request latency samples."""
+        with self._lock:
+            if self.profile is not None:
+                self.profile.clear()
+            for samples in self._latency_samples.values():
+                samples.clear()
+
+    @classmethod
+    def latency_summary(
+        cls,
+        total: list[float],
+        receive: list[float],
+        *,
+        attempts: float,
+        failures: float,
+    ) -> dict[str, float]:
+        """Summarize combined samples without averaging per-Worker quantiles."""
+        summary: dict[str, float] = {}
+        for percentile, fraction in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+            summary[f"rpc_latency_{percentile}_ms"] = (
+                cls._quantile(total, fraction) * 1000.0
+            )
+        summary["rpc_latency_max_ms"] = (max(total) * 1000.0) if total else 0.0
+        summary["rpc_receive_latency_p95_ms"] = (
+            cls._quantile(receive, 0.95) * 1000.0
+        )
+        summary["rpc_failure_rate"] = failures / attempts if attempts else 0.0
+        return summary
+
+    def latency_samples(self) -> dict[str, list[float]]:
+        with self._lock:
+            return {
+                name: list(samples)
+                for name, samples in self._latency_samples.items()
+            }
+
+    def profile_summary(self) -> dict[str, float]:
+        """Return counters plus exact latency quantiles for this client."""
+        with self._lock:
+            summary = dict(self.profile or {})
+            summary.update(self.latency_summary(
+                self._latency_samples["total"],
+                self._latency_samples["receive"],
+                attempts=summary.get("rpc_attempts", 0.0),
+                failures=summary.get("rpc_failures", 0.0),
+            ))
+            return summary
 
     def close(self) -> None:
         reader, connection = self._reader, self._socket
@@ -84,6 +148,10 @@ class JsonLineClient:
         with self._lock:
             for attempt in range(2):
                 connect_seconds = 0.0
+                if self.profile is not None:
+                    self.profile["rpc_attempts"] = (
+                        self.profile.get("rpc_attempts", 0.0) + 1.0
+                    )
                 try:
                     if self._socket is None:
                         connect_seconds = self._connect()
@@ -117,10 +185,18 @@ class JsonLineClient:
                         }
                         for key, value in values.items():
                             self.profile[key] = self.profile.get(key, 0.0) + value
+                        self._latency_samples["total"].append(
+                            parsed - encoded_started
+                        )
+                        self._latency_samples["receive"].append(received - sent)
                     if operation == "shutdown":
                         self.close()
                     return response
                 except (OSError, ConnectionError, ValueError, json.JSONDecodeError):
+                    if self.profile is not None:
+                        self.profile["rpc_failures"] = (
+                            self.profile.get("rpc_failures", 0.0) + 1.0
+                        )
                     self.close()
                     if attempt == 0 and operation in IDEMPOTENT_OPS:
                         continue

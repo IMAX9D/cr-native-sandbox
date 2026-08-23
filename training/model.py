@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import NamedTuple
 
 import torch
@@ -26,6 +27,51 @@ class SampledAction:
     log_probability: float
     value: float
     hidden: tuple[Tensor, Tensor]
+
+
+class _CudaGraphStep:
+    """Shape-specialized CUDA Graph for the pure recurrent network forward."""
+
+    def __init__(
+        self,
+        model: "RecurrentPolicyValueNet",
+        grid: Tensor,
+        scalars: Tensor,
+        privileged: Tensor,
+        hidden: tuple[Tensor, Tensor],
+    ) -> None:
+        self.grid = grid.clone()
+        self.scalars = scalars.clone()
+        self.privileged = privileged.clone()
+        self.hidden = (hidden[0].clone(), hidden[1].clone())
+        warmup = torch.cuda.Stream(device=grid.device)
+        warmup.wait_stream(torch.cuda.current_stream(grid.device))
+        with torch.cuda.stream(warmup):
+            for _ in range(3):
+                model.forward_step(
+                    self.grid, self.scalars, self.privileged, self.hidden
+                )
+        torch.cuda.current_stream(grid.device).wait_stream(warmup)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self.output = model.forward_step(
+                self.grid, self.scalars, self.privileged, self.hidden
+            )
+
+    def run(
+        self,
+        grid: Tensor,
+        scalars: Tensor,
+        privileged: Tensor,
+        hidden: tuple[Tensor, Tensor],
+    ) -> PolicyOutput:
+        self.grid.copy_(grid)
+        self.scalars.copy_(scalars)
+        self.privileged.copy_(privileged)
+        self.hidden[0].copy_(hidden[0])
+        self.hidden[1].copy_(hidden[1])
+        self.graph.replay()
+        return self.output
 
 
 def _masked_logits(logits: Tensor, mask: Tensor) -> Tensor:
@@ -69,6 +115,48 @@ class RecurrentPolicyValueNet(nn.Module):
             nn.Linear(128, 1),
             nn.Tanh(),
         )
+        self._cuda_graph_inference = False
+        self._cuda_graph_steps: dict[
+            tuple[int, int | None, torch.dtype], _CudaGraphStep
+        ] = {}
+        self.cuda_graph_stats: dict[str, float] = {
+            "captures": 0.0,
+            "capture_seconds": 0.0,
+            "replays": 0.0,
+        }
+
+    def enable_cuda_graph_inference(self, enabled: bool = True) -> None:
+        if not enabled:
+            self._cuda_graph_steps.clear()
+        self._cuda_graph_inference = enabled
+
+    def _inference_step(
+        self,
+        grid: Tensor,
+        scalars: Tensor,
+        privileged: Tensor,
+        hidden: tuple[Tensor, Tensor] | None,
+    ) -> tuple[PolicyOutput, bool]:
+        if not (
+            self._cuda_graph_inference
+            and grid.is_cuda
+            and hidden is not None
+        ):
+            return self.forward_step(grid, scalars, privileged, hidden), False
+        key = (grid.shape[0], grid.device.index, grid.dtype)
+        runner = self._cuda_graph_steps.get(key)
+        if runner is None:
+            started = time.perf_counter()
+            runner = _CudaGraphStep(
+                self, grid, scalars, privileged, hidden
+            )
+            self._cuda_graph_steps[key] = runner
+            self.cuda_graph_stats["captures"] += 1.0
+            self.cuda_graph_stats["capture_seconds"] += (
+                time.perf_counter() - started
+            )
+        self.cuda_graph_stats["replays"] += 1.0
+        return runner.run(grid, scalars, privileged, hidden), True
 
     def initial_hidden(
         self, batch_size: int, *, device: torch.device | str
@@ -136,7 +224,13 @@ class RecurrentPolicyValueNet(nn.Module):
         *,
         deterministic: bool = False,
     ) -> list[SampledAction]:
-        output = self.forward_step(grid, scalars, privileged, hidden)
+        output, graph_backed = self._inference_step(
+            grid, scalars, privileged, hidden
+        )
+        stable_hidden = (
+            (output.hidden[0].clone(), output.hidden[1].clone())
+            if graph_backed else output.hidden
+        )
         card_distribution = Categorical(
             logits=_masked_logits(output.card_logits, card_mask)
         )
@@ -157,14 +251,14 @@ class RecurrentPolicyValueNet(nn.Module):
                 position_distribution = Categorical(
                     logits=_masked_logits(logits, mask)
                 )
-                position_tensor = (
+                position_value = (
                     torch.argmax(position_distribution.logits, dim=-1)
                     if deterministic
                     else position_distribution.sample()
                 )
-                position = int(position_tensor.item())
+                position = int(position_value.item())
                 log_probability = log_probability + position_distribution.log_prob(
-                    position_tensor
+                    position_value
                 )
             results.append(
                 SampledAction(
@@ -173,8 +267,8 @@ class RecurrentPolicyValueNet(nn.Module):
                     log_probability=float(log_probability.item()),
                     value=float(output.values[index].item()),
                     hidden=(
-                        output.hidden[0][:, index : index + 1].detach(),
-                        output.hidden[1][:, index : index + 1].detach(),
+                        stable_hidden[0][:, index : index + 1].detach(),
+                        stable_hidden[1][:, index : index + 1].detach(),
                     ),
                 )
             )

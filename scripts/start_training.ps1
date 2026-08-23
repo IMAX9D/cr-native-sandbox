@@ -1,11 +1,12 @@
 param(
     [switch]$Smoke,
-    [ValidateRange(1, 8)] [int]$Workers = 2,
+    [ValidateRange(1, 8)] [int]$Workers = 4,
     [ValidateRange(1, 1000000000)] [int]$Iterations = 1000000,
     [ValidateRange(1, 1024)] [int]$EpisodesPerIteration = 4,
     [ValidateRange(101, 20000)] [int]$MaxTicks = 7200,
     [int]$Seed = 1,
     [string]$Device = "auto",
+    [ValidateSet("direct", "adb")] [string]$Transport = "direct",
     [string]$DataRoot = "D:\AI_data\cr-native-core\training",
     [string]$Python = "D:\AI_data\runtime\venv\Scripts\python.exe"
 )
@@ -60,6 +61,7 @@ $Arguments = @(
     "--max-ticks", "$MaxTicks",
     "--seed", "$Seed",
     "--device", $Device,
+    "--transport", $Transport,
     "--data-root", $DataRoot
 )
 if ($Smoke) { $Arguments += "--smoke" }
