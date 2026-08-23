@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "runtime_version": "150535029",
+  "abi": "x86_64",
+  "libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+  "source": "static disassembly plus isolated in-process probes",
+  "entries": {
+    "jni_on_load": {"rva": "0x1458bc0", "status": "executed"},
+    "create_game_main": {"rva": "0x1458e00", "status": "executed"},
+    "manager_global": {"rva": "0x1a85978", "status": "observed"},
+    "manager_init": {
+      "rva": "0xce65b0",
+      "status": "unsafe_without_resource_registry",
+      "evidence": "allocates 0xd0 bytes, calls 0xce7000, stores manager_global"
+    },
+    "manager_constructor": {"rva": "0xce7000", "status": "disassembled"},
+    "state_factory": {"rva": "0xce6660", "status": "disassembled", "battle_type": 4},
+    "manager_update": {"rva": "0xce7810", "status": "executed"},
+    "set_replay_data": {"rva": "0xce7c40", "status": "executed"},
+    "battle_state_update": {"rva": "0xce26d0", "status": "executed"},
+    "battle_core_update": {"rva": "0xce2cc0", "status": "executed"},
+    "skip_core_and_presentation_flag": {"rva": "0x1a85930", "status": "executed"},
+    "native_alloc": {"rva": "0x18b1600", "status": "executed"},
+    "native_free": {"rva": "0x18b1630", "status": "executed"},
+    "native_string_from_utf8": {"rva": "0x140f8f0", "status": "executed"},
+    "native_string_destroy": {"rva": "0x140f7d0", "status": "executed"},
+    "parse_json_object": {"rva": "0x127c450", "status": "executed"}
+  },
+  "fields": {
+    "manager.current_state": "0x20",
+    "manager.current_state_type": "0x30",
+    "manager.pending_state_type": "0x34",
+    "manager.replay_data": "0x78",
+    "battle_state.battle": "0x90",
+    "battle.tick": "0x60",
+    "battle.logic": "0xa8"
+  }
+}

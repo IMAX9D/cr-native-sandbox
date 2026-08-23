@@ -47,9 +47,20 @@ can:
 Until all six conditions pass, this repository makes no claim that the current
 runtime has been separated into a reusable kernel.
 
+## Experiment layout
+
+- `android_probe/`: isolated Java lifecycle probe. It intentionally keeps the
+  JNI class name expected by the frozen bridge while varying only lifecycle
+  calls around the original `libg.so`.
+- `scripts/`: build/deploy/measurement entry points owned by this repository.
+- `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).
+
+The probe consumes the frozen APK, packaged libraries, and JNI observation
+bridge from the production repository by explicit absolute input paths. It
+does not write to that repository and does not import its Python sandbox.
+
 ## Upstream reference
 
 `third_party/Scroll` pins Reversed Rooms' experimental Clash Royale v1.3.2
 server-on-libg prototype. It is architectural evidence only: its ARMv7 layouts,
 RVAs, resources, and lifecycle must never be reused as current-version facts.
-

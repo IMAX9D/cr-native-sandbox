@@ -1,0 +1,82 @@
+param(
+    [ValidateSet("probe-baseline", "probe-detach-surface", "probe-no-surface", "probe-create-only", "probe-minimal", "probe-direct")]
+    [string]$Profile = "probe-baseline",
+    [string]$Adb = "D:\Codex\toolchains\android-sdk\platform-tools\adb.exe",
+    [string]$Serial = "emulator-5554",
+    [string]$RuntimeDirectory = "D:\Codex\E\AI ClashRoyale\native_host\build\runtime-x86_64",
+    [string]$Bridge = "",
+    [string]$BaseApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\base.apk",
+    [string]$ReplayJson = "D:\Codex\E\AI ClashRoyale\examples\native_replay_probe.json",
+    [string]$RemoteRoot = "/data/local/tmp/cr-native-core-probe",
+    [string]$EvidenceRoot = "D:\AI_data\cr-native-core\experiment-0001"
+)
+
+$ErrorActionPreference = "Stop"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+$Jar = Join-Path $ProjectRoot "artifacts\lifecycle-probe.jar"
+if (-not $Bridge) {
+    $Bridge = Join-Path $ProjectRoot "artifacts\libnative_core_probe.so"
+}
+foreach ($Path in @($Adb, $Jar, $Bridge, $BaseApk, $ReplayJson, (Join-Path $RuntimeDirectory "libg.so"))) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Missing probe input: $Path"
+    }
+}
+
+function Invoke-Adb {
+    param([string[]]$CommandArguments)
+    & $Adb (@("-s", $Serial) + @($CommandArguments))
+    if ($LASTEXITCODE -ne 0) { throw "adb failed: $($CommandArguments -join ' ')" }
+}
+
+function Get-RemoteSha256 {
+    param([string]$RemotePath)
+    $Value = & $Adb -s $Serial shell "sha256sum '$RemotePath' 2>/dev/null || true"
+    if ($LASTEXITCODE -ne 0) { return "" }
+    $Text = ($Value | Out-String).Trim()
+    if (-not $Text) { return "" }
+    return (($Text -split "\s+")[0]).ToLowerInvariant()
+}
+
+function Push-Verified {
+    param([string]$LocalPath, [string]$RemotePath)
+    $Hash = (Get-FileHash -LiteralPath $LocalPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ((Get-RemoteSha256 -RemotePath $RemotePath) -eq $Hash) { return }
+    Invoke-Adb -CommandArguments @("push", $LocalPath, "$RemotePath.upload")
+    if ((Get-RemoteSha256 -RemotePath "$RemotePath.upload") -ne $Hash) {
+        throw "Remote hash mismatch: $RemotePath.upload"
+    }
+    Invoke-Adb -CommandArguments @("shell", "mv -f '$RemotePath.upload' '$RemotePath' && chmod 0666 '$RemotePath'")
+}
+
+Invoke-Adb -CommandArguments @("shell", "mkdir -p '$RemoteRoot'")
+foreach ($Library in Get-ChildItem -LiteralPath $RuntimeDirectory -Filter "*.so") {
+    Push-Verified -LocalPath $Library.FullName -RemotePath "$RemoteRoot/$($Library.Name)"
+}
+Push-Verified -LocalPath $Jar -RemotePath "$RemoteRoot/lifecycle-probe.jar"
+Push-Verified -LocalPath $Bridge -RemotePath "$RemoteRoot/libnative_host_bridge.so"
+Push-Verified -LocalPath $BaseApk -RemotePath "$RemoteRoot/base.apk"
+Push-Verified -LocalPath $ReplayJson -RemotePath "$RemoteRoot/input-replay.json"
+
+New-Item -ItemType Directory -Path $EvidenceRoot -Force | Out-Null
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+$LogPath = Join-Path $EvidenceRoot "$Stamp-$Profile.log"
+$ClassPath = "$RemoteRoot/lifecycle-probe.jar`:$RemoteRoot/base.apk"
+$Launch = "cd '$RemoteRoot' && exec env CLASSPATH='$ClassPath' LD_LIBRARY_PATH='$RemoteRoot' app_process /system/bin royale.nativehost.JniHost '$RemoteRoot' '$Profile' '$RemoteRoot/input-replay.json'"
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$Output = & $Adb -s $Serial shell "$Launch; status=`$?; echo __PROBE_EXIT__=`$status; exit `$status" 2>&1
+$ExitCode = $LASTEXITCODE
+$ErrorActionPreference = $PreviousErrorActionPreference
+$Output | Set-Content -LiteralPath $LogPath -Encoding utf8
+$Output | Out-Host
+[pscustomobject]@{
+    profile = $Profile
+    exit_code = $ExitCode
+    log = $LogPath
+    jar_sha256 = (Get-FileHash -LiteralPath $Jar -Algorithm SHA256).Hash.ToLowerInvariant()
+    libg_sha256 = (Get-FileHash -LiteralPath (Join-Path $RuntimeDirectory "libg.so") -Algorithm SHA256).Hash.ToLowerInvariant()
+    bridge_sha256 = (Get-FileHash -LiteralPath $Bridge -Algorithm SHA256).Hash.ToLowerInvariant()
+    replay_sha256 = (Get-FileHash -LiteralPath $ReplayJson -Algorithm SHA256).Hash.ToLowerInvariant()
+} | ConvertTo-Json | Tee-Object -FilePath "$LogPath.manifest.json"
+if ($ExitCode -ne 0) { exit $ExitCode }
