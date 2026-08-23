@@ -65,7 +65,9 @@ class PPOTrainer:
             model.parameters(), lr=config.learning_rate, eps=1e-5
         )
 
-    def _chunks(self, trajectories: Iterable[AgentTrajectory]) -> list[dict[str, Any]]:
+    def _chunks(
+        self, trajectories: Iterable[AgentTrajectory]
+    ) -> tuple[list[dict[str, Any]], dict[str, float]]:
         chunks: list[dict[str, Any]] = []
         all_advantages: list[np.ndarray] = []
         prepared: list[tuple[dict[str, np.ndarray], np.ndarray, np.ndarray]] = []
@@ -100,7 +102,20 @@ class PPOTrainer:
                         "loss_start": loss_start,
                     }
                 )
-        return chunks
+        values_all = np.concatenate([item[0]["values"] for item in prepared])
+        returns_all = np.concatenate([item[2] for item in prepared])
+        return_variance = float(np.var(returns_all))
+        explained_variance = (
+            1.0 - float(np.var(returns_all - values_all)) / return_variance
+            if return_variance > 1e-12 else 0.0
+        )
+        return chunks, {
+            "explained_variance": explained_variance,
+            "value_mean": float(np.mean(values_all)),
+            "value_abs_max": float(np.max(np.abs(values_all))),
+            "return_mean": float(np.mean(returns_all)),
+            "return_std": float(np.std(returns_all)),
+        }
 
     @staticmethod
     def _pad(array: np.ndarray, length: int, *, value: float = 0.0) -> np.ndarray:
@@ -158,7 +173,7 @@ class PPOTrainer:
         return batch
 
     def update(self, trajectories: Iterable[AgentTrajectory]) -> dict[str, float]:
-        chunks = self._chunks(trajectories)
+        chunks, diagnostics = self._chunks(trajectories)
         self.model.train()
         metrics: dict[str, list[float]] = {
             "loss": [], "policy_loss": [], "value_loss": [], "entropy": [],
@@ -217,4 +232,7 @@ class PPOTrainer:
                     ("gradient_norm", gradient_norm),
                 ):
                     metrics[key].append(float(value.detach().cpu()))
-        return {key: float(np.mean(value)) for key, value in metrics.items()}
+        result = {key: float(np.mean(value)) for key, value in metrics.items()}
+        result.update(diagnostics)
+        result["learning_rate"] = float(self.optimizer.param_groups[0]["lr"])
+        return result

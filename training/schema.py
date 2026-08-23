@@ -281,7 +281,10 @@ def build_action_masks(
     card_mask[0] = True  # wait is always legal
     position_masks = np.zeros((4, ARENA_ROWS * ARENA_COLUMNS), dtype=np.bool_)
     elixir = int(player["elixir"])
-    deployment_open = int(state.get("tick", 0)) >= 100
+    deployment_open = (
+        int(state.get("tick", 0)) >= 100
+        and bool(state.get("episode", {}).get("commands_allowed", True))
+    )
     for hand_index, deck_index in enumerate(hand[:4]):
         if deck_index < 0:
             continue
@@ -431,49 +434,34 @@ class ObservationEncoder:
 
 
 class PotentialReward:
-    """Zero-sum potential shaping; terminal winner remains the only objective."""
+    """v0.1 zero-sum shaping from normalized crown-tower HP only."""
 
-    def __init__(self, *, gamma: float = 0.997, shaping_scale: float = 0.20) -> None:
+    schema_version = "tower_hp_only_v1"
+
+    def __init__(
+        self, *, gamma: float = 0.99995, shaping_scale: float = 0.20
+    ) -> None:
         self.gamma = gamma
         self.shaping_scale = shaping_scale
 
     @staticmethod
     def potential(state: Mapping[str, Any], side: int) -> float:
         towers = state.get("episode", {}).get("crown_towers", [])
-        tower_value = [0.0, 0.0]
+        remaining_hp = [0, 0]
+        maximum_hp = [0, 0]
         for tower in towers:
             owner = int(tower["side"])
-            weight = 2.0 if tower.get("type") == "king" else 1.0
-            tower_value[owner] += weight * max(
-                0.0, int(tower["hp"]) / max(1, int(tower["max_hp"]))
-            )
-        tower_advantage = (tower_value[side] - tower_value[1 - side]) / 4.0
-        players = {int(item["side"]): item for item in state.get("players", [])}
-        elixir_advantage = 0.0
-        if side in players and 1 - side in players:
-            elixir_advantage = (
-                int(players[side]["elixir"]) - int(players[1 - side]["elixir"])
-            ) / 10.0
-        board_value = [0.0, 0.0]
-        for entity in state.get("entities", []):
-            owner = int(entity.get("side", -1))
-            card_id = int(entity.get("card_id", -1))
-            if owner not in (0, 1) or card_id not in CARD_COSTS:
+            if owner not in (0, 1):
                 continue
-            hp_ratio = max(0.0, int(entity.get("hp", 0))) / max(
-                1, int(entity.get("max_hp", 1))
-            )
-            board_value[owner] += CARD_COSTS[card_id] * min(1.0, hp_ratio)
-        board_advantage = np.clip(
-            (board_value[side] - board_value[1 - side]) / 20.0, -1.0, 1.0
-        )
-        return float(np.clip(
-            0.75 * tower_advantage
-            + 0.10 * elixir_advantage
-            + 0.15 * board_advantage,
-            -1.0,
-            1.0,
-        ))
+            maximum = max(1, int(tower.get("max_hp", 1)))
+            remaining_hp[owner] += min(maximum, max(0, int(tower.get("hp", 0))))
+            maximum_hp[owner] += maximum
+        fractions = [
+            remaining_hp[owner] / maximum_hp[owner]
+            if maximum_hp[owner] else 0.0
+            for owner in (0, 1)
+        ]
+        return float(fractions[side] - fractions[1 - side])
 
     def transition(
         self,
@@ -510,6 +498,16 @@ class RunStore:
     def __init__(self, root: Path = Path(r"D:\AI_data")) -> None:
         self.root = root.resolve()
 
+    def _paths(self, run: Path) -> TrainingPaths:
+        return TrainingPaths(
+            root=run,
+            runs=self.root / "runs",
+            trajectories=run / "trajectories",
+            checkpoints=run / "checkpoints",
+            logs=run / "logs",
+            evaluations=run / "evaluations",
+        )
+
     @staticmethod
     def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,14 +523,9 @@ class RunStore:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             run_id = f"native8-{stamp}-{uuid.uuid4().hex[:8]}"
         run = self.root / "runs" / run_id
-        paths = TrainingPaths(
-            root=run,
-            runs=self.root / "runs",
-            trajectories=run / "trajectories",
-            checkpoints=run / "checkpoints",
-            logs=run / "logs",
-            evaluations=run / "evaluations",
-        )
+        if run.exists():
+            raise FileExistsError(f"training run already exists: {run}")
+        paths = self._paths(run)
         for path in asdict(paths).values():
             Path(path).mkdir(parents=True, exist_ok=True)
         self._atomic_json(
@@ -547,3 +540,23 @@ class RunStore:
             },
         )
         return paths
+
+    def open(self, run_id: str) -> tuple[TrainingPaths, dict[str, Any]]:
+        run = (self.root / "runs" / run_id).resolve()
+        expected_parent = (self.root / "runs").resolve()
+        if run.parent != expected_parent:
+            raise ValueError(f"invalid run id: {run_id}")
+        manifest_path = run / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"run manifest not found: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if manifest.get("kind") != "native_eight_card_selfplay_run":
+            raise RuntimeError("run manifest kind mismatch")
+        manifest_root = Path(str(manifest.get("data_root", ""))).resolve()
+        if manifest_root != self.root:
+            raise RuntimeError("run manifest data root mismatch")
+        paths = self._paths(run)
+        for path in asdict(paths).values():
+            if not Path(path).is_dir():
+                raise FileNotFoundError(f"run directory is incomplete: {path}")
+        return paths, manifest

@@ -15,7 +15,7 @@ from native_core.client import JsonLineClient
 from native_core.env import NativeRoyaleEnv
 
 from .model import RecurrentPolicyValueNet, SampledAction
-from .rollout import AgentTrajectory, EpisodeResult
+from .rollout import AgentTrajectory, EpisodeResult, summarize_episode_behavior
 from .schema import (
     ActionMaskCache, ObservationEncoder, PotentialReward, build_action_masks,
 )
@@ -91,13 +91,24 @@ class VectorNativeSelfPlayCollector:
         device: torch.device,
         reward_mode: str = "terminal",
         max_ticks: int = 7200,
+        policies_by_side: Mapping[int, Any] | None = None,
     ) -> None:
         if not envs:
             raise ValueError("vector collector requires at least one environment")
-        if reward_mode not in ("terminal", "potential"):
-            raise ValueError("reward_mode must be terminal or potential")
+        if reward_mode not in ("terminal", "potential", "tower_hp_potential_v1"):
+            raise ValueError("unsupported reward_mode")
         self.envs = envs
         self.policy = policy
+        self.policies_by_side = (
+            {0: policy, 1: policy}
+            if policies_by_side is None
+            else {side: policies_by_side[side] for side in (0, 1)}
+        )
+        self.unique_policies: list[Any] = []
+        for side in (0, 1):
+            candidate = self.policies_by_side[side]
+            if all(candidate is not item for item in self.unique_policies):
+                self.unique_policies.append(candidate)
         self.replay = json.loads(json.dumps(replay))
         self.device = device
         self.reward_mode = reward_mode
@@ -105,7 +116,10 @@ class VectorNativeSelfPlayCollector:
         self.encoder = ObservationEncoder()
         self.potential_reward = PotentialReward(gamma=0.99995)
         self.vector_profile: dict[str, float] = {}
-        self._cuda_graph_stats_before = dict(policy.cuda_graph_stats)
+        self._cuda_graph_stats_before = {
+            id(item): dict(getattr(item, "cuda_graph_stats", {}))
+            for item in self.unique_policies
+        }
         self.rpc_latency_samples: dict[str, list[float]] = {
             "total": [],
             "receive": [],
@@ -179,7 +193,7 @@ class VectorNativeSelfPlayCollector:
         for env, seed, (state, reset_seconds) in zip(
             self.envs, seeds, reset_results, strict=True
         ):
-            cursors.append(_Cursor(
+            cursor = _Cursor(
                 env=env,
                 seed=seed,
                 state=state,
@@ -188,17 +202,36 @@ class VectorNativeSelfPlayCollector:
                     AgentTrajectory(side=1, seed=seed),
                 ),
                 hidden={
-                    side: self.policy.initial_hidden(1, device=self.device)
+                    side: self.policies_by_side[side].initial_hidden(
+                        1, device=self.device
+                    )
                     for side in (0, 1)
                 },
                 last_hash=state.get("state_hash"),
-                profile={"reset_seconds": reset_seconds},
-            ))
+                profile={
+                    "reset_seconds": reset_seconds,
+                    "rnn_hidden_reset_checks": 2.0,
+                    "rnn_hidden_independence_checks": 1.0,
+                },
+            )
+            for hidden in cursor.hidden.values():
+                if (
+                    torch.count_nonzero(hidden[0]).item()
+                    or torch.count_nonzero(hidden[1]).item()
+                ):
+                    raise RuntimeError("recurrent hidden state was not reset to zero")
+            if (
+                cursor.hidden[0][0].data_ptr() == cursor.hidden[1][0].data_ptr()
+                or cursor.hidden[0][1].data_ptr() == cursor.hidden[1][1].data_ptr()
+            ):
+                raise RuntimeError("both sides share recurrent hidden storage")
+            cursors.append(cursor)
         return cursors
 
     def collect(self, seeds: list[int]) -> list[EpisodeResult]:
         cursors = self._start(seeds)
-        self.policy.eval()
+        for policy in self.unique_policies:
+            policy.eval()
         with ThreadPoolExecutor(max_workers=len(cursors)) as executor:
             while True:
                 active = [
@@ -251,24 +284,62 @@ class VectorNativeSelfPlayCollector:
                         row_owners.append((cursor, side, hand))
 
                 inference_started = time.perf_counter()
-                hidden_batch = (
-                    torch.cat(
-                        [owner[0].hidden[owner[1]][0] for owner in row_owners],
-                        dim=1,
-                    ),
-                    torch.cat(
-                        [owner[0].hidden[owner[1]][1] for owner in row_owners],
-                        dim=1,
-                    ),
-                )
-                sampled = self.policy.sample_batch(
-                    torch.from_numpy(np.stack([row[0] for row in encoded_rows])).to(self.device),
-                    torch.from_numpy(np.stack([row[1] for row in encoded_rows])).to(self.device),
-                    torch.from_numpy(np.stack([row[2] for row in encoded_rows])).to(self.device),
-                    torch.from_numpy(np.stack([row[3] for row in encoded_rows])).to(self.device),
-                    torch.from_numpy(np.stack([row[4] for row in encoded_rows])).to(self.device),
-                    hidden_batch,
-                )
+                sampled_slots: list[SampledAction | None] = [
+                    None for _ in row_owners
+                ]
+                for policy in self.unique_policies:
+                    indices = [
+                        index
+                        for index, (_cursor, side, _hand) in enumerate(row_owners)
+                        if self.policies_by_side[side] is policy
+                    ]
+                    hidden_batch = (
+                        torch.cat(
+                            [
+                                row_owners[index][0].hidden[
+                                    row_owners[index][1]
+                                ][0]
+                                for index in indices
+                            ],
+                            dim=1,
+                        ),
+                        torch.cat(
+                            [
+                                row_owners[index][0].hidden[
+                                    row_owners[index][1]
+                                ][1]
+                                for index in indices
+                            ],
+                            dim=1,
+                        ),
+                    )
+                    policy_samples = policy.sample_batch(
+                        torch.from_numpy(
+                            np.stack([encoded_rows[index][0] for index in indices])
+                        ).to(self.device),
+                        torch.from_numpy(
+                            np.stack([encoded_rows[index][1] for index in indices])
+                        ).to(self.device),
+                        torch.from_numpy(
+                            np.stack([encoded_rows[index][2] for index in indices])
+                        ).to(self.device),
+                        torch.from_numpy(
+                            np.stack([encoded_rows[index][3] for index in indices])
+                        ).to(self.device),
+                        torch.from_numpy(
+                            np.stack([encoded_rows[index][4] for index in indices])
+                        ).to(self.device),
+                        hidden_batch,
+                    )
+                    for index, sample in zip(
+                        indices, policy_samples, strict=True
+                    ):
+                        sampled_slots[index] = sample
+                if any(sample is None for sample in sampled_slots):
+                    raise RuntimeError("policy batch left an action row unresolved")
+                sampled = [
+                    sample for sample in sampled_slots if sample is not None
+                ]
                 self._record_vector("vector_inference_seconds", inference_started)
                 self.vector_profile["policy_decisions"] = (
                     self.vector_profile.get("policy_decisions", 0.0)
@@ -295,6 +366,8 @@ class VectorNativeSelfPlayCollector:
                         x, y = self._absolute_cell(sample.position, side)
                         values["chosen"].append({
                             "side": side, "deck_index": deck_index, "x": x, "y": y,
+                            "card_id": card_id,
+                            "canonical_position": sample.position,
                         })
                         values["next_public"][side] = {
                             "card_id": card_id, "x": x, "y": y,
@@ -374,7 +447,7 @@ class VectorNativeSelfPlayCollector:
                     terminal_rewards = episode.get(
                         "rewards_by_side", {0: 0.0, 1: 0.0}
                     )
-                    if self.reward_mode == "potential":
+                    if self.reward_mode in ("potential", "tower_hp_potential_v1"):
                         rewards = self.potential_reward.transition(
                             cursor.state,
                             next_state,
@@ -445,6 +518,10 @@ class VectorNativeSelfPlayCollector:
                 action_log=cursor.action_log,
                 state_hash=cursor.last_hash,
                 profile=cursor.profile,
+                terminal_episode=dict(episode),
+                behavior=summarize_episode_behavior(
+                    cursor.trajectories, cursor.action_log, episode
+                ),
             ))
         if results:
             total_latency: list[float] = []
@@ -467,10 +544,16 @@ class VectorNativeSelfPlayCollector:
                 attempts=attempts,
                 failures=failures,
             ))
-            for name, value in self.policy.cuda_graph_stats.items():
-                self.vector_profile[f"cuda_graph_{name}"] = (
-                    value - self._cuda_graph_stats_before.get(name, 0.0)
-                )
+            for policy in self.unique_policies:
+                before = self._cuda_graph_stats_before[id(policy)]
+                for name, value in getattr(
+                    policy, "cuda_graph_stats", {}
+                ).items():
+                    key = f"cuda_graph_{name}"
+                    self.vector_profile[key] = (
+                        self.vector_profile.get(key, 0.0)
+                        + value - before.get(name, 0.0)
+                    )
             self.vector_profile.update(summarize_barrier(self.barrier_rows))
             results[0].profile.update(self.vector_profile)
         return results

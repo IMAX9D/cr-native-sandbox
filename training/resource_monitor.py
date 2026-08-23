@@ -137,12 +137,14 @@ class TrainingResourceMonitor:
 
     def _sample(self, *, refresh_guest: bool) -> dict[str, Any]:
         host_memory = psutil.virtual_memory()
+        host_swap = psutil.swap_memory()
         sample: dict[str, Any] = {
             "monotonic_seconds": time.perf_counter(),
             "phase": self.phase,
             "host_cpu_percent": psutil.cpu_percent(None),
             "system_ram_used_gb": host_memory.used / (1024.0 ** 3),
             "system_ram_available_gb": host_memory.available / (1024.0 ** 3),
+            "system_swap_used_gb": host_swap.used / (1024.0 ** 3),
         }
         if self._nvml_handle is not None:
             utilization = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
@@ -237,6 +239,7 @@ class TrainingResourceMonitor:
             "host_cpu_percent",
             "system_ram_used_gb",
             "system_ram_available_gb",
+            "system_swap_used_gb",
             "gpu_utilization_percent",
             "gpu_memory_utilization_percent",
             "gpu_vram_used_mb",

@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from training.schema import ActionMaskCache, deployment_mask
+from training.schema import ActionMaskCache, build_action_masks, deployment_mask
 
 
 def _state(dead: set[tuple[int, int]]) -> dict:
@@ -26,6 +26,34 @@ def _state(dead: set[tuple[int, int]]) -> dict:
 
 
 class ActionMaskCacheTests(unittest.TestCase):
+    def test_native_command_gate_forces_wait_only(self):
+        state = _state(set())
+        state.update({
+            "tick": 3600,
+            "episode": {"commands_allowed": False, "command_gate_code": 4},
+            "players": [{
+                "side": 0,
+                "elixir": 10,
+                "hand_deck_indices": [0, 1, 2, 3],
+            }],
+        })
+        card_ids = [
+            26000000, 26000001, 26000003, 26000010,
+            26000014, 26000021, 27000000, 28000001,
+        ]
+        decks = [[{"card_id": card_id} for card_id in card_ids]]
+        native_masks = {
+            (0, index): ["1" * 18 for _ in range(32)]
+            for index in range(4)
+        }
+        card_mask, _positions, _hand = build_action_masks(
+            state,
+            side=0,
+            native_masks=native_masks,
+            decks=decks,
+        )
+        self.assertEqual(card_mask.tolist(), [True, False, False, False, False])
+
     def test_cached_mask_is_bit_exact_for_tower_states_and_cards(self):
         rng = random.Random(12345)
         cache = ActionMaskCache()

@@ -69,6 +69,8 @@ class EpisodeResult:
     action_log: list[dict[str, Any]]
     state_hash: str | None
     profile: dict[str, float]
+    terminal_episode: dict[str, Any] = field(default_factory=dict)
+    behavior: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -84,7 +86,87 @@ class EpisodeResult:
             "actions": self.actions,
             "state_hash": self.state_hash,
             "profile": self.profile,
+            "terminal_episode": self.terminal_episode,
+            "behavior": self.behavior,
         }
+
+
+def summarize_episode_behavior(
+    trajectories: tuple[AgentTrajectory, AgentTrajectory],
+    action_log: list[dict[str, Any]],
+    terminal_episode: Mapping[str, Any],
+) -> dict[str, Any]:
+    decisions = sum(len(item.cards) for item in trajectories)
+    waits = sum(sum(card == 0 for card in item.cards) for item in trajectories)
+    elixir_values = [
+        float(row[1]) * 10.0
+        for trajectory in trajectories
+        for row in trajectory.scalars
+    ]
+    card_attempts: dict[str, int] = {}
+    card_plays: dict[str, int] = {}
+    deployment_positions: list[list[int]] = []
+    rejection_codes: dict[str, int] = {}
+    for frame in action_log:
+        native = frame.get("native", {})
+        native_items = native.get("actions", []) if isinstance(native, Mapping) else []
+        accepted_sides = {
+            int(item["side"])
+            for item in native_items
+            if bool(item.get("result", {}).get("accepted", False))
+        }
+        for item in native_items:
+            result = item.get("result", {})
+            if bool(result.get("accepted", False)):
+                continue
+            code = str(int(result.get("result_code", -1)))
+            rejection_codes[code] = rejection_codes.get(code, 0) + 1
+        for action in frame.get("actions", []):
+            card_id = str(int(action.get("card_id", -1)))
+            card_attempts[card_id] = card_attempts.get(card_id, 0) + 1
+            if int(action["side"]) not in accepted_sides:
+                continue
+            card_plays[card_id] = card_plays.get(card_id, 0) + 1
+            deployment_positions.append([
+                int(action.get("card_id", -1)),
+                int(action.get("canonical_position", 0)),
+            ])
+
+    towers = terminal_episode.get("crown_towers", [])
+    remaining_hp = [0, 0]
+    maximum_hp = [0, 0]
+    for tower in towers:
+        side = int(tower.get("side", -1))
+        if side not in (0, 1):
+            continue
+        remaining_hp[side] += max(0, int(tower.get("hp", 0)))
+        maximum_hp[side] += max(0, int(tower.get("max_hp", 0)))
+    damage_inflicted = [
+        maximum_hp[1] - remaining_hp[1],
+        maximum_hp[0] - remaining_hp[0],
+    ]
+    crowns = [int(value) for value in terminal_episode.get("crowns", [0, 0])]
+    return {
+        "decision_count": decisions,
+        "wait_count": waits,
+        "wait_ratio": waits / decisions if decisions else 0.0,
+        "card_attempts": card_attempts,
+        "card_plays": card_plays,
+        "deployment_positions": deployment_positions,
+        "average_elixir": (
+            float(np.mean(elixir_values)) if elixir_values else 0.0
+        ),
+        "elixir_leak_steps": sum(value >= 10.0 for value in elixir_values),
+        "elixir_sample_count": len(elixir_values),
+        "native_rejection_codes": rejection_codes,
+        "native_rejection_count": sum(rejection_codes.values()),
+        "crowns": crowns,
+        "crown_difference_side0": crowns[0] - crowns[1],
+        "tower_remaining_hp": remaining_hp,
+        "tower_damage_inflicted": damage_inflicted,
+        "tower_hp_difference_side0": remaining_hp[0] - remaining_hp[1],
+        "match_ticks": int(terminal_episode.get("terminal_tick", 0)),
+    }
 
 
 class NativeSelfPlayCollector:
@@ -100,8 +182,8 @@ class NativeSelfPlayCollector:
         reward_mode: str = "terminal",
         max_ticks: int = 7200,
     ) -> None:
-        if reward_mode not in ("terminal", "potential"):
-            raise ValueError("reward_mode must be terminal or potential")
+        if reward_mode not in ("terminal", "potential", "tower_hp_potential_v1"):
+            raise ValueError("unsupported reward_mode")
         self.env = env
         self.policy = policy
         self.replay = json.loads(json.dumps(replay))
@@ -243,6 +325,8 @@ class NativeSelfPlayCollector:
                         "deck_index": deck_index,
                         "x": x,
                         "y": y,
+                        "card_id": card_id,
+                        "canonical_position": sample.position,
                     }
                     chosen.append(action)
                     next_public[side] = {
@@ -284,7 +368,7 @@ class NativeSelfPlayCollector:
             next_state = None if done else transition["state"]
             terminal_rewards = episode.get("rewards_by_side", {0: 0.0, 1: 0.0})
             stage_started = time.perf_counter()
-            if self.reward_mode == "potential":
+            if self.reward_mode in ("potential", "tower_hp_potential_v1"):
                 rewards = self.potential_reward.transition(
                     state,
                     next_state,
@@ -354,6 +438,10 @@ class NativeSelfPlayCollector:
             action_log=action_log,
             state_hash=str(last_hash) if last_hash is not None else None,
             profile=profile,
+            terminal_episode=dict(episode),
+            behavior=summarize_episode_behavior(
+                trajectories, action_log, episode
+            ),
         )
 
 

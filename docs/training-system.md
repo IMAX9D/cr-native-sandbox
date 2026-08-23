@@ -24,10 +24,20 @@ Rider, Cannon, and Arrows. Evolution/elite/champion/hero variants are excluded.
    receives enemy hand/elixir during training.
 8. Candidate placement cells come from `libg`'s deployment validator. Accepted
    commands use the original command constructor/selection/execute functions.
+   The mask also reads the original `0xD50CD0/0xD503D0` command gates, forcing
+   WAIT during the native result-animation interval instead of submitting
+   actions that `DoSpellCommand::execute` must reject.
 9. A canonical two-sided action RPC advances the original battle one tick and
    returns the next native observation.
-10. Complete trajectories feed recurrent PPO. Run files and checkpoints are
-    written atomically under `D:\AI_data`.
+10. Complete trajectories feed recurrent PPO. Formal v0.1 run files and
+    checkpoints are written atomically under
+    `D:\AI_data\cr-native-core\selfplay-v0.1`.
+
+Self-Play v0.1 freezes the reward to terminal win/draw/loss `+1/0/-1` plus
+`0.2 * (gamma * Phi(next) - Phi(current))`, with `gamma=0.99995`. `Phi` is
+only the normalized difference in total remaining crown-tower HP. Elixir,
+kills, river crossing, unit damage and board value are explicitly excluded.
+The absorbing terminal state's potential is zero.
 
 The hot path uses persistent `TCP_NODELAY` JSON-line connections,
 `joint_training_transition_v1` compact observations, exact layered deployment
@@ -49,8 +59,14 @@ p95 26.961 ms.
 
 ## Entry points
 
-Normal unattended training (defaults: four Workers, four episodes per update,
-direct Emulator transport and CUDA Graph inference):
+Formal unattended Stage A (2 AVD / 8 Worker, 1M native ticks, fixed evaluation):
+
+```powershell
+.\scripts\start_selfplay_v0_1.ps1
+```
+
+The lower-level training launcher also defaults to the formal 2 AVD / 8 Worker
+profile, direct Emulator transport, CUDA Graph inference and a 1M-tick target:
 
 ```powershell
 .\scripts\start_training.ps1
@@ -90,15 +106,15 @@ Custom run:
 ```
 
 The formal concurrency sweep measured 2 AVD / 8 Worker as this machine's
-maximum-throughput sweet spot. Use:
+maximum-throughput sweet spot. Use the generic launcher with explicit values:
 
 ```powershell
 .\scripts\start_training.ps1 -Avds 2 -Workers 8
 ```
 
 This profile reached 393.22 training steps/s including PPO, but PPO-stage
-system RAM headroom fell to about 0.30 GiB. The default remains 1 AVD / 4
-Worker for safer coexistence with desktop workloads. Exact evidence is in
+system RAM headroom fell to about 0.30 GiB. Close other memory-heavy programs
+before a formal run. Exact evidence is in
 `docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`.
 
 The Python layer may also be invoked directly after the artifacts/services are
@@ -111,14 +127,12 @@ D:\AI_data\runtime\venv\Scripts\python.exe -m training.train `
 
 ## Acceptance evidence
 
-On 2026-08-23 the complete smoke entry was run after stopping both the native
-service and emulator. It automatically cold-started the no-window Worker and
-wrote:
-
-`D:\AI_data\cr-native-core\training\runs\smoke-20260823T063225Z\checkpoints\checkpoint-000001.pt`
-
-The checkpoint contains the model, AdamW optimizer, run schema, PPO config,
-metrics, episode summary, completed episode count, and environment-step count.
+The bounded smoke entry has been exercised from a cold no-window Worker and
+then resumed from `latest.pt`. The v0.1 checkpoint contract contains model,
+AdamW optimizer, explicit `scheduler=None`, native/agent step counters,
+episode and next-seed counters, Python/NumPy/Torch CPU/CUDA RNG state, frozen
+run manifest, implementation digest, PPO metrics and behavior statistics.
+Every new run also preserves the immutable initialization candidate `P000`.
 
 All eight cards were also submitted independently through the original native
 command path. Every command was accepted, spent native elixir, and rotated the

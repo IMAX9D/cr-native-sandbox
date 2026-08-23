@@ -71,6 +71,8 @@ constexpr uintptr_t kBattleLoadReplayRva = 0x10B85B0;
 constexpr uintptr_t kSkipCoreAndPresentationFlagRva = 0x1A85930;
 constexpr uintptr_t kDoSpellCommandCtorRva = 0xD8D4D0;
 constexpr uintptr_t kDoSpellCommandExecuteRva = 0xD8D520;
+constexpr uintptr_t kBattleCommandHardGateRva = 0xD50CD0;
+constexpr uintptr_t kBattleCommandGateRva = 0xD503D0;
 constexpr uintptr_t kBuildCanonicalSelectionRva = 0x1048170;
 constexpr uintptr_t kResolveCanonicalSelectionRva = 0xE85D40;
 constexpr uintptr_t kValidateDeploymentRva = 0xD5B770;
@@ -157,6 +159,7 @@ using BattleStateUpdate = void (*)(void*, float);
 using BattleLoadReplay = void (*)(void*, void*, void*, void*);
 using DoSpellCommandCtor = void (*)(void*, void*);
 using DoSpellCommandExecute = int32_t (*)(void*, void*, int32_t, int32_t);
+using BattleLogicPredicate = bool (*)(void*);
 using BuildCanonicalSelection = void* (*)(void*, void*, void*, int32_t);
 using ResolveCanonicalSelection = void* (*)(void*);
 using ValidateDeployment = int32_t (*)(
@@ -244,6 +247,7 @@ struct EpisodeState {
   int32_t logic_state = -1;
   int32_t logic_substate = -1;
   int32_t battle_flag_1e9 = -1;
+  int32_t command_gate_code = -1;
   CrownTowerState towers[6] = {};
   size_t tower_count = 0;
   bool initialized = false;
@@ -281,7 +285,8 @@ bool read_entity_hp(const SafeMemoryReader& memory,
   return true;
 }
 
-bool capture_episode_state(const SafeMemoryReader& memory, uint64_t battle) {
+bool capture_episode_state(
+    const SafeMemoryReader& memory, uintptr_t base, uint64_t battle) {
   uint64_t logic = 0, registry = 0, collection = 0, data = 0;
   int32_t tick = -1, count = -1;
   if (battle == 0 || !memory.read(battle + 0x60, &tick) ||
@@ -298,6 +303,14 @@ bool capture_episode_state(const SafeMemoryReader& memory, uint64_t battle) {
     g_episode.battle = battle;
   }
   g_episode.tick = tick;
+  auto command_hard_gate = reinterpret_cast<BattleLogicPredicate>(
+      base + kBattleCommandHardGateRva);
+  auto command_gate = reinterpret_cast<BattleLogicPredicate>(
+      base + kBattleCommandGateRva);
+  g_episode.command_gate_code = command_hard_gate(
+      reinterpret_cast<void*>(logic))
+      ? 3
+      : (command_gate(reinterpret_cast<void*>(logic)) ? 4 : 0);
   memory.read(battle + 0x24, &g_episode.battle_phase);
   memory.read(logic + 0x18, &g_episode.logic_state);
   unsigned char flag_1e9 = 0;
@@ -433,14 +446,17 @@ std::string episode_json() {
       "\"crowns\":[%d,%d],\"rewards\":[%.1f,%.1f],"
       "\"reward_definition\":\"zero_sum_from_native_winner\","
       "\"result_source\":\"native_logic_terminal_and_crown_tower_entities\","
-      "\"terminal_tick\":%d,\"native_phase\":{"
+      "\"terminal_tick\":%d,\"commands_allowed\":%s,"
+      "\"command_gate_code\":%d,\"native_phase\":{"
       "\"battle\":%d,\"logic\":%d,\"logic_substate\":%d,\"flag_1e9\":%d},"
       "\"termination_reason\":%s,"
       "\"tower_snapshot_complete\":%s,\"crown_towers\":[",
       g_episode.terminated ? "true" : "false",
       outcome,
       winner < 0 ? "null" : (winner == 0 ? "0" : "1"), crowns0, crowns1,
-      reward0, -reward0, g_episode.tick, g_episode.battle_phase,
+      reward0, -reward0, g_episode.tick,
+      g_episode.command_gate_code == 0 ? "true" : "false",
+      g_episode.command_gate_code, g_episode.battle_phase,
       g_episode.logic_state, g_episode.logic_substate,
       g_episode.battle_flag_1e9,
       g_episode.termination_reason == nullptr
@@ -869,7 +885,7 @@ static jstring observe_state_json(
     throw_state(env, "native battle registry is not ready for observation");
     return nullptr;
   }
-  capture_episode_state(memory, battle);
+  capture_episode_state(memory, base, battle);
 
   std::string result;
   result.reserve(
@@ -1646,7 +1662,7 @@ Java_royale_nativehost_JniHost_nativeStep(
     return nullptr;
   }
   memory.read(battle + 0x60, &tick_before);
-  capture_episode_state(memory, battle);
+  capture_episode_state(memory, base, battle);
   // CE26D0 is the full BattleGameState frame. CE2CC0 is its authoritative
   // simulation call. Run the core exactly once, then run the outer state with
   // libg's own 0x1A85930 gate enabled: that gate skips both the duplicate core
@@ -1674,7 +1690,7 @@ Java_royale_nativehost_JniHost_nativeStep(
       g_episode.tiebreak_start_crowns[1] = episode_crowns(1);
     }
     core_update(reinterpret_cast<void*>(state), 0.05F);
-    capture_episode_state(memory, battle);
+    capture_episode_state(memory, base, battle);
     if (g_episode.tick >= 100 && g_episode.tick == tick_before_update) {
       ++g_episode.stalled_updates;
     } else {
@@ -1710,7 +1726,7 @@ Java_royale_nativehost_JniHost_nativeStep(
       g_episode.termination_reason = "native_battle_state_transition";
       break;
     }
-    capture_episode_state(memory, battle);
+    capture_episode_state(memory, base, battle);
     if (g_episode.logic_state == 1 &&
         (g_episode.logic_substate == 6 || g_episode.logic_substate == 15)) {
       battle_active = false;

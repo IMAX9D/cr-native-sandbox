@@ -63,21 +63,27 @@ All six conditions passed on 2026-08-23. The certificate is reproducible with:
 Double-click [`START_TRAINING.cmd`](START_TRAINING.cmd), or run:
 
 ```powershell
-.\scripts\start_training.ps1
+.\scripts\start_selfplay_v0_1.ps1
 ```
 
 The entry point builds the Java host and JNI bridge, starts the no-window
-Android x86_64 ABI container when necessary, launches four persistent
+Android x86_64 ABI containers when necessary, launches eight persistent
 Surface-free `app_process` workers, attests the original battle state, and
 runs recurrent PPO self-play. It does not start MuMu or the visual game.
 
+`START_TRAINING.cmd` invokes the guarded v0.1 stage runner
+`scripts/start_selfplay_v0_1.ps1`: 2 AVD / 8 Worker, 1M native ticks,
+milestone checkpoints, resource monitoring, paired side-swapped evaluation
+and report generation. `scripts/start_training.ps1` remains the lower-level
+launcher.
+
 All mutable output is under `D:\AI_data\cr-native-core`:
 
-- `training\runs\<run-id>\manifest.json`: immutable run configuration;
-- `training\runs\<run-id>\trajectories`: replayable episode tensors/metadata;
-- `training\runs\<run-id>\logs\events.jsonl`: append-only progress events;
-- `training\runs\<run-id>\checkpoints\latest.pt`: resumable model/optimizer;
-- `training\latest_run.json`: atomic pointer to the newest checkpoint.
+- `selfplay-v0.1\runs\<run-id>\manifest.json`: immutable run configuration;
+- `selfplay-v0.1\runs\<run-id>\trajectories`: replayable episode tensors/metadata;
+- `selfplay-v0.1\runs\<run-id>\logs\events.jsonl`: append-only progress events;
+- `selfplay-v0.1\runs\<run-id>\checkpoints`: P000/latest/recovery state;
+- `selfplay-v0.1\latest_run.json`: atomic pointer to the newest checkpoint.
 
 For a bounded end-to-end check, double-click
 [`SMOKE_TEST_TRAINING.cmd`](SMOKE_TEST_TRAINING.cmd). The acceptance requires a
@@ -104,7 +110,8 @@ four Workers per AVD, and policy batch 16. Launch it explicitly with:
 .\scripts\start_training.ps1 -Avds 2 -Workers 8
 ```
 
-The one-AVD default remains the lower-memory safe profile.
+The formal default is 2 AVD / 8 Worker. Because measured free RAM can fall
+below 1 GiB, close unrelated memory-heavy applications before starting it.
 
 ## Native-core status
 
@@ -134,7 +141,7 @@ call-chain boundaries.
 - `native_core/`: persistent Worker lifecycle plus stable JSON-line client/env.
 - `training/`: observation schema, action masks, recurrent actor/critic,
   self-play collection, PPO update, and atomic run storage.
-- `START_TRAINING.cmd`: normal long-running four-worker training entry.
+- `START_TRAINING.cmd`: guarded Self-Play v0.1 2-AVD/8-Worker stage entry.
 - `SMOKE_TEST_TRAINING.cmd`: bounded one-iteration acceptance entry.
 - `GAME_LOGIC_GUI.cmd`: interactive native battle-logic acceptance entry.
 - `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).

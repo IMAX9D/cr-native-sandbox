@@ -1,14 +1,18 @@
 param(
     [switch]$Smoke,
-    [ValidateRange(1, 8)] [int]$Workers = 4,
-    [ValidateRange(1, 4)] [int]$Avds = 1,
+    [ValidateRange(1, 32)] [int]$Workers = 8,
+    [ValidateRange(1, 4)] [int]$Avds = 2,
     [ValidateRange(1, 1000000000)] [int]$Iterations = 1000000,
+    [ValidateRange(1, 1000000000)] [int]$TargetNativeTicks = 1000000,
     [ValidateRange(0, 1024)] [int]$EpisodesPerIteration = 0,
     [ValidateRange(101, 20000)] [int]$MaxTicks = 7200,
     [int]$Seed = 1,
     [string]$Device = "auto",
+    [ValidateSet("tower_hp_potential_v1", "terminal")] [string]$Reward = "tower_hp_potential_v1",
     [ValidateSet("direct", "adb")] [string]$Transport = "direct",
-    [string]$DataRoot = "D:\AI_data\cr-native-core\training",
+    [string]$DataRoot = "D:\AI_data\cr-native-core\selfplay-v0.1",
+    [string]$RunId = "",
+    [string]$Resume = "",
     [string]$Python = "D:\AI_data\runtime\venv\Scripts\python.exe"
 )
 
@@ -62,14 +66,18 @@ $Arguments = @(
     "--workers", "$Workers",
     "--avds", "$Avds",
     "--iterations", "$Iterations",
+    "--target-native-ticks", "$TargetNativeTicks",
     "--episodes-per-iteration", "$EpisodesPerIteration",
     "--max-ticks", "$MaxTicks",
     "--seed", "$Seed",
     "--device", $Device,
+    "--reward", $Reward,
     "--transport", $Transport,
     "--data-root", $DataRoot
 )
 if ($Smoke) { $Arguments += "--smoke" }
+if ($RunId) { $Arguments += @("--run-id", $RunId) }
+if ($Resume) { $Arguments += @("--resume", $Resume) }
 
 "[$(Get-Date -Format o)] starting persistent native training" |
     Tee-Object -FilePath $Log -Append
