@@ -8,6 +8,9 @@ Self-Play 吞吐优化报告：
 正式训练并发 Scaling Sweep：
 [`docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`](docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md)
 
+Self-Play v0.2 可变等待动作设计：
+[`docs/SELFPLAY_V0_2_ACTION_TIMING_DESIGN.zh-CN.md`](docs/SELFPLAY_V0_2_ACTION_TIMING_DESIGN.zh-CN.md)
+
 Isolated feasibility project for driving the original Clash Royale `libg.so`
 as a headless battle oracle and, if the experiment succeeds, as a high-speed
 self-play kernel.
