@@ -733,11 +733,9 @@ $env:CR_SANDBOX_DATA\acceptance-match-rules.json
 - 当前沙盒主文档：本文；
 - 全卡/形态/技能附录：
   [`NATIVE_FULL_CARD_RUNTIME.zh-CN.md`](NATIVE_FULL_CARD_RUNTIME.zh-CN.md)；
+- JSON-line 外部协议：
+  [`API.md`](API.md)；
+- 冻结 Runtime 清单：
+  [`runtime-manifest.json`](../bindings/runtime-manifest.json)；
 - Android 生命周期探针：
-  [`android_probe/README.md`](../android_probe/README.md)；
-- 无 Surface 可行性原始结果：
-  [`experiment-0002-results.md`](experiment-0002-results.md)；
-- 历史综合路线：
-  [`TECHNICAL_ROUTE.zh-CN.md`](TECHNICAL_ROUTE.zh-CN.md)。
-
-历史综合路线包含旧八卡阶段的叙述，不再作为当前全卡沙盒能力的唯一事实源。
+  [`android_probe/README.md`](../android_probe/README.md)。

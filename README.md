@@ -1,217 +1,201 @@
 # CR Native Sandbox
 
-Headless, externally controlled Clash Royale battle sandbox backed by the
-original Android x86_64 `libg.so` runtime.
+基于原版 Android x86_64 `libg.so` 的无界面《皇室战争》标准 1v1 沙盒。
 
-这是一个独立的无界面战斗沙盒仓库，只提供：
+它提供：
 
-- Android x86_64 无 Surface 宿主；
-- 原生 JNI Bridge；
-- 标准 1v1 Replay 创建与进程内重置；
+- 原生 20 Hz 战斗推进；
 - 全卡牌、觉醒、英雄和主动技能接口；
-- 持久 JSON-line TCP 协议；
-- Python 外部 API；
-- 原生状态、路径、目标、效果、塔血和终局观测；
-- 纯沙盒验收脚本。
+- Replay 创建与进程内重置；
+- 完整/紧凑原生观测；
+- 持久 JSON-line TCP API；
+- Python 外部接口；
+- 自动化部署、环境诊断和原生验收。
 
-本仓库**不包含 GUI、桌面界面、浏览器界面、AI、模型、权重或学习代码**。
+仓库**不包含 GUI、AI、模型或学习代码**。
 
-## Important
+## 1. 使用 Runtime ZIP 一键部署
 
-This repository does not distribute Supercell binaries or game assets.
-
-以下内容不会上传，也不属于本仓库许可证范围：
-
-- `libg.so` 或其他原版 `.so`；
-- APK / split APK / XAPK；
-- Asset Pack 和解包后的游戏 Assets；
-- 游戏账号、回放数据、运行日志或本地证书；
-- Supercell 商标、美术、音频或其他受版权保护内容。
-
-使用者必须自行合法取得与绑定清单完全匹配的 Android runtime。项目仅用于
-互操作性研究、自动化验证和本地开发。
-
-## Frozen runtime
-
-| Item | Value |
-| --- | --- |
-| Game content | `15.535.29` |
-| Runtime version | `150535029` |
-| ABI | Android `x86_64` |
-| Mode | Standard 1v1 |
-| Logic rate | 20 Hz / 50 ms per Tick |
-| `libg.so` SHA-256 | `fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba` |
-| Observation scope | `public-observe-v6` |
-
-The complete runtime is pinned in
-[`bindings/runtime-manifest.json`](bindings/runtime-manifest.json): 5 split APKs
-and 14 native libraries, each with filename, byte size and SHA-256.
-
-Required APKs (5):
+如果你已经合法取得：
 
 ```text
-base.apk
-split_config.en.apk
-split_config.hdpi.apk
-split_config.x86_64.apk
-split_install_time_asset_pack.apk
+cr-native-sandbox-runtime-150535029.zip
 ```
 
-Required native libraries (14), from `split_config.x86_64.apk/lib/x86_64/`:
+这是推荐的部署路线。ZIP 本身不存放在本 GitHub 仓库中。
+
+### 1.1 前置软件
+
+先安装：Windows 10/11 x64、Git、Python 3.11+、JDK 17，以及 Android SDK
+Command-line Tools。
+
+还需要在 BIOS/UEFI 开启 VT-x/AMD-V，并在 Windows 中启用
+**Windows Hypervisor Platform (WHPX)** 或 Hyper-V。
+
+Android Command-line Tools 应放到类似目录：
 
 ```text
-libg.so
-libc++_shared.so
-libfmod.so
-libfmodstudio.so
-libandroidx.graphics.path.so
-libapp.so
-libdatastore_shared_counter.so
-libflutter.so
-libimage_processing_util_jni.so
-libQuagoTool.so
-libscid_sdk.so
-libsentry-android.so
-libsentry.so
-libsupercell_clashroyale.so
+C:\Android\Sdk\cmdline-tools\latest
 ```
 
-The asset pack must also contain `assets/locations/training_arena.csv` and
-`assets/tilemaps/tilemap.csv`, plus the `csv_client`/`csv_logic` tables
-(383 CSV files).
-
-`libg.so`'s hash is a hard frozen constant; the other entries are recorded once
-by `scripts\freeze_runtime.ps1` from the locally obtained runtime and
-re-verified by `scripts\doctor.ps1`.
-
-The JNI bindings are version-specific. A different library hash or
-`JNI_OnLoad` RVA must fail closed.
-
-## Current coverage
-
-- 122/122 visible standard base cards accepted by the original action path.
-- 41/41 evolution forms resolved by native card-cycle state.
-- 16/16 hero forms resolved by the native form selector.
-- Native active-ability command type `0x5A` exposed through the API.
-- Representative hero and champion abilities verified for cost, charges and
-  casting state.
-- Standard 3-minute regulation + 2-minute overtime, ×1/×2/×3 elixir and native
-  HP-drain tiebreak exported through the terminal observation.
-
-Coverage means the corresponding native path is executable. It does not claim
-that every pairwise card interaction has been exhaustively certified.
-
-## Architecture
+确保以下文件存在：
 
 ```text
-Python / JSON client
-        │ persistent UTF-8 JSON lines
-        ▼
-Android app_process · royale.nativehost.JniHost
-        │ JNI
-        ▼
-libnative_core_probe.so
-        │ version-guarded RVAs
-        ▼
-original libg.so · BattleGameState type 4
+C:\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat
+C:\Android\Sdk\cmdline-tools\latest\bin\avdmanager.bat
+C:\Android\Sdk\cmdline-tools\latest\lib\r8.jar
 ```
 
-Android supplies the ABI, dynamic linker, Java/JNI and asset filesystem. It is
-not used as a visible game client. `serve-direct` creates no Android Surface.
+其余 SDK 包、NDK 和 AVD 可由 `bootstrap.ps1` 自动安装/创建。
 
-## Repository contents
-
-```text
-android_probe/       Java host, required Titan stubs and JNI bridge
-bindings/            Frozen runtime hash/RVA manifest
-docs/                Detailed sandbox and full-card documentation
-examples/            Bootstrap Replay JSON examples
-native_core/         Python client, environment, catalog and deployment rules
-scripts/             Build, lifecycle and acceptance scripts
-tests/               Runtime-independent interface tests
-```
-
-There is intentionally no GUI package or GUI launcher.
-
-## Requirements
-
-Verified toolchain baseline (frozen compatibility matrix):
-
-| Component | Version |
-| --- | --- |
-| Windows | 10/11 x64, hardware virtualization (VT-x/AMD-V) |
-| PowerShell | 5.1+ or PowerShell 7 |
-| Python | ≥ 3.11 |
-| JDK | 17.0.20.1 (Temurin/Adoptium) |
-| Android Emulator | 37.1.11 |
-| Platform-Tools / ADB | 37.0.1 |
-| Android command-line tools | `latest` (D8/R8 in `lib\r8.jar`) |
-| Android Platform (compile) | `platforms;android-35` rev 2 |
-| Build-Tools | 35.0.0 |
-| NDK | 27.3.13750724 / r27d |
-| System image | `system-images;android-31;default;x86_64` rev 3 |
-| AVD device | `pixel_2`, 4 vCPU, 4 GB RAM, 10 GB data partition |
-
-The system image must be the **AOSP `default`** image, not the Google Play
-image: the host requires a rootable image (`adb root`). The default AVD name is
-`royale_worker_api31`.
-
-`scripts\bootstrap.ps1` installs the SDK packages and creates the AVD, so you
-only need to install JDK 17 and Python 3.11+ yourself.
-
-### Environment prerequisites
-
-- **PowerShell Execution Policy.** The scripts invoke themselves with
-  `-ExecutionPolicy Bypass`, so a `Restricted` policy does not block them. If
-  you prefer, run once:
-  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
-- **Virtualization / WHPX.** Enable "Windows Hypervisor Platform" (WHPX) or
-  Hyper-V so the emulator gets hardware acceleration. Without it the emulator
-  falls back to software and boot is impractically slow. Verify in
-  `OptionalFeatures.exe` or `Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`.
-- **Ports.** The emulator uses `5554`/`5555`; the sandbox service uses
-  `37031`+ (one per slot) and direct transport `38031`+. Free these or override
-  the ports before starting.
-- **Disk space.** Plan ~30 GB free: Android SDK + system image (~10 GB), the AVD
-  data partition (10 GB) and the extracted runtime.
-- **Windows Firewall.** The service binds loopback only; do not expose the
-  service port publicly. If the firewall prompts on first emulator launch,
-  allow `emulator.exe` / `qemu-system-x86_64.exe` on private networks.
-
-## Install the Python package
+### 1.2 克隆源码并安装 Python 包
 
 ```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-The runtime API itself has no third-party Python dependency.
-
-## One-shot deployment
-
-From a clean Windows machine, after installing JDK 17 and Python 3.11+:
-
-```powershell
-git clone https://github.com/IMAX9D/cr-native-sandbox
+git clone https://github.com/IMAX9D/cr-native-sandbox.git
 cd cr-native-sandbox
+
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e .
-
-Copy-Item runtime.env.example.ps1 runtime.env.ps1
-# Edit runtime.env.ps1: JDK path and drop your legally obtained APKs into the
-# runtime\apks\ directory (see "Configure local paths" below).
-. .\runtime.env.ps1
-
-.\scripts\bootstrap.ps1   # SDK packages + rootable AVD + extract & freeze runtime
-.\scripts\doctor.ps1      # preflight all dependencies
-.\scripts\smoke.ps1       # build → start → Tick 0→100 → six towers → hash → stop
 ```
 
-Expected smoke output:
+### 1.3 校验并解压 Runtime ZIP
+
+```powershell
+$Bundle = "D:\Downloads\cr-native-sandbox-runtime-150535029.zip"
+$Expected = "82b2e79eaa03aa98d83f5cfec78b053179a77f1f7c0d1fd274f8ec5c833c4310"
+$Actual = (Get-FileHash -LiteralPath $Bundle -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Expected) {
+    throw "Runtime ZIP SHA-256 mismatch: $Actual"
+}
+
+Expand-Archive -LiteralPath $Bundle -DestinationPath .
+Move-Item `
+  -LiteralPath .\cr-native-sandbox-runtime-150535029 `
+  -Destination .\runtime
+```
+
+如果 `runtime\` 已存在，请先自行备份或选择空目录，不要直接覆盖来源不明的
+Runtime。
+
+解压后应为：
+
+```text
+runtime/
+├─ README.txt
+├─ SHA256SUMS.txt
+├─ apks/
+│  ├─ base.apk
+│  ├─ split_config.en.apk
+│  ├─ split_config.hdpi.apk
+│  ├─ split_config.x86_64.apk
+│  └─ split_install_time_asset_pack.apk
+├─ x86_64-libs/
+│  ├─ libg.so
+│  ├─ libc++_shared.so
+│  ├─ libfmod.so
+│  ├─ libfmodstudio.so
+│  └─ 其余 10 个依赖库
+└─ extracted-assets/
+   ├─ csv_client/
+   └─ csv_logic/
+```
+
+Bundle 内容：
+
+| 类型 | 数量 | 用途 |
+| --- | ---: | --- |
+| Split APK | 5 | 安装 Android 包、提供 package context 和 Asset Pack |
+| x86_64 `.so` | 14 | 在无界面 `app_process` 中加载原生核心和依赖 |
+| DataTables 文件 | 383 | 初始化 `csv_client` / `csv_logic` 原生数据表 |
+
+`SHA256SUMS.txt` 保存 Bundle 内各文件的校验值。两个地图文件仍位于 Asset Pack：
+
+```text
+assets/locations/training_arena.csv
+assets/tilemaps/tilemap.csv
+```
+
+部署脚本会自动提取它们。
+
+### 1.4 配置本机路径
+
+```powershell
+Copy-Item runtime.env.example.ps1 runtime.env.ps1
+notepad runtime.env.ps1
+. .\runtime.env.ps1
+```
+
+通常只需修改 Android SDK 和 JDK：
+
+```powershell
+$env:CR_SANDBOX_ANDROID_SDK = "C:\Android\Sdk"
+$env:CR_SANDBOX_JDK = "C:\Program Files\Eclipse Adoptium\jdk-17"
+```
+
+示例文件默认把 Runtime 指向仓库内 Git 忽略的目录：
+
+```text
+runtime\apks
+runtime\x86_64-libs
+runtime\extracted-assets
+```
+
+每次打开新 PowerShell 后，都要重新执行：
+
+```powershell
+. .\runtime.env.ps1
+```
+
+### 1.5 准备 SDK、AVD 和 Runtime
+
+```powershell
+.\scripts\bootstrap.ps1
+```
+
+它会：
+
+1. 接受 Android SDK 许可证；
+2. 安装 Platform-Tools、Emulator、Android 35 Platform、Build-Tools 35、
+   NDK r27d 和 Android 31 x86_64 System Image；
+3. 创建可 root 的 AOSP AVD `royale_worker_api31`；
+4. 固定 AVD 为 4 vCPU、4 GB RAM、10 GB 数据分区；
+5. 从 APK 重新提取并核对 14 个 `.so`；
+6. 提取 DataTables、Arena 和 Tilemap；
+7. 生成本机冻结 Runtime Manifest。
+
+必须使用：
+
+```text
+system-images;android-31;default;x86_64
+```
+
+不要使用 Google Play System Image，因为它不能通过 `adb root`。
+
+### 1.6 环境诊断
+
+```powershell
+.\scripts\doctor.ps1
+```
+
+它会一次性检查：环境变量、Python/JDK/SDK/NDK、5 个 APK 和 14 个原生库的
+大小与 SHA-256、DataTables、Arena、Tilemap、AVD、虚拟化、端口和磁盘空间。
+
+必须解决所有工具链、Runtime、Assets 和 AVD 的硬性 `FAIL`。虚拟化探测和端口
+占用属于环境提示：如果对应 Emulator/服务正是你主动启动的，可以忽略该端口
+提示；否则应先关闭冲突进程。
+
+### 1.7 完整冒烟验收
+
+```powershell
+.\scripts\smoke.ps1
+```
+
+它会构建宿主、启动 AVD、安装 5 个 Split APK、启动无 Surface 服务、推进到
+Tick 100、检查六塔和状态哈希，然后停止服务与 AVD。
+
+预期输出：
 
 ```text
 PASS toolchain
@@ -225,78 +209,100 @@ PASS public-observe-v6
 PASS hash 96598dc9028e1802
 ```
 
-## Configure local paths
-
-Copy the example and edit paths for your machine:
+需要验收后继续保留服务：
 
 ```powershell
-Copy-Item runtime.env.example.ps1 runtime.env.ps1
+.\scripts\smoke.ps1 -KeepRunning
+```
+
+## 2. Runtime ZIP 中每类文件怎么用
+
+### `apks\`
+
+5 个 APK 必须作为同一个 Split Package 安装。`native_core.worker` 在包缺失时会
+自动执行等价于：
+
+```powershell
+adb install-multiple -r -t `
+  base.apk `
+  split_config.en.apk `
+  split_config.hdpi.apk `
+  split_config.x86_64.apk `
+  split_install_time_asset_pack.apk
+```
+
+不要只安装 `base.apk`，否则会缺少 x86_64 原生库和 Asset Pack。
+
+### `x86_64-libs\`
+
+14 个 `.so` 不需要手工放入 AVD 系统目录。`start_direct_service.ps1` 会逐个
+校验后推送到：
+
+```text
+/data/local/tmp/cr-native-direct-<slot>/
+```
+
+并通过该目录的 `LD_LIBRARY_PATH` 启动 `app_process`。`libg.so` 是战斗核心，
+其余库是该版本的依赖；不能混用其他版本或 ABI 的同名文件。
+
+### `extracted-assets\`
+
+`csv_client` 和 `csv_logic` 用于加载原生 DataTables。启动脚本会把它们与
+Arena/Tilemap 合并为本地 `artifacts/runtime-assets.tar`，随后推送并解压到：
+
+```text
+/data/local/tmp/cr-native-direct-<slot>/assets/
+```
+
+这些文件由原版 `libg.so` 解析，不是 Python 重写的战斗数据。
+
+### `SHA256SUMS.txt`
+
+用于核对 Bundle 内每个 APK、`.so` 和 DataTables 文件。部署时
+`doctor.ps1` 还会根据
+[`bindings/runtime-manifest.json`](bindings/runtime-manifest.json)
+重新检查 5 个 APK 和 14 个 `.so`。
+
+### `README.txt`
+
+Runtime Bundle 自身的简要说明，不参与程序运行。
+
+## 3. 日常启动与停止
+
+已执行过 `bootstrap.ps1` 后，日常启动：
+
+```powershell
 . .\runtime.env.ps1
+.\.venv\Scripts\Activate.ps1
+
+python -m native_core.worker start `
+  --workers 1 `
+  --base-port 37031 `
+  --transport adb `
+  --avd-name royale_worker_api31
 ```
 
-Required variables:
-
-| Variable | Meaning |
-| --- | --- |
-| `CR_SANDBOX_ANDROID_SDK` | Android SDK root |
-| `CR_SANDBOX_ADB` | `adb.exe` |
-| `CR_SANDBOX_ANDROID_TOOLS` | Android command-line tools root (`cmdline-tools\latest`) |
-| `CR_SANDBOX_ANDROID_JAR` | compilation `android.jar` (`platforms\android-35`) |
-| `CR_SANDBOX_NDK` | Android NDK r27d root |
-| `CR_SANDBOX_JDK` | JDK 17 root |
-| `CR_SANDBOX_AVD_HOME` | directory containing the provisioned AVD |
-| `CR_SANDBOX_AVD_NAME` | AVD name (default `royale_worker_api31`) |
-| `CR_SANDBOX_SYSTEM_IMAGE` | `system-images;android-31;default;x86_64` |
-| `CR_SANDBOX_APKS` | directory containing the complete split APK set |
-| `CR_SANDBOX_RUNTIME_DIR` | directory containing `libg.so` and peer `.so` files |
-| `CR_SANDBOX_BASE_APK` | matching `base.apk` |
-| `CR_SANDBOX_ASSET_PACK_APK` | matching install-time asset-pack APK |
-| `CR_SANDBOX_ASSETS` | extracted base assets directory |
-| `CR_SANDBOX_DATA` | writable logs/certificates/cache directory |
-
-`runtime.env.ps1` is ignored by Git.
-
-Expected runtime layout (the default in `runtime.env.example.ps1`):
-
-```text
-runtime/
-├─ apks/
-│  ├─ base.apk
-│  ├─ split_config.en.apk
-│  ├─ split_config.hdpi.apk
-│  ├─ split_config.x86_64.apk
-│  └─ split_install_time_asset_pack.apk
-├─ x86_64-libs/
-│  ├─ libg.so
-│  ├─ libc++_shared.so
-│  ├─ libfmod.so
-│  ├─ libfmodstudio.so
-│  └─ …共 14 个 .so
-└─ extracted-assets/
-   ├─ csv_client/
-   └─ csv_logic/
-```
-
-`scripts\prepare_runtime.ps1` populates `x86_64-libs\` and `extracted-assets\`
-from the APK set; `scripts\freeze_runtime.ps1` then records the manifest.
-
-## Build
+检查服务：
 
 ```powershell
-.\scripts\build_probe.ps1
-.\scripts\build_bridge.ps1
+python -m native_core.client --port 37031 ping
+python -m native_core.client --port 37031 status
+python -m native_core.client --port 37031 observe
 ```
 
-Generated outputs are local-only:
+停止服务但保留 AVD：
 
-```text
-artifacts/lifecycle-probe.jar
-artifacts/libnative_core_probe.so
+```powershell
+python -m native_core.worker stop --workers 1 --base-port 37031
 ```
 
-## Start one headless service
+同时停止 AVD：
 
-Make sure the AVD is booted and the matching APK set is installed, then run:
+```powershell
+python -m native_core.worker stop --workers 1 --base-port 37031 --stop-vm
+```
+
+也可以直接启动单个已开机 Emulator 中的服务：
 
 ```powershell
 .\scripts\start_direct_service.ps1 `
@@ -306,31 +312,7 @@ Make sure the AVD is booted and the matching APK set is installed, then run:
   -BootstrapReplayJson .\examples\full-card-bootstrap.json
 ```
 
-Or let the Python worker manager start the AVD and service:
-
-```powershell
-python -m native_core.worker start `
-  --workers 1 `
-  --base-port 37031 `
-  --transport adb `
-  --avd-name royale_worker_api31
-```
-
-Check status:
-
-```powershell
-python -m native_core.client --port 37031 ping
-python -m native_core.client --port 37031 status
-python -m native_core.client --port 37031 observe
-```
-
-Stop the service:
-
-```powershell
-.\scripts\stop_direct_service.ps1 -Port 37031 -Slot 0
-```
-
-## Build an arbitrary Replay
+## 4. 创建自定义牌组 Replay
 
 ```powershell
 python scripts\build_native_replay.py `
@@ -339,16 +321,14 @@ python scripts\build_native_replay.py `
   --output "$env:CR_SANDBOX_DATA\sandbox-replay.json"
 ```
 
-Form encoding:
+| 写法 | 原生 `el` | 含义 |
+| --- | ---: | --- |
+| `Knight` | 0/省略 | 基础形态 |
+| `Knight@evolution` | 1 | 开启觉醒循环 |
+| `Knight@hero` | 2 | 英雄形态 |
+| `Card@both` | 3 | 同时启用两种形态（目录允许时） |
 
-| Form | Native `el` |
-| --- | ---: |
-| base | 0 / omitted |
-| evolution | 1 |
-| hero | 2 |
-| both | 3 |
-
-## Python API
+## 5. Python 外部接口
 
 ```python
 from pathlib import Path
@@ -358,7 +338,6 @@ replay = Path(r"D:\sandbox-data\sandbox-replay.json")
 
 with NativeRoyaleEnv(port=37031) as env:
     state = env.reset(replay, warmup_steps=100)
-
     player = state["players"][0]
     deck_index = player["hand_deck_indices"][0]
 
@@ -368,7 +347,7 @@ with NativeRoyaleEnv(port=37031) as env:
         adjusted=True,
     )
 
-    result = env.act(
+    action = env.act(
         side=0,
         deck_index=deck_index,
         x=9000,
@@ -379,66 +358,41 @@ with NativeRoyaleEnv(port=37031) as env:
     next_state = env.observe()
 ```
 
-Active ability:
+主动技能：
 
 ```python
 unit = next(
     entity for entity in next_state["entities"]
     if entity["side"] == 0 and entity["ability_available"]
 )
-ability_result = env.use_ability(
-    side=0,
-    entity_id=unit["entity_id"],
-)
+
+result = env.use_ability(side=0, entity_id=unit["entity_id"])
 ```
 
-Two-sided action and Tick in one call:
+双方同 Tick 动作：
 
 ```python
 transition = env.joint_transition(
     [
-        {"type": "play", "side": 0, "deck_index": 2, "x": 9000, "y": 10000},
+        {"type": "play", "side": 0, "deck_index": 2,
+         "x": 9000, "y": 10000},
         {"type": "ability", "side": 1, "entity_id": 5000012},
     ],
     steps=1,
 )
 ```
 
-## JSON-line protocol
+完整 JSON-line 协议见 [`docs/API.md`](docs/API.md)。
 
-One request and one response per UTF-8 line. Main operations:
+## 6. 验收命令
 
-```text
-ping / status
-reset / restart_replay / load_replay
-observe / observe_compact_v1
-step / step_trace
-probe_grid
-act / ability
-joint_act / joint_transition / joint_transition_trace
-shutdown
-```
-
-Mutating requests are never automatically replayed after an ambiguous network
-failure. See [the technical document](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
-for schemas, limits, state fields and fail-closed conditions.
-
-## Validation
-
-One-shot smoke and preflight:
-
-```powershell
-.\scripts\doctor.ps1
-.\scripts\smoke.ps1
-```
-
-Runtime-independent tests:
+不依赖原生 Runtime 的测试：
 
 ```powershell
 python -m unittest discover -s tests
 ```
 
-Native acceptance, after starting the service:
+服务启动后的原生验收：
 
 ```powershell
 python scripts\accept_full_card_catalog.py --port 37031
@@ -446,35 +400,95 @@ python scripts\accept_native_card_forms.py --port 37031
 python scripts\accept_match_rules.py --port 37031
 ```
 
-Strict ten-process no-Surface cold-start certificate:
+严格无 Surface 十进程冷启动：
 
 ```powershell
 .\scripts\accept_direct_core.ps1 -Runs 10
 ```
 
-## Security and failure policy
+当前覆盖：122/122 标准基础卡、41/41 觉醒形态、16/16 英雄形态、原生主动
+技能、3+2 分钟赛程、×1/×2/×3 圣水、原生 HP drain 拼血和终局后重置。
 
-- The service is intended for local use only.
-- Keep host forwarding bound to loopback and do not expose the port publicly.
-- Runtime hash/RVA mismatch is fatal.
-- Invalid pointers, entity counts, path counts or response schemas are fatal.
-- Rejected native commands remain rejected.
-- Never commit runtime binaries, APKs, assets, logs, Replay datasets or account
-  data.
+## 7. 常见问题
 
-## Documentation
+### `sdkmanager.bat not found`
 
-- [Sandbox runtime architecture](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
-- [Full-card, evolution, hero and ability interface](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
-- [JSON-line API protocol](docs/API.md)
-- [Runtime manifest](bindings/runtime-manifest.json)
-- [Android lifecycle host](android_probe/README.md)
+Android Command-line Tools 没有放在 `cmdline-tools\latest`，或
+`CR_SANDBOX_ANDROID_TOOLS` 配置错误。
 
-## License and trademarks
+### `adb root` 失败
 
-The original wrapper/interface source in this repository is licensed under the
-MIT License. This license does not apply to Clash Royale, Supercell binaries,
-assets, trademarks or other third-party material.
+使用了 Google Play/Google APIs 镜像。删除该 AVD，改用：
 
-Clash Royale and Supercell are trademarks of Supercell Oy. This project is not
-affiliated with, endorsed by, sponsored by or approved by Supercell.
+```text
+system-images;android-31;default;x86_64
+```
+
+### `libg.so hash mismatch`
+
+Runtime 不是 `15.535.29 / 150535029 / x86_64`，或 ZIP 已损坏。不要绕过
+版本检查。
+
+### `Missing APK input`
+
+确认 ZIP 被移动为仓库内 `runtime\`，并重新加载：
+
+```powershell
+. .\runtime.env.ps1
+```
+
+### `runtime assets` 失败
+
+```powershell
+.\scripts\prepare_runtime.ps1
+.\scripts\freeze_runtime.ps1
+.\scripts\doctor.ps1
+```
+
+### 端口被占用
+
+默认端口：`5554/5555`（Emulator）、`37031+`（ADB 转发服务）、`38031+`
+（direct transport）。关闭旧实例或传入其他端口。
+
+### 服务启动后立即退出
+
+```powershell
+adb -s emulator-5554 shell `
+  "tail -n 120 /data/local/tmp/cr-native-direct-0/service.log"
+```
+
+## 8. 冻结版本
+
+| 项目 | 值 |
+| --- | --- |
+| 游戏内容 | `15.535.29` |
+| Runtime Version | `150535029` |
+| ABI | Android `x86_64` |
+| 模式 | 标准 1v1 |
+| 逻辑频率 | 20 Hz / 50 ms |
+| `libg.so` SHA-256 | `fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba` |
+| Runtime ZIP SHA-256 | `82b2e79eaa03aa98d83f5cfec78b053179a77f1f7c0d1fd274f8ec5c833c4310` |
+| 公开观测协议 | `public-observe-v6` |
+
+完整文件清单：[`bindings/runtime-manifest.json`](bindings/runtime-manifest.json)。
+
+## 9. 安全与法律边界
+
+- GitHub 仓库不分发 APK、`.so`、Assets 或 Runtime ZIP；
+- Runtime 由使用者自行合法取得；
+- 不要把账号信息、Replay 数据集或本地日志提交到仓库；
+- 服务只应用于本机回环端口，不要暴露到公网；
+- 版本、哈希、结构或原生命令不匹配时必须 fail closed。
+
+Clash Royale 和 Supercell 是 Supercell Oy 的商标。本项目与 Supercell 无隶属、
+赞助或认可关系。
+
+## 10. 更多文档
+
+- [沙盒 Runtime 架构](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+- [JSON-line API](docs/API.md)
+- [全卡、觉醒、英雄和技能接口](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+- [Android 无界面宿主](android_probe/README.md)
+- [Runtime Manifest](bindings/runtime-manifest.json)
+
+项目源码使用 MIT License；该许可证不适用于任何第三方游戏二进制、资产或商标。

@@ -40,6 +40,12 @@ foreach ($Apk in $Manifest.apks) {
     }
     $File = Get-Item -LiteralPath $Path
     $Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Apk.size -and [long]$Apk.size -ne [long]$File.Length) {
+        throw "$($Apk.name) size mismatch: got $($File.Length), expected $($Apk.size)"
+    }
+    if ($Apk.sha256 -and [string]$Apk.sha256 -ne $Hash) {
+        throw "$($Apk.name) SHA-256 mismatch: got $Hash, expected $($Apk.sha256)"
+    }
     $Apk.size = [long]$File.Length
     $Apk.sha256 = $Hash
 }
@@ -52,6 +58,12 @@ foreach ($Lib in $Manifest.native_libs) {
     }
     $File = Get-Item -LiteralPath $Path
     $Hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($Lib.size -and [long]$Lib.size -ne [long]$File.Length) {
+        throw "$($Lib.name) size mismatch: got $($File.Length), expected $($Lib.size)"
+    }
+    if ($Lib.sha256 -and [string]$Lib.sha256 -ne $Hash) {
+        throw "$($Lib.name) SHA-256 mismatch: got $Hash, expected $($Lib.sha256)"
+    }
     $Lib.size = [long]$File.Length
     $Lib.sha256 = $Hash
     if ($Lib.name -eq "libg.so" -and $Hash -ne $FrozenLibg) {

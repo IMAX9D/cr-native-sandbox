@@ -62,7 +62,7 @@ function Test-Dir {
 # --- 1. environment + toolchain -----------------------------------------
 $EnvOk = Test-EnvConfigured
 if ($EnvOk) {
-    Test-Tool "python" (Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+    Test-Tool "python" (Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source) | Out-Null
     $Py = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source
     if ($Py) {
         $PyVer = & $Py -c "import sys; print('.'.join(map(str, sys.version_info[:2])))" 2>$null
@@ -70,15 +70,15 @@ if ($EnvOk) {
         if ($PyVer -match '^(\d+)') { $PyMajor = [int]$Matches[1] }
         Add-Check "python 3.11+" ($PyMajor -ge 3 -and ([int]($PyVer -split '\.')[1] -ge 11)) "python $PyVer"
     }
-    Test-Tool "adb" (Get-Env "CR_SANDBOX_ADB")
-    Test-Tool "emulator" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_SDK") "emulator\emulator.exe")
-    Test-Tool "sdkmanager" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "bin\sdkmanager.bat")
-    Test-Tool "avdmanager" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "bin\avdmanager.bat")
-    Test-Tool "android.jar (platform 35)" (Get-Env "CR_SANDBOX_ANDROID_JAR")
-    Test-Tool "r8.jar" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "lib\r8.jar")
-    Test-Tool "javac" (Join-Path (Get-Env "CR_SANDBOX_JDK") "bin\javac.exe")
-    Test-Tool "clang++ (NDK r27d)" (Join-Path (Get-Env "CR_SANDBOX_NDK") "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe")
-    Test-Dir "avd home" (Get-Env "CR_SANDBOX_AVD_HOME")
+    Test-Tool "adb" (Get-Env "CR_SANDBOX_ADB") | Out-Null
+    Test-Tool "emulator" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_SDK") "emulator\emulator.exe") | Out-Null
+    Test-Tool "sdkmanager" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "bin\sdkmanager.bat") | Out-Null
+    Test-Tool "avdmanager" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "bin\avdmanager.bat") | Out-Null
+    Test-Tool "android.jar (platform 35)" (Get-Env "CR_SANDBOX_ANDROID_JAR") | Out-Null
+    Test-Tool "r8.jar" (Join-Path (Get-Env "CR_SANDBOX_ANDROID_TOOLS") "lib\r8.jar") | Out-Null
+    Test-Tool "javac" (Join-Path (Get-Env "CR_SANDBOX_JDK") "bin\javac.exe") | Out-Null
+    Test-Tool "clang++ (NDK r27d)" (Join-Path (Get-Env "CR_SANDBOX_NDK") "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe") | Out-Null
+    Test-Dir "avd home" (Get-Env "CR_SANDBOX_AVD_HOME") | Out-Null
 }
 
 # --- 2. runtime hashes ---------------------------------------------------
@@ -213,11 +213,17 @@ if ($Policy -eq "Restricted" -and -not $env:CR_SANDBOX_POLICY_OK) {
 Add-Check "execution policy" $PolicyOk "process=$Policy (scripts self-bypass)"
 
 # --- summary ------------------------------------------------------------
-$Hard = @($Checks | Where-Object { $_.name -in @("environment","runtime hashes","runtime assets","avd","adb","emulator","android.jar (platform 35)","r8.jar","javac","clang++ (NDK r27d)") })
+$HardNames = @(
+    "environment", "python", "python 3.11+", "adb", "emulator",
+    "sdkmanager", "avdmanager", "android.jar (platform 35)", "r8.jar",
+    "javac", "clang++ (NDK r27d)", "avd home", "runtime hashes",
+    "runtime assets", "avd"
+)
+$Hard = @($Checks | Where-Object { $_.name -in $HardNames })
 $Failed = @($Hard | Where-Object { -not $_.pass })
 
 if ($Json) {
-    @($Checks) | ConvertTo-Json -Depth 4
+    $Checks.ToArray() | ConvertTo-Json -Depth 4
 } elseif ($Failed.Count -eq 0) {
     Write-Host "doctor: all hard checks passed"
 } else {

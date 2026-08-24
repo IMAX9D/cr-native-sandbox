@@ -5,34 +5,39 @@
   "runtime_version": "150535029",
   "abi": "x86_64",
   "mode": "standard_1v1",
+  "bundle": {
+    "name": "cr-native-sandbox-runtime-150535029.zip",
+    "size": 896114476,
+    "sha256": "82b2e79eaa03aa98d83f5cfec78b053179a77f1f7c0d1fd274f8ec5c833c4310"
+  },
   "frozen_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
-  "note": "sizes and sha256 are null until scripts/freeze_runtime.ps1 records the locally obtained runtime. Only libg.so's hash is a hard frozen constant; every other entry is pinned by freeze_runtime.ps1 and re-verified by doctor.ps1.",
+  "note": "Canonical local runtime bundle. The archive itself is not distributed in this repository. Every listed APK/native library is re-verified by doctor.ps1.",
   "apks": [
-    {"name": "base.apk", "size": null, "sha256": null},
-    {"name": "split_config.en.apk", "size": null, "sha256": null},
-    {"name": "split_config.hdpi.apk", "size": null, "sha256": null},
-    {"name": "split_config.x86_64.apk", "size": null, "sha256": null},
-    {"name": "split_install_time_asset_pack.apk", "size": null, "sha256": null}
+    {"name": "base.apk", "size": 46768886, "sha256": "7b6b0320eebcc953a77ecb4708b0543d5d71b9c83830594fb577cd01b72ea826"},
+    {"name": "split_config.en.apk", "size": 123289, "sha256": "a2a1dce9a324163b38ded6f635cb946afa1806da67813ef530430a5af1896f7a"},
+    {"name": "split_config.hdpi.apk", "size": 88604, "sha256": "e3216b1e4fd2b43bcfa07551380a956b0b93e65be1cd40388ca06f7b28ad412a"},
+    {"name": "split_config.x86_64.apk", "size": 77768051, "sha256": "8e1dee3d6ad0d8b7737bd215b2d0614826a5184a0d478db9dc30e5b5076a1fc0"},
+    {"name": "split_install_time_asset_pack.apk", "size": 885861071, "sha256": "ff8986f7a2f5fdac54956a628f8dbc8572cb0ef23b287bd24e59f5e2ee3a3da8"}
   ],
   "native_libs": [
-    {"name": "libg.so", "size": null, "sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba"},
-    {"name": "libc++_shared.so", "size": null, "sha256": null},
-    {"name": "libfmod.so", "size": null, "sha256": null},
-    {"name": "libfmodstudio.so", "size": null, "sha256": null},
-    {"name": "libandroidx.graphics.path.so", "size": null, "sha256": null},
-    {"name": "libapp.so", "size": null, "sha256": null},
-    {"name": "libdatastore_shared_counter.so", "size": null, "sha256": null},
-    {"name": "libflutter.so", "size": null, "sha256": null},
-    {"name": "libimage_processing_util_jni.so", "size": null, "sha256": null},
-    {"name": "libQuagoTool.so", "size": null, "sha256": null},
-    {"name": "libscid_sdk.so", "size": null, "sha256": null},
-    {"name": "libsentry-android.so", "size": null, "sha256": null},
-    {"name": "libsentry.so", "size": null, "sha256": null},
-    {"name": "libsupercell_clashroyale.so", "size": null, "sha256": null}
+    {"name": "libg.so", "size": 28309024, "sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba"},
+    {"name": "libc++_shared.so", "size": 1252080, "sha256": "db9609240e60ca18b816a5e95a6bbc784e799261efbd5b30c8e2e03b540b3fa8"},
+    {"name": "libfmod.so", "size": 1261896, "sha256": "c35d05b0968c79b31e35903c64cd6e7172cbbb92a0f5e57fadf996ab9a0c2367"},
+    {"name": "libfmodstudio.so", "size": 1018128, "sha256": "bd562d3ebd95848d14da4904f4bae96578367821714cb3900dda63414d35c28e"},
+    {"name": "libandroidx.graphics.path.so", "size": 10760, "sha256": "4e56c996f13670e70082658de7880c4020eabf4f25e43387f88ed78a713fc9f0"},
+    {"name": "libapp.so", "size": 11207600, "sha256": "af9d991113af4fcba023044d474ea8b6a64d59567dcb6df248a0ff237dcceeaf"},
+    {"name": "libdatastore_shared_counter.so", "size": 6224, "sha256": "fb6c9208988c49ae94943bc3236fa763ba584722e044fa4ea9a12d2941027105"},
+    {"name": "libflutter.so", "size": 12143760, "sha256": "94a457f1f2de2ed4831460f9426a8e7bd3424b9a398564415bbf14349afc29e4"},
+    {"name": "libimage_processing_util_jni.so", "size": 48104, "sha256": "676e3e280c10dcb9b71ef5bb727552610dc73c7ec85af54c7c898f82785c33d7"},
+    {"name": "libQuagoTool.so", "size": 5512, "sha256": "809ba462b389a590ad1b17f471fff2d546b3264abd745d353f024e754a4eecd3"},
+    {"name": "libscid_sdk.so", "size": 14765640, "sha256": "0e89ddac52ed75c234b76d2ce551fd7109e08d602a98ac4154941e17bfe6755c"},
+    {"name": "libsentry-android.so", "size": 16384, "sha256": "12f93144c1a66d375550473aa88ecbfe78126fde0748dd61628709d7b21ba55c"},
+    {"name": "libsentry.so", "size": 690848, "sha256": "3885778f4ea8c73b6261e54273a92d1289fddfaf7b0bb285bdb65a8d386b5194"},
+    {"name": "libsupercell_clashroyale.so", "size": 6860712, "sha256": "db6bbe728bf480faa1622d27d627966c72689cc7d1d9cf6d276a9fe26b7ba5e9"}
   ],
   "assets": {
     "extracted_directories": ["csv_client", "csv_logic"],
-    "expected_csv_files": 383,
+    "expected_table_files": 383,
     "map_csv": [
       "assets/locations/training_arena.csv",
       "assets/tilemaps/tilemap.csv"
