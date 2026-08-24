@@ -71,6 +71,10 @@ public final class JniHost {
         String libgPath, int side, int deckIndex, int x, int y,
         int accountHi, int accountLo, boolean dryRun
     );
+    private static native String nativeUseAbility(
+        String libgPath, int side, int entityCategory,
+        int accountHi, int accountLo
+    );
     private static native String nativeProbeGrid(
         String libgPath, int side, int deckIndex, int accountHi, int accountLo
     );
@@ -793,6 +797,10 @@ public final class JniHost {
                         } else if ("act".equals(op)) {
                             JSONObject action = request.getJSONObject("action");
                             response.put("result", executeAction(root, action));
+                        } else if ("ability".equals(op)) {
+                            JSONObject action = request.getJSONObject("action");
+                            action.put("type", "ability");
+                            response.put("result", executeAction(root, action));
                         } else if ("shutdown".equals(op)) {
                             running = false;
                         } else if (!"ping".equals(op)) {
@@ -911,15 +919,31 @@ public final class JniHost {
     private static JSONObject executeAction(
         String root, JSONObject action
     ) throws Exception {
+        int side = action.getInt("side");
+        String type = action.optString("type", "play");
+        if ("ability".equals(type)) {
+            return new JSONObject(
+                nativeUseAbility(
+                    root + "/libg.so",
+                    side,
+                    action.getInt("entity_id"),
+                    action.optInt("account_hi", side + 1),
+                    action.optInt("account_lo", side + 1)
+                )
+            );
+        }
+        if (!"play".equals(type)) {
+            throw new IllegalArgumentException("unknown action type: " + type);
+        }
         return new JSONObject(
             nativeAct(
                 root + "/libg.so",
-                action.getInt("side"),
+                side,
                 action.getInt("deck_index"),
                 action.getInt("x"),
                 action.getInt("y"),
-                action.optInt("account_hi", action.getInt("side") + 1),
-                action.optInt("account_lo", action.getInt("side") + 1),
+                action.optInt("account_hi", side + 1),
+                action.optInt("account_lo", side + 1),
                 action.optBoolean("dry_run", false)
             )
         );

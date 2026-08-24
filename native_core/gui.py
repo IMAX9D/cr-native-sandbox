@@ -14,21 +14,18 @@ import uuid
 
 try:
     from .env import CARD_NAMES, NativeHostError, NativeRoyaleEnv
+    from .card_catalog import catalog as live_card_catalog
 except ImportError:  # direct ``python native_core/gui.py`` execution
     from env import CARD_NAMES, NativeHostError, NativeRoyaleEnv
+    from card_catalog import catalog as live_card_catalog
 
 from training.schema import deployment_mask
 
 
 CARD_COSTS = {
-    26000000: 3,
-    26000001: 3,
-    26000003: 5,
-    26000010: 1,
-    26000014: 4,
-    26000021: 4,
-    27000000: 3,
-    28000001: 3,
+    card_id: int(value["elixir"])
+    for card_id, value in live_card_catalog().items()
+    if value.get("elixir") is not None
 }
 
 TERMINAL_RECYCLE_MARKER = "native terminal is latched"

@@ -2,6 +2,9 @@
 
 完整中文技术路线：[`docs/TECHNICAL_ROUTE.zh-CN.md`](docs/TECHNICAL_ROUTE.zh-CN.md)
 
+原生全卡、觉醒/英雄形态与主动技能接口：
+[`docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md`](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+
 Self-Play 吞吐优化报告：
 [`docs/throughput-optimization-20260823.md`](docs/throughput-optimization-20260823.md)
 
@@ -18,15 +21,21 @@ Isolated feasibility project for driving the original Clash Royale `libg.so`
 as a headless battle oracle and, if the experiment succeeds, as a high-speed
 self-play kernel.
 
-## Frozen target
+## Historical frozen training target
 
 - Android runtime version: `150535029`
 - Content identity: `15.535.29` / packaged Core8-equivalent content
 - ABI: `x86_64`
 - Mode: standard 1v1
 - Levels: card 11, tower 11
-- Variants: base cards only; no evolution, elite level, champion, or hero
+- Variants: the frozen v0.1/v0.2 policy uses base forms only
 - Deck: Knight, Archers, Giant, Skeletons, Musketeer, Hog Rider, Cannon, Arrows
+
+This section describes the historical eight-card policy/checkpoint boundary,
+not the current native runtime. The runtime now accepts all 122 visible
+standard cards, 41 evolution forms, 16 hero forms, and the original active
+ability command. Existing eight-card Actor heads remain frozen and are not
+silently reused as full-card models.
 
 ## Prime directive
 

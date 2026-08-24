@@ -12,6 +12,8 @@ import uuid
 
 import numpy as np
 
+from native_core.card_catalog import catalog as live_card_catalog
+
 
 CARD_IDS = (
     26000000,  # Knight
@@ -25,14 +27,9 @@ CARD_IDS = (
 )
 CARD_INDEX = {card_id: index for index, card_id in enumerate(CARD_IDS)}
 CARD_COSTS = {
-    26000000: 3,
-    26000001: 3,
-    26000003: 5,
-    26000010: 1,
-    26000014: 4,
-    26000021: 4,
-    27000000: 3,
-    28000001: 3,
+    card_id: int(value["elixir"])
+    for card_id, value in live_card_catalog().items()
+    if value.get("elixir") is not None
 }
 
 ARENA_COLUMNS = 18

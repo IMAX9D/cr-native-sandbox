@@ -293,7 +293,7 @@ class HeadlessWorkerPool:
         maxima = sorted(int(item.get("max_hp", -1)) for item in towers)
         if not (
             state.get("coherent") is True and state.get("entity_count") == 6
-            and state.get("state_hash_scope") == "public-observe-v5"
+            and state.get("state_hash_scope") == "public-observe-v6"
             and maxima == [3052, 3052, 3052, 3052, 4824, 4824]
         ):
             raise WorkerError(f"slot {slot} failed native opening attestation")

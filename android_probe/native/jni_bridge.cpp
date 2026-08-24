@@ -71,6 +71,8 @@ constexpr uintptr_t kBattleLoadReplayRva = 0x10B85B0;
 constexpr uintptr_t kSkipCoreAndPresentationFlagRva = 0x1A85930;
 constexpr uintptr_t kDoSpellCommandCtorRva = 0xD8D4D0;
 constexpr uintptr_t kDoSpellCommandExecuteRva = 0xD8D520;
+constexpr uintptr_t kAbilityCommandCtorRva = 0xD8F360;
+constexpr uintptr_t kAbilityCommandExecuteRva = 0xD8F3C0;
 constexpr uintptr_t kBattleCommandHardGateRva = 0xD50CD0;
 constexpr uintptr_t kBattleCommandGateRva = 0xD503D0;
 constexpr uintptr_t kBuildCanonicalSelectionRva = 0x1048170;
@@ -80,6 +82,8 @@ constexpr uintptr_t kBattleIdentityIndexRva = 0xD4E180;
 constexpr uintptr_t kBattlePlayerAtIndexRva = 0xD4FFE0;
 constexpr uintptr_t kDeckIndexToHandRva = 0xF96360;
 constexpr uintptr_t kHandEntryRva = 0xF8FD20;
+constexpr uintptr_t kAbilitySlotForCharacterRva = 0xF96D80;
+constexpr uintptr_t kAbilityComponentAtSlotRva = 0xF925D0;
 constexpr uintptr_t kPlayerElixirRva = 0xF93EA0;
 constexpr uintptr_t kNextDeckIndexRva = 0xF98120;
 constexpr size_t kMaxObservedEntities = 2048;
@@ -159,6 +163,8 @@ using BattleStateUpdate = void (*)(void*, float);
 using BattleLoadReplay = void (*)(void*, void*, void*, void*);
 using DoSpellCommandCtor = void (*)(void*, void*);
 using DoSpellCommandExecute = int32_t (*)(void*, void*, int32_t, int32_t);
+using AbilityCommandCtor = void (*)(void*, void*, void*);
+using AbilityCommandExecute = int32_t (*)(void*, void*, int32_t, int32_t);
 using BattleLogicPredicate = bool (*)(void*);
 using BuildCanonicalSelection = void* (*)(void*, void*, void*, int32_t);
 using ResolveCanonicalSelection = void* (*)(void*);
@@ -168,6 +174,8 @@ using BattleIdentityIndex = int32_t (*)(void*, int32_t, int32_t);
 using BattlePlayerAtIndex = void* (*)(void*, int32_t);
 using DeckIndexToHand = int32_t (*)(void*, int32_t);
 using HandEntry = void* (*)(void*, int32_t);
+using AbilitySlotForCharacter = int32_t (*)(void*, void*);
+using AbilityComponentAtSlot = void* (*)(void*, int32_t);
 using PlayerElixir = int32_t (*)(void*);
 using NextDeckIndex = int32_t (*)(void*);
 
@@ -641,14 +649,45 @@ Java_royale_nativehost_JniHost_nativeAct(
 
   int32_t packed_selection = 0;
   uint64_t original_spell = 0;
+  int32_t entry_i18 = 0, entry_i1c = 0, entry_i20 = 0, entry_i24 = 0;
+  int32_t entry_i28 = 0, entry_i2c = 0, entry_i30 = 0, entry_i34 = 0;
+  int32_t entry_i44 = 0, entry_i48 = 0;
+  uint8_t entry_b40 = 0, entry_b41 = 0;
+  uint64_t entry_vtable = 0, entry_json_loader = 0;
   memory.read(reinterpret_cast<uintptr_t>(command) + 0x38, &original_spell);
   memory.read(reinterpret_cast<uintptr_t>(command) + 0x48, &packed_selection);
+  const uintptr_t entry_address = reinterpret_cast<uintptr_t>(entry);
+  memory.read(entry_address, &entry_vtable);
+  if (entry_vtable != 0) {
+    memory.read(entry_vtable + 0xB0, &entry_json_loader);
+  }
+  memory.read(entry_address + 0x18, &entry_i18);
+  memory.read(entry_address + 0x1C, &entry_i1c);
+  memory.read(entry_address + 0x20, &entry_i20);
+  memory.read(entry_address + 0x24, &entry_i24);
+  memory.read(entry_address + 0x28, &entry_i28);
+  memory.read(entry_address + 0x2C, &entry_i2c);
+  memory.read(entry_address + 0x30, &entry_i30);
+  memory.read(entry_address + 0x34, &entry_i34);
+  memory.read(entry_address + 0x40, &entry_b40);
+  memory.read(entry_address + 0x41, &entry_b41);
+  memory.read(entry_address + 0x44, &entry_i44);
+  memory.read(entry_address + 0x48, &entry_i48);
   auto resolve_selection = reinterpret_cast<ResolveCanonicalSelection>(
       base + kResolveCanonicalSelectionRva);
   auto validate_deployment = reinterpret_cast<ValidateDeployment>(
       base + kValidateDeploymentRva);
   void* resolved_selection = resolve_selection(
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(command) + 0x38));
+  uint64_t resolved_vtable = 0;
+  int32_t resolved_data_id = -1;
+  if (resolved_selection != nullptr) {
+    memory.read(
+        reinterpret_cast<uintptr_t>(resolved_selection), &resolved_vtable);
+    memory.read(
+        reinterpret_cast<uintptr_t>(resolved_selection) + 0x40,
+        &resolved_data_id);
+  }
   const int32_t placement_code = resolved_selection == nullptr
       ? -1
       : validate_deployment(
@@ -680,7 +719,7 @@ Java_royale_nativehost_JniHost_nativeAct(
       : placement_code == 5
       ? "blocked_tile_or_card_constraint"
       : "selection_unavailable";
-  char payload[640];
+  char payload[1024];
   std::snprintf(
       payload, sizeof(payload),
       "{\"accepted\":%s,\"result_code\":%d,\"tick\":%d,"
@@ -689,15 +728,257 @@ Java_royale_nativehost_JniHost_nativeAct(
       "\"dry_run\":%s,\"placement_valid\":%s,"
       "\"placement_code\":%d,\"placement_reason\":\"%s\","
       "\"packed_selection\":%d,\"execution_flags\":%d,"
+      "\"entry_fields\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+      "\"entry_vtable_rva\":\"0x%llx\","
+      "\"entry_json_loader_rva\":\"0x%llx\","
+      "\"resolved_spell\":\"0x%llx\","
+      "\"resolved_vtable_rva\":\"0x%llx\","
+      "\"resolved_data_id\":%d,"
       "\"original_spell\":\"0x%llx\","
       "\"command_rva\":\"0x%llx\",\"execute_rva\":\"0x%llx\"}",
       result_code == 0 ? "true" : "false", result_code, tick, side,
       deck_index, hand_index, x, y, dry_run ? "true" : "false",
       placement_code == 0 ? "true" : "false", placement_code,
       placement_reason, packed_selection, kCommandExecutionFlags,
+      entry_i18, entry_i1c, entry_i20, entry_i24,
+      entry_i28, entry_i2c, entry_i30, entry_i34,
+      static_cast<int>(entry_b40), static_cast<int>(entry_b41),
+      entry_i44, entry_i48,
+      static_cast<unsigned long long>(entry_vtable - base),
+      static_cast<unsigned long long>(entry_json_loader - base),
+      static_cast<unsigned long long>(
+          reinterpret_cast<uintptr_t>(resolved_selection)),
+      static_cast<unsigned long long>(resolved_vtable - base),
+      resolved_data_id,
       static_cast<unsigned long long>(original_spell),
       static_cast<unsigned long long>(kDoSpellCommandCtorRva),
       static_cast<unsigned long long>(kDoSpellCommandExecuteRva));
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeUseAbility(
+    JNIEnv* env, jclass, jstring libg_path, jint side,
+    jint entity_category, jint account_hi, jint account_lo) {
+  if (side < 0 || side > 1 || entity_category < 5000000 ||
+      entity_category >= 6000000) {
+    throw_state(env, "ability fields are outside the native entity range");
+    return nullptr;
+  }
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for native ability execution");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for native ability execution");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  if (reinterpret_cast<uintptr_t>(exported) - base !=
+      kExpectedJniOnLoadRva) {
+    dlclose(handle);
+    throw_state(env, "libg version guard rejected native ability execution");
+    return nullptr;
+  }
+
+  SafeMemoryReader memory;
+  uint64_t manager = 0, state = 0, battle = 0, battle_logic = 0;
+  uint64_t command_context = 0, registry = 0, collection = 0, data = 0;
+  int32_t current_type = -1, tick = -1, count = -1;
+  if (!memory.read(base + kManagerGlobalRva, &manager) || manager == 0 ||
+      !memory.read(manager + 0x20, &state) || state == 0 ||
+      !memory.read(manager + 0x30, &current_type) || current_type != 4 ||
+      !memory.read(state + 0x90, &battle) || battle == 0 ||
+      !memory.read(battle + 0xA8, &battle_logic) || battle_logic == 0 ||
+      !memory.read(battle + 0x208, &command_context) ||
+      command_context == 0 || !memory.read(battle + 0x60, &tick) ||
+      !memory.read(battle_logic + 0x08, &registry) || registry == 0 ||
+      !memory.read(registry + 0x40, &collection) || collection == 0 ||
+      !memory.read(collection + 0x08, &data) || data == 0 ||
+      !memory.read(collection + 0x14, &count) || count < 0 ||
+      count > static_cast<int32_t>(kMaxObservedEntities)) {
+    dlclose(handle);
+    throw_state(env, "native battle is not ready for ability execution");
+    return nullptr;
+  }
+
+  uint64_t character = 0;
+  uint64_t character_data = 0, ability_data = 0;
+  int32_t character_card_id = -1;
+  int32_t character_behavior = -1;
+  for (int32_t index = 0; index < count; ++index) {
+    uint64_t candidate = 0;
+    unsigned char raw[0x124] = {};
+    if (!memory.read(data + static_cast<uintptr_t>(index) * 8, &candidate) ||
+        candidate == 0 || !memory.read_bytes(candidate, raw, sizeof(raw))) {
+      continue;
+    }
+    int32_t category = 0, candidate_side = -1, kind = -1;
+    std::memcpy(&category, raw + 0x08, sizeof(category));
+    std::memcpy(&kind, raw + 0x30, sizeof(kind));
+    std::memcpy(&candidate_side, raw + 0x78, sizeof(candidate_side));
+    if (category != entity_category) {
+      continue;
+    }
+    if (candidate_side != side || kind < 10 || kind > 20) {
+      dlclose(handle);
+      char payload[320];
+      std::snprintf(
+          payload, sizeof(payload),
+          "{\"accepted\":false,\"result_code\":9,\"tick\":%d,"
+          "\"side\":%d,\"entity_id\":%d,"
+          "\"reason\":\"entity_side_or_kind_mismatch\"}",
+          tick, side, entity_category);
+      return env->NewStringUTF(payload);
+    }
+    std::memcpy(&character_card_id, raw + 0xAC, sizeof(character_card_id));
+    std::memcpy(&character_behavior, raw + 0x11C,
+                sizeof(character_behavior));
+    std::memcpy(&character_data, raw + 0x48, sizeof(character_data));
+    character = candidate;
+    break;
+  }
+  if (character == 0) {
+    dlclose(handle);
+    char payload[320];
+    std::snprintf(
+        payload, sizeof(payload),
+        "{\"accepted\":false,\"result_code\":9,\"tick\":%d,"
+        "\"side\":%d,\"entity_id\":%d,"
+        "\"reason\":\"entity_not_alive\"}",
+        tick, side, entity_category);
+    return env->NewStringUTF(payload);
+  }
+
+  auto identity_index = reinterpret_cast<BattleIdentityIndex>(
+      base + kBattleIdentityIndexRva);
+  auto player_at_index = reinterpret_cast<BattlePlayerAtIndex>(
+      base + kBattlePlayerAtIndexRva);
+  const int32_t player_index = identity_index(
+      reinterpret_cast<void*>(battle_logic), account_hi, account_lo);
+  void* player = player_index < 0
+      ? nullptr
+      : player_at_index(reinterpret_cast<void*>(battle_logic), player_index);
+  if (player == nullptr) {
+    dlclose(handle);
+    throw_state(env, "native ability player identity is unavailable");
+    return nullptr;
+  }
+
+  auto ability_slot_for_character =
+      reinterpret_cast<AbilitySlotForCharacter>(
+          base + kAbilitySlotForCharacterRva);
+  auto ability_component_at_slot = reinterpret_cast<AbilityComponentAtSlot>(
+      base + kAbilityComponentAtSlotRva);
+  const int32_t ability_slot = ability_slot_for_character(
+      player, reinterpret_cast<void*>(character));
+  void* ability_component = ability_slot <= 0
+      ? nullptr
+      : ability_component_at_slot(player, ability_slot);
+  int32_t state_before = -1, cooldown_before = -1;
+  int32_t charges_before = -1, pending_before = -1;
+  int32_t cached_cost_before = -1, native_mana_cost = -1;
+  if (character_data != 0 &&
+      memory.read(character_data + 0x710, &ability_data) &&
+      ability_data != 0) {
+    memory.read(ability_data + 0xB0, &native_mana_cost);
+  }
+  if (ability_component != nullptr) {
+    const uintptr_t component = reinterpret_cast<uintptr_t>(ability_component);
+    memory.read(component + 0x98, &state_before);
+    memory.read(component + 0x78, &cooldown_before);
+    memory.read(component + 0x80, &charges_before);
+    memory.read(component + 0x84, &pending_before);
+    memory.read(component + 0xB0, &cached_cost_before);
+  }
+  auto player_elixir = reinterpret_cast<PlayerElixir>(
+      base + kPlayerElixirRva);
+  const int32_t elixir_before = player_elixir(player);
+
+  auto native_alloc = reinterpret_cast<NativeAlloc>(base + kNativeAllocRva);
+  void* command = native_alloc(0x38);
+  if (command == nullptr) {
+    dlclose(handle);
+    throw_state(env, "libg could not allocate native ability command");
+    return nullptr;
+  }
+  auto construct = reinterpret_cast<AbilityCommandCtor>(
+      base + kAbilityCommandCtorRva);
+  auto execute = reinterpret_cast<AbilityCommandExecute>(
+      base + kAbilityCommandExecuteRva);
+  construct(command, reinterpret_cast<void*>(command_context),
+            reinterpret_cast<void*>(character));
+  *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x14) =
+      account_hi;
+  *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x18) =
+      account_lo;
+  constexpr int32_t kCommandExecutionFlags = 3;
+  const int32_t result_code = execute(
+      command, reinterpret_cast<void*>(battle), kCommandExecutionFlags, 0);
+
+  int32_t state_after = -1, cooldown_after = -1;
+  int32_t charges_after = -1, pending_after = -1;
+  int32_t cached_cost_after = -1;
+  if (ability_component != nullptr) {
+    const uintptr_t component = reinterpret_cast<uintptr_t>(ability_component);
+    memory.read(component + 0x98, &state_after);
+    memory.read(component + 0x78, &cooldown_after);
+    memory.read(component + 0x80, &charges_after);
+    memory.read(component + 0x84, &pending_after);
+    memory.read(component + 0xB0, &cached_cost_after);
+  }
+  const int32_t elixir_after = player_elixir(player);
+  auto** command_vtable = *reinterpret_cast<void***>(command);
+  reinterpret_cast<void (*)(void*)>(command_vtable[1])(command);
+
+  const char* reason = result_code == 0
+      ? "accepted"
+      : result_code == 0x3ED
+      ? "cooldown_active"
+      : result_code == 0x3F6
+      ? "no_charges"
+      : result_code == 0x41A
+      ? "insufficient_elixir"
+      : result_code == 9
+      ? "entity_unavailable"
+      : "native_rejected";
+  char payload[1400];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"accepted\":%s,\"result_code\":%d,\"tick\":%d,"
+      "\"side\":%d,\"entity_id\":%d,\"card_id\":%d,"
+      "\"behavior_state\":%d,\"ability_slot\":%d,"
+      "\"reason\":\"%s\",\"execution_flags\":%d,"
+      "\"native_mana_cost\":%d,"
+      "\"elixir_before\":%d,\"elixir_after\":%d,"
+      "\"ability_before\":{\"state_code\":%d,"
+      "\"cooldown_remaining_ms\":%d,\"charges_remaining\":%d,"
+      "\"pending_ms\":%d,\"cached_elixir_cost\":%d},"
+      "\"ability_after\":{\"state_code\":%d,"
+      "\"cooldown_remaining_ms\":%d,\"charges_remaining\":%d,"
+      "\"pending_ms\":%d,\"cached_elixir_cost\":%d},"
+      "\"command_type\":90,\"command_rva\":\"0x%llx\","
+      "\"execute_rva\":\"0x%llx\"}",
+      result_code == 0 ? "true" : "false", result_code, tick, side,
+      entity_category, character_card_id, character_behavior, ability_slot,
+      reason, kCommandExecutionFlags, native_mana_cost,
+      elixir_before, elixir_after,
+      state_before, cooldown_before, charges_before, pending_before,
+      cached_cost_before, state_after, cooldown_after, charges_after,
+      pending_after, cached_cost_after,
+      static_cast<unsigned long long>(kAbilityCommandCtorRva),
+      static_cast<unsigned long long>(kAbilityCommandExecuteRva));
   dlclose(handle);
   return env->NewStringUTF(payload);
 }
@@ -923,6 +1204,13 @@ static jstring observe_state_json(
     int32_t hp = 0;
     int32_t max_hp = 0;
     int32_t behavior = 0;
+    int32_t ability_slot = 0;
+    int32_t ability_state_code = -1;
+    int32_t ability_cooldown_remaining_ms = -1;
+    int32_t ability_charges_remaining = -1;
+    int32_t ability_pending_ms = -1;
+    int32_t ability_mana_cost = -1;
+    bool ability_available = false;
     int32_t pending_damage = -1;
     int32_t event_timer_ms = -1;
     int32_t target_previous_x = 0;
@@ -965,6 +1253,13 @@ static jstring observe_state_json(
   std::vector<ObservedEffect> observed_effects;
   observed.reserve(static_cast<size_t>(count));
   observed_effects.reserve(static_cast<size_t>(count));
+  auto observer_player_at_index = reinterpret_cast<BattlePlayerAtIndex>(
+      base + kBattlePlayerAtIndexRva);
+  auto observer_ability_slot = reinterpret_cast<AbilitySlotForCharacter>(
+      base + kAbilitySlotForCharacterRva);
+  auto observer_ability_component =
+      reinterpret_cast<AbilityComponentAtSlot>(
+          base + kAbilityComponentAtSlotRva);
   for (int32_t index = 0; index < count; ++index) {
     uint64_t entity = 0;
     unsigned char raw[0x128] = {};
@@ -1014,13 +1309,51 @@ static jstring observe_state_json(
           card_id, raw_i32(0x120), raw_i32(0x124)});
       continue;
     }
+    const int32_t card_table = card_id < 0 ? -1 : card_id / 1000000;
+    const bool supported_card_table =
+        card_id == -1 || card_table == 13 || card_table == 26 ||
+        card_table == 27 || card_table == 28 || card_table == 203;
     if (category < 5000000 || category >= 6000000 || kind < 10 ||
         kind > 20 || (side != 0 && side != 1) || x < 0 || x > 18000 ||
         y < 0 || y > 32000 || level < 1 || level > 17 ||
-        (card_id != -1 && (card_id < 20000000 || card_id >= 1000000000))) {
+        !supported_card_table) {
       continue;
     }
     int32_t hp = -1, max_hp = -1;
+    int32_t ability_slot = 0, ability_state_code = -1;
+    int32_t ability_cooldown_remaining_ms = -1;
+    int32_t ability_charges_remaining = -1, ability_pending_ms = -1;
+    int32_t ability_mana_cost = -1;
+    bool ability_available = false;
+    const uint64_t character_data = raw_u64(0x48);
+    uint64_t ability_data = 0;
+    unsigned char ability_enabled = 0;
+    if (character_data != 0 &&
+        memory.read(character_data + 0x710, &ability_data) &&
+        ability_data != 0 &&
+        memory.read(ability_data + 0xA8, &ability_enabled) &&
+        ability_enabled != 0) {
+      memory.read(ability_data + 0xB0, &ability_mana_cost);
+      void* ability_player = observer_player_at_index(
+          reinterpret_cast<void*>(hp_state), side);
+      if (ability_player != nullptr) {
+        ability_slot = observer_ability_slot(
+            ability_player, reinterpret_cast<void*>(entity));
+        void* ability_component = ability_slot <= 0
+            ? nullptr
+            : observer_ability_component(ability_player, ability_slot);
+        if (ability_component != nullptr) {
+          const uintptr_t component =
+              reinterpret_cast<uintptr_t>(ability_component);
+          memory.read(component + 0x98, &ability_state_code);
+          memory.read(
+              component + 0x78, &ability_cooldown_remaining_ms);
+          memory.read(component + 0x80, &ability_charges_remaining);
+          memory.read(component + 0x84, &ability_pending_ms);
+          ability_available = ability_state_code == 2;
+        }
+      }
+    }
     uint64_t components[3] = {};
     const uint64_t component_array = raw_u64(0x18);
     if (component_array != 0 &&
@@ -1094,7 +1427,10 @@ static jstring observe_state_json(
     }
     observed.push_back({
         entity, target, category, kind, side, x, y, x2, y2, card_id,
-        level, hp, max_hp, behavior, pending_damage, event_timer_ms,
+        level, hp, max_hp, behavior, ability_slot, ability_state_code,
+        ability_cooldown_remaining_ms, ability_charges_remaining,
+        ability_pending_ms, ability_mana_cost, ability_available,
+        pending_damage, event_timer_ms,
         target_previous_x, target_previous_y, attack_progress_ms,
         attack_load_timer_ms, direction_x, direction_y,
         collision_accumulator_x, collision_accumulator_y, collision_count,
@@ -1148,10 +1484,18 @@ static jstring observe_state_json(
           compact_row, sizeof(compact_row),
           "%s{\"category\":%d,\"side\":%d,\"x\":%d,\"y\":%d,"
           "\"card_id\":%d,\"hp\":%d,\"max_hp\":%d,"
-          "\"behavior_state\":%d}",
+          "\"behavior_state\":%d,\"ability_slot\":%d,"
+          "\"ability_state_code\":%d,\"ability_available\":%s,"
+          "\"ability_cooldown_remaining_ms\":%d,"
+          "\"ability_charges_remaining\":%d,\"ability_pending_ms\":%d,"
+          "\"ability_mana_cost\":%d}",
           emitted == 0 ? "" : ",", entity.category, entity.side,
           entity.x, entity.y, entity.card_id, entity.hp, entity.max_hp,
-          entity.behavior);
+          entity.behavior, entity.ability_slot, entity.ability_state_code,
+          entity.ability_available ? "true" : "false",
+          entity.ability_cooldown_remaining_ms,
+          entity.ability_charges_remaining, entity.ability_pending_ms,
+          entity.ability_mana_cost);
       result.append(compact_row);
       ++emitted;
       continue;
@@ -1180,14 +1524,18 @@ static jstring observe_state_json(
         attack_load_json, sizeof(attack_load_json),
         entity.attack_component_valid ? "%d" : "null",
         entity.attack_load_timer_ms);
-    char row[1536];
+    char row[1792];
     std::snprintf(
         row, sizeof(row),
         "%s{\"id\":\"0x%llx\",\"generation_key\":%d,"
         "\"creation_ordinal\":%d,\"category\":%d,\"kind\":%d,"
         "\"side\":%d,\"x\":%d,\"y\":%d,\"x2\":%d,\"y2\":%d,"
         "\"card_id\":%d,\"level\":%d,\"hp\":%d,\"max_hp\":%d,"
-        "\"behavior_state\":%d,\"pending_damage\":%s,"
+        "\"behavior_state\":%d,\"ability_slot\":%d,"
+        "\"ability_state_code\":%d,\"ability_available\":%s,"
+        "\"ability_cooldown_remaining_ms\":%d,"
+        "\"ability_charges_remaining\":%d,\"ability_pending_ms\":%d,"
+        "\"ability_mana_cost\":%d,\"pending_damage\":%s,"
         "\"event_timer_ms\":%s,\"target\":%s,"
         "\"target_previous_x\":%d,\"target_previous_y\":%d,"
         "\"attack_progress_ms\":%s,\"attack_load_timer_ms\":%s,"
@@ -1201,7 +1549,12 @@ static jstring observe_state_json(
         entity.category, entity.category - 5000000,
         entity.category, entity.kind, entity.side, entity.x, entity.y,
         entity.x2, entity.y2, entity.card_id, entity.level, entity.hp,
-        entity.max_hp, entity.behavior, pending_json, event_json, target_json,
+        entity.max_hp, entity.behavior, entity.ability_slot,
+        entity.ability_state_code,
+        entity.ability_available ? "true" : "false",
+        entity.ability_cooldown_remaining_ms,
+        entity.ability_charges_remaining, entity.ability_pending_ms,
+        entity.ability_mana_cost, pending_json, event_json, target_json,
         entity.target_previous_x, entity.target_previous_y,
         attack_progress_json, attack_load_json, entity.direction_x,
         entity.direction_y, entity.move_component_valid
@@ -1241,6 +1594,18 @@ static jstring observe_state_json(
              static_cast<uint64_t>(static_cast<uint32_t>(entity.hp)),
              static_cast<uint64_t>(static_cast<uint32_t>(entity.max_hp)),
              static_cast<uint64_t>(static_cast<uint32_t>(entity.behavior)),
+             static_cast<uint64_t>(static_cast<uint32_t>(entity.ability_slot)),
+             static_cast<uint64_t>(static_cast<uint32_t>(
+                 entity.ability_state_code)),
+             static_cast<uint64_t>(static_cast<uint32_t>(
+                 entity.ability_cooldown_remaining_ms)),
+             static_cast<uint64_t>(static_cast<uint32_t>(
+                 entity.ability_charges_remaining)),
+             static_cast<uint64_t>(static_cast<uint32_t>(
+                 entity.ability_pending_ms)),
+             static_cast<uint64_t>(static_cast<uint32_t>(
+                 entity.ability_mana_cost)),
+             static_cast<uint64_t>(entity.ability_available),
              static_cast<uint64_t>(static_cast<uint32_t>(entity.pending_damage)),
              static_cast<uint64_t>(static_cast<uint32_t>(entity.event_timer_ms)),
              static_cast<uint64_t>(static_cast<uint32_t>(entity.attack_progress_ms)),
@@ -1588,7 +1953,7 @@ static jstring observe_state_json(
         static_cast<unsigned long long>(state_hash));
     result.append(",\"state_hash\":");
     result.append(hash_json);
-    result.append(",\"state_hash_scope\":\"public-observe-v5\"");
+    result.append(",\"state_hash_scope\":\"public-observe-v6\"");
     result.append(",\"state_hash_certificate\":false");
   }
   result.append(",\"episode\":");
@@ -1837,7 +2202,7 @@ std::string terminal_trace_observation() {
   result += ",\"tick_after\":" + std::to_string(g_episode.tick);
   result += ",\"rng_algorithm\":\"libg_xorshift32_v150535029\"";
   result += ",\"rng_state\":null,\"state_hash\":\"unavailable\"";
-  result += ",\"state_hash_scope\":\"public-observe-v5\"";
+  result += ",\"state_hash_scope\":\"public-observe-v6\"";
   result += ",\"state_hash_certificate\":false,\"episode\":";
   result += episode_json();
   result.push_back('}');

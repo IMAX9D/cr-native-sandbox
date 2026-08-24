@@ -405,7 +405,7 @@ bootstrap replay 位于 `examples/eight-card-bootstrap.json`，包含：
 - 双方玩家、手牌、循环和圣水可读；
 - battle phase 4；
 - 状态 coherent；
-- `state_hash_scope == public-observe-v5`。
+- `state_hash_scope == public-observe-v6`。
 
 ## 12. JSON-line 外部协议
 
@@ -639,8 +639,8 @@ Python env 根据冻结 replay 的 deck 表把 deck index 扩展为 card ID、�
 
 ### 17.5 公开哈希
 
-`state_hash_scope = public-observe-v5`。哈希覆盖公开 tick、实体、玩家、路径、
-效果、RNG 等规范化字段，用于：
+`state_hash_scope = public-observe-v6`。哈希覆盖公开 tick、实体、技能槽/次数/
+冷却、玩家、路径、效果、RNG 等规范化字段，用于：
 
 - 同 seed 重置确定性；
 - 冷启动一致性；

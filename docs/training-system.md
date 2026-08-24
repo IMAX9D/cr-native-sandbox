@@ -6,9 +6,11 @@ The original x86_64 `libg.so` is the only battle-rule implementation. Python
 never predicts movement, targeting, collision, damage, card cycle, elixir, or
 deployment legality. It supplies actions and consumes native observations.
 
-The frozen game target is version `15.535.29`, standard 1v1, level 11 towers
-and these eight base cards: Knight, Archers, Giant, Skeletons, Musketeer, Hog
-Rider, Cannon, and Arrows. Evolution/elite/champion/hero variants are excluded.
+The frozen v0.1/v0.2 policy target is version `15.535.29`, standard 1v1,
+level 11 towers and these eight base cards: Knight, Archers, Giant, Skeletons,
+Musketeer, Hog Rider, Cannon, and Arrows. Evolution/champion/hero actions are
+excluded from those historical model heads only. The native runtime itself is
+now full-card/form capable; see `NATIVE_FULL_CARD_RUNTIME.zh-CN.md`.
 
 ## Runtime flow
 

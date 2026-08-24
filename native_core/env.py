@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 try:
+    from .card_catalog import catalog as live_card_catalog, observed_card
+except ImportError:  # direct ``python native_core/env.py`` consumers
+    from card_catalog import (  # type: ignore[no-redef]
+        catalog as live_card_catalog,
+        observed_card,
+    )
+
+try:
     from .client import (
         MAX_TRACE_RESPONSE_BYTES,
         MAX_TRACE_STEPS,
@@ -26,14 +34,24 @@ except ImportError:  # direct ``python native_core/env.py`` consumers
 
 
 CARD_NAMES = {
-    26000000: "Knight",
-    26000001: "Archers",
-    26000003: "Giant",
-    26000010: "Skeletons",
-    26000014: "Musketeer",
-    26000021: "Hog Rider",
-    27000000: "Cannon",
-    28000001: "Arrows",
+    card_id: str(value["display_name"])
+    for card_id, value in live_card_catalog().items()
+}
+
+ABILITY_STATE_NAMES = {
+    0: "unknown",
+    1: "absent",
+    2: "ready",
+    3: "on_cooldown",
+    4: "all_charges_consumed",
+    5: "limited_availability",
+    6: "disabled",
+    7: "not_enough_elixir",
+    8: "temporarily_unavailable",
+    9: "deploying",
+    10: "pending",
+    11: "casting",
+    12: "not_yet_available",
 }
 
 
@@ -155,6 +173,7 @@ class NativeRoyaleEnv:
             self.decks.append(
                 [
                     {"card_id": int(item["d"]), "level": int(item["l"]) + 1}
+                    | {"form_flags": int(item.get("el", 0))}
                     for item in spells
                 ]
             )
@@ -208,10 +227,32 @@ class NativeRoyaleEnv:
                         "deck_index": deck_index,
                         "card_id": card_id,
                         "level": card["level"],
+                        "form_flags": int(card.get("form_flags", 0)),
+                        "has_evolution": bool(int(card.get("form_flags", 0)) & 1),
+                        "has_hero": bool(int(card.get("form_flags", 0)) & 2),
                         "name": CARD_NAMES.get(card_id, str(card_id)),
                     }
                 )
             player["hand"] = hand
+        for entity in result.get("entities", []):
+            if isinstance(entity.get("category"), int):
+                # libg's 5,000,000-series generation key is stable for the
+                # life of an entity and is the public handle accepted by the
+                # native ability command. Raw process pointers stay private.
+                entity["entity_id"] = int(entity["category"])
+            if isinstance(entity.get("ability_state_code"), int):
+                entity["ability_state_name"] = ABILITY_STATE_NAMES.get(
+                    int(entity["ability_state_code"]), "unknown_native_state"
+                )
+            native_card_id = int(entity.get("card_id", -1))
+            if native_card_id < 0:
+                continue
+            identity = observed_card(native_card_id)
+            entity["native_card_id"] = native_card_id
+            entity.update(identity)
+            entity["name"] = CARD_NAMES.get(
+                int(identity["base_card_id"]), str(identity["form_name"])
+            )
         return result
 
     @staticmethod
@@ -237,6 +278,7 @@ class NativeRoyaleEnv:
             {
                 "op": "act",
                 "action": {
+                    "type": "play",
                     "side": side,
                     "deck_index": deck_index,
                     "x": x,
@@ -248,9 +290,26 @@ class NativeRoyaleEnv:
             }
         )["result"]
 
-    def joint_act(self, actions: list[Mapping[str, int]]) -> dict[str, Any]:
-        """Submit both decisions in one RPC and a fixed side-0/side-1 order."""
-        payload: list[dict[str, int | bool]] = []
+    def use_ability(self, *, side: int, entity_id: int) -> dict[str, Any]:
+        """Press the authoritative native ability button for a live entity."""
+        account_hi, account_lo = self.accounts[side]
+        return self._request(
+            {
+                "op": "ability",
+                "action": {
+                    "type": "ability",
+                    "side": side,
+                    "entity_id": int(entity_id),
+                    "account_hi": account_hi,
+                    "account_lo": account_lo,
+                },
+            }
+        )["result"]
+
+    def _joint_payload(
+        self, actions: list[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
         seen: set[int] = set()
         for value in actions:
             side = int(value["side"])
@@ -258,8 +317,18 @@ class NativeRoyaleEnv:
                 raise ValueError("joint actions require unique sides 0 and/or 1")
             seen.add(side)
             account_hi, account_lo = self.accounts[side]
-            payload.append(
-                {
+            action_type = str(value.get("type", "play"))
+            if action_type == "ability":
+                payload.append({
+                    "type": "ability",
+                    "side": side,
+                    "entity_id": int(value["entity_id"]),
+                    "account_hi": account_hi,
+                    "account_lo": account_lo,
+                })
+            elif action_type == "play":
+                payload.append({
+                    "type": "play",
                     "side": side,
                     "deck_index": int(value["deck_index"]),
                     "x": int(value["x"]),
@@ -267,33 +336,21 @@ class NativeRoyaleEnv:
                     "account_hi": account_hi,
                     "account_lo": account_lo,
                     "dry_run": False,
-                }
-            )
+                })
+            else:
+                raise ValueError(f"unknown native action type: {action_type}")
+        return payload
+
+    def joint_act(self, actions: list[Mapping[str, Any]]) -> dict[str, Any]:
+        """Submit both decisions in one RPC and a fixed side-0/side-1 order."""
+        payload = self._joint_payload(actions)
         return self._request({"op": "joint_act", "actions": payload})["result"]
 
     def joint_transition(
-        self, actions: list[Mapping[str, int]], *, steps: int = 1
+        self, actions: list[Mapping[str, Any]], *, steps: int = 1
     ) -> dict[str, Any]:
         """Joint action, native step and next observation in one loopback RPC."""
-        payload: list[dict[str, int | bool]] = []
-        seen: set[int] = set()
-        for value in actions:
-            side = int(value["side"])
-            if side not in (0, 1) or side in seen:
-                raise ValueError("joint actions require unique sides 0 and/or 1")
-            seen.add(side)
-            account_hi, account_lo = self.accounts[side]
-            payload.append(
-                {
-                    "side": side,
-                    "deck_index": int(value["deck_index"]),
-                    "x": int(value["x"]),
-                    "y": int(value["y"]),
-                    "account_hi": account_hi,
-                    "account_lo": account_lo,
-                    "dry_run": False,
-                }
-            )
+        payload = self._joint_payload(actions)
         result = self._request(
             {"op": "joint_transition", "actions": payload, "steps": steps}
         )["result"]
@@ -306,28 +363,10 @@ class NativeRoyaleEnv:
         return result
 
     def joint_training_transition(
-        self, actions: list[Mapping[str, int]], *, steps: int = 1
+        self, actions: list[Mapping[str, Any]], *, steps: int = 1
     ) -> dict[str, Any]:
         """One compact RPC for joint actions, one native Tick and next state."""
-        payload: list[dict[str, int | bool]] = []
-        seen: set[int] = set()
-        for value in actions:
-            side = int(value["side"])
-            if side not in (0, 1) or side in seen:
-                raise ValueError("joint actions require unique sides 0 and/or 1")
-            seen.add(side)
-            account_hi, account_lo = self.accounts[side]
-            payload.append(
-                {
-                    "side": side,
-                    "deck_index": int(value["deck_index"]),
-                    "x": int(value["x"]),
-                    "y": int(value["y"]),
-                    "account_hi": account_hi,
-                    "account_lo": account_lo,
-                    "dry_run": False,
-                }
-            )
+        payload = self._joint_payload(actions)
         raw = self._request(
             {
                 "op": "joint_training_transition_v1",
@@ -596,7 +635,7 @@ class NativeRoyaleEnv:
             or not isinstance(state.get("players"), list)
             or not isinstance(state.get("coherent"), bool)
             or not isinstance(state.get("state_hash"), str)
-            or state.get("state_hash_scope") != "public-observe-v5"
+            or state.get("state_hash_scope") != "public-observe-v6"
             or state.get("state_hash_certificate") is not False
         ):
             raise NativeHostError("step_trace observation contract mismatch")
