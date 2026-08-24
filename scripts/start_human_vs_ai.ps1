@@ -1,5 +1,5 @@
 param(
-    [string]$Checkpoint = "D:\AI_data\cr-native-core\selfplay-v0.1\runs\selfplay-v0.1-stage-a-20260823T141402Z\evaluations\candidates\P010.pt",
+    [string]$Checkpoint = "D:\AI_data\cr-native-core\selfplay-v0.2\runs\selfplay-v0.2-scratch-5m-20260824T023123Z\evaluations\candidates\P050.pt",
     [int]$BattleSeed = 20260824,
     [int]$PolicySeed = 20260824,
     [string]$Python = "D:\AI_data\runtime\venv\Scripts\python.exe",
@@ -13,7 +13,7 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Training Python runtime not found: $Python"
 }
 if (-not (Test-Path -LiteralPath $Checkpoint -PathType Leaf)) {
-    throw "P010 checkpoint not found: $Checkpoint"
+    throw "AI checkpoint not found: $Checkpoint"
 }
 
 & (Join-Path $PSScriptRoot "build_probe.ps1") | Out-Host
@@ -42,4 +42,4 @@ if ($Smoke) {
 $Pythonw = Join-Path (Split-Path -Parent $Python) "pythonw.exe"
 if (-not (Test-Path -LiteralPath $Pythonw -PathType Leaf)) { $Pythonw = $Python }
 Start-Process -FilePath $Pythonw -ArgumentList $Arguments -WorkingDirectory $ProjectRoot
-Write-Host "Human-vs-P010 GUI started. You are Blue; P010 is Red."
+Write-Host "Human-vs-P050 GUI started. You are Blue; P050 is Red."

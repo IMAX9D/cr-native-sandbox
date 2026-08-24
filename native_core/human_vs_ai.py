@@ -1,4 +1,4 @@
-"""One real-time human-vs-P010 match on the original native battle core."""
+"""One real-time human-vs-trained-policy match on the original native core."""
 
 from __future__ import annotations
 
@@ -20,7 +20,10 @@ import torch
 from .env import CARD_NAMES, NativeRoyaleEnv
 from .gui import CARD_COSTS, NativeCoreGui
 from .worker import HeadlessWorkerPool, WorkerConfig
+from selfplay_v2 import CHECKPOINT_KIND as V2_CHECKPOINT_KIND
+from selfplay_v2.model import ContinuousRatePolicyValueNet
 from training.evaluate import load_neural_policy
+from training.run_contract import state_dict_digest
 from training.schema import (
     ActionMaskCache,
     ObservationEncoder,
@@ -29,12 +32,50 @@ from training.schema import (
 
 
 DEFAULT_CHECKPOINT = Path(
-    r"D:\AI_data\cr-native-core\selfplay-v0.1\runs"
-    r"\selfplay-v0.1-stage-a-20260823T141402Z"
-    r"\evaluations\candidates\P010.pt"
+    r"D:\AI_data\cr-native-core\selfplay-v0.2\runs"
+    r"\selfplay-v0.2-scratch-5m-20260824T023123Z"
+    r"\evaluations\candidates\P050.pt"
 )
 DEFAULT_REPLAY = Path("examples/eight-card-bootstrap.json")
 SESSION_ROOT = Path(r"D:\AI_data\cr-native-core\human-vs-ai")
+
+
+def _load_policy(
+    checkpoint_path: Path,
+    *,
+    device: torch.device,
+    cuda_graph: bool,
+) -> tuple[Any, dict[str, Any]]:
+    """Load either the legacy v0.1 policy or continuous-rate v0.2."""
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    if checkpoint.get("kind") != V2_CHECKPOINT_KIND:
+        model, metadata = load_neural_policy(
+            checkpoint_path, device=device, cuda_graph=cuda_graph
+        )
+        metadata["policy_version"] = "v0.1"
+        return model, metadata
+    rate_contract = checkpoint.get("config", {}).get("rate_contract", {})
+    model = ContinuousRatePolicyValueNet(
+        lambda_max=float(rate_contract.get("lambda_max", 20.0)),
+        lambda_initial=float(rate_contract.get("lambda_initial", 0.3)),
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.enable_cuda_graph_inference(cuda_graph and device.type == "cuda")
+    model.eval()
+    digest = state_dict_digest(checkpoint["model"])
+    expected = checkpoint.get("current_model_digest")
+    if expected is not None and str(expected) != digest:
+        raise RuntimeError(f"checkpoint model digest mismatch: {checkpoint_path}")
+    return model, {
+        "kind": "checkpoint",
+        "policy_version": "v0.2",
+        "path": str(checkpoint_path.resolve()),
+        "native_ticks": int(checkpoint.get("native_ticks", 0)),
+        "iteration": int(checkpoint.get("iteration", 0)),
+        "model_digest": digest,
+    }
 
 
 class HumanVsAiGui(NativeCoreGui):
@@ -58,6 +99,8 @@ class HumanVsAiGui(NativeCoreGui):
         self.checkpoint = checkpoint.resolve()
         self.model = model
         self.model_meta = model_meta
+        self.policy_version = str(model_meta.get("policy_version", "v0.1"))
+        self.policy_label = "P050" if self.policy_version == "v0.2" else "P010"
         self.device = device
         self.policy_seed = int(policy_seed)
         self.autostart = autostart
@@ -82,7 +125,7 @@ class HumanVsAiGui(NativeCoreGui):
         super().__init__(root, env, replay)
         self.selected_side.set(self.HUMAN_SIDE)
         self.auto.set(False)
-        root.title("Clash Royale · 人类（蓝）vs P010（红）")
+        root.title(f"Clash Royale · 人类（蓝）vs {self.policy_label}（红）")
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._lock_debug_controls()
 
@@ -292,14 +335,26 @@ class HumanVsAiGui(NativeCoreGui):
         position_masks = self._canonical_positions(
             position_masks, self.AI_SIDE
         )
-        sample = self.model.sample(
+        tensors = (
             torch.from_numpy(grid).unsqueeze(0).to(self.device),
             torch.from_numpy(scalars).unsqueeze(0).to(self.device),
             torch.from_numpy(privileged).unsqueeze(0).to(self.device),
-            torch.from_numpy(card_mask).unsqueeze(0).to(self.device),
-            torch.from_numpy(position_masks).unsqueeze(0).to(self.device),
-            self.ai_hidden,
         )
+        if self.policy_version == "v0.2":
+            sample = self.model.sample_batch(
+                *tensors,
+                torch.from_numpy(card_mask[1:]).unsqueeze(0).to(self.device),
+                torch.from_numpy(position_masks).unsqueeze(0).to(self.device),
+                self.ai_hidden,
+                collect_position_diagnostics=False,
+            )[0]
+        else:
+            sample = self.model.sample(
+                *tensors,
+                torch.from_numpy(card_mask).unsqueeze(0).to(self.device),
+                torch.from_numpy(position_masks).unsqueeze(0).to(self.device),
+                self.ai_hidden,
+            )
         self.ai_hidden = sample.hidden
         self.ai_last_value = sample.value
         if sample.card == 0:
@@ -355,7 +410,7 @@ class HumanVsAiGui(NativeCoreGui):
                 self.unexpected_rejections += 1
         if ai_action is not None and self.AI_SIDE not in accepted:
             raise RuntimeError(
-                "P010 selected an action rejected by libg: "
+                f"{self.policy_label} selected an action rejected by libg: "
                 + json.dumps(results_by_side.get(self.AI_SIDE), ensure_ascii=False)
             )
         if human_action is not None and self.HUMAN_SIDE not in accepted:
@@ -431,7 +486,7 @@ class HumanVsAiGui(NativeCoreGui):
         )
         self.status.set(
             self.status.get()
-            + f"  |  你=蓝  P010=红"
+            + f"  |  你=蓝  {self.policy_label}=红"
             + f"  |  AI上次={self.ai_last_action} V={self.ai_last_value:+.3f}"
             + f"  |  待执行={queued}"
         )
@@ -463,7 +518,9 @@ class HumanVsAiGui(NativeCoreGui):
             return self.session_path
         SESSION_ROOT.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        target = SESSION_ROOT / f"human-vs-p010-{stamp}-{uuid.uuid4().hex[:8]}.json"
+        target = SESSION_ROOT / (
+            f"human-vs-{self.policy_label.lower()}-{stamp}-{uuid.uuid4().hex[:8]}.json"
+        )
         temporary = target.with_name(target.name + ".tmp")
         temporary.write_text(
             json.dumps(
@@ -485,7 +542,8 @@ class HumanVsAiGui(NativeCoreGui):
         episode = (self.state or {}).get("episode", {})
         winner = episode.get("winner")
         outcome = "平局" if winner is None else (
-            "你获胜" if int(winner) == self.HUMAN_SIDE else "P010 获胜"
+            "你获胜" if int(winner) == self.HUMAN_SIDE
+            else f"{self.policy_label} 获胜"
         )
         messagebox.showinfo(
             "人机对战结束",
@@ -537,9 +595,9 @@ def main() -> int:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
     if not args.checkpoint.is_file():
-        raise FileNotFoundError(f"P010 checkpoint not found: {args.checkpoint}")
+        raise FileNotFoundError(f"AI checkpoint not found: {args.checkpoint}")
     _seed_everything(args.policy_seed)
-    model, model_meta = load_neural_policy(
+    model, model_meta = _load_policy(
         args.checkpoint.resolve(),
         device=device,
         cuda_graph=device.type == "cuda",
