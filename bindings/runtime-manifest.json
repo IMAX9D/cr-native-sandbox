@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "kind": "libg_native_runtime_manifest_v1",
+  "game_version": "15.535.29",
+  "runtime_version": "150535029",
+  "abi": "x86_64",
+  "mode": "standard_1v1",
+  "frozen_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+  "note": "sizes and sha256 are null until scripts/freeze_runtime.ps1 records the locally obtained runtime. Only libg.so's hash is a hard frozen constant; every other entry is pinned by freeze_runtime.ps1 and re-verified by doctor.ps1.",
+  "apks": [
+    {"name": "base.apk", "size": null, "sha256": null},
+    {"name": "split_config.en.apk", "size": null, "sha256": null},
+    {"name": "split_config.hdpi.apk", "size": null, "sha256": null},
+    {"name": "split_config.x86_64.apk", "size": null, "sha256": null},
+    {"name": "split_install_time_asset_pack.apk", "size": null, "sha256": null}
+  ],
+  "native_libs": [
+    {"name": "libg.so", "size": null, "sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba"},
+    {"name": "libc++_shared.so", "size": null, "sha256": null},
+    {"name": "libfmod.so", "size": null, "sha256": null},
+    {"name": "libfmodstudio.so", "size": null, "sha256": null},
+    {"name": "libandroidx.graphics.path.so", "size": null, "sha256": null},
+    {"name": "libapp.so", "size": null, "sha256": null},
+    {"name": "libdatastore_shared_counter.so", "size": null, "sha256": null},
+    {"name": "libflutter.so", "size": null, "sha256": null},
+    {"name": "libimage_processing_util_jni.so", "size": null, "sha256": null},
+    {"name": "libQuagoTool.so", "size": null, "sha256": null},
+    {"name": "libscid_sdk.so", "size": null, "sha256": null},
+    {"name": "libsentry-android.so", "size": null, "sha256": null},
+    {"name": "libsentry.so", "size": null, "sha256": null},
+    {"name": "libsupercell_clashroyale.so", "size": null, "sha256": null}
+  ],
+  "assets": {
+    "extracted_directories": ["csv_client", "csv_logic"],
+    "expected_csv_files": 383,
+    "map_csv": [
+      "assets/locations/training_arena.csv",
+      "assets/tilemaps/tilemap.csv"
+    ]
+  }
+}

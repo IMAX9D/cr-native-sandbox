@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -23,23 +24,20 @@ from .client import request
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _path_from_env(name: str, fallback: str) -> Path:
-    return Path(os.environ.get(name, fallback))
+def _path_from_env(name: str) -> Path | None:
+    """Resolve a required path from the environment, with no personal fallback.
+
+    Returns ``None`` when the variable is unset; the CLI fails closed with a
+    clear message instead of silently using a developer-specific path.
+    """
+    value = os.environ.get(name)
+    return Path(value) if value else None
 
 
-DEFAULT_SDK = _path_from_env(
-    "CR_SANDBOX_ANDROID_SDK", r"D:\Codex\toolchains\android-sdk"
-)
-DEFAULT_JDK = _path_from_env(
-    "CR_SANDBOX_JDK", r"D:\Codex\toolchains\jdk-17.0.20.1+1"
-)
-DEFAULT_DATA = _path_from_env(
-    "CR_SANDBOX_DATA", r"D:\AI_data\cr-native-sandbox"
-)
-DEFAULT_APKS = _path_from_env(
-    "CR_SANDBOX_APKS",
-    r"D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks",
-)
+DEFAULT_SDK = _path_from_env("CR_SANDBOX_ANDROID_SDK")
+DEFAULT_JDK = _path_from_env("CR_SANDBOX_JDK")
+DEFAULT_DATA = _path_from_env("CR_SANDBOX_DATA")
+DEFAULT_APKS = _path_from_env("CR_SANDBOX_APKS")
 DEFAULT_AVD_NAMES = (
     "royale_worker_api31",
     "royale_worker_api31_b",
@@ -62,10 +60,10 @@ def _powershell() -> str:
 
 @dataclass(frozen=True)
 class WorkerConfig:
-    sdk_root: Path = DEFAULT_SDK
-    jdk_root: Path = DEFAULT_JDK
-    data_root: Path = DEFAULT_DATA
-    apk_root: Path = DEFAULT_APKS
+    sdk_root: Path | None = DEFAULT_SDK
+    jdk_root: Path | None = DEFAULT_JDK
+    data_root: Path | None = DEFAULT_DATA
+    apk_root: Path | None = DEFAULT_APKS
     avd_name: str = "royale_worker_api31"
     emulator_port: int = 5554
     service_base_port: int = 37031
@@ -86,10 +84,8 @@ class WorkerConfig:
         return f"emulator-{self.emulator_port}"
 
     @property
-    def avd_home(self) -> Path:
-        return _path_from_env(
-            "CR_SANDBOX_AVD_HOME", r"D:\AI_data\android\avd"
-        )
+    def avd_home(self) -> Path | None:
+        return _path_from_env("CR_SANDBOX_AVD_HOME")
 
     @property
     def logs(self) -> Path:
@@ -100,8 +96,10 @@ class HeadlessWorkerPool:
     def __init__(self, config: WorkerConfig = WorkerConfig()) -> None:
         self.config = config
 
-    def _require(self, *paths: Path) -> None:
-        missing = [str(path) for path in paths if not path.is_file()]
+    def _require(self, *paths: Path | None) -> None:
+        missing = [
+            str(path) for path in paths if path is None or not path.is_file()
+        ]
         if missing:
             raise WorkerError("missing worker input: " + ", ".join(missing))
 
@@ -499,6 +497,30 @@ def main() -> int:
     parser.add_argument("--transport", choices=("direct", "adb"), default="direct")
     parser.add_argument("--stop-vm", action="store_true")
     args = parser.parse_args()
+    undefined = [
+        name
+        for name, value in {
+            "CR_SANDBOX_ANDROID_SDK": args.sdk_root,
+            "CR_SANDBOX_JDK": args.jdk_root,
+            "CR_SANDBOX_DATA": args.data_root,
+            "CR_SANDBOX_APKS": args.apk_root,
+        }.items()
+        if value is None
+    ]
+    if not os.environ.get("CR_SANDBOX_AVD_HOME"):
+        undefined.append("CR_SANDBOX_AVD_HOME")
+    if undefined:
+        print(
+            "error: missing environment variable(s): " + ", ".join(undefined),
+            file=sys.stderr,
+        )
+        print(
+            "Copy runtime.env.example.ps1 to runtime.env.ps1, edit the paths "
+            "for this machine, and dot-source it (`. .\\runtime.env.ps1`) "
+            "before running the worker.",
+            file=sys.stderr,
+        )
+        return 2
     pool = HeadlessWorkerPool(WorkerConfig(
         sdk_root=args.sdk_root,
         jdk_root=args.jdk_root,

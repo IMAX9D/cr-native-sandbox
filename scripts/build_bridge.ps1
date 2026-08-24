@@ -1,5 +1,5 @@
 param(
-    [string]$NdkRoot = $(if ($env:CR_SANDBOX_NDK) { $env:CR_SANDBOX_NDK } else { "D:\Codex\toolchains\android-ndk-r27d" }),
+    [string]$NdkRoot = $(if ($env:CR_SANDBOX_NDK) { $env:CR_SANDBOX_NDK } else { throw "Missing CR_SANDBOX_NDK; dot-source runtime.env.ps1 first" }),
     [int]$ApiLevel = 23
 )
 

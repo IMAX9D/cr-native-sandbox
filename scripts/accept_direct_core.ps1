@@ -2,9 +2,12 @@ param(
     [ValidateRange(1, 100)]
     [int]$Runs = 10,
     [string]$ExpectedHash = "96598dc9028e1802",
-    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "acceptance-direct-core" } else { "D:\AI_data\cr-native-sandbox\acceptance-direct-core" })
+    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "acceptance-direct-core" } else { throw "Missing CR_SANDBOX_DATA; dot-source runtime.env.ps1 first" })
 )
 
+# Requires an already-booted, rootable AVD with the matching package installed.
+# Use scripts\smoke.ps1 as the unified entry; it boots the AVD, installs the
+# package and then runs this acceptance pass.
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $ExpectedTowerHp = @(4824, 3052, 3052, 4824, 3052, 3052)

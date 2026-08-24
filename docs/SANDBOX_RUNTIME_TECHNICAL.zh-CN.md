@@ -74,8 +74,9 @@
 | 路径 | 作用 | 写入策略 |
 | --- | --- | --- |
 | 当前 Git 仓库 | 宿主、JNI、Python API 和文档 | 当前工程可写 |
-| `D:\Codex\E\AI ClashRoyale` | 冻结 APK、原生库和旧工程参考 | 只读来源 |
-| `D:\Deepseek\cr_re` | 静态逆向、数据表和证据 | 只读来源 |
+| `CR_SANDBOX_APKS` | 冻结 split APK 集合（5 个） | 只读来源 |
+| `CR_SANDBOX_RUNTIME_DIR` | 冻结 x86_64 原生库（14 个 `.so`） | 只读来源 |
+| `CR_SANDBOX_ASSETS` | 解包后的 csv_client/csv_logic 与地图 CSV | 只读来源 |
 | `CR_SANDBOX_DATA` | 证书、日志和运行时缓存 | 运行时可写 |
 
 主要外部输入：
@@ -316,11 +317,10 @@ Replay 模板：
 生成任意牌组：
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  scripts\build_native_replay.py `
+python scripts\build_native_replay.py `
   --deck0 "Knight@evolution,Berserker@hero,Archer,Giant,Skeletons,Musketeer,HogRider,Cannon" `
   --deck1 "Knight,Archer,Giant,Skeletons,Musketeer,HogRider,Cannon,Arrows" `
-  --output D:\AI_data\cr-native-sandbox\sandbox-replay.json
+  --output "$env:CR_SANDBOX_DATA\sandbox-replay.json"
 ```
 
 ## 14. 觉醒、英雄与“精英”语义
@@ -394,7 +394,7 @@ from native_core.env import NativeRoyaleEnv
 
 with NativeRoyaleEnv(port=37031) as env:
     state = env.reset(
-        Path(r"D:\AI_data\cr-native-sandbox\sandbox-replay.json"),
+        Path("sandbox-replay.json"),
         warmup_steps=100,
     )
     grid = env.deployment_grid(side=0, deck_index=2, adjusted=True)
@@ -607,17 +607,15 @@ episode
 .\scripts\start_direct_service.ps1 `
   -Port 37031 `
   -Slot 0 `
-  -BootstrapReplayJson D:\AI_data\cr-native-sandbox\sandbox-replay.json
+  -BootstrapReplayJson "$env:CR_SANDBOX_DATA\sandbox-replay.json"
 ```
 
 检查：
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  -m native_core.client --port 37031 ping
+python -m native_core.client --port 37031 ping
 
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  -m native_core.client --port 37031 observe
+python -m native_core.client --port 37031 observe
 ```
 
 停止：
@@ -646,8 +644,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe `
 ### 24.2 全部标准基础卡
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  scripts\accept_full_card_catalog.py --port 37031
+python scripts\accept_full_card_catalog.py --port 37031
 ```
 
 当前证书：122/122。
@@ -655,8 +652,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe `
 ### 24.3 觉醒、英雄与主动技能
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  scripts\accept_native_card_forms.py --port 37031
+python scripts\accept_native_card_forms.py --port 37031
 ```
 
 当前证书：41/41 觉醒形态、16/16 英雄形态；狂战士英雄与弓箭女皇主动技能
@@ -665,8 +661,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe `
 ### 24.4 时间、圣水与拼血
 
 ```powershell
-D:\AI_data\runtime\venv\Scripts\python.exe `
-  scripts\accept_match_rules.py --port 37032
+python scripts\accept_match_rules.py --port 37032
 ```
 
 验证 ×1/×2/×3、完全同血平局、非同血 HP drain 胜者和终局后 reset。
@@ -674,10 +669,10 @@ D:\AI_data\runtime\venv\Scripts\python.exe `
 证书位置：
 
 ```text
-D:\AI_data\cr-native-sandbox\acceptance-direct-core\
-D:\AI_data\cr-native-sandbox\full-card-acceptance.json
-D:\AI_data\cr-native-sandbox\card-form-acceptance.json
-D:\AI_data\cr-native-sandbox\acceptance-match-rules.json
+$env:CR_SANDBOX_DATA\acceptance-direct-core\
+$env:CR_SANDBOX_DATA\full-card-acceptance.json
+$env:CR_SANDBOX_DATA\card-form-acceptance.json
+$env:CR_SANDBOX_DATA\acceptance-match-rules.json
 ```
 
 ## 25. Fail-closed 条件

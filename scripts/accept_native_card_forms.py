@@ -341,13 +341,16 @@ def all_evolution_forms(env: NativeRoyaleEnv) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=37031)
-    parser.add_argument(
-        "--output", type=Path,
-        default=Path(os.environ.get(
-            "CR_SANDBOX_DATA", r"D:\AI_data\cr-native-sandbox"
-        )) / "card-form-acceptance.json",
-    )
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.output is None:
+        data_root = os.environ.get("CR_SANDBOX_DATA")
+        if not data_root:
+            parser.error(
+                "--output is required when CR_SANDBOX_DATA is not set; "
+                "dot-source runtime.env.ps1 or pass --output"
+            )
+        args.output = Path(data_root) / "card-form-acceptance.json"
     with NativeRoyaleEnv(port=args.port) as env:
         result = {
             "schema_version": 1,

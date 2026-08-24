@@ -19,13 +19,16 @@ from native_core.env import NativeRoyaleEnv
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=37032)
-    parser.add_argument(
-        "--output", type=Path,
-        default=Path(os.environ.get(
-            "CR_SANDBOX_DATA", r"D:\AI_data\cr-native-sandbox"
-        )) / "acceptance-match-rules.json",
-    )
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.output is None:
+        data_root = os.environ.get("CR_SANDBOX_DATA")
+        if not data_root:
+            parser.error(
+                "--output is required when CR_SANDBOX_DATA is not set; "
+                "dot-source runtime.env.ps1 or pass --output"
+            )
+        args.output = Path(data_root) / "acceptance-match-rules.json"
     template = json.loads(
         (PROJECT_ROOT / "examples" / "eight-card-bootstrap.json").read_text(
             encoding="utf-8-sig"

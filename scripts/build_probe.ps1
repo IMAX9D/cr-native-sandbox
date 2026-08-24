@@ -1,7 +1,7 @@
 param(
-    [string]$JdkRoot = $(if ($env:CR_SANDBOX_JDK) { $env:CR_SANDBOX_JDK } else { "D:\Codex\toolchains\jdk-17.0.20.1+1" }),
-    [string]$AndroidCommandLineTools = $(if ($env:CR_SANDBOX_ANDROID_TOOLS) { $env:CR_SANDBOX_ANDROID_TOOLS } else { "D:\Codex\toolchains\android-sdk\cmdline-tools\latest" }),
-    [string]$AndroidJar = $(if ($env:CR_SANDBOX_ANDROID_JAR) { $env:CR_SANDBOX_ANDROID_JAR } else { "D:\Codex\toolchains\android-sdk\platforms\android-35\android.jar" })
+    [string]$JdkRoot = $(if ($env:CR_SANDBOX_JDK) { $env:CR_SANDBOX_JDK } else { throw "Missing CR_SANDBOX_JDK; dot-source runtime.env.ps1 first" }),
+    [string]$AndroidCommandLineTools = $(if ($env:CR_SANDBOX_ANDROID_TOOLS) { $env:CR_SANDBOX_ANDROID_TOOLS } else { throw "Missing CR_SANDBOX_ANDROID_TOOLS; dot-source runtime.env.ps1 first" }),
+    [string]$AndroidJar = $(if ($env:CR_SANDBOX_ANDROID_JAR) { $env:CR_SANDBOX_ANDROID_JAR } else { throw "Missing CR_SANDBOX_ANDROID_JAR; dot-source runtime.env.ps1 first" })
 )
 
 $ErrorActionPreference = "Stop"

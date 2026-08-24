@@ -1,16 +1,16 @@
 param(
     [ValidateSet("probe-baseline", "probe-detach-surface", "probe-null-surface", "probe-no-surface", "probe-create-only", "probe-minimal", "probe-direct")]
     [string]$Profile = "probe-baseline",
-    [string]$Adb = $(if ($env:CR_SANDBOX_ADB) { $env:CR_SANDBOX_ADB } else { "D:\Codex\toolchains\android-sdk\platform-tools\adb.exe" }),
+    [string]$Adb = $(if ($env:CR_SANDBOX_ADB) { $env:CR_SANDBOX_ADB } else { throw "Missing CR_SANDBOX_ADB; dot-source runtime.env.ps1 first" }),
     [string]$Serial = "emulator-5554",
-    [string]$RuntimeDirectory = $(if ($env:CR_SANDBOX_RUNTIME_DIR) { $env:CR_SANDBOX_RUNTIME_DIR } else { "D:\Codex\E\AI ClashRoyale\native_host\build\runtime-x86_64" }),
+    [string]$RuntimeDirectory = $(if ($env:CR_SANDBOX_RUNTIME_DIR) { $env:CR_SANDBOX_RUNTIME_DIR } else { throw "Missing CR_SANDBOX_RUNTIME_DIR; dot-source runtime.env.ps1 first" }),
     [string]$Bridge = "",
-    [string]$BaseApk = $(if ($env:CR_SANDBOX_BASE_APK) { $env:CR_SANDBOX_BASE_APK } else { "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\base.apk" }),
+    [string]$BaseApk = $(if ($env:CR_SANDBOX_BASE_APK) { $env:CR_SANDBOX_BASE_APK } else { throw "Missing CR_SANDBOX_BASE_APK; dot-source runtime.env.ps1 first" }),
     [string]$ReplayJson = "",
-    [string]$AssetDirectory = $(if ($env:CR_SANDBOX_ASSETS) { $env:CR_SANDBOX_ASSETS } else { "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\extracted\assets" }),
-    [string]$AssetPackApk = $(if ($env:CR_SANDBOX_ASSET_PACK_APK) { $env:CR_SANDBOX_ASSET_PACK_APK } else { "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\split_install_time_asset_pack.apk" }),
+    [string]$AssetDirectory = $(if ($env:CR_SANDBOX_ASSETS) { $env:CR_SANDBOX_ASSETS } else { throw "Missing CR_SANDBOX_ASSETS; dot-source runtime.env.ps1 first" }),
+    [string]$AssetPackApk = $(if ($env:CR_SANDBOX_ASSET_PACK_APK) { $env:CR_SANDBOX_ASSET_PACK_APK } else { throw "Missing CR_SANDBOX_ASSET_PACK_APK; dot-source runtime.env.ps1 first" }),
     [string]$RemoteRoot = "/data/local/tmp/cr-native-sandbox-probe",
-    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "probe" } else { "D:\AI_data\cr-native-sandbox\probe" }),
+    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "probe" } else { throw "Missing CR_SANDBOX_DATA; dot-source runtime.env.ps1 first" }),
     [switch]$Quiet
 )
 

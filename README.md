@@ -43,6 +43,47 @@ This repository does not distribute Supercell binaries or game assets.
 | `libg.so` SHA-256 | `fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba` |
 | Observation scope | `public-observe-v6` |
 
+The complete runtime is pinned in
+[`bindings/runtime-manifest.json`](bindings/runtime-manifest.json): 5 split APKs
+and 14 native libraries, each with filename, byte size and SHA-256.
+
+Required APKs (5):
+
+```text
+base.apk
+split_config.en.apk
+split_config.hdpi.apk
+split_config.x86_64.apk
+split_install_time_asset_pack.apk
+```
+
+Required native libraries (14), from `split_config.x86_64.apk/lib/x86_64/`:
+
+```text
+libg.so
+libc++_shared.so
+libfmod.so
+libfmodstudio.so
+libandroidx.graphics.path.so
+libapp.so
+libdatastore_shared_counter.so
+libflutter.so
+libimage_processing_util_jni.so
+libQuagoTool.so
+libscid_sdk.so
+libsentry-android.so
+libsentry.so
+libsupercell_clashroyale.so
+```
+
+The asset pack must also contain `assets/locations/training_arena.csv` and
+`assets/tilemaps/tilemap.csv`, plus the `csv_client`/`csv_logic` tables
+(383 CSV files).
+
+`libg.so`'s hash is a hard frozen constant; the other entries are recorded once
+by `scripts\freeze_runtime.ps1` from the locally obtained runtime and
+re-verified by `scripts\doctor.ps1`.
+
 The JNI bindings are version-specific. A different library hash or
 `JNI_OnLoad` RVA must fail closed.
 
@@ -94,21 +135,48 @@ There is intentionally no GUI package or GUI launcher.
 
 ## Requirements
 
-- Windows 10/11 x64 with hardware virtualization.
-- Python 3.11+.
-- PowerShell 5.1+ or PowerShell 7.
-- JDK 17.
-- Android SDK with:
-  - platform-tools / ADB;
-  - emulator;
-  - Android platform 35 for compilation;
-  - command-line tools with D8/R8.
-- Android NDK r27d.
-- A pre-provisioned Android 31 x86_64 AVD.
-- A complete, legally obtained runtime matching the frozen hash.
+Verified toolchain baseline (frozen compatibility matrix):
 
-The default AVD name is `royale_worker_api31`. You may override it from the
-worker CLI.
+| Component | Version |
+| --- | --- |
+| Windows | 10/11 x64, hardware virtualization (VT-x/AMD-V) |
+| PowerShell | 5.1+ or PowerShell 7 |
+| Python | ≥ 3.11 |
+| JDK | 17.0.20.1 (Temurin/Adoptium) |
+| Android Emulator | 37.1.11 |
+| Platform-Tools / ADB | 37.0.1 |
+| Android command-line tools | `latest` (D8/R8 in `lib\r8.jar`) |
+| Android Platform (compile) | `platforms;android-35` rev 2 |
+| Build-Tools | 35.0.0 |
+| NDK | 27.3.13750724 / r27d |
+| System image | `system-images;android-31;default;x86_64` rev 3 |
+| AVD device | `pixel_2`, 4 vCPU, 4 GB RAM, 10 GB data partition |
+
+The system image must be the **AOSP `default`** image, not the Google Play
+image: the host requires a rootable image (`adb root`). The default AVD name is
+`royale_worker_api31`.
+
+`scripts\bootstrap.ps1` installs the SDK packages and creates the AVD, so you
+only need to install JDK 17 and Python 3.11+ yourself.
+
+### Environment prerequisites
+
+- **PowerShell Execution Policy.** The scripts invoke themselves with
+  `-ExecutionPolicy Bypass`, so a `Restricted` policy does not block them. If
+  you prefer, run once:
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+- **Virtualization / WHPX.** Enable "Windows Hypervisor Platform" (WHPX) or
+  Hyper-V so the emulator gets hardware acceleration. Without it the emulator
+  falls back to software and boot is impractically slow. Verify in
+  `OptionalFeatures.exe` or `Get-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`.
+- **Ports.** The emulator uses `5554`/`5555`; the sandbox service uses
+  `37031`+ (one per slot) and direct transport `38031`+. Free these or override
+  the ports before starting.
+- **Disk space.** Plan ~30 GB free: Android SDK + system image (~10 GB), the AVD
+  data partition (10 GB) and the extracted runtime.
+- **Windows Firewall.** The service binds loopback only; do not expose the
+  service port publicly. If the firewall prompts on first emulator launch,
+  allow `emulator.exe` / `qemu-system-x86_64.exe` on private networks.
 
 ## Install the Python package
 
@@ -120,6 +188,42 @@ python -m pip install -e .
 ```
 
 The runtime API itself has no third-party Python dependency.
+
+## One-shot deployment
+
+From a clean Windows machine, after installing JDK 17 and Python 3.11+:
+
+```powershell
+git clone https://github.com/IMAX9D/cr-native-sandbox
+cd cr-native-sandbox
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
+
+Copy-Item runtime.env.example.ps1 runtime.env.ps1
+# Edit runtime.env.ps1: JDK path and drop your legally obtained APKs into the
+# runtime\apks\ directory (see "Configure local paths" below).
+. .\runtime.env.ps1
+
+.\scripts\bootstrap.ps1   # SDK packages + rootable AVD + extract & freeze runtime
+.\scripts\doctor.ps1      # preflight all dependencies
+.\scripts\smoke.ps1       # build → start → Tick 0→100 → six towers → hash → stop
+```
+
+Expected smoke output:
+
+```text
+PASS toolchain
+PASS runtime hashes
+PASS AVD root/access
+PASS package versionCode=150535029
+PASS no-Surface host
+PASS six towers
+PASS tick 0 -> 100
+PASS public-observe-v6
+PASS hash 96598dc9028e1802
+```
 
 ## Configure local paths
 
@@ -136,11 +240,13 @@ Required variables:
 | --- | --- |
 | `CR_SANDBOX_ANDROID_SDK` | Android SDK root |
 | `CR_SANDBOX_ADB` | `adb.exe` |
-| `CR_SANDBOX_ANDROID_TOOLS` | Android command-line tools root |
-| `CR_SANDBOX_ANDROID_JAR` | compilation `android.jar` |
+| `CR_SANDBOX_ANDROID_TOOLS` | Android command-line tools root (`cmdline-tools\latest`) |
+| `CR_SANDBOX_ANDROID_JAR` | compilation `android.jar` (`platforms\android-35`) |
 | `CR_SANDBOX_NDK` | Android NDK r27d root |
 | `CR_SANDBOX_JDK` | JDK 17 root |
 | `CR_SANDBOX_AVD_HOME` | directory containing the provisioned AVD |
+| `CR_SANDBOX_AVD_NAME` | AVD name (default `royale_worker_api31`) |
+| `CR_SANDBOX_SYSTEM_IMAGE` | `system-images;android-31;default;x86_64` |
 | `CR_SANDBOX_APKS` | directory containing the complete split APK set |
 | `CR_SANDBOX_RUNTIME_DIR` | directory containing `libg.so` and peer `.so` files |
 | `CR_SANDBOX_BASE_APK` | matching `base.apk` |
@@ -149,6 +255,30 @@ Required variables:
 | `CR_SANDBOX_DATA` | writable logs/certificates/cache directory |
 
 `runtime.env.ps1` is ignored by Git.
+
+Expected runtime layout (the default in `runtime.env.example.ps1`):
+
+```text
+runtime/
+├─ apks/
+│  ├─ base.apk
+│  ├─ split_config.en.apk
+│  ├─ split_config.hdpi.apk
+│  ├─ split_config.x86_64.apk
+│  └─ split_install_time_asset_pack.apk
+├─ x86_64-libs/
+│  ├─ libg.so
+│  ├─ libc++_shared.so
+│  ├─ libfmod.so
+│  ├─ libfmodstudio.so
+│  └─ …共 14 个 .so
+└─ extracted-assets/
+   ├─ csv_client/
+   └─ csv_logic/
+```
+
+`scripts\prepare_runtime.ps1` populates `x86_64-libs\` and `extracted-assets\`
+from the APK set; `scripts\freeze_runtime.ps1` then records the manifest.
 
 ## Build
 
@@ -295,6 +425,13 @@ for schemas, limits, state fields and fail-closed conditions.
 
 ## Validation
 
+One-shot smoke and preflight:
+
+```powershell
+.\scripts\doctor.ps1
+.\scripts\smoke.ps1
+```
+
 Runtime-independent tests:
 
 ```powershell
@@ -329,6 +466,8 @@ Strict ten-process no-Surface cold-start certificate:
 
 - [Sandbox runtime architecture](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
 - [Full-card, evolution, hero and ability interface](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+- [JSON-line API protocol](docs/API.md)
+- [Runtime manifest](bindings/runtime-manifest.json)
 - [Android lifecycle host](android_probe/README.md)
 
 ## License and trademarks

@@ -19,10 +19,10 @@
 | 英雄主动技能形态 | 16 | 通用原生技能命令已用狂战士英雄闭环 |
 
 基础卡证书：
-`D:\AI_data\cr-native-sandbox\full-card-acceptance.json`。
+`$env:CR_SANDBOX_DATA\full-card-acceptance.json`。
 
 形态/技能证书：
-`D:\AI_data\cr-native-sandbox\card-form-acceptance.json`。
+`$env:CR_SANDBOX_DATA\card-form-acceptance.json`。
 
 这表示全卡 Runtime 输入、原生形态解析和主动技能按钮已经打通。覆盖范围只
 针对本文冻结的游戏版本和标准 1v1 Runtime。
@@ -68,7 +68,7 @@
 python scripts/build_native_replay.py `
   --deck0 "Knight@evolution,Berserker@hero,Archer,Giant,Skeletons,Musketeer,HogRider,Cannon" `
   --deck1 "Knight,Archer,Giant,Skeletons,Musketeer,HogRider,Cannon,Arrows" `
-  --output D:\AI_data\cr-native-sandbox\full-form-replay.json
+  --output "$env:CR_SANDBOX_DATA\full-form-replay.json"
 ```
 
 Python 也可直接使用 `native_core.decks.build_replay()`。

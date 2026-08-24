@@ -20,11 +20,6 @@ from native_core.env import NativeRoyaleEnv
 
 
 DEFAULT_REPLAY = PROJECT_ROOT / "examples" / "eight-card-bootstrap.json"
-DEFAULT_OUTPUT = Path(
-    os.environ.get(
-        "CR_SANDBOX_DATA", r"D:\AI_data\cr-native-sandbox"
-    )
-) / "full-card-acceptance.json"
 SAFE_FILLERS = (
     26000000, 26000001, 26000002, 26000010,
     26000013, 26000030, 26000031, 28000008,
@@ -79,8 +74,16 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=37031)
     parser.add_argument("--replay", type=Path, default=DEFAULT_REPLAY)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.output is None:
+        data_root = os.environ.get("CR_SANDBOX_DATA")
+        if not data_root:
+            parser.error(
+                "--output is required when CR_SANDBOX_DATA is not set; "
+                "dot-source runtime.env.ps1 or pass --output"
+            )
+        args.output = Path(data_root) / "full-card-acceptance.json"
     template = json.loads(args.replay.read_text(encoding="utf-8-sig"))
     opponent = list(SAFE_FILLERS)
     records: list[dict[str, Any]] = []
