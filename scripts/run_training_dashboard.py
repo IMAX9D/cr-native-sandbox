@@ -54,10 +54,18 @@ class DashboardState:
         run_root: Path,
         output_root: Path,
         target_native_ticks: int,
+        checkpoint_kind: str = CHECKPOINT_KIND,
+        display_title: str = "Self-Play v0.1 · P010 → P020",
+        display_subtitle: str = (
+            "冻结原生20Hz · 2 AVD / 8 Worker · Recurrent PPO · 塔血势函数"
+        ),
     ) -> None:
         self.run_root = run_root
         self.output_root = output_root
         self.target_native_ticks = target_native_ticks
+        self.checkpoint_kind = checkpoint_kind
+        self.display_title = display_title
+        self.display_subtitle = display_subtitle
         self.events_path = run_root / "logs" / "events.jsonl"
         self.lock = threading.RLock()
         self.phase = "initializing"
@@ -85,8 +93,10 @@ class DashboardState:
 
     def _load_checkpoint(self) -> None:
         path = self.run_root / "checkpoints" / "latest.pt"
+        if not path.is_file():
+            return
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-        if checkpoint.get("kind") != CHECKPOINT_KIND:
+        if checkpoint.get("kind") != self.checkpoint_kind:
             raise RuntimeError("latest checkpoint contract mismatch")
         self.native_ticks = int(checkpoint["native_ticks"])
         self.episodes = int(checkpoint["completed_episodes"])
@@ -229,6 +239,8 @@ class DashboardState:
                 "schema_version": 1,
                 "kind": "selfplay_training_dashboard_state",
                 "run_id": self.run_root.name,
+                "display_title": self.display_title,
+                "display_subtitle": self.display_subtitle,
                 "run_root": str(self.run_root),
                 "output_root": str(self.output_root),
                 "status": self.status,

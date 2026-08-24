@@ -36,7 +36,7 @@ class TrainingDashboardTests(unittest.TestCase):
     def test_serves_dashboard_and_json_without_cache(self):
         with urlopen(self.base + "/", timeout=2) as response:
             html = response.read().decode("utf-8")
-            self.assertIn("Self-Play v0.1", html)
+            self.assertIn('id="pageTitle"', html)
             self.assertEqual(response.headers["Cache-Control"], "no-store")
         with urlopen(self.base + "/api/state", timeout=2) as response:
             state = json.loads(response.read())
