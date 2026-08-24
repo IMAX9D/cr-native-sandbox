@@ -1,5 +1,9 @@
 # 原生全卡 Runtime、形态与技能接口
 
+> 本文是
+> [`SANDBOX_RUNTIME_TECHNICAL.zh-CN.md`](SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+> 的全卡/形态/技能附录。
+
 ## 1. 结论
 
 `CR-Native-Core` 的原生宿主已经不再受固定八卡限制。当前冻结版本
@@ -20,9 +24,8 @@
 形态/技能证书：
 `D:\AI_data\cr-native-core\card-form-acceptance.json`。
 
-这表示“全卡 Runtime 输入、原生形态解析、主动技能按钮”已经打通；不表示
-旧的固定八卡 PPO 网络自动变成了全卡模型。旧模型的 Card Head、Embedding 和
-统计口径仍是冻结实验，需要另开全卡训练版本。
+这表示全卡 Runtime 输入、原生形态解析和主动技能按钮已经打通。覆盖范围只
+针对本文冻结的游戏版本和标准 1v1 Runtime。
 
 ## 2. 全卡目录
 
@@ -105,8 +108,8 @@ Mega Minion、Elite Archer、Berserker、Tombstone、Barbarian Barrel。
 基础骑士     基础骑士     觉醒骑士
 ```
 
-因此训练动作空间不应给觉醒额外增加 `ABILITY` 按钮；模型只需看见当前手牌
-的觉醒状态，并正常执行 `PLAY(card, position)`。
+因此外部动作接口不应给觉醒额外增加 `ABILITY` 按钮；调用方只需读取当前
+手牌的觉醒状态，并正常执行 `PLAY(card, position)`。
 
 ### 4.3 精英等级/“精英化”
 
@@ -149,7 +152,7 @@ env.joint_training_transition([
 
 ## 6. 技能观测
 
-完整观测和紧凑训练观测都输出：
+完整观测和紧凑兼容观测都输出：
 
 ```text
 entity_id
@@ -168,8 +171,9 @@ ability_mana_cost
 state_hash_scope = public-observe-v6
 ```
 
-模型应优先用 `ability_available` 做动作 Mask，同时保留原生 `result_code` 作为
-fail-closed 防线，不能在 Python 侧自行推测可用性后绕过原生命令。
+调用方应优先用 `ability_available` 做按钮可用性提示，同时保留原生
+`result_code` 作为 fail-closed 防线，不能在 Python 侧自行推测可用性后绕过
+原生命令。
 
 `ability_state_code` 直接对应原生按钮状态：0 unknown、1 absent、2 ready、
 3 cooldown、4 charges consumed、5 limited、6 disabled、7 not enough elixir、
@@ -214,15 +218,15 @@ python -m unittest discover -s tests
 当前结果：16/16 英雄形态、41/41 觉醒形态、122/122 标准基础卡、37/37
 单元测试全部通过。
 
-## 8. 后续训练边界
+## 8. Runtime 边界
 
-Runtime 层下一步不应再为每张卡写 Python 战斗规则。全卡训练版本需要做的是：
+当前证书证明的是全卡选择/形态解析和通用技能命令，不是所有组合场景的穷举。
+仍需持续扩充的纯沙盒证据包括：
 
-1. 将固定八卡 Card ID 编码改为目录驱动的全卡 Embedding；
-2. Observation 中加入当前手牌形态、循环进度和技能状态；
-3. 动作空间扩展为 `WAIT / PLAY / ABILITY`，其中位置只在 `PLAY` 时参与；
-4. 用原生 Mask 和 `0x5A` 命令做 fail-closed 差分；
-5. 新建模型、优化器、Checkpoint 命名空间，不加载旧八卡 Actor Head。
+1. 每个主动技能各自的目标、时序、Buff、召唤物和特殊移动场景；
+2. 高实体量下的 effect/projectile 分类完整性；
+3. 全卡之间的关键交互组合；
+4. 塔兵、特殊模式和未来新增内容；
+5. 游戏版本升级后的全部 RVA、结构和证书重建。
 
-战斗规则、形态切换、技能扣费、施法、目标与终局仍全部由原版 `libg.so`
-负责。
+这些扩展仍应调用原版 `libg.so`，不为单卡在 Python 中补写战斗规则。

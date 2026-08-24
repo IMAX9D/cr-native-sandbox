@@ -1,5 +1,12 @@
 # Clash Royale 八卡原生核心技术路线
 
+> **历史综合文档。** 本文保留项目从八卡闭环到后续工程阶段的演进记录，
+> 其中“八卡限制”和“尚未覆盖全卡/英雄”的部分已经过期。当前沙盒 Runtime
+> 的权威说明请以
+> [`SANDBOX_RUNTIME_TECHNICAL.zh-CN.md`](SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+> 为准；全卡形态细节见
+> [`NATIVE_FULL_CARD_RUNTIME.zh-CN.md`](NATIVE_FULL_CARD_RUNTIME.zh-CN.md)。
+
 文档版本：1.0
 
 对应代码提交基线：`a592e6b` 及其后续文档提交

@@ -1,9 +1,13 @@
 # CR Native Core
 
-完整中文技术路线：[`docs/TECHNICAL_ROUTE.zh-CN.md`](docs/TECHNICAL_ROUTE.zh-CN.md)
+当前沙盒模拟器主技术文档：
+[`docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md`](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
 
 原生全卡、觉醒/英雄形态与主动技能接口：
 [`docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md`](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+
+历史综合技术路线（包含旧八卡阶段）：
+[`docs/TECHNICAL_ROUTE.zh-CN.md`](docs/TECHNICAL_ROUTE.zh-CN.md)
 
 Self-Play 吞吐优化报告：
 [`docs/throughput-optimization-20260823.md`](docs/throughput-optimization-20260823.md)
@@ -67,7 +71,8 @@ can:
 5. reproduce the same canonical state hash across ten fresh runs; and
 6. report measured startup latency and sustained ticks per second.
 
-All six conditions passed on 2026-08-23. The certificate is reproducible with:
+All six conditions passed again against the v6 observation scope on
+2026-08-24. The certificate is reproducible with:
 
 ```powershell
 .\scripts\accept_direct_core.ps1 -Runs 10
@@ -142,11 +147,11 @@ below 1 GiB, close unrelated memory-heavy applications before starting it.
   arena and tilemap through the native resource request list, creates the
   standard 1v1 battle, and advances `0 -> 100` logic ticks.
 - Ten fresh processes produced the same RNG, hands, cycle, six tower entities,
-  tower HP, and canonical state hash `5594aa3c81dc52fa`.
-- Mean cold process wall time was `13.095 s`. The measured replay-injection to
-  100-tick observation path averaged `13.126 ms`, or about `7,618` validated
+  tower HP, and `public-observe-v6` state hash `96598dc9028e1802`.
+- Mean cold process wall time was `14.405 s`. The measured replay-injection to
+  100-tick observation path averaged `9.795 ms`, or about `10,209` validated
   ticks/s for one process. Cold wall time includes deployment orchestration and
-  a deliberate 5-second platform initialization fence.
+  a deliberate platform initialization fence.
 
 See `docs/experiment-0002-results.md` for exact direct-core evidence and native
 call-chain boundaries.

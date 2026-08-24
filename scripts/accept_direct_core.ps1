@@ -1,7 +1,7 @@
 param(
     [ValidateRange(1, 100)]
     [int]$Runs = 10,
-    [string]$ExpectedHash = "5594aa3c81dc52fa",
+    [string]$ExpectedHash = "96598dc9028e1802",
     [string]$EvidenceRoot = "D:\AI_data\cr-native-core\acceptance-direct-core"
 )
 
@@ -40,13 +40,19 @@ for ($Run = 1; $Run -le $Runs; ++$Run) {
     })
     $HasSurface = [bool](Select-String -LiteralPath $Log.FullName `
         -SimpleMatch '"stage":"surface_create"' -Quiet)
+    $DataTables = Get-Content -LiteralPath $Log.FullName | Where-Object {
+        $_ -like '*"stage":"direct_data_tables"*'
+    } | Select-Object -Last 1 | ForEach-Object {
+        ($_ | ConvertFrom-Json).value
+    }
     $Checks = [ordered]@{
         no_surface = -not $HasSurface
-        loading_complete = [bool](Get-Content -LiteralPath $Log.FullName |
-            Where-Object { $_ -like '*"stage":"direct_data_tables"*' } |
-            Select-Object -Last 1 | ForEach-Object {
-                ($_ | ConvertFrom-Json).value.loading_complete
-            })
+        data_tables_ready = (
+            [bool]$DataTables.completed -and
+            [int]$DataTables.ready_latch -eq 1 -and
+            [string]$DataTables.tables -ne "0x0" -and
+            [string]$DataTables.first_table -ne "0x0"
+        )
         battle_ready_at_tick_zero = ([int]$Value.ready.tick -eq 0)
         advanced_exactly_100_ticks = (
             [int]$Value.step.tick_before -eq 0 -and
