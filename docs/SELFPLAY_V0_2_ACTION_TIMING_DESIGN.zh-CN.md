@@ -1,6 +1,11 @@
 # Self-Play v0.2：可变等待动作设计
 
-状态：**设计冻结候选，尚未实现、尚未训练**  
+状态：**已否决，不得实现**
+
+否决原因：承诺式 `WAIT(N)` 会让策略在等待期间放弃主动控制，不能完整表达主动
+过牌、试探、逼牌、骗牌、突然进攻和随时改变计划的实时博弈。替代方案见
+[`SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md`](SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md)。
+
 基线：Self-Play v0.1 / P010 / `1,033,302 native ticks`  
 目标：消除20 Hz逐Tick随机采样导致的低费循环，同时保持原生战斗逻辑20 Hz、
 原生规则、终局目标和塔血势函数不变。
