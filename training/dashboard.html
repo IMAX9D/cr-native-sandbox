@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CR Self-Play 实时训练</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #07111e;
+      --panel: #0d1b2c;
+      --panel-2: #12243a;
+      --line: #263b52;
+      --text: #edf5ff;
+      --muted: #91a9bf;
+      --blue: #47b8ff;
+      --cyan: #45e0d0;
+      --green: #55d98a;
+      --yellow: #f2c45a;
+      --orange: #f5965b;
+      --red: #ff6f7e;
+      --purple: #b794ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 20% -20%, #183959 0, var(--bg) 38%);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      min-width: 320px;
+    }
+    main { width: min(1480px, 100%); margin: 0 auto; padding: 22px; }
+    header { display: flex; gap: 18px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+    h1 { margin: 0; font-size: clamp(22px, 3vw, 34px); font-weight: 600; }
+    h2 { margin: 0 0 14px; font-size: 17px; font-weight: 600; }
+    .subtitle { color: var(--muted); margin-top: 6px; }
+    .status-wrap { display: flex; gap: 10px; align-items: center; }
+    .status {
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(71,184,255,.14);
+      color: var(--blue);
+      font-weight: 600;
+    }
+    .status.error { background: rgba(255,111,126,.14); color: var(--red); }
+    .status.complete { background: rgba(85,217,138,.14); color: var(--green); }
+    button {
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+      border-radius: 8px; padding: 7px 11px; cursor: pointer;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .progress-shell { margin: 20px 0 16px; }
+    .progress-label { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: var(--muted); }
+    .progress-track { height: 13px; border-radius: 8px; overflow: hidden; background: #172a3e; }
+    .progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, var(--blue), var(--cyan)); transition: width .5s ease; }
+    .stats { display: grid; grid-template-columns: repeat(6, minmax(130px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .stat, section { background: rgba(13,27,44,.94); border: 1px solid var(--line); border-radius: 12px; }
+    .stat { padding: 13px 14px; min-height: 84px; }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-value { font-size: 24px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+    .stat-note { color: var(--muted); font-size: 11px; margin-top: 2px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    section { padding: 15px; min-width: 0; }
+    canvas { display: block; width: 100%; height: 230px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; background: var(--legend); margin-right: 5px; vertical-align: middle; }
+    .lower { display: grid; grid-template-columns: minmax(320px, 1.2fr) minmax(300px, .8fr); gap: 14px; margin-top: 14px; }
+    .bars { display: grid; gap: 9px; }
+    .bar-row { display: grid; grid-template-columns: 90px 1fr 58px; gap: 9px; align-items: center; }
+    .bar-name, .bar-value { font-size: 12px; }
+    .bar-value { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+    .bar-track { height: 9px; background: #172a3e; border-radius: 5px; overflow: hidden; }
+    .bar-fill { height: 100%; background: var(--blue); border-radius: 5px; transition: width .4s ease; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: right; padding: 7px 5px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: var(--muted); font-weight: 500; }
+    .warning { margin-top: 14px; padding: 11px 13px; border-radius: 9px; background: rgba(245,150,91,.12); color: #ffd2b6; display: none; }
+    .warning.show { display: block; }
+    .footer { margin: 15px 2px 0; color: var(--muted); font-size: 11px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+    @media (max-width: 1050px) { .stats { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 760px) {
+      main { padding: 14px; }
+      .grid, .lower { grid-template-columns: 1fr; }
+      .stats { grid-template-columns: repeat(2, 1fr); }
+      canvas { height: 205px; }
+    }
+    @media (max-width: 430px) { .stats { grid-template-columns: 1fr; } .bar-row { grid-template-columns: 78px 1fr 52px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Self-Play v0.1 · P010 → P020</h1>
+      <div class="subtitle">冻结原生20Hz · 2 AVD / 8 Worker · Recurrent PPO · 塔血势函数</div>
+    </div>
+    <div class="status-wrap">
+      <div id="status" class="status" aria-live="polite">连接中</div>
+      <button id="shutdown" type="button" disabled>关闭面板</button>
+    </div>
+  </header>
+
+  <div class="progress-shell">
+    <div class="progress-label"><span id="progressText">读取训练进度…</span><span id="eta">ETA —</span></div>
+    <div class="progress-track" role="progressbar" aria-label="训练进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progressBar" class="progress-bar"></div></div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-label">累计 Native ticks</div><div id="ticks" class="stat-value">—</div><div class="stat-note">目标 2,000,000</div></div>
+    <div class="stat"><div class="stat-label">完整对局</div><div id="episodes" class="stat-value">—</div><div id="iteration" class="stat-note">迭代 —</div></div>
+    <div class="stat"><div class="stat-label">含 PPO 吞吐</div><div id="trainSps" class="stat-value">—</div><div class="stat-note">environment steps/s</div></div>
+    <div class="stat"><div class="stat-label">Entropy</div><div id="entropy" class="stat-value">—</div><div id="kl" class="stat-note">KL —</div></div>
+    <div class="stat"><div class="stat-label">Explained variance</div><div id="ev" class="stat-value">—</div><div id="valueMax" class="stat-note">Value max —</div></div>
+    <div class="stat"><div class="stat-label">Worker / GPU</div><div id="workers" class="stat-value">—</div><div id="gpu" class="stat-note">GPU —</div></div>
+  </div>
+
+  <div class="grid">
+    <section>
+      <h2>PPO Loss</h2>
+      <canvas id="lossChart" role="img" aria-label="PPO loss随迭代变化"></canvas>
+      <div class="legend"><span style="--legend:var(--blue)">Total</span><span style="--legend:var(--yellow)">Policy</span><span style="--legend:var(--purple)">Value</span></div>
+    </section>
+    <section>
+      <h2>学习健康</h2>
+      <canvas id="healthChart" role="img" aria-label="Entropy和Explained Variance随迭代变化"></canvas>
+      <div class="legend"><span style="--legend:var(--cyan)">Entropy</span><span style="--legend:var(--green)">Explained variance</span><span style="--legend:var(--orange)">Gradient norm</span></div>
+    </section>
+    <section>
+      <h2>真实闭环吞吐</h2>
+      <canvas id="throughputChart" role="img" aria-label="训练与环境吞吐随迭代变化"></canvas>
+      <div class="legend"><span style="--legend:var(--blue)">Training steps/s</span><span style="--legend:var(--green)">Environment steps/s</span></div>
+    </section>
+    <section>
+      <h2>系统资源</h2>
+      <canvas id="resourceChart" role="img" aria-label="CPU GPU和内存资源"></canvas>
+      <div class="legend"><span style="--legend:var(--blue)">Host CPU %</span><span style="--legend:var(--purple)">GPU %</span><span style="--legend:var(--green)">可用 RAM GiB</span></div>
+    </section>
+  </div>
+
+  <div class="lower">
+    <section>
+      <h2>最近一轮八卡使用率</h2>
+      <div id="cardBars" class="bars"></div>
+    </section>
+    <section>
+      <h2>最近迭代</h2>
+      <table>
+        <thead><tr><th>迭代</th><th>Ticks</th><th>Loss</th><th>Entropy</th><th>EV</th><th>steps/s</th></tr></thead>
+        <tbody id="historyRows"></tbody>
+      </table>
+    </section>
+  </div>
+  <div id="warning" class="warning" role="alert"></div>
+  <div class="footer"><span id="updated">最后刷新 —</span><span id="runPath">Run —</span></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const colors = () => {
+  const s = getComputedStyle(document.documentElement);
+  return { grid:s.getPropertyValue('--line').trim(), text:s.getPropertyValue('--muted').trim(), blue:s.getPropertyValue('--blue').trim(), yellow:s.getPropertyValue('--yellow').trim(), purple:s.getPropertyValue('--purple').trim(), cyan:s.getPropertyValue('--cyan').trim(), green:s.getPropertyValue('--green').trim(), orange:s.getPropertyValue('--orange').trim() };
+};
+const fmt = (v, d=3) => Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—';
+const compact = v => Number.isFinite(Number(v)) ? Math.round(Number(v)).toLocaleString('zh-CN') : '—';
+function drawChart(id, history, series, percent=false) {
+  const canvas = $(id), box = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.floor(box.width*dpr)); canvas.height = Math.max(1, Math.floor(box.height*dpr));
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr,dpr); const w=box.width,h=box.height,c=colors();
+  ctx.clearRect(0,0,w,h); const pad={l:48,r:12,t:12,b:27}; const pw=w-pad.l-pad.r,ph=h-pad.t-pad.b;
+  const points=history.slice(-60), values=[]; series.forEach(s=>points.forEach(p=>{const v=s.get(p);if(Number.isFinite(v))values.push(v);}));
+  let min=values.length?Math.min(...values):0,max=values.length?Math.max(...values):1; if(min===max){min-=.5;max+=.5;} const gap=(max-min)*.12; min-=gap;max+=gap;
+  ctx.strokeStyle=c.grid;ctx.lineWidth=1;ctx.fillStyle=c.text;ctx.font='11px Segoe UI';ctx.textAlign='right';ctx.textBaseline='middle';
+  for(let i=0;i<=4;i++){const y=pad.t+ph*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(w-pad.r,y);ctx.stroke();const v=max-(max-min)*i/4;ctx.fillText(percent?fmt(v,0)+'%':fmt(v,3),pad.l-7,y);}
+  ctx.textAlign='center';ctx.textBaseline='top'; if(points.length){const first=points[0].iteration??'较早',last=points[points.length-1].iteration??'现在';ctx.fillText(String(first),pad.l,h-pad.b+7);ctx.fillText(String(last),w-pad.r,h-pad.b+7);}
+  series.forEach(s=>{ctx.strokeStyle=c[s.color];ctx.lineWidth=2;ctx.beginPath();let started=false;points.forEach((p,i)=>{const v=s.get(p);if(!Number.isFinite(v))return;const x=pad.l+(points.length===1?pw:pw*i/(points.length-1)),y=pad.t+(max-v)/(max-min)*ph;if(!started){ctx.moveTo(x,y);started=true;}else ctx.lineTo(x,y);});ctx.stroke();});
+}
+const cardNames={26000000:'骑士',26000001:'弓箭手',26000003:'巨人',26000010:'骷髅兵',26000014:'火枪手',26000021:'野猪骑士',27000000:'加农炮',28000001:'箭雨'};
+function updateCards(rates={}) { $('cardBars').innerHTML=Object.entries(cardNames).map(([id,name])=>{const v=Number(rates[id]||0);return `<div class="bar-row"><div class="bar-name">${name}</div><div class="bar-track"><div class="bar-fill" style="width:${Math.min(100,v*100)}%"></div></div><div class="bar-value">${(v*100).toFixed(2)}%</div></div>`;}).join(''); }
+function update(data) {
+  const latest=data.latest||{},m=latest.metrics||{},b=latest.behavior||{},r=data.resource||{},progress=Math.max(0,Math.min(100,Number(data.progress||0)*100));
+  $('status').textContent=data.phase_label||'未知'; $('status').className='status '+(data.status==='error'?'error':data.status==='complete'?'complete':'');
+  $('progressBar').style.width=progress+'%'; document.querySelector('.progress-track').setAttribute('aria-valuenow',progress.toFixed(1));
+  $('progressText').textContent=`${progress.toFixed(2)}% · ${compact(data.native_ticks)} / ${compact(data.target_native_ticks)} ticks`; $('eta').textContent=data.eta_seconds==null?'ETA —':`ETA ${Math.floor(data.eta_seconds/60)}分${Math.round(data.eta_seconds%60)}秒`;
+  $('ticks').textContent=compact(data.native_ticks);$('episodes').textContent=compact(data.episodes);$('iteration').textContent=`迭代 ${latest.iteration??'—'}`;
+  $('trainSps').textContent=fmt(m.training_steps_per_second,1);$('entropy').textContent=fmt(m.entropy,4);$('kl').textContent=`KL ${fmt(m.approx_kl,6)} · Clip ${fmt(m.clip_fraction,4)}`;
+  $('ev').textContent=fmt(m.explained_variance,3);$('valueMax').textContent=`Value max ${fmt(m.value_abs_max,3)} · Grad ${fmt(m.gradient_norm,3)}`;
+  $('workers').textContent=`${compact(r.guest_worker_count||0)} / 8`;$('gpu').textContent=`GPU ${fmt(r.gpu_utilization_percent,0)}% · VRAM ${fmt((r.gpu_vram_used_mb||0)/1024,1)} GiB`;
+  updateCards(b.card_usage_rate);
+  const h=data.history||[]; drawChart('lossChart',h,[{color:'blue',get:p=>Number(p.metrics?.loss)},{color:'yellow',get:p=>Number(p.metrics?.policy_loss)},{color:'purple',get:p=>Number(p.metrics?.value_loss)}]);
+  drawChart('healthChart',h,[{color:'cyan',get:p=>Number(p.metrics?.entropy)},{color:'green',get:p=>Number(p.metrics?.explained_variance)},{color:'orange',get:p=>Number(p.metrics?.gradient_norm)}]);
+  drawChart('throughputChart',h,[{color:'blue',get:p=>Number(p.metrics?.training_steps_per_second)},{color:'green',get:p=>Number(p.metrics?.environment_steps_per_second)}]);
+  drawChart('resourceChart',data.resource_history||[],[{color:'blue',get:p=>Number(p.host_cpu_percent)},{color:'purple',get:p=>Number(p.gpu_utilization_percent)},{color:'green',get:p=>Number(p.system_ram_available_gb)}]);
+  $('historyRows').innerHTML=h.slice(-8).reverse().map(p=>`<tr><td>${p.iteration}</td><td>${compact(p.native_ticks)}</td><td>${fmt(p.metrics?.loss,4)}</td><td>${fmt(p.metrics?.entropy,4)}</td><td>${fmt(p.metrics?.explained_variance,3)}</td><td>${fmt(p.metrics?.training_steps_per_second,1)}</td></tr>`).join('');
+  const warnings=data.warnings||[];$('warning').textContent=warnings.join(' · ');$('warning').className='warning '+(warnings.length?'show':'');
+  $('updated').textContent='最后刷新 '+new Date().toLocaleTimeString('zh-CN');$('runPath').textContent=data.run_id||'—';$('shutdown').disabled=data.running;
+}
+async function refresh(){try{const res=await fetch('/api/state',{cache:'no-store'});if(!res.ok)throw new Error('HTTP '+res.status);update(await res.json());}catch(e){$('status').textContent='面板连接中断';$('status').className='status error';$('warning').textContent=String(e);$('warning').className='warning show';}}
+$('shutdown').addEventListener('click',async()=>{const res=await fetch('/api/shutdown',{method:'POST'});const v=await res.json();if(!v.accepted)alert(v.message);else window.close();});
+window.addEventListener('resize',()=>refresh()); refresh(); setInterval(refresh,1000);
+</script>
+</body>
+</html>

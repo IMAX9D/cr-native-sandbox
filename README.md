@@ -77,6 +77,12 @@ milestone checkpoints, resource monitoring, paired side-swapped evaluation
 and report generation. `scripts/start_training.ps1` remains the lower-level
 launcher.
 
+To resume the frozen P010 checkpoint to the controlled 2M gate with live
+telemetry, double-click [`TRAINING_DASHBOARD.cmd`](TRAINING_DASHBOARD.cmd).
+The loopback-only browser page shows PPO losses, entropy/KL/explained variance,
+throughput, resources, card usage, progress and ETA. It cannot hide or stop an
+active training process, and the native Workers stop automatically at 2M.
+
 All mutable output is under `D:\AI_data\cr-native-core`:
 
 - `selfplay-v0.1\runs\<run-id>\manifest.json`: immutable run configuration;
