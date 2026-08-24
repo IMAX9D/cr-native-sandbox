@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cr-native-sandbox"
+version = "0.1.0"
+description = "Headless external API for a version-pinned native Clash Royale battle runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "IMAX9D"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development :: Testing",
+]
+
+[tool.setuptools.packages.find]
+include = ["native_core*"]
+
+[tool.setuptools.package-data]
+native_core = ["data/*.json"]
