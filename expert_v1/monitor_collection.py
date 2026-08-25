@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover
     orjson = None
 
 from .upgrade_base_cycles import solve_cycle
+from .finalize_corpus import run as finalize_corpus
 
 
 def loads(raw: bytes) -> dict[str, Any]:
@@ -247,6 +248,73 @@ def run(args: argparse.Namespace) -> int:
             (output / "TARGET_REACHED").write_text(
                 state["updated_utc"] + "\n", encoding="utf-8"
             )
+            if args.auto_finalize:
+                ready = output / "READY_TO_TRAIN.json"
+                if ready.exists():
+                    return 0
+                try:
+                    final_result = finalize_corpus(argparse.Namespace(
+                        base_manifest=base_manifest,
+                        live_manifest=accepted_path,
+                        output_batch=args.final_batch,
+                        output_manifest=base_manifest,
+                        target=args.target,
+                    ))
+                    compile_result = subprocess.run(
+                        [
+                            str(args.training_python.resolve(strict=True)), "-m",
+                            "expert_v1.compile_sequence_dataset",
+                            "--accepted-manifest", str(base_manifest),
+                            "--output-root", str(args.compiled_root),
+                            "--replace",
+                        ],
+                        cwd=str(args.project_root.resolve(strict=True)),
+                        check=False,
+                    )
+                    if compile_result.returncode != 0:
+                        raise RuntimeError(
+                            f"full sequence compilation failed: {compile_result.returncode}"
+                        )
+                    tests = subprocess.run(
+                        [
+                            str(args.training_python.resolve(strict=True)), "-m", "unittest",
+                            "discover", "-s", "tests",
+                        ],
+                        cwd=str(args.project_root.resolve(strict=True)),
+                        check=False,
+                    )
+                    if tests.returncode != 0:
+                        raise RuntimeError(f"regression tests failed: {tests.returncode}")
+                    smoke = subprocess.run(
+                        [
+                            "powershell.exe", "-NoLogo", "-NoProfile",
+                            "-ExecutionPolicy", "Bypass", "-File",
+                            str(args.project_root / "scripts" / "start_expert_sequence_pretraining_v1.ps1"),
+                            "-Smoke", "-AcceptedManifest", str(base_manifest),
+                        ],
+                        cwd=str(args.project_root.resolve(strict=True)),
+                        check=False,
+                    )
+                    if smoke.returncode != 0:
+                        raise RuntimeError(f"one-click smoke failed: {smoke.returncode}")
+                    ready.write_text(
+                        json.dumps({
+                            "created_utc": datetime.now(timezone.utc).isoformat(),
+                            "finalization": final_result,
+                            "compiled_root": str(args.compiled_root),
+                            "formal_training_started": False,
+                        }, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                except Exception as error:
+                    (output / "FINALIZATION_FAILED.json").write_text(
+                        json.dumps({
+                            "created_utc": datetime.now(timezone.utc).isoformat(),
+                            "error": str(error),
+                        }, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
+                    raise
             return 0
         if not active:
             subprocess.run(
@@ -265,7 +333,20 @@ def main() -> int:
     parser.add_argument("--min-timestamp", type=int, required=True)
     parser.add_argument("--target", type=int, default=100_000)
     parser.add_argument("--interval", type=float, default=30.0)
-    return run(parser.parse_args())
+    parser.add_argument("--auto-finalize", action="store_true")
+    parser.add_argument("--training-python", type=Path)
+    parser.add_argument("--project-root", type=Path)
+    parser.add_argument("--final-batch", type=Path)
+    parser.add_argument("--compiled-root", type=Path)
+    args = parser.parse_args()
+    if args.auto_finalize and not all((
+        args.training_python, args.project_root, args.final_batch, args.compiled_root,
+    )):
+        parser.error(
+            "--auto-finalize requires --training-python, --project-root, "
+            "--final-batch and --compiled-root"
+        )
+    return run(args)
 
 
 if __name__ == "__main__":
