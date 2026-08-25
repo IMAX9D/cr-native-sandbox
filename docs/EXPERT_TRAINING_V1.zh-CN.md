@@ -83,9 +83,9 @@ WAIT Tick 不产生 Card、Position 或 Ability 梯度。被原生规则判定�
 
 当前有效源清单固定为：
 
-`D:\AI_data\cr-native-core\expert-v1\training-dataset\version-window-20260804\accepted.jsonl`
+`D:\AI_data\cr-native-core\expert-v1\training-dataset\version-window-20260804\accepted-cycle-clean.jsonl`
 
-截至本方案落地时该窗口为 73,556 场唯一记录；后续下载、清洗会更新它。编译数据 manifest 必须固化该清单的绝对路径和 SHA-256。一键入口会重新计算当前清单哈希；源清单一旦变化，旧编译数据会被判为 stale，必须增量重编译，不能误用早先的 `combined-current-20260826.jsonl`。
+截至本方案落地时该窗口为 73,436 场“双方循环均有效”的唯一记录；后续下载、清洗会更新它。编译数据 manifest 必须固化该清单的绝对路径和 SHA-256。一键入口会重新计算当前清单哈希；源清单一旦变化，旧编译数据会被判为 stale，必须增量重编译，不能误用早先的 `combined-current-20260826.jsonl`。
 
 根目录包含 `manifest.json`，每个 shard 是普通 `.npy` 目录，支持 mmap 和多进程 DataLoader。主要数组：
 

@@ -11,6 +11,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Any, Iterable
@@ -60,6 +61,11 @@ def initial_states() -> tuple[np.ndarray, np.ndarray]:
 
 
 INITIAL_MASKS, INITIAL_QUEUES = initial_states()
+FORM_SUFFIX_RE = re.compile(r"-(?:ev\d+|hero)$")
+
+
+def base_card(value: str) -> str:
+    return FORM_SUFFIX_RE.sub("", str(value).lower())
 
 
 def solve_cycle(card_indices: list[int]) -> dict[str, Any]:
@@ -150,6 +156,7 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
     plays = value.get("card_plays") or []
     counts = value.get("card_counts") or {}
     output: list[dict[str, Any]] = []
+    source_schema_version = int(value.get("schema_version") or 1)
     for side in ("team", "opponent"):
         deck = list((counts.get(side) or {}).keys())
         events = [
@@ -163,17 +170,35 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
         indices = [card_index[str(event["card"])] for _, event in events]
         solved = solve_cycle(indices)
         actor_xy = [actor_coordinates(event, side) for _, event in events]
+        exact_source_deck = value.get(f"{side}_deck") or []
+        variants = {base_card(card): str(card) for card in exact_source_deck}
+        exact_deck = [variants.get(base_card(card)) for card in deck]
+        exact_forms = len(exact_source_deck) == 8 and all(exact_deck)
+        player: dict[str, Any] = {}
+        rounds = value.get("rounds") or []
+        if len(rounds) == 1 and isinstance(rounds[0], dict):
+            players = rounds[0].get(side) or []
+            if len(players) == 1 and isinstance(players[0], dict):
+                player = players[0]
+        level_map = player.get("card_levels") or {}
+        card_levels = [level_map.get(card) for card in exact_deck] if exact_forms else []
+        exact_levels = exact_forms and all(isinstance(level, int) for level in card_levels)
+        tower_troop = player.get("tower_troop")
         output.append({
             "schema_version": 1,
             "kind": "expert_base_cycle_side_v1",
             "battle_tag": battle_tag,
             "side": side,
             "source_path": str(source),
+            "source_schema_version": source_schema_version,
             "base_deck": deck,
             "base_deck_complete": True,
-            "exact_forms": False,
-            "exact_levels": False,
-            "exact_tower_troop": False,
+            "exact_card_forms": exact_deck if exact_forms else None,
+            "exact_forms": exact_forms,
+            "card_levels": card_levels if exact_levels else None,
+            "exact_levels": exact_levels,
+            "tower_troop": tower_troop,
+            "exact_tower_troop": bool(tower_troop),
             "ability_events_complete": ability_count(value, side) == 0,
             "missing_ability_event_count": ability_count(value, side),
             "action_count": len(events),
@@ -187,12 +212,12 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
     return output
 
 
-def schema_one_records(path: Path, limit: int) -> list[dict[str, Any]]:
+def schema_records(path: Path, schema_version: int, limit: int) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     with path.open("rb") as handle:
         for raw in handle:
             value = loads(raw)
-            if int(value.get("schema_version") or 1) != 1:
+            if int(value.get("schema_version") or 1) != schema_version:
                 continue
             records.append(value)
             if limit and len(records) >= limit:
@@ -208,10 +233,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     building = output.with_name(output.name + ".building")
     if building.exists():
         raise FileExistsError(f"staging output already exists: {building}")
-    records = schema_one_records(union, args.limit)
+    records = schema_records(union, args.schema_version, args.limit)
     if args.expected_count and len(records) != args.expected_count:
         raise RuntimeError(
-            f"expected {args.expected_count} schema-v1 battles, got {len(records)}"
+            f"expected {args.expected_count} schema-v{args.schema_version} battles, "
+            f"got {len(records)}"
         )
 
     started = time.perf_counter()
@@ -266,6 +292,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "union_manifest": str(union),
             "union_manifest_sha256": sha256(union),
+            "source_schema_version": args.schema_version,
             **counters,
             "exact_action_fraction": (
                 counters["usable_exact_actions"] / counters["usable_actions"]
@@ -293,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--expected-count", type=int, default=0)
+    parser.add_argument("--schema-version", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--progress-every", type=int, default=5_000)
     return parser

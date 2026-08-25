@@ -365,7 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(
             r"D:\AI_data\cr-native-core\expert-v1\training-dataset"
-            r"\version-window-20260804\accepted.jsonl"
+            r"\version-window-20260804\accepted-cycle-clean.jsonl"
         ),
     )
     parser.add_argument("--run-id")
