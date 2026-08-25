@@ -37,10 +37,18 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--allow-non-candidate", action="store_true")
     parser.add_argument("--no-decision-records", action="store_true")
+    parser.add_argument("--team-crowns", type=int)
+    parser.add_argument("--opponent-crowns", type=int)
     args = parser.parse_args()
     raw = args.source.read_bytes()
     value = orjson.loads(raw) if orjson is not None else json.loads(raw)
-    plan = compile_battle(value)
+    if (args.team_crowns is None) != (args.opponent_crowns is None):
+        raise ValueError("team/opponent crowns must be supplied together")
+    terminal_crowns = (
+        None if args.team_crowns is None
+        else (args.team_crowns, args.opponent_crowns)
+    )
+    plan = compile_battle(value, terminal_crowns=terminal_crowns)
     if not plan.native_replay_ready and not args.allow_non_candidate:
         raise RuntimeError(
             f"plan tier {plan.replay_tier!r} is not native-replay-ready; "

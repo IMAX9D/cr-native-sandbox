@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover
     orjson = None
 
 from expert_v1.native_replay_plan import ReplayPlanError, compile_battle
+from expert_v1.source_terminal_anchors import manifest_terminal_anchors
 
 
 def loads(raw: bytes) -> dict[str, Any]:
@@ -33,9 +34,14 @@ def loads(raw: bytes) -> dict[str, Any]:
     return value
 
 
-def audit_one(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+def audit_one(
+    item: tuple[Path, tuple[int, int] | None]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    path, terminal_crowns = item
     try:
-        plan = compile_battle(loads(path.read_bytes()))
+        plan = compile_battle(
+            loads(path.read_bytes()), terminal_crowns=terminal_crowns
+        )
         return ({
             "battle_tag": plan.battle_tag,
             "source_schema_version": plan.source_schema_version,
@@ -46,6 +52,7 @@ def audit_one(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]
             "hand_provenance": plan.hand_provenance,
             "ability_provenance": plan.ability_provenance,
             "terminal_provenance": plan.terminal_provenance,
+            "terminal_crowns": plan.terminal_crowns,
             "duration_ticks": plan.duration_ticks,
             "actions": len(plan.actions),
             "missing_abilities": sum(
@@ -73,29 +80,30 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def source_files(args: argparse.Namespace) -> list[Path]:
+def source_items(
+    args: argparse.Namespace,
+) -> list[tuple[Path, tuple[int, int] | None]]:
     if args.manifest is not None:
-        files: list[Path] = []
-        with args.manifest.open("rb") as source:
-            for raw in source:
-                row = loads(raw)
-                path = Path(str(row.get("source_path") or ""))
-                if not path.is_file():
-                    raise FileNotFoundError(
-                        f"accepted manifest points to missing source: {path}"
-                    )
-                files.append(path)
-                if args.limit and len(files) >= args.limit:
-                    break
-        return files
+        records, anchors = manifest_terminal_anchors(args.manifest)
+        if args.limit:
+            records = records[:args.limit]
+        return [
+            (
+                Path(str(row["source_path"])),
+                anchors[str(row["battle_tag"])],
+            )
+            for row in records
+        ]
     assert args.input_root is not None
     files = sorted(args.input_root.rglob("*.json"))
-    return files[:args.limit] if args.limit else files
+    if args.limit:
+        files = files[:args.limit]
+    return [(path, None) for path in files]
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
-    files = source_files(args)
-    if not files:
+    items = source_items(args)
+    if not items:
         raise FileNotFoundError("no source battle JSON found")
     started = time.perf_counter()
     counters: Counter[str] = Counter()
@@ -104,7 +112,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ready_rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        for accepted, rejected in executor.map(audit_one, files):
+        for accepted, rejected in executor.map(audit_one, items):
             counters["files"] += 1
             if accepted is not None:
                 counters["compiled"] += 1
@@ -137,6 +145,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "source_manifest_sha256": (
             sha256(args.manifest) if args.manifest is not None else None
+        ),
+        "terminal_anchor_count": sum(
+            1 for _, crowns in items if crowns is not None
         ),
         "workers": args.workers,
         "elapsed_seconds": elapsed,

@@ -122,6 +122,7 @@ class BattlePlan:
     hand_provenance: str
     ability_provenance: str
     terminal_provenance: str
+    terminal_crowns: tuple[int, int] | None
     limitations: tuple[str, ...]
 
     def json(self) -> dict[str, Any]:
@@ -283,10 +284,25 @@ def _side_deck(
     return result, tower
 
 
-def compile_battle(value: Mapping[str, Any]) -> BattlePlan:
+def compile_battle(
+    value: Mapping[str, Any],
+    *,
+    terminal_crowns: Sequence[int] | None = None,
+) -> BattlePlan:
     battle_tag = str(value.get("battle_tag") or "")
     if not battle_tag:
         raise ReplayPlanError("battle tag is missing")
+    crowns: tuple[int, int] | None = None
+    if terminal_crowns is not None:
+        if (
+            len(terminal_crowns) != 2
+            or any(
+                isinstance(value, bool) or not 0 <= int(value) <= 3
+                for value in terminal_crowns
+            )
+        ):
+            raise ReplayPlanError("terminal crowns must contain two values in 0..3")
+        crowns = (int(terminal_crowns[0]), int(terminal_crowns[1]))
     source_schema = int(value.get("schema_version") or 1)
     if value.get("draft") is True:
         raise ReplayPlanError("draft battles are not supported")
@@ -425,7 +441,10 @@ def compile_battle(value: Mapping[str, Any]) -> BattlePlan:
             else "inferred_cycle_compatible_initial"
         ),
         ability_provenance=_ability_provenance(value, ability_counts),
-        terminal_provenance="unknown_no_source_anchor",
+        terminal_provenance=(
+            "source_index_crowns" if crowns is not None else "unknown_no_source_anchor"
+        ),
+        terminal_crowns=crowns,
         limitations=tuple(limitations),
     )
 

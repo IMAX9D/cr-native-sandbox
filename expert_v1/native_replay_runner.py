@@ -40,6 +40,10 @@ class NativeReplayResult:
     observe_seconds: float
     action_seconds: float
     wall_seconds: float
+    terminal_validated: bool
+    terminal_match: bool | None
+    source_crowns: tuple[int, int] | None
+    observed_crowns: tuple[int, int] | None
     decision_records: tuple[dict[str, Any], ...]
 
     def json(self) -> dict[str, Any]:
@@ -151,6 +155,9 @@ def execute_plan(
     records: list[dict[str, Any]] = []
     failure: str | None = None
     final_tick = 0
+    terminal_validated = False
+    terminal_match: bool | None = None
+    observed_crowns: tuple[int, int] | None = None
     replay, mappings = materialize_replay(
         plan, template, calibration, seed=seed
     )
@@ -257,6 +264,34 @@ def execute_plan(
             accepted_actions += len(results)
             previous_source_tick = source_tick
 
+    if failure is None and plan.terminal_crowns is not None:
+        # Duration is stored at one-second resolution.  A 20-Tick fence lets
+        # libg emit the terminal object without accepting an unbounded run.
+        remaining = max(1, plan.duration_ticks + 20 - final_tick)
+        step_started = time.perf_counter()
+        final_step = env.step(remaining)
+        step_seconds += time.perf_counter() - step_started
+        native_ticks += max(0, int(final_step.get("stepped", remaining)))
+        final_tick = int(final_step.get("tick_after", final_tick + remaining))
+        episode = final_step.get("episode", {})
+        crowns = episode.get("crowns")
+        if (
+            (episode.get("terminated") or episode.get("truncated"))
+            and isinstance(crowns, list)
+            and len(crowns) == 2
+        ):
+            observed_crowns = (int(crowns[0]), int(crowns[1]))
+            terminal_validated = True
+            terminal_match = observed_crowns == plan.terminal_crowns
+            if not terminal_match:
+                failure = (
+                    f"terminal_crowns_{observed_crowns}_expected_"
+                    f"{plan.terminal_crowns}"
+                )
+        else:
+            terminal_match = False
+            failure = "native_terminal_missing_at_source_end"
+
     return NativeReplayResult(
         battle_tag=plan.battle_tag,
         accepted=failure is None and accepted_actions == len(plan.actions),
@@ -270,6 +305,10 @@ def execute_plan(
         observe_seconds=observe_seconds,
         action_seconds=action_seconds,
         wall_seconds=time.perf_counter() - started,
+        terminal_validated=terminal_validated,
+        terminal_match=terminal_match,
+        source_crowns=plan.terminal_crowns,
+        observed_crowns=observed_crowns,
         decision_records=tuple(records),
     )
 

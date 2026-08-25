@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 from expert_v1.native_replay_plan import (
@@ -12,6 +13,7 @@ from expert_v1.native_replay_plan import (
     split_card_token,
 )
 from expert_v1.native_replay_runner import _compact_decision_state
+from expert_v1.source_terminal_anchors import index_terminal_anchors
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +110,11 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         self.assertEqual(plan.replay_tier, "action_sequence_only")
         self.assertIn("ability_button_events_missing", plan.limitations)
 
+    def test_terminal_crowns_are_explicit_source_provenance(self) -> None:
+        plan = compile_battle(battle(), terminal_crowns=(2, 1))
+        self.assertEqual(plan.terminal_crowns, (2, 1))
+        self.assertEqual(plan.terminal_provenance, "source_index_crowns")
+
     def test_same_side_same_tick_is_rejected(self) -> None:
         value = battle()
         duplicate = dict(value["card_plays"][0])
@@ -143,6 +150,18 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         self.assertNotIn("9000", encoded)
         self.assertNotIn("[4, 5, 6, 7]", encoded)
         self.assertNotIn("opponent_hand", encoded)
+
+    def test_terminal_anchor_is_recovered_from_source_index_url(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "index.jsonl"
+            path.write_text(json.dumps({
+                "kind": "battle",
+                "url": (
+                    "https://royaleapi.com/data/replay?tag=TAG123"
+                    "&team_crowns=3&opponent_crowns=1"
+                ),
+            }) + "\n", encoding="utf-8")
+            self.assertEqual(index_terminal_anchors(path), {"TAG123": (3, 1)})
 
 
 if __name__ == "__main__":

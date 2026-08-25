@@ -55,16 +55,16 @@ action_provenance = observed_deployments
 
 审计输出：
 
-`D:\AI_data\cr-native-core\expert-v1\native-replay-audit-current-window-v2-20260826`
+`D:\AI_data\cr-native-core\expert-v1\native-replay-audit-current-window-v3-20260826`
 
 16 线程纯编译实测：
 
 | 指标 | 结果 |
 | --- | ---: |
-| 墙钟 | 256.288 s |
-| 文件吞吐 | 287.01 场/s |
-| 动作吞吐 | 21,228.56 动作/s |
-| 源 Tick 扫描等价吞吐 | 1,341,703.35 tick/s |
+| 墙钟 | 268.398 s |
+| 文件吞吐 | 274.06 场/s |
+| 动作吞吐 | 20,270.73 动作/s |
+| 源 Tick 扫描等价吞吐 | 1,281,165.55 tick/s |
 | 编译成功 | 72,955 场 |
 | 编译动作 | 5,440,619 |
 | 源时长 | 343,862,040 tick |
@@ -77,6 +77,12 @@ action_provenance = observed_deployments
 这里的 898 场只表示：完整形态/等级可映射、双方公主塔、八卡循环有效、统计
 表报告没有能力按钮事件。它们仍是 `native_generated_unanchored`，不是
 `authoritative`。
+
+单个 battle JSON 不含皇冠，但两轮源 `index.jsonl` 的 replay URL 保留了双方
+皇冠，并且必须按源文件名而不是只按 battle tag 连接（同一局从另一玩家视角
+抓取时双方会对调）。当前实现已为 73,556/73,556 场恢复
+`terminal_provenance=source_index_crowns`。这使终局比较可测，但终局一致仍不能
+替代逐 Tick 状态锚点。
 
 主要缺口：
 
@@ -192,14 +198,17 @@ manifest 至少增加：
     "sequence_only": 0
   },
   "terminal_validation": {
-    "status": "unknown_without_anchor",
+    "anchor_provenance": "source_index_crowns",
+    "anchor_count": 73556,
+    "status": "pending_native_replay",
     "mismatches": null
   }
 }
 ```
 
-不能把未知终局写成 `terminal_mismatches=0`。只有源索引给出皇冠/胜负，且
-原生复演具备足以证明同一状态轨迹的锚点时才能统计终局一致。
+不能在尚未运行 Native replay 时把终局写成 `terminal_mismatches=0`。Runner
+会在源时长后读取原生皇冠逐场比较；未执行写 `null`，执行过才写计数。
+即使皇冠一致也不能将 unanchored scene 升格为 authoritative。
 
 Actor 记录必须在写盘前按单方投影；当前 runner 已删除敌方当前手牌和精确
 圣水，只保留己方 hand/next/elixir 与公开场上实体。生成状态只能进入单独的
