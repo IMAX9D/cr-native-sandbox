@@ -134,6 +134,7 @@ def _validate_battle(
     root: Path,
     index: dict[str, dict[str, Any]],
     list_metadata: dict[str, dict[str, Any]],
+    require_observed_eight_cycle: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     reasons: list[str] = []
     try:
@@ -190,6 +191,11 @@ def _validate_battle(
         reasons.append("team_more_than_8_cards")
     if len(cards["opponent"]) > 8:
         reasons.append("opponent_more_than_8_cards")
+    if require_observed_eight_cycle:
+        if len(cards["team"]) != 8:
+            reasons.append("team_incomplete_observed_cycle")
+        if len(cards["opponent"]) != 8:
+            reasons.append("opponent_incomplete_observed_cycle")
 
     indexed = index.get(battle_tag)
     if indexed is None:
@@ -259,12 +265,16 @@ def _process_shard(
     index: dict[str, dict[str, Any]],
     list_metadata: dict[str, dict[str, Any]],
     limit: int,
+    require_observed_eight_cycle: bool,
 ) -> list[tuple[str, dict[str, Any]]]:
     files = list(directory.glob("*.json"))
     if limit > 0:
         files = files[:limit]
     return [
-        _validate_battle(path, battle_root, index, list_metadata)
+        _validate_battle(
+            path, battle_root, index, list_metadata,
+            require_observed_eight_cycle=require_observed_eight_cycle,
+        )
         for path in files
     ]
 
@@ -315,7 +325,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 shard_limit = 0 if remaining <= 0 else min(remaining, 1000)
                 futures.append(executor.submit(
                     _process_shard, shard, battle_root, index, list_metadata,
-                    shard_limit,
+                    shard_limit, args.require_observed_eight_cycle,
                 ))
                 if remaining > 0:
                     remaining -= shard_limit
@@ -361,6 +371,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "quarantine_groups": dict(quarantine.most_common()),
         "confirmed_game_mode_ids": dict(modes.most_common()),
         "workers": args.workers,
+        "require_observed_eight_cycle": args.require_observed_eight_cycle,
         "elapsed_seconds": time.perf_counter() - started,
     }
     (output_root / "summary.json").write_bytes(
@@ -381,6 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--require-observed-eight-cycle", action="store_true")
     return parser
 
 

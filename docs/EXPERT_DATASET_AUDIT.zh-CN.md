@@ -13,6 +13,14 @@ python -m expert_v1.filter_dataset
 - `rejected.jsonl`：2v2、特殊选卡模式、空壳/损坏文件或其他不满足标准八卡 1v1 的记录。
 - `summary.json`：汇总统计。
 
+若正式数据集要求双方的出牌记录都实际覆盖完整八张卡，使用：
+
+```powershell
+python -m expert_v1.filter_dataset --require-observed-eight-cycle
+```
+
+此选项不会根据列表卡组补齐未出过的牌；任何一方只观察到 0–7 张不同卡时，对局都会进入拒绝清单。
+
 `uncertain_1v1` 不是负样本，也不能直接称为已确认标准模式。它只能进入后续元数据补全队列；在完整卡组、卡牌形态、英雄技能事件和初始循环被可靠恢复前，不进入权威专家训练集。
 
 当前历史数据丢弃了 `_invalid` 技能事件，因此含英雄/冠军主动技能的对局即使卡组完整，也不能仅靠现有 JSON 做逐 Tick 权威复演。占位卡只能生成带 `synthetic_partial` 标记的调试样本，不能混入正式监督学习数据。
