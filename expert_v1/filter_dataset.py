@@ -213,6 +213,25 @@ def _validate_battle(
             reasons.append(f"invalid_{key}")
 
     metadata = list_metadata.get(battle_tag)
+    if metadata is None and int(value.get("schema_version") or 1) >= 2:
+        rounds = value.get("rounds") or []
+        one_vs_one = (
+            len(rounds) == 1
+            and isinstance(rounds[0], dict)
+            and len(rounds[0].get("team") or []) == 1
+            and len(rounds[0].get("opponent") or []) == 1
+        )
+        metadata = {
+            "source": "embedded_schema_v2",
+            "players": "1v1" if one_vs_one else "unknown",
+            "draft": value.get("draft"),
+            "game_mode_id": value.get("game_mode_id"),
+            "battle_type": value.get("battle_type"),
+            "game_mode": value.get("game_mode"),
+            "team_deck": value.get("team_deck") or [],
+            "opponent_deck": value.get("opponent_deck") or [],
+            "deck_metadata": value.get("deck_metadata") or {},
+        }
     metadata_reasons: list[str] = []
     full_decks = False
     if metadata is not None:
@@ -345,8 +364,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     if classification == "rejected":
                         quarantine[quarantine_group(record.get("reasons", []))] += 1
                     metadata = record.get("list_metadata") or {}
-                    if metadata.get("game_mode_id"):
-                        modes[str(metadata["game_mode_id"])] += 1
+                    mode = (
+                        metadata.get("game_mode_id")
+                        or metadata.get("game_mode")
+                        or metadata.get("battle_type")
+                    )
+                    if mode:
+                        modes[str(mode)] += 1
     finally:
         for handle in outputs.values():
             handle.close()
