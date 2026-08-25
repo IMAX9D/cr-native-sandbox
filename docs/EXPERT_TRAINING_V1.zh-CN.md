@@ -159,6 +159,15 @@ manifest 必须声明并由编译器证明 `battle_tag_disjoint=true`、`source_
 
 ## 入口
 
+当前公开动作序列的第一阶段预训练使用独立入口，详见
+`docs/EXPERT_SEQUENCE_PRETRAINING_V1.zh-CN.md`：
+
+```powershell
+.\START_EXPERT_SEQUENCE_PRETRAIN_V1.cmd
+```
+
+该入口明确标记 `state_provenance=sequence_only`，不会生成全零 native grid。下面的原有入口仍保留给通过 libg 状态复演准入门的数据。
+
 离线 smoke：
 
 ```powershell

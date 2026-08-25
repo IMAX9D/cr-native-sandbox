@@ -11,7 +11,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .schema import load_shard_arrays, read_manifest, unpack_position_masks, validate_shard
+from .schema import (
+    OBSERVATION_SEQUENCE,
+    load_shard_arrays,
+    read_manifest,
+    unpack_position_masks,
+    validate_shard,
+)
 
 
 TOKEN_FIELDS = (
@@ -92,7 +98,7 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
     def _open(self, shard_index: int) -> dict[str, np.ndarray]:
         arrays = self._arrays.get(shard_index)
         if arrays is None:
-            arrays = load_shard_arrays(self.shards[shard_index])
+            arrays = load_shard_arrays(self.shards[shard_index], self.manifest)
             self._arrays[shard_index] = arrays
         return arrays
 
@@ -122,24 +128,51 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         burn = target_start - read_start
 
         item: dict[str, torch.Tensor] = {
-            "grid": torch.from_numpy(np.asarray(arrays["grid"][sl]).copy()).float().div_(255.0),
             "public_scalars": torch.from_numpy(np.asarray(arrays["public_scalars"][sl]).copy()).float(),
             "delta_ticks": torch.from_numpy(np.asarray(arrays["delta_ticks"][sl]).copy()).float(),
             "timing_exposure_ticks": torch.from_numpy(
                 np.asarray(arrays["timing_exposure_ticks"][sl]).copy()
             ).float(),
             "sample_weight": torch.from_numpy(np.asarray(arrays["sample_weight"][sl]).copy()).float(),
-            "position_mask": torch.from_numpy(
-                unpack_position_masks(np.asarray(arrays["selected_position_mask_packed"][sl]))
-            ),
-            "ability_position_mask": torch.from_numpy(
-                unpack_position_masks(np.asarray(arrays["ability_position_mask_packed"][sl]))
-            ),
         }
-        for name in TOKEN_FIELDS + LABEL_FIELDS:
-            item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).long()
-        for name in MASK_FIELDS:
-            item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
+        sequence_only = (
+            str(self.manifest.get("observation_mode")) == OBSERVATION_SEQUENCE
+        )
+        if sequence_only:
+            for name in (
+                "own_deck_tokens",
+                "hand_tokens",
+                "next_card_token",
+                "revealed_enemy_tokens",
+                "previous_event_card_token",
+                "previous_event_side",
+                "previous_event_position",
+                "card_slot",
+                "position",
+            ):
+                item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).long()
+            for name in (
+                "card_mask",
+                "timing_label_mask",
+                "card_label_mask",
+                "position_label_mask",
+                "play_now",
+            ):
+                item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
+        else:
+            item["grid"] = torch.from_numpy(
+                np.asarray(arrays["grid"][sl]).copy()
+            ).float().div_(255.0)
+            item["position_mask"] = torch.from_numpy(
+                unpack_position_masks(np.asarray(arrays["selected_position_mask_packed"][sl]))
+            )
+            item["ability_position_mask"] = torch.from_numpy(
+                unpack_position_masks(np.asarray(arrays["ability_position_mask_packed"][sl]))
+            )
+            for name in TOKEN_FIELDS + LABEL_FIELDS:
+                item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).long()
+            for name in MASK_FIELDS:
+                item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
         loss_mask = torch.ones(count, dtype=torch.bool)
         loss_mask[:burn] = False
         item["loss_mask"] = loss_mask
@@ -162,4 +195,3 @@ def collate_sequences(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.T
             padded[:steps] = value
             output[key].append(padded)
     return {key: torch.stack(values) for key, values in output.items()}
-

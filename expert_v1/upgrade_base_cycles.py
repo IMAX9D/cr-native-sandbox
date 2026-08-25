@@ -147,6 +147,11 @@ def ability_count(value: dict[str, Any], side: str) -> int:
     return int(raw or 0)
 
 
+def recorded_ability_events(value: dict[str, Any], side: str) -> list[dict[str, Any]]:
+    events = value.get("ability_plays") or []
+    return [event for event in events if event.get("side") == side]
+
+
 def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
     source = Path(str(record["source_path"])).resolve(strict=True)
     value = loads(source.read_bytes())
@@ -160,7 +165,7 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
     for side in ("team", "opponent"):
         deck = list((counts.get(side) or {}).keys())
         events = [
-            (event_index, event)
+            (int(event.get("marker_index", event_index)), event)
             for event_index, event in enumerate(plays)
             if event.get("side") == side
         ]
@@ -184,6 +189,12 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
         card_levels = [level_map.get(card) for card in exact_deck] if exact_forms else []
         exact_levels = exact_forms and all(isinstance(level, int) for level in card_levels)
         tower_troop = player.get("tower_troop")
+        ability_events = recorded_ability_events(value, side)
+        expected_abilities = ability_count(value, side)
+        ability_log_complete = (
+            source_schema_version >= 3
+            and len(ability_events) == expected_abilities
+        ) or expected_abilities == 0
         output.append({
             "schema_version": 1,
             "kind": "expert_base_cycle_side_v1",
@@ -199,8 +210,15 @@ def process_battle(record: dict[str, Any]) -> list[dict[str, Any]]:
             "exact_levels": exact_levels,
             "tower_troop": tower_troop,
             "exact_tower_troop": bool(tower_troop),
-            "ability_events_complete": ability_count(value, side) == 0,
-            "missing_ability_event_count": ability_count(value, side),
+            "ability_events_complete": ability_log_complete,
+            "missing_ability_event_count": max(
+                0, expected_abilities - len(ability_events)
+            ),
+            "ability_ticks": [int(event["time_raw"]) for event in ability_events],
+            "ability_event_indices": [
+                int(event.get("marker_index", index))
+                for index, event in enumerate(ability_events)
+            ],
             "action_count": len(events),
             "event_indices": [event_index for event_index, _ in events],
             "ticks": [int(event["time_raw"]) for _, event in events],

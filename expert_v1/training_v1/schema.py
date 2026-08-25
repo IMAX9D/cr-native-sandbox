@@ -17,6 +17,8 @@ import numpy as np
 SCHEMA_VERSION = 1
 DATASET_KIND = "cr_native_expert_bc_dataset_v1"
 SHARD_KIND = "cr_native_expert_bc_shard_v1"
+OBSERVATION_NATIVE = "native_state_v1"
+OBSERVATION_SEQUENCE = "sequence_only_v1"
 ARENA_ROWS = 32
 ARENA_COLUMNS = 18
 POSITION_COUNT = ARENA_ROWS * ARENA_COLUMNS
@@ -26,7 +28,7 @@ HAND_SIZE = 4
 
 # A shard is a directory of plain .npy arrays.  This keeps large arrays
 # memory-mappable and avoids loading a compressed archive into every worker.
-REQUIRED_ARRAYS = {
+NATIVE_REQUIRED_ARRAYS = {
     "sequence_offsets",
     "grid",
     "public_scalars",
@@ -56,6 +58,36 @@ REQUIRED_ARRAYS = {
     "ability_position_label_mask",
     "sample_weight",
 }
+
+# Sequence-only data is deliberately a different physical contract.  In
+# particular it does not contain a fabricated all-zero native grid, native
+# legality masks, abilities or privileged state.  The three previous-event
+# fields are public replay history and let the recurrent model retain spatial
+# and opponent-play context without pretending to know the libg scene.
+SEQUENCE_REQUIRED_ARRAYS = {
+    "sequence_offsets",
+    "public_scalars",
+    "own_deck_tokens",
+    "hand_tokens",
+    "next_card_token",
+    "revealed_enemy_tokens",
+    "previous_event_card_token",
+    "previous_event_side",
+    "previous_event_position",
+    "delta_ticks",
+    "timing_exposure_ticks",
+    "card_mask",
+    "play_now",
+    "card_slot",
+    "position",
+    "timing_label_mask",
+    "card_label_mask",
+    "position_label_mask",
+    "sample_weight",
+}
+
+# Backwards-compatible public name used by existing native smoke fixtures.
+REQUIRED_ARRAYS = NATIVE_REQUIRED_ARRAYS
 
 # Fail closed if a compiler accidentally adds privileged arrays to an actor
 # dataset.  Future public fields must be explicitly added to REQUIRED_ARRAYS.
@@ -97,10 +129,18 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
         raise DatasetContractError("unexpected dataset kind")
     if int(value.get("schema_version", -1)) != SCHEMA_VERSION:
         raise DatasetContractError("unsupported expert dataset schema")
+    observation_mode = str(value.get("observation_mode") or OBSERVATION_NATIVE)
+    if observation_mode not in (OBSERVATION_NATIVE, OBSERVATION_SEQUENCE):
+        raise DatasetContractError(f"unsupported observation mode: {observation_mode}")
     dimensions = value.get("dimensions") or {}
-    for key in ("grid_channels", "public_scalar_size", "card_vocab_size"):
+    for key in ("public_scalar_size", "card_vocab_size"):
         if int(dimensions.get(key, 0)) <= 0:
             raise DatasetContractError(f"invalid dataset dimension: {key}")
+    grid_channels = int(dimensions.get("grid_channels", -1))
+    if observation_mode == OBSERVATION_NATIVE and grid_channels <= 0:
+        raise DatasetContractError("native-state datasets require grid channels")
+    if observation_mode == OBSERVATION_SEQUENCE and grid_channels != 0:
+        raise DatasetContractError("sequence-only datasets must declare zero grid channels")
     if int(dimensions.get("ability_vocab_size", 0)) <= 0:
         raise DatasetContractError("ability vocab must reserve at least PAD")
     if int(dimensions.get("max_ability_slots", 0)) <= 0:
@@ -131,6 +171,18 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
         raise DatasetContractError("source_file_disjoint must be proven true")
     if value.get("actor_information") != "public_only_v1":
         raise DatasetContractError("actor information contract must be public_only_v1")
+    provenance = value.get("state_provenance") or {}
+    if observation_mode == OBSERVATION_SEQUENCE:
+        if provenance.get("mode") != "sequence_only":
+            raise DatasetContractError("sequence-only provenance must be explicit")
+        if int(provenance.get("native_grid_rows", -1)) != 0:
+            raise DatasetContractError("sequence-only data cannot claim native grid rows")
+        if value.get("native_replay_validated") is not False:
+            raise DatasetContractError(
+                "sequence-only data must not claim native replay validation"
+            )
+        if value.get("timing_target") != "piecewise_exponential_event_v1":
+            raise DatasetContractError("unexpected sequence-only timing target")
     feature_schema = value.get("feature_schema") or {}
     grid_names = feature_schema.get("grid_channels")
     scalar_names = feature_schema.get("public_scalars")
@@ -150,15 +202,26 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
         )
 
 
-def _load_arrays(shard: Path, *, mmap: bool = True) -> dict[str, np.ndarray]:
+def required_arrays(manifest: Mapping[str, Any]) -> set[str]:
+    mode = str(manifest.get("observation_mode") or OBSERVATION_NATIVE)
+    return SEQUENCE_REQUIRED_ARRAYS if mode == OBSERVATION_SEQUENCE else NATIVE_REQUIRED_ARRAYS
+
+
+def _load_arrays(
+    shard: Path,
+    manifest: Mapping[str, Any],
+    *,
+    mmap: bool = True,
+) -> dict[str, np.ndarray]:
     names = {path.stem for path in shard.glob("*.npy")}
     forbidden = sorted(
         name for name in names if any(fragment in name.lower() for fragment in FORBIDDEN_FRAGMENTS)
     )
     if forbidden:
         raise DatasetContractError(f"privileged arrays are forbidden: {forbidden}")
-    missing = sorted(REQUIRED_ARRAYS - names)
-    extra = sorted(names - REQUIRED_ARRAYS)
+    approved = required_arrays(manifest)
+    missing = sorted(approved - names)
+    extra = sorted(names - approved)
     if missing:
         raise DatasetContractError(f"missing arrays in {shard}: {missing}")
     if extra:
@@ -168,7 +231,7 @@ def _load_arrays(shard: Path, *, mmap: bool = True) -> dict[str, np.ndarray]:
 
 
 def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
-    arrays = _load_arrays(shard, mmap=True)
+    arrays = _load_arrays(shard, manifest, mmap=True)
     offsets = arrays["sequence_offsets"]
     if offsets.ndim != 1 or len(offsets) < 2 or int(offsets[0]) != 0:
         raise DatasetContractError(f"bad sequence offsets: {shard}")
@@ -176,6 +239,8 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         raise DatasetContractError(f"empty or reversed sequence in {shard}")
     rows = int(offsets[-1])
     dimensions = manifest["dimensions"]
+    if str(manifest.get("observation_mode") or OBSERVATION_NATIVE) == OBSERVATION_SEQUENCE:
+        return _validate_sequence_shard(shard, manifest, arrays, offsets, rows)
     grid_shape = (
         rows,
         int(dimensions["grid_channels"]),
@@ -338,6 +403,100 @@ def unpack_position_masks(packed: np.ndarray) -> np.ndarray:
     ).astype(np.bool_)
 
 
-def load_shard_arrays(shard: Path) -> dict[str, np.ndarray]:
+def _validate_sequence_shard(
+    shard: Path,
+    manifest: Mapping[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    offsets: np.ndarray,
+    rows: int,
+) -> dict[str, int]:
+    dimensions = manifest["dimensions"]
+    shapes = {
+        "public_scalars": (rows, int(dimensions["public_scalar_size"])),
+        "own_deck_tokens": (rows, DECK_SIZE),
+        "hand_tokens": (rows, HAND_SIZE),
+        "next_card_token": (rows,),
+        "revealed_enemy_tokens": (rows, DECK_SIZE),
+        "card_mask": (rows, HAND_SIZE),
+    }
+    shapes.update(
+        {
+            name: (rows,)
+            for name in SEQUENCE_REQUIRED_ARRAYS - set(shapes) - {"sequence_offsets"}
+        }
+    )
+    for name, expected in shapes.items():
+        if tuple(arrays[name].shape) != expected:
+            raise DatasetContractError(
+                f"{shard}/{name}.npy shape {arrays[name].shape} != {expected}"
+            )
+    vocab_size = int(dimensions["card_vocab_size"])
+    for name in (
+        "own_deck_tokens",
+        "hand_tokens",
+        "next_card_token",
+        "revealed_enemy_tokens",
+        "previous_event_card_token",
+    ):
+        values = arrays[name]
+        if values.min(initial=0) < 0 or values.max(initial=0) >= vocab_size:
+            raise DatasetContractError(f"card token outside vocabulary: {name}")
+    previous_side = arrays["previous_event_side"]
+    if np.any((previous_side < 0) | (previous_side > 2)):
+        raise DatasetContractError("previous event side outside NONE/OWN/ENEMY")
+    previous_position = arrays["previous_event_position"]
+    if np.any((previous_position < 0) | (previous_position > POSITION_COUNT)):
+        raise DatasetContractError("previous event position outside arena/sentinel")
+    if np.any(~np.isfinite(arrays["public_scalars"])):
+        raise DatasetContractError("public scalar contains NaN/Inf")
+    weights = arrays["sample_weight"]
+    if np.any(~np.isfinite(weights)) or np.any(weights < 0):
+        raise DatasetContractError("sample weights must be finite and non-negative")
+    timing_rows = arrays["timing_label_mask"].astype(bool)
+    if np.any(arrays["timing_exposure_ticks"][timing_rows] <= 0):
+        raise DatasetContractError("timing exposure must be positive")
+    if np.any(weights[timing_rows] <= 0):
+        raise DatasetContractError("supervised timing rows require positive weight")
+
+    own_deck = arrays["own_deck_tokens"]
+    hand = arrays["hand_tokens"]
+    next_card = arrays["next_card_token"]
+    if np.any(own_deck == 0) or np.any(hand == 0) or np.any(next_card == 0):
+        raise DatasetContractError("exact cycle fields cannot contain PAD")
+    if np.any(np.sort(own_deck, axis=1)[:, 1:] == np.sort(own_deck, axis=1)[:, :-1]):
+        raise DatasetContractError("own deck contains duplicate card tokens")
+    if np.any(np.sort(hand, axis=1)[:, 1:] == np.sort(hand, axis=1)[:, :-1]):
+        raise DatasetContractError("current hand contains duplicate card tokens")
+    if np.any(~(hand[:, :, None] == own_deck[:, None, :]).any(axis=-1)):
+        raise DatasetContractError("current hand is not a subset of own deck")
+    if np.any(~(next_card[:, None] == own_deck).any(axis=-1)):
+        raise DatasetContractError("next card is not in own deck")
+    if np.any((next_card[:, None] == hand).any(axis=-1)):
+        raise DatasetContractError("next card is already in current hand")
+
+    card_rows = arrays["card_label_mask"].astype(bool)
+    position_rows = arrays["position_label_mask"].astype(bool)
+    play_now = arrays["play_now"].astype(bool)
+    slots = arrays["card_slot"].astype(np.int64)
+    if np.any(card_rows & ~play_now):
+        raise DatasetContractError("card label requires an observed play event")
+    if np.any((slots[card_rows] < 0) | (slots[card_rows] >= HAND_SIZE)):
+        raise DatasetContractError("card label outside hand slots")
+    if np.any(~arrays["card_mask"][np.flatnonzero(card_rows), slots[card_rows]].astype(bool)):
+        raise DatasetContractError("expert card is outside the exact hand")
+    positions = arrays["position"].astype(np.int64)
+    if np.any((positions[position_rows] < 0) | (positions[position_rows] >= POSITION_COUNT)):
+        raise DatasetContractError("position label outside arena")
+    if np.any(position_rows & ~card_rows):
+        raise DatasetContractError("position label requires a card label")
+    any_supervision = timing_rows | card_rows | position_rows
+    if np.any(weights[any_supervision] <= 0):
+        raise DatasetContractError("every supervised row requires positive sample weight")
+    return {"sequences": len(offsets) - 1, "rows": rows}
+
+
+def load_shard_arrays(
+    shard: Path, manifest: Mapping[str, Any]
+) -> dict[str, np.ndarray]:
     """Public loader used by the mmap dataset after validation."""
-    return _load_arrays(shard, mmap=True)
+    return _load_arrays(shard, manifest, mmap=True)

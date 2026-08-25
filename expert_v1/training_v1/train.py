@@ -19,7 +19,13 @@ from torch.utils.data import DataLoader
 from .dataset import NativeExpertSequenceDataset, collate_sequences
 from .losses import MetricAccumulator, behaviour_cloning_loss
 from .model import ExpertPolicyConfig, RecurrentExpertPolicy
-from .schema import read_manifest, sha256_file, validate_shard
+from .schema import (
+    OBSERVATION_NATIVE,
+    OBSERVATION_SEQUENCE,
+    read_manifest,
+    sha256_file,
+    validate_shard,
+)
 from .smoke_data import create_smoke_dataset
 
 
@@ -120,11 +126,22 @@ def run(args: argparse.Namespace) -> Path:
     if args.smoke:
         create_smoke_dataset(dataset_root, replace=True)
     manifest = read_manifest(dataset_root)
+    observation_mode = str(
+        manifest.get("observation_mode") or OBSERVATION_NATIVE
+    )
     if not args.smoke:
         if manifest.get("production_ready") is not True:
             raise RuntimeError("dataset is not marked production_ready")
-        if manifest.get("native_replay_validated") is not True:
-            raise RuntimeError("dataset lacks native replay validation")
+        if observation_mode == OBSERVATION_NATIVE:
+            if manifest.get("native_replay_validated") is not True:
+                raise RuntimeError("dataset lacks native replay validation")
+        elif observation_mode == OBSERVATION_SEQUENCE:
+            if manifest.get("native_replay_validated") is not False:
+                raise RuntimeError(
+                    "sequence-only dataset must not claim native replay validation"
+                )
+        else:
+            raise RuntimeError(f"unsupported observation mode: {observation_mode}")
         if (manifest.get("split_contract") or {}).get("player_holdout_test") is not True:
             raise RuntimeError("production dataset lacks a player-holdout test split")
         expected_source = args.expected_source_manifest.resolve()
@@ -142,14 +159,16 @@ def run(args: argparse.Namespace) -> Path:
                 "active accepted source manifest changed after dataset compilation"
             )
         gates = manifest.get("quality_gates") or {}
-        required_zero = (
+        required_zero = [
             "split_collisions",
             "forbidden_actor_features",
             "nonfinite_features",
             "expert_label_mask_violations",
-            "native_action_rejections",
-            "terminal_mismatches",
-        )
+        ]
+        if observation_mode == OBSERVATION_NATIVE:
+            required_zero.extend(("native_action_rejections", "terminal_mismatches"))
+        else:
+            required_zero.extend(("fabricated_native_grid_rows", "player_holdout_leaks"))
         failures = {
             name: gates.get(name)
             for name in required_zero
@@ -158,27 +177,35 @@ def run(args: argparse.Namespace) -> Path:
         if failures:
             raise RuntimeError(f"dataset quality gates are not clean: {failures}")
         provenance = manifest.get("state_provenance") or {}
-        if "terminal_validation_unknown" not in gates:
-            raise RuntimeError("dataset does not report terminal_validation_unknown")
-        if not all(
-            key in provenance
-            for key in ("authoritative_rows", "native_generated_unanchored_rows")
-        ):
-            raise RuntimeError("dataset does not declare state provenance counts")
-        if (
-            int(provenance.get("authoritative_rows", 0))
-            + int(provenance.get("native_generated_unanchored_rows", 0))
-            <= 0
-        ):
-            raise RuntimeError("dataset contains no state-conditioned training rows")
-        unanchored_rows = int(provenance.get("native_generated_unanchored_rows", 0))
-        terminal_unknown = int(gates.get("terminal_validation_unknown", 0))
-        if (unanchored_rows or terminal_unknown) and not args.allow_unanchored_native_states:
-            raise RuntimeError(
-                "dataset contains unanchored libg-generated states; pass the explicit "
-                "--allow-unanchored-native-states acknowledgement to train an approximate "
-                "state-conditioned model"
-            )
+        if observation_mode == OBSERVATION_SEQUENCE:
+            if provenance.get("mode") != "sequence_only":
+                raise RuntimeError("sequence-only state provenance is not explicit")
+            if int(provenance.get("sequence_only_rows", 0)) <= 0:
+                raise RuntimeError("sequence-only dataset has no training rows")
+            if int(provenance.get("native_grid_rows", -1)) != 0:
+                raise RuntimeError("sequence-only dataset contains/claims native grid rows")
+        else:
+            if "terminal_validation_unknown" not in gates:
+                raise RuntimeError("dataset does not report terminal_validation_unknown")
+            if not all(
+                key in provenance
+                for key in ("authoritative_rows", "native_generated_unanchored_rows")
+            ):
+                raise RuntimeError("dataset does not declare state provenance counts")
+            if (
+                int(provenance.get("authoritative_rows", 0))
+                + int(provenance.get("native_generated_unanchored_rows", 0))
+                <= 0
+            ):
+                raise RuntimeError("dataset contains no state-conditioned training rows")
+            unanchored_rows = int(provenance.get("native_generated_unanchored_rows", 0))
+            terminal_unknown = int(gates.get("terminal_validation_unknown", 0))
+            if (unanchored_rows or terminal_unknown) and not args.allow_unanchored_native_states:
+                raise RuntimeError(
+                    "dataset contains unanchored libg-generated states; pass the explicit "
+                    "--allow-unanchored-native-states acknowledgement to train an approximate "
+                    "state-conditioned model"
+                )
     shard_summary: dict[str, dict[str, int]] = {}
     for split, shards in manifest["splits"].items():
         for relative in shards:
@@ -197,6 +224,7 @@ def run(args: argparse.Namespace) -> Path:
         hidden_size=args.hidden_size,
         lambda_max=args.lambda_max,
         lambda_initial=args.lambda_initial,
+        observation_mode=observation_mode,
     )
     device = _device(args.device)
     model = RecurrentExpertPolicy(config).to(device)
@@ -243,7 +271,12 @@ def run(args: argparse.Namespace) -> Path:
             "reward": None,
             "ppo": False,
             "actor_information": "public_only_v1",
-            "action_heads": ["timing_hazard", "action_kind", "hand_slot", "position", "ability", "ability_position"],
+            "action_heads": (
+                ["timing_hazard", "hand_slot", "position"]
+                if observation_mode == OBSERVATION_SEQUENCE
+                else ["timing_hazard", "action_kind", "hand_slot", "position", "ability", "ability_position"]
+            ),
+            "observation_mode": observation_mode,
             "allow_unanchored_native_states": bool(args.allow_unanchored_native_states),
             "state_provenance": manifest.get("state_provenance", {}),
         },

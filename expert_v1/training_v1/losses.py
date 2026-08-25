@@ -11,6 +11,7 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from .model import ExpertPolicyOutput, ExpertPolicyConfig, masked_logits
+from .schema import OBSERVATION_SEQUENCE
 
 
 def _weighted_mean(values: Tensor, mask: Tensor, weights: Tensor) -> Tensor:
@@ -53,10 +54,30 @@ def behaviour_cloning_loss(
     rate = torch.sigmoid(output.rate_logits) * config.lambda_max
     log_no_play = -(rate * exposure)
     play_probability = -torch.expm1(log_no_play)
-    log_play = torch.log(play_probability.clamp_min(torch.finfo(rate.dtype).tiny))
-    timing_nll = -torch.where(batch["play_now"], log_play, log_no_play)
+    if config.observation_mode == OBSERVATION_SEQUENCE:
+        # Piecewise exponential point-process likelihood.  Each replay row
+        # closes one public-event interval; own deployments are events and
+        # opponent-only intervals are right-censored.  Unlike a categorical
+        # WAIT head, this remains invariant to the native 20 Hz clock.
+        timing_nll = rate * exposure - batch["play_now"].float() * torch.log(
+            rate.clamp_min(torch.finfo(rate.dtype).tiny)
+        )
+    else:
+        log_play = torch.log(play_probability.clamp_min(torch.finfo(rate.dtype).tiny))
+        timing_nll = -torch.where(batch["play_now"], log_play, log_no_play)
     timing_mask = base & batch["timing_label_mask"]
     timing_loss = _weighted_mean(timing_nll, timing_mask, weights)
+
+    if config.observation_mode == OBSERVATION_SEQUENCE:
+        return _sequence_only_loss(
+            output,
+            batch,
+            coefficients,
+            timing_loss,
+            timing_mask,
+            rate,
+            play_probability,
+        )
 
     kind_logits = masked_logits(output.action_kind_logits, _safe_mask(batch["action_kind_mask"]))
     kind_nll = F.cross_entropy(
@@ -157,6 +178,125 @@ def behaviour_cloning_loss(
             distance = torch.sqrt((prow - trow).float().square() + (pcol - tcol).float().square())
             metrics["position_mean_cell_error"] = float(distance.mean().item())
             metrics["position_within_1_cell"] = float((distance <= 1.0).float().mean().item())
+        else:
+            metrics["position_mean_cell_error"] = 0.0
+            metrics["position_within_1_cell"] = 0.0
+    return total, metrics
+
+
+def _sequence_only_loss(
+    output: ExpertPolicyOutput,
+    batch: Mapping[str, Tensor],
+    coefficients: Mapping[str, float],
+    timing_loss: Tensor,
+    timing_mask: Tensor,
+    rate: Tensor,
+    play_probability: Tensor,
+) -> tuple[Tensor, dict[str, float]]:
+    """Loss for public action sequences with no fabricated native state."""
+    base = batch["loss_mask"]
+    weights = batch["sample_weight"].clamp_min(0)
+    card_logits = masked_logits(output.card_logits, _safe_mask(batch["card_mask"]))
+    card_nll = F.cross_entropy(
+        card_logits.flatten(0, 1),
+        batch["card_slot"].flatten(),
+        reduction="none",
+        ignore_index=-100,
+    ).reshape_as(batch["card_slot"])
+    card_mask = base & batch["card_label_mask"]
+    card_loss = _weighted_mean(card_nll, card_mask, weights)
+
+    selected_card = batch["card_slot"].clamp(0, 3)
+    gather_position = selected_card[..., None, None].expand(
+        *selected_card.shape, 1, output.position_logits.shape[-1]
+    )
+    position_logits = output.position_logits.gather(2, gather_position).squeeze(2)
+    position_nll = F.cross_entropy(
+        position_logits.flatten(0, 1),
+        batch["position"].flatten(),
+        reduction="none",
+        ignore_index=-100,
+    ).reshape_as(batch["position"])
+    position_mask = base & batch["position_label_mask"]
+    position_loss = _weighted_mean(position_nll, position_mask, weights)
+
+    total = (
+        coefficients["timing"] * timing_loss
+        + coefficients["card"] * card_loss
+        + coefficients["position"] * position_loss
+    )
+    metrics: dict[str, float] = {
+        "loss": float(total.detach().item()),
+        "loss_timing": float(timing_loss.detach().item()),
+        "loss_kind": 0.0,
+        "loss_card": float(card_loss.detach().item()),
+        "loss_position": float(position_loss.detach().item()),
+        "loss_ability": 0.0,
+        "loss_ability_position": 0.0,
+        "lambda_mean": (
+            float(rate[timing_mask].mean().detach().item())
+            if bool(timing_mask.any())
+            else 0.0
+        ),
+        "play_probability_mean": (
+            float(play_probability[timing_mask].mean().detach().item())
+            if bool(timing_mask.any())
+            else 0.0
+        ),
+        "timing_count": float(timing_mask.sum().item()),
+        "card_count": float(card_mask.sum().item()),
+        "position_count": float(position_mask.sum().item()),
+        "kind_count": 0.0,
+        "ability_count": 0.0,
+    }
+    with torch.no_grad():
+        metrics["timing_brier"] = (
+            float(
+                (
+                    play_probability[timing_mask]
+                    - batch["play_now"][timing_mask].float()
+                )
+                .square()
+                .mean()
+                .item()
+            )
+            if bool(timing_mask.any())
+            else 0.0
+        )
+        metrics["card_top1"] = (
+            float(
+                (card_logits.argmax(-1)[card_mask] == batch["card_slot"][card_mask])
+                .float()
+                .mean()
+                .item()
+            )
+            if bool(card_mask.any())
+            else 0.0
+        )
+        top3 = card_logits.topk(k=min(3, card_logits.shape[-1]), dim=-1).indices
+        metrics["card_top3"] = (
+            float(
+                (top3[card_mask] == batch["card_slot"][card_mask, None])
+                .any(-1)
+                .float()
+                .mean()
+                .item()
+            )
+            if bool(card_mask.any())
+            else 0.0
+        )
+        if bool(position_mask.any()):
+            predicted = position_logits.argmax(-1)[position_mask]
+            target = batch["position"][position_mask]
+            prow, pcol = predicted.div(18, rounding_mode="floor"), predicted.remainder(18)
+            trow, tcol = target.div(18, rounding_mode="floor"), target.remainder(18)
+            distance = torch.sqrt(
+                (prow - trow).float().square() + (pcol - tcol).float().square()
+            )
+            metrics["position_mean_cell_error"] = float(distance.mean().item())
+            metrics["position_within_1_cell"] = float(
+                (distance <= 1.0).float().mean().item()
+            )
         else:
             metrics["position_mean_cell_error"] = 0.0
             metrics["position_within_1_cell"] = 0.0

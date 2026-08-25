@@ -9,7 +9,13 @@ from typing import NamedTuple
 import torch
 from torch import Tensor, nn
 
-from .schema import ARENA_COLUMNS, ARENA_ROWS, POSITION_COUNT
+from .schema import (
+    ARENA_COLUMNS,
+    ARENA_ROWS,
+    OBSERVATION_NATIVE,
+    OBSERVATION_SEQUENCE,
+    POSITION_COUNT,
+)
 
 
 @dataclass(frozen=True)
@@ -25,8 +31,9 @@ class ExpertPolicyConfig:
     lambda_max: float = 20.0
     lambda_initial: float = 0.30
     native_tick_seconds: float = 0.05
+    observation_mode: str = OBSERVATION_NATIVE
 
-    def to_dict(self) -> dict[str, int | float]:
+    def to_dict(self) -> dict[str, int | float | str]:
         return asdict(self)
 
 
@@ -55,16 +62,40 @@ class RecurrentExpertPolicy(nn.Module):
         embed = config.card_embedding_size
         spatial = config.spatial_size
         hidden = config.hidden_size
+        if config.observation_mode not in (OBSERVATION_NATIVE, OBSERVATION_SEQUENCE):
+            raise ValueError(f"unsupported observation mode: {config.observation_mode}")
         self.card_embedding = nn.Embedding(config.card_vocab_size, embed, padding_idx=0)
         self.ability_embedding = nn.Embedding(config.ability_vocab_size, embed, padding_idx=0)
-        self.spatial = nn.Sequential(
-            nn.Conv2d(config.grid_channels, 32, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(32, spatial, 3, padding=1),
-            nn.SiLU(),
-            nn.Conv2d(spatial, spatial, 3, padding=1),
-            nn.SiLU(),
-        )
+        if config.observation_mode == OBSERVATION_NATIVE:
+            if config.grid_channels <= 0:
+                raise ValueError("native-state model requires grid channels")
+            self.spatial = nn.Sequential(
+                nn.Conv2d(config.grid_channels, 32, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(32, spatial, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(spatial, spatial, 3, padding=1),
+                nn.SiLU(),
+            )
+            self.cell_features = nn.Conv2d(spatial, embed, 1)
+            recurrent_spatial = spatial
+        else:
+            if config.grid_channels != 0:
+                raise ValueError("sequence-only model cannot accept grid channels")
+            self.spatial = None
+            self.cell_features = None
+            self.sequence_cell_embedding = nn.Embedding(POSITION_COUNT, embed)
+            self.previous_position_embedding = nn.Embedding(
+                POSITION_COUNT + 1, embed, padding_idx=POSITION_COUNT
+            )
+            self.previous_side_embedding = nn.Embedding(3, 8, padding_idx=0)
+            self.event_context = nn.Sequential(
+                nn.Linear(embed * 2 + 8, 96),
+                nn.SiLU(),
+                nn.Linear(96, spatial),
+                nn.SiLU(),
+            )
+            recurrent_spatial = spatial
         self.scalar = nn.Sequential(
             nn.Linear(config.public_scalar_size, 96),
             nn.SiLU(),
@@ -78,7 +109,7 @@ class RecurrentExpertPolicy(nn.Module):
             nn.SiLU(),
         )
         self.recurrent = nn.LSTM(
-            input_size=spatial + 64 + 96 + 1,
+            input_size=recurrent_spatial + 64 + 96 + 1,
             hidden_size=hidden,
             num_layers=1,
             batch_first=True,
@@ -88,7 +119,6 @@ class RecurrentExpertPolicy(nn.Module):
         self.card_query = nn.Linear(hidden, embed, bias=False)
         self.card_key = nn.Linear(embed, embed, bias=False)
         self.card_bias = nn.Sequential(nn.Linear(embed, 32), nn.SiLU(), nn.Linear(32, 1))
-        self.cell_features = nn.Conv2d(spatial, embed, 1)
         self.position_query = nn.Sequential(
             nn.Linear(hidden + embed, embed), nn.SiLU(), nn.Linear(embed, embed)
         )
@@ -119,23 +149,53 @@ class RecurrentExpertPolicy(nn.Module):
     def forward_sequence(
         self,
         *,
-        grid: Tensor,
+        grid: Tensor | None,
         public_scalars: Tensor,
         own_deck_tokens: Tensor,
         hand_tokens: Tensor,
         next_card_token: Tensor,
         revealed_enemy_tokens: Tensor,
-        ability_tokens: Tensor,
+        ability_tokens: Tensor | None,
         delta_ticks: Tensor,
+        previous_event_card_token: Tensor | None = None,
+        previous_event_side: Tensor | None = None,
+        previous_event_position: Tensor | None = None,
         hidden: tuple[Tensor, Tensor] | None = None,
     ) -> ExpertPolicyOutput:
-        if grid.ndim != 5:
-            raise ValueError("grid must have shape [batch,time,channels,32,18]")
-        batch, steps = grid.shape[:2]
-        if tuple(grid.shape[-2:]) != (ARENA_ROWS, ARENA_COLUMNS):
-            raise ValueError("arena shape must be 32x18")
-        flat_spatial = self.spatial(grid.flatten(0, 1))
-        pooled = flat_spatial.mean(dim=(-2, -1)).reshape(batch, steps, -1)
+        batch, steps = public_scalars.shape[:2]
+        if self.config.observation_mode == OBSERVATION_NATIVE:
+            if grid is None or grid.ndim != 5:
+                raise ValueError("grid must have shape [batch,time,channels,32,18]")
+            if tuple(grid.shape[-2:]) != (ARENA_ROWS, ARENA_COLUMNS):
+                raise ValueError("arena shape must be 32x18")
+            assert self.spatial is not None
+            flat_spatial = self.spatial(grid.flatten(0, 1))
+            pooled = flat_spatial.mean(dim=(-2, -1)).reshape(batch, steps, -1)
+        else:
+            if grid is not None:
+                raise ValueError("sequence-only model must not receive a native grid")
+            if any(
+                value is None
+                for value in (
+                    previous_event_card_token,
+                    previous_event_side,
+                    previous_event_position,
+                )
+            ):
+                raise ValueError("sequence-only model requires previous public event fields")
+            assert previous_event_card_token is not None
+            assert previous_event_side is not None
+            assert previous_event_position is not None
+            pooled = self.event_context(
+                torch.cat(
+                    (
+                        self.card_embedding(previous_event_card_token),
+                        self.previous_position_embedding(previous_event_position),
+                        self.previous_side_embedding(previous_event_side),
+                    ),
+                    dim=-1,
+                )
+            )
         hand = self.card_embedding(hand_tokens)
         own_deck = self._masked_mean(self.card_embedding(own_deck_tokens), own_deck_tokens)
         enemy = self._masked_mean(
@@ -160,33 +220,46 @@ class RecurrentExpertPolicy(nn.Module):
         ) / math.sqrt(hand.shape[-1])
         card_logits = card_logits + self.card_bias(hand).squeeze(-1)
 
-        cells = self.cell_features(flat_spatial).flatten(2).transpose(1, 2)
-        cells = cells.reshape(batch, steps, POSITION_COUNT, -1)
+        if self.config.observation_mode == OBSERVATION_NATIVE:
+            assert self.cell_features is not None
+            cells = self.cell_features(flat_spatial).flatten(2).transpose(1, 2)
+            cells = cells.reshape(batch, steps, POSITION_COUNT, -1)
+        else:
+            cells = self.sequence_cell_embedding.weight.unsqueeze(0).unsqueeze(0)
+            cells = cells.expand(batch, steps, -1, -1)
         position_queries = self.position_query(
             torch.cat((recurrent.unsqueeze(2).expand(-1, -1, 4, -1), hand), dim=-1)
         )
         position_logits = torch.einsum("btse,btpe->btsp", position_queries, cells)
         position_logits = position_logits / math.sqrt(cells.shape[-1])
 
-        abilities = self.ability_embedding(ability_tokens)
-        ability_logits = torch.einsum(
-            "bte,btae->bta", self.ability_query(recurrent), self.ability_key(abilities)
-        ) / math.sqrt(abilities.shape[-1])
-        ability_logits = ability_logits + self.ability_bias(abilities).squeeze(-1)
-        ability_position_queries = self.ability_position_query(
-            torch.cat(
-                (
-                    recurrent.unsqueeze(2).expand(
-                        -1, -1, self.config.max_ability_slots, -1
-                    ),
-                    abilities,
-                ),
-                dim=-1,
+        if ability_tokens is None:
+            ability_logits = recurrent.new_zeros(
+                batch, steps, self.config.max_ability_slots
             )
-        )
-        ability_position_logits = torch.einsum(
-            "btae,btpe->btap", ability_position_queries, cells
-        ) / math.sqrt(cells.shape[-1])
+            ability_position_logits = recurrent.new_zeros(
+                batch, steps, self.config.max_ability_slots, POSITION_COUNT
+            )
+        else:
+            abilities = self.ability_embedding(ability_tokens)
+            ability_logits = torch.einsum(
+                "bte,btae->bta", self.ability_query(recurrent), self.ability_key(abilities)
+            ) / math.sqrt(abilities.shape[-1])
+            ability_logits = ability_logits + self.ability_bias(abilities).squeeze(-1)
+            ability_position_queries = self.ability_position_query(
+                torch.cat(
+                    (
+                        recurrent.unsqueeze(2).expand(
+                            -1, -1, self.config.max_ability_slots, -1
+                        ),
+                        abilities,
+                    ),
+                    dim=-1,
+                )
+            )
+            ability_position_logits = torch.einsum(
+                "btae,btpe->btap", ability_position_queries, cells
+            ) / math.sqrt(cells.shape[-1])
         return ExpertPolicyOutput(
             self.rate_head(recurrent).squeeze(-1),
             self.action_kind_head(recurrent),
@@ -198,14 +271,23 @@ class RecurrentExpertPolicy(nn.Module):
         )
 
     def forward_batch(self, batch: dict[str, Tensor]) -> ExpertPolicyOutput:
-        names = (
-            "grid",
+        common = (
             "public_scalars",
             "own_deck_tokens",
             "hand_tokens",
             "next_card_token",
             "revealed_enemy_tokens",
-            "ability_tokens",
             "delta_ticks",
         )
-        return self.forward_sequence(**{name: batch[name] for name in names})
+        values = {name: batch[name] for name in common}
+        if self.config.observation_mode == OBSERVATION_SEQUENCE:
+            values.update(
+                grid=None,
+                ability_tokens=None,
+                previous_event_card_token=batch["previous_event_card_token"],
+                previous_event_side=batch["previous_event_side"],
+                previous_event_position=batch["previous_event_position"],
+            )
+        else:
+            values.update(grid=batch["grid"], ability_tokens=batch["ability_tokens"])
+        return self.forward_sequence(**values)
