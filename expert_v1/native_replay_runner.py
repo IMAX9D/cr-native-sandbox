@@ -161,6 +161,13 @@ def execute_plan(
     replay, mappings = materialize_replay(
         plan, template, calibration, seed=seed
     )
+    first_exact_ticks: list[int | None] = []
+    for side, side_plan in enumerate(plan.sides):
+        exact_index = side_plan.cycle.first_exact_action_index
+        side_actions = [action for action in plan.actions if action.side == side]
+        first_exact_ticks.append(
+            None if exact_index is None else side_actions[exact_index].tick
+        )
     reset_started = time.perf_counter()
     state = env.reset(replay, warmup_steps=10)
     reset_seconds += time.perf_counter() - reset_started
@@ -233,7 +240,12 @@ def execute_plan(
                     record.update({
                         "state_provenance": plan.state_provenance,
                         "action_provenance": plan.action_provenance,
-                        "hand_provenance": plan.hand_provenance,
+                        "hand_provenance": (
+                            "inferred_exact"
+                            if first_exact_ticks[actor_side] is not None
+                            and source_tick >= int(first_exact_ticks[actor_side])
+                            else "inferred_ambiguous_prefix"
+                        ),
                         "ability_provenance": plan.ability_provenance,
                         "terminal_provenance": plan.terminal_provenance,
                     })

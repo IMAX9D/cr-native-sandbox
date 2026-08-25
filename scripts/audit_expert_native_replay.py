@@ -61,6 +61,12 @@ def audit_one(
             "compatible_initial_states": [
                 side.cycle.compatible_initial_state_count for side in plan.sides
             ],
+            "first_exact_action_indices": [
+                side.cycle.first_exact_action_index for side in plan.sides
+            ],
+            "exact_hand_actions": sum(
+                side.cycle.exact_action_count for side in plan.sides
+            ),
             "limitations": list(plan.limitations),
         }, None)
     except Exception as error:

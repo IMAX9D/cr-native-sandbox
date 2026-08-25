@@ -78,6 +78,8 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         plan = compile_battle(battle())
         self.assertTrue(plan.native_replay_ready)
         self.assertFalse(plan.original_state_exact)
+        self.assertEqual(plan.sides[0].cycle.first_exact_action_index, 4)
+        self.assertEqual(plan.sides[1].cycle.first_exact_action_index, 4)
         template = json.loads(
             (PROJECT_ROOT / "examples" / "eight-card-bootstrap.json").read_text(
                 encoding="utf-8"

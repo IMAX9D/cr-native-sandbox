@@ -110,6 +110,11 @@ Ability 统计。但 `ability_id` 目前仍为 unresolved；Tick 本身不能告
 - 不能声称选择出的初始 hand 就是真人原始 hand；
 - 不能声称任意兼容 hand 对应的 RNG seed 是原始 seed。
 
+计划逐方保存 `first_exact_action_index`。在该 index 之前，虽然专家打出的牌必然
+属于某个兼容手牌，但另外三张牌不唯一，Card Head/Hand 特征的 source 标签必须
+关闭；从唯一收敛点开始才写 `hand_provenance=inferred_exact`。不能因为生成的
+libg replay 任意选了一副兼容初始手牌，就把开局歧义前缀升级成真人精确手牌。
+
 每个原生 Worker 首先用固定 seed 校准一次 `hand_deck_indices +
 cycle_deck_indices` 的 4+4 shuffle 布局。编译器随后重排 replay 的八个 deck slot，
 使 libg shuffle 后恰好等于所选兼容状态，并将逻辑卡索引双射到原生 deck index。

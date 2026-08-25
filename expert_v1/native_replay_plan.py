@@ -81,6 +81,8 @@ class CycleCandidate:
     initial_hand: tuple[int, int, int, int]
     initial_queue: tuple[int, int, int, int]
     compatible_initial_state_count: int
+    first_exact_action_index: int | None
+    exact_action_count: int
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class ExpertAction:
     x: int
     y: int
     source_event_index: int
+    side_action_index: int
 
 
 @dataclass(frozen=True)
@@ -185,10 +188,18 @@ def compatible_cycle(played: Sequence[int]) -> CycleCandidate:
     queues = INITIAL_QUEUES.copy()
     origin_masks = masks.copy()
     origin_queues = queues.copy()
+    first_exact_action_index: int | None = None
+    exact_action_count = 0
     for action_index, raw_index in enumerate(played):
         index = int(raw_index)
         if not 0 <= index < 8:
             raise ReplayPlanError(f"invalid logical card index at action {action_index}")
+        hand_unique = bool(len(masks) and np.all(masks == masks[0]))
+        next_unique = bool(len(queues) and np.all(queues[:, 0] == queues[0, 0]))
+        if hand_unique and next_unique:
+            if first_exact_action_index is None:
+                first_exact_action_index = action_index
+            exact_action_count += 1
         keep = ((masks >> np.uint16(index)) & np.uint16(1)).astype(bool)
         masks, queues = masks[keep], queues[keep]
         origin_masks, origin_queues = origin_masks[keep], origin_queues[keep]
@@ -214,6 +225,8 @@ def compatible_cycle(played: Sequence[int]) -> CycleCandidate:
         initial_hand=hand,  # type: ignore[arg-type]
         initial_queue=queue,  # type: ignore[arg-type]
         compatible_initial_state_count=int(len(origin_masks)),
+        first_exact_action_index=first_exact_action_index,
+        exact_action_count=exact_action_count,
     )
 
 
@@ -326,6 +339,7 @@ def compile_battle(
     actions: list[ExpertAction] = []
     per_side_indices: list[list[int]] = [[], []]
     same_side_ticks: set[tuple[int, int]] = set()
+    side_action_counts = [0, 0]
     for event_index, event in enumerate(plays):
         if not isinstance(event, Mapping):
             raise ReplayPlanError(f"event {event_index} is not an object")
@@ -358,7 +372,9 @@ def compile_battle(
         actions.append(ExpertAction(
             tick=tick, side=side, logical_card_index=logical,
             base_token=base_token, x=x, y=y, source_event_index=event_index,
+            side_action_index=side_action_counts[side],
         ))
+        side_action_counts[side] += 1
     if any(
         actions[index].tick > actions[index + 1].tick
         for index in range(len(actions) - 1)
@@ -436,9 +452,9 @@ def compile_battle(
         state_provenance="native_generated_unanchored",
         action_provenance="observed_deployments",
         hand_provenance=(
-            "inferred_cycle_unique"
-            if all(cycle.compatible_initial_state_count == 1 for cycle in cycles)
-            else "inferred_cycle_compatible_initial"
+            "inferred_exact_all_actions"
+            if all(cycle.first_exact_action_index == 0 for cycle in cycles)
+            else "inferred_mixed_ambiguous_prefix_then_exact"
         ),
         ability_provenance=_ability_provenance(value, ability_counts),
         terminal_provenance=(
