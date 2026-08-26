@@ -76,6 +76,7 @@ constexpr uintptr_t kAbilityCommandExecuteRva = 0xD8F3C0;
 constexpr uintptr_t kBattleCommandHardGateRva = 0xD50CD0;
 constexpr uintptr_t kBattleCommandGateRva = 0xD503D0;
 constexpr uintptr_t kBuildCanonicalSelectionRva = 0x1048170;
+constexpr uintptr_t kBuildDynamicChoiceSelectionRva = 0xD71800;
 constexpr uintptr_t kResolveCanonicalSelectionRva = 0xE85D40;
 constexpr uintptr_t kValidateDeploymentRva = 0xD5B770;
 constexpr uintptr_t kBattleIdentityIndexRva = 0xD4E180;
@@ -89,6 +90,10 @@ constexpr uintptr_t kNextDeckIndexRva = 0xF98120;
 constexpr size_t kMaxObservedEntities = 2048;
 constexpr size_t kMaxPathNodes = 115;
 constexpr uintptr_t kProjectileVtableRva = 0x1969B38;
+// Native choice-wrapper used by MergeMaiden/Spirit Empress in 15.535.29.
+// Its +0x2e8 form vector is consumed by D71800. Ordinary card roots do not
+// own that vector, so calling D71800 for every card is invalid.
+constexpr uintptr_t kDynamicChoiceSpellVtableRva = 0x1942898;
 constexpr jint kTraceSchemaVersion = 1;
 constexpr jint kMaxTraceSteps = 64;
 constexpr jint kMinTraceResponseBytes = 64 * 1024;
@@ -208,6 +213,36 @@ class SafeMemoryReader {
  private:
   int fd_;
 };
+
+int32_t build_deployment_selection(
+    uintptr_t base, const SafeMemoryReader& memory, void* output,
+    void* entry, void* player, int32_t mode,
+    uint64_t* root_vtable_rva = nullptr) {
+  uint64_t root = 0;
+  uint64_t root_vtable = 0;
+  if (entry == nullptr ||
+      !memory.read(reinterpret_cast<uintptr_t>(entry) + 0x10, &root) ||
+      root == 0 ||
+      !memory.read(root, &root_vtable) || root_vtable < base) {
+    if (root_vtable_rva != nullptr) {
+      *root_vtable_rva = 0;
+    }
+    return -1;
+  }
+  const uint64_t vtable_rva = root_vtable - base;
+  if (root_vtable_rva != nullptr) {
+    *root_vtable_rva = vtable_rva;
+  }
+  const bool dynamic_choice = vtable_rva == kDynamicChoiceSpellVtableRva;
+  const uintptr_t builder_rva = dynamic_choice
+      ? kBuildDynamicChoiceSelectionRva : kBuildCanonicalSelectionRva;
+  auto build = reinterpret_cast<BuildCanonicalSelection>(base + builder_rva);
+  // D71800 is the original libg choice-card path. It internally constructs
+  // canonical state once, runs the wrapper's native player/resource
+  // predicate, then encodes the chosen form index into bits 4..6.
+  build(output, entry, player, mode);
+  return dynamic_choice ? 1 : 0;
+}
 
 const char* native_data_string_chars(const SafeMemoryReader& memory,
                                      void* native_string,
@@ -633,8 +668,6 @@ Java_royale_nativehost_JniHost_nativeAct(
       base + kDoSpellCommandCtorRva);
   auto execute = reinterpret_cast<DoSpellCommandExecute>(
       base + kDoSpellCommandExecuteRva);
-  auto build_selection = reinterpret_cast<BuildCanonicalSelection>(
-      base + kBuildCanonicalSelectionRva);
   construct(command, reinterpret_cast<void*>(command_context));
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x14) =
       account_hi;
@@ -643,9 +676,19 @@ Java_royale_nativehost_JniHost_nativeAct(
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x28) = x;
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x2C) = y;
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x30) = -1;
-  build_selection(
+  uint64_t selection_root_vtable_rva = 0;
+  const int32_t selection_strategy = build_deployment_selection(
+      base, memory,
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(command) + 0x38),
-      entry, player, 0);
+      entry, player, 0, &selection_root_vtable_rva);
+  if (selection_strategy < 0) {
+    auto** command_vtable = *reinterpret_cast<void***>(command);
+    reinterpret_cast<void (*)(void*)>(command_vtable[1])(command);
+    dlclose(handle);
+    throw_state(env, "native hand-entry selection root is unavailable");
+    return nullptr;
+  }
+  const bool dynamic_choice_selection = selection_strategy == 1;
 
   int32_t packed_selection = 0;
   uint64_t original_spell = 0;
@@ -724,6 +767,10 @@ Java_royale_nativehost_JniHost_nativeAct(
   const int32_t elixir_before = player_elixir(player);
   const int32_t card_cost =
       static_cast<int32_t>(static_cast<uint32_t>(packed_selection) >> 28);
+  const int32_t encoded_form_index =
+      (static_cast<uint32_t>(packed_selection) >> 4) & 7;
+  const int32_t selection_form_index = encoded_form_index == 0
+      ? -1 : encoded_form_index - 1;
   const int32_t resource_deficit_raw =
       std::max(0, card_cost * 10000 - elixir_raw_before);
   const int32_t next_deck_index_before = next_deck_index(
@@ -783,7 +830,7 @@ Java_royale_nativehost_JniHost_nativeAct(
       : result_code == 13
       ? "insufficient_elixir"
       : "native_command_rejected";
-  char payload[2048];
+  char payload[2304];
   std::snprintf(
       payload, sizeof(payload),
       "{\"accepted\":%s,\"result_code\":%d,\"tick\":%d,"
@@ -793,6 +840,10 @@ Java_royale_nativehost_JniHost_nativeAct(
       "\"dry_run\":%s,\"placement_valid\":%s,"
       "\"placement_code\":%d,\"placement_reason\":\"%s\","
       "\"packed_selection\":%d,\"execution_flags\":%d,"
+      "\"selection_strategy\":\"%s\","
+      "\"selection_builder_rva\":\"0x%llx\","
+      "\"selection_root_vtable_rva\":\"0x%llx\","
+      "\"selection_form_index\":%d,"
       "\"guard_before\":{\"hard_gate\":%s,\"command_gate\":%s,"
       "\"battle_phase\":%d,\"battle_flag_1e9\":%d,"
       "\"logic_state\":%d,\"logic_substate\":%d,"
@@ -816,6 +867,11 @@ Java_royale_nativehost_JniHost_nativeAct(
       deck_index, hand_index, x, y, dry_run ? "true" : "false",
       placement_code == 0 ? "true" : "false", placement_code,
       placement_reason, packed_selection, kCommandExecutionFlags,
+      dynamic_choice_selection ? "native_dynamic_choice" : "canonical",
+      static_cast<unsigned long long>(dynamic_choice_selection
+          ? kBuildDynamicChoiceSelectionRva : kBuildCanonicalSelectionRva),
+      static_cast<unsigned long long>(selection_root_vtable_rva),
+      selection_form_index,
       hard_gate_before ? "true" : "false",
       command_gate_before ? "true" : "false",
       battle_phase, static_cast<int>(battle_flag_1e9), logic_state,
@@ -1149,8 +1205,6 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
   }
   auto construct = reinterpret_cast<DoSpellCommandCtor>(
       base + kDoSpellCommandCtorRva);
-  auto build_selection = reinterpret_cast<BuildCanonicalSelection>(
-      base + kBuildCanonicalSelectionRva);
   auto resolve_selection = reinterpret_cast<ResolveCanonicalSelection>(
       base + kResolveCanonicalSelectionRva);
   auto validate_deployment = reinterpret_cast<ValidateDeployment>(
@@ -1161,9 +1215,21 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x18) =
       account_lo;
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x30) = -1;
-  build_selection(
+  uint64_t selection_root_vtable_rva = 0;
+  const int32_t selection_strategy = build_deployment_selection(
+      base, memory,
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(command) + 0x38),
-      entry, player, 0);
+      entry, player, 0, &selection_root_vtable_rva);
+  if (selection_strategy < 0) {
+    auto** command_vtable = *reinterpret_cast<void***>(command);
+    reinterpret_cast<void (*)(void*)>(command_vtable[1])(command);
+    dlclose(handle);
+    throw_state(env, "native grid-probe selection root is unavailable");
+    return nullptr;
+  }
+  const bool dynamic_choice_selection = selection_strategy == 1;
+  int32_t packed_selection = 0;
+  memory.read(reinterpret_cast<uintptr_t>(command) + 0x48, &packed_selection);
   void* resolved_selection = resolve_selection(
       reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(command) + 0x38));
   if (resolved_selection == nullptr) {
@@ -1173,6 +1239,16 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
     throw_state(env, "native grid probe selection is unavailable");
     return nullptr;
   }
+  int32_t resolved_data_id = -1;
+  memory.read(
+      reinterpret_cast<uintptr_t>(resolved_selection) + 0x40,
+      &resolved_data_id);
+  const int32_t card_cost =
+      static_cast<int32_t>(static_cast<uint32_t>(packed_selection) >> 28);
+  const int32_t encoded_form_index =
+      (static_cast<uint32_t>(packed_selection) >> 4) & 7;
+  const int32_t selection_form_index = encoded_form_index == 0
+      ? -1 : encoded_form_index - 1;
 
   std::string rows;
   int32_t valid_cells = 0;
@@ -1198,6 +1274,28 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
   std::string payload =
       "{\"width\":18,\"height\":32,\"cell_size\":1000,";
   payload += "\"valid_cells\":" + std::to_string(valid_cells);
+  payload += ",\"resolved_data_id\":" + std::to_string(resolved_data_id);
+  payload += ",\"packed_selection\":" + std::to_string(packed_selection);
+  payload += ",\"card_cost\":" + std::to_string(card_cost);
+  payload += ",\"card_cost_raw\":" + std::to_string(card_cost * 10000);
+  payload += ",\"selection_form_index\":" +
+      std::to_string(selection_form_index);
+  payload += ",\"selection_strategy\":\"";
+  payload += dynamic_choice_selection ? "native_dynamic_choice" : "canonical";
+  payload += "\",\"selection_builder_rva\":\"0x";
+  char builder_rva[32];
+  std::snprintf(
+      builder_rva, sizeof(builder_rva), "%llx",
+      static_cast<unsigned long long>(dynamic_choice_selection
+          ? kBuildDynamicChoiceSelectionRva : kBuildCanonicalSelectionRva));
+  payload += builder_rva;
+  payload += "\",\"selection_root_vtable_rva\":\"0x";
+  char root_vtable_rva[32];
+  std::snprintf(
+      root_vtable_rva, sizeof(root_vtable_rva), "%llx",
+      static_cast<unsigned long long>(selection_root_vtable_rva));
+  payload += root_vtable_rva;
+  payload += "\"";
   payload += ",\"rows\":[" + rows + "]}";
   dlclose(handle);
   return env->NewStringUTF(payload.c_str());
