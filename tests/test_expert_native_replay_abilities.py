@@ -155,12 +155,35 @@ class ExpertNativeReplayAbilityTests(unittest.TestCase):
         self.assertEqual(result.accepted_ability_actions, 1)
         self.assertTrue(result.ability_replay_complete)
         self.assertEqual(result.ability_resolution_counts, {"unique": 1})
-        self.assertEqual(result.action_execution_tick_offset, 0)
+        self.assertEqual(result.action_execution_tick_offset, 1)
         self.assertEqual(result.ability_resolutions[0]["source_tick"], 25)
-        self.assertEqual(result.ability_resolutions[0]["execution_tick"], 25)
+        self.assertEqual(result.ability_resolutions[0]["execution_tick"], 26)
+        self.assertEqual(env.submitted_ticks, [21, 26])
         self.assertEqual(env.submitted[-1], [
             {"type": "ability", "side": 0, "entity_id": 50}
         ])
+        profile = result.json()["native_teacher_forced_profile"]
+        self.assertEqual(profile["name"], "royaleapi_native_teacher_forced")
+        self.assertEqual(profile["version"], 1)
+        self.assertFalse(profile["diagnostic_override"])
+
+    def test_explicit_offset_zero_remains_a_diagnostic_override(self) -> None:
+        plan = compile_battle(ability_battle())
+        env = FakeNativeEnv()
+        result = execute_plan(
+            env,
+            plan,
+            template(),
+            calibration(),
+            action_execution_tick_offset=0,
+        )
+
+        self.assertTrue(result.accepted, result.failure)
+        self.assertEqual(env.submitted_ticks, [20, 25])
+        self.assertEqual(result.action_execution_tick_offset, 0)
+        profile = result.json()["native_teacher_forced_profile"]
+        self.assertEqual(profile["native_execution_boundary"], "source_tick+0")
+        self.assertTrue(profile["diagnostic_override"])
 
     def test_offset_one_keeps_source_ticks_and_uses_data_i_coordinates(self) -> None:
         source = ability_battle()

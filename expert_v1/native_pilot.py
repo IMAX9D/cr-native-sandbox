@@ -23,6 +23,12 @@ except ImportError:  # pragma: no cover - stdlib fallback is supported
 from native_core.env import NativeRoyaleEnv
 from native_core.card_catalog import catalog
 
+from .native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    action_tick_provenance,
+    native_teacher_forced_profile,
+    validate_action_execution_tick_offset,
+)
 from .native_replay_plan import (
     DEFAULT_NATIVE_SEED,
     BattlePlan,
@@ -186,12 +192,11 @@ def _logical_state_digest(
 def action_execution_tick(source_tick: int, offset: int) -> int:
     """Map an immutable source label onto an explicit execution boundary.
 
-    Offset 0 is the production default.  Offset 1 exists only for the audited
-    RoyaleAPI marker-phase experiment; arbitrary offsets are rejected so a
-    caller cannot silently turn this diagnostic into replay correction.
+    RoyaleAPI native teacher-forced profile v1 uses offset 1.  Explicit offset
+    0 remains available only for reproducing the historical phase diagnostic;
+    arbitrary offsets are rejected.
     """
-    if offset not in (0, 1):
-        raise ValueError("action execution Tick offset must be exactly 0 or 1")
+    offset = validate_action_execution_tick_offset(offset)
     source_tick = int(source_tick)
     if source_tick < 0:
         raise ValueError("source Tick must be non-negative")
@@ -209,7 +214,9 @@ def execute_deployment_trace(
     warmup_tick: int = 10,
     trace_batch_steps: int = 64,
     terminal_fence_ticks: int = 20,
-    action_execution_tick_offset: int = 0,
+    action_execution_tick_offset: int = (
+        ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+    ),
 ) -> TraceReplay:
     """Replay deployments and retain every complete native Tick.
 
@@ -642,9 +649,11 @@ def execute_deployment_trace(
         "accepted_deployment_actions": accepted_actions,
         "first_rejection": first_rejection,
         "action_execution_tick_offset": action_execution_tick_offset,
-        "action_tick_provenance": (
-            "source label is RoyaleAPI time_raw; native execution Tick is "
-            f"source_tick+{action_execution_tick_offset}; source label unchanged"
+        "action_tick_provenance": action_tick_provenance(
+            action_execution_tick_offset
+        ),
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            action_execution_tick_offset
         ),
         "reset_tick": states[0].tick if states else None,
         "last_source_action_tick": plan.actions[-1].tick if plan.actions else None,

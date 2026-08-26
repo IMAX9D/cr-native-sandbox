@@ -17,6 +17,10 @@ try:
 except ImportError:  # pragma: no cover
     orjson = None
 
+from expert_v1.native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    native_teacher_forced_profile,
+)
 from expert_v1.native_replay_plan import compile_battle
 from expert_v1.native_replay_runner import (
     execute_plan,
@@ -38,6 +42,18 @@ def main() -> int:
     parser.add_argument("--no-decision-records", action="store_true")
     parser.add_argument("--team-crowns", type=int)
     parser.add_argument("--opponent-crowns", type=int)
+    parser.add_argument(
+        "--action-execution-tick-offset",
+        type=int,
+        choices=(0, 1),
+        default=(
+            ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+        ),
+        help=(
+            "RoyaleAPI native teacher-forced profile v1 defaults to T+1; "
+            "pass 0 only to reproduce the historical phase diagnostic"
+        ),
+    )
     args = parser.parse_args()
     raw = args.source.read_bytes()
     value = orjson.loads(raw) if orjson is not None else json.loads(raw)
@@ -58,9 +74,13 @@ def main() -> int:
         result = execute_plan(
             env, plan, template,
             capture_decisions=not args.no_decision_records,
+            action_execution_tick_offset=args.action_execution_tick_offset,
         )
     output = {
         "source": str(args.source.resolve()),
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            args.action_execution_tick_offset
+        ),
         "plan": plan.json(),
         "result": result.json(),
     }

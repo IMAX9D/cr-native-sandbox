@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
+from expert_v1.native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    ROYALEAPI_NATIVE_TEACHER_FORCED_PROFILE_NAME,
+    ROYALEAPI_NATIVE_TEACHER_FORCED_PROFILE_VERSION,
+    native_teacher_forced_profile,
+)
 from expert_v1.native_pilot import action_execution_tick, _logical_state_digest
 from expert_v1.tick_store_v1.schema import (
     EntityState,
@@ -13,6 +19,20 @@ from expert_v1.tick_store_v1.schema import (
 
 
 class ExpertNativePilotTest(unittest.TestCase):
+    def test_royaleapi_native_teacher_forced_profile_v1_is_t_plus_one(self) -> None:
+        self.assertEqual(
+            ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET, 1
+        )
+        profile = native_teacher_forced_profile(1)
+        self.assertEqual(profile["name"], ROYALEAPI_NATIVE_TEACHER_FORCED_PROFILE_NAME)
+        self.assertEqual(
+            profile["version"], ROYALEAPI_NATIVE_TEACHER_FORCED_PROFILE_VERSION
+        )
+        self.assertEqual(profile["native_execution_boundary"], "source_tick+1")
+        self.assertTrue(profile["source_marker_tick_immutable"])
+        self.assertFalse(profile["diagnostic_override"])
+        self.assertTrue(native_teacher_forced_profile(0)["diagnostic_override"])
+
     def test_action_execution_tick_offset_is_explicit_and_bounded(self) -> None:
         self.assertEqual(action_execution_tick(674, 0), 674)
         self.assertEqual(action_execution_tick(674, 1), 675)

@@ -399,6 +399,7 @@ def build_store_manifest(
     source_manifest: Path,
     expected_episodes: int,
     expected_ticks: int | None = None,
+    store_metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Hash every immutable shard and atomically publish the global store."""
     root = root.resolve(strict=True)
@@ -445,9 +446,10 @@ def build_store_manifest(
         "content_sha256": content_digest,
         "total_bytes": sum(int(value["bytes"]) for value in manifests),
     }
+    if store_metadata is not None:
+        manifest["metadata"] = dict(store_metadata)
     _atomic_json(root / "manifest.json", manifest)
     (root / "manifest.sha256").write_text(
         f"{sha256_file(root / 'manifest.json')}  manifest.json\n", encoding="ascii"
     )
     return manifest
-

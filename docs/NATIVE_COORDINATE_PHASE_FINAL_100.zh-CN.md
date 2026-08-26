@@ -11,8 +11,8 @@ native command execution boundary：T + 1
 ```
 
 这不是修补源数据，也不是把回放标签整体加一；它只定义源 marker 与 libg
-命令消费边界之间的相位关系。本审计没有修改 runner 默认值，只给出下一步配置
-变更建议。
+命令消费边界之间的相位关系。本审计提交本身没有修改 runner 默认值；其结论现已
+由 `royaleapi_native_teacher_forced` profile v1 正式落地，当前生产默认是 1。
 
 固定坐标修正后的 99 场可比较样本给出了单调证据：
 
@@ -214,8 +214,8 @@ action_tick_provenance = source label remains RoyaleAPI time_raw T;
 3. `089Y82CPYYY9` 这类“到不了目标执行边界”的逻辑冻结单列，不能归类成
    action reject；
 4. code4 仍然是生成态 command gate 分叉，需要另行诊断，不能用相位偏移规避；
-5. 正式切默认前，给 runner 默认值变更单独提交并运行现有 smoke/acceptance；本次
-   审计提交不改默认。
+5. runner 默认值变更由独立的 profile v1 实现提交完成，并保留显式 offset 0 作为
+   历史诊断入口；本审计提交自身仍不包含该逻辑变更。
 
 ## 机器报告与复核
 

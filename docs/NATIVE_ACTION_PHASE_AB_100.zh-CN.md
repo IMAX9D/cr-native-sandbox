@@ -1,5 +1,11 @@
 # RoyaleAPI `time_raw` 原生命令相位固定 100 场 A/B
 
+> 历史文档说明：本页记录的是坐标方向修复前的 v7/v8 A/B 及当时结论。
+> 随后的正确坐标 v9/v10 固定 100 场审计已经把正式生产语义定为 T+1，见
+> `NATIVE_COORDINATE_PHASE_FINAL_100.zh-CN.md` 和
+> `ROYALEAPI_NATIVE_TEACHER_FORCED_PROFILE_V1.zh-CN.md`。以下实验数据保持原样，
+> “默认 0”只表示当时的代码状态，不再是当前配置。
+
 ## 1. 实验问题
 
 RoyaleAPI replay marker 只提供 20Hz 整数 `data-t`。采集器原样保存为
@@ -13,8 +19,9 @@ A / offset 0: source label T，native command 在 T 执行
 B / offset 1: source label仍为 T，native command 在 T+1 执行
 ```
 
-B 不覆盖源字段、不补圣水、不绕过原生命令，也不作为正式训练数据修复。
-生产默认仍为 offset 0。
+B 不覆盖源字段、不补圣水、不绕过原生命令，也不作为当时的正式训练数据修复。
+该实验运行时生产默认仍为 offset 0；此历史默认现已被 profile v1 的 offset 1
+取代。
 
 ## 2. 固定条件
 
@@ -188,7 +195,7 @@ B 本次墙钟吞吐较高，但两分支的失败深度与成功场数不同，
 
 ## 9. 判定
 
-### 保持 `Unknown`，生产默认继续为 offset 0
+### 当时判定：保持 `Unknown`，生产默认继续为 offset 0（已被后续审计取代）
 
 offset +1 对这批样本呈现**单调消除 6 个首个资源拒绝**，且没有让原成功场
 失败；这是支持“marker Tick 与即时 command execution boundary 可能相差一步”
@@ -206,7 +213,7 @@ offset +1 对这批样本呈现**单调消除 6 个首个资源拒绝**，且没
 因此：
 
 - 不修改源 `time_raw`；
-- 不把 offset 1 设为默认；
+- 当时不把 offset 1 设为默认；后续正确坐标 v9/v10 已提供独立证据并正式改为 1；
 - 不将 v8 Tick Store 混入 exact 训练集；
 - 将 v8 保留为可复现实验分支；
 - 等 RoyaleAPI hidden fields / replay marker 语义审计给出独立证据后再决定。

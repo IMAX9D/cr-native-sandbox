@@ -19,6 +19,11 @@ from typing import Any, Mapping, Sequence
 from native_core.env import NativeRoyaleEnv
 
 from .native_capabilities import ability_cards, resolve_live_ability
+from .native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    action_tick_provenance,
+    native_teacher_forced_profile,
+)
 from .native_pilot import action_execution_tick
 from .native_replay_plan import (
     DEFAULT_NATIVE_SEED,
@@ -84,6 +89,9 @@ class NativeReplayResult:
             "schema_version": 1,
             "kind": "expert_native_replay_result_v1",
             **self.__dict__,
+            "native_teacher_forced_profile": native_teacher_forced_profile(
+                self.action_execution_tick_offset
+            ),
             "decision_records": list(self.decision_records),
         }
 
@@ -234,7 +242,9 @@ def execute_plan(
     tick_sink: Any | None = None,
     tick_store_metadata: Mapping[str, Any] | None = None,
     trace_batch_steps: int = 64,
-    action_execution_tick_offset: int = 0,
+    action_execution_tick_offset: int = (
+        ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+    ),
 ) -> NativeReplayResult:
     """Replay one battle with gap-batched native stepping."""
     if tick_sink is not None and not 1 <= trace_batch_steps <= 64:
@@ -243,9 +253,8 @@ def execute_plan(
     # happens to be empty.  Source labels are immutable RoyaleAPI ``time_raw``
     # values; only the native command boundary may move by the audited offset.
     action_execution_tick(0, action_execution_tick_offset)
-    action_tick_provenance = (
-        "source label is RoyaleAPI time_raw; native execution Tick is "
-        f"source_tick+{action_execution_tick_offset}; source label unchanged"
+    action_tick_provenance_value = action_tick_provenance(
+        action_execution_tick_offset
     )
     coordinate_audit = asdict(plan.coordinate_audit)
     started = time.perf_counter()
@@ -431,7 +440,7 @@ def execute_plan(
                     "source_tick": int(source_tick),
                     "execution_tick": int(execution_tick),
                     "execution_tick_offset": int(action_execution_tick_offset),
-                    "action_tick_provenance": action_tick_provenance,
+                    "action_tick_provenance": action_tick_provenance_value,
                     "source_event_index": int(event["source_event_index"]),
                     "source_marker_index": marker,
                     "source_ability_id": event.get("source_ability_id"),
@@ -504,7 +513,7 @@ def execute_plan(
                     record.update({
                         "execution_tick": int(execution_tick),
                         "execution_tick_offset": int(action_execution_tick_offset),
-                        "action_tick_provenance": action_tick_provenance,
+                        "action_tick_provenance": action_tick_provenance_value,
                         "source_wait_ticks_before": source_tick - previous_source_tick,
                         "execution_wait_ticks_before": (
                             execution_tick - previous_execution_tick
@@ -607,7 +616,10 @@ def execute_plan(
             "state_provenance": plan.state_provenance,
             "action_provenance": plan.action_provenance,
             "action_execution_tick_offset": action_execution_tick_offset,
-            "action_tick_provenance": action_tick_provenance,
+            "action_tick_provenance": action_tick_provenance_value,
+            "native_teacher_forced_profile": native_teacher_forced_profile(
+                action_execution_tick_offset
+            ),
             "coordinate_provenance": plan.coordinate_provenance,
             "coordinate_audit": coordinate_audit,
             "ability_provenance": plan.ability_provenance,
@@ -650,7 +662,7 @@ def execute_plan(
         ability_resolution_counts=dict(ability_resolution_counts),
         ability_resolutions=tuple(ability_resolutions),
         action_execution_tick_offset=action_execution_tick_offset,
-        action_tick_provenance=action_tick_provenance,
+        action_tick_provenance=action_tick_provenance_value,
         coordinate_provenance=plan.coordinate_provenance,
         coordinate_audit=coordinate_audit,
         preferred_seed=seed_resolution.preferred_seed,

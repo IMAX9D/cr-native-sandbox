@@ -18,6 +18,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from expert_v1.native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    action_tick_provenance,
+    native_teacher_forced_profile,
+)
 from expert_v1.native_ability_pilot import (
     AbilityPilotTask,
     execute_ability_task,
@@ -160,6 +165,9 @@ def _worker(
         "failures": completed - successes,
         "stored_ticks": stored_ticks,
         "action_execution_tick_offset": action_execution_tick_offset,
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            action_execution_tick_offset
+        ),
         "wall_seconds": time.perf_counter() - started,
         "worker_error": worker_error,
         "shards": manifests,
@@ -233,6 +241,11 @@ def run(args: argparse.Namespace) -> int:
         # than crashing while trying to pretend that frame does not exist.
         expected_episodes=len(stored),
         expected_ticks=total_store_ticks,
+        store_metadata={
+            "native_teacher_forced_profile": native_teacher_forced_profile(
+                args.action_execution_tick_offset
+            )
+        },
     )
     failures: Counter[str] = Counter()
     resolutions: Counter[str] = Counter()
@@ -269,6 +282,8 @@ def run(args: argparse.Namespace) -> int:
         == int(args.action_execution_tick_offset)
         and f"source_tick+{args.action_execution_tick_offset}"
         in str(row.get("action_tick_provenance") or "")
+        and row.get("native_teacher_forced_profile")
+        == native_teacher_forced_profile(args.action_execution_tick_offset)
         for row in results
     )
     zero_worker_errors = all(row["worker_error"] is None for row in worker_reports)
@@ -285,6 +300,9 @@ def run(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "kind": "expert_native_ability_pilot_summary_v1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            args.action_execution_tick_offset
+        ),
         "task_manifest": str(task_manifest),
         "task_manifest_sha256": sha256_file(task_manifest),
         "template": str(template_path),
@@ -294,9 +312,8 @@ def run(args: argparse.Namespace) -> int:
         "maximum_seeds_to_test": args.maximum_seeds,
         "trace_batch_steps": args.trace_batch_steps,
         "action_execution_tick_offset": args.action_execution_tick_offset,
-        "action_tick_provenance": (
-            "source label is RoyaleAPI time_raw; native execution Tick is "
-            f"source_tick+{args.action_execution_tick_offset}; source label unchanged"
+        "action_tick_provenance": action_tick_provenance(
+            args.action_execution_tick_offset
         ),
         "selected_battles": len(tasks),
         "processed_battles": len(results),
@@ -368,10 +385,14 @@ def main() -> int:
         "--action-execution-tick-offset",
         type=int,
         choices=(0, 1),
-        default=0,
+        default=(
+            ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+        ),
         help=(
-            "diagnostic only: execute deploy and ability commands at "
-            "time_raw+offset while preserving every source Tick; default 0"
+            "execute deploy and ability commands at time_raw+offset while "
+            "preserving every source Tick; RoyaleAPI native teacher-forced "
+            "profile v1 defaults to 1; pass 0 only for the historical phase "
+            "diagnostic"
         ),
     )
     run_parser.set_defaults(function=run)

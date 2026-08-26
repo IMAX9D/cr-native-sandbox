@@ -183,6 +183,10 @@ v9 仍按 `time_raw + 0` 执行。余下 6 个 code 13 中有多个只差一个�
 需要单独的 +1 execution-boundary A/B；不能因为此前坐标错误制造过 code 13，
 就把全量 source label 统一覆盖为 T+1。
 
+后续正确坐标 v9/v10 A/B 已完成：source label 仍永久保存 T，但正式
+`royaleapi_native_teacher_forced` profile v1 将 native execution boundary 定为
+T+1。见 `NATIVE_COORDINATE_PHASE_FINAL_100.zh-CN.md`。
+
 ## 5. `data-index` 与数字 game mode
 
 列表页同一场对局有两个 sibling button：

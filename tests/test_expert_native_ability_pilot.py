@@ -268,7 +268,14 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             self.assertIsNone(diagnostic)
             self.assertEqual(record["accepted_ability_actions"], 1)
             self.assertEqual(record["ability_resolution_counts"], {"unique": 1})
-            self.assertEqual(record["action_execution_tick_offset"], 0)
+            self.assertEqual(record["action_execution_tick_offset"], 1)
+            self.assertEqual(
+                record["native_teacher_forced_profile"]["name"],
+                "royaleapi_native_teacher_forced",
+            )
+            self.assertEqual(
+                record["native_teacher_forced_profile"]["version"], 1
+            )
             self.assertTrue(record["tick_store_integrity"])
             self.assertEqual(len(manifests), 1)
             manifest = manifests[0]
@@ -276,10 +283,21 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
                 root / "store" / manifest["data_file"],
                 root / "store" / manifest["index_file"],
             ) as reader:
-                states = list(reader.episode(task.battle_tag).iter_ticks())
+                episode = reader.episode(task.battle_tag)
+                states = list(episode.iter_ticks())
+                metadata = episode.metadata
             self.assertEqual(
                 [state.tick for state in states],
                 list(range(states[0].tick, states[-1].tick + 1)),
+            )
+            self.assertEqual(
+                metadata["native_teacher_forced_profile"]["version"], 1
+            )
+            self.assertEqual(
+                metadata["native_teacher_forced_profile"][
+                    "effective_action_execution_tick_offset"
+                ],
+                1,
             )
 
     def test_offset_one_is_audited_in_result_and_tick_store(self) -> None:
@@ -346,7 +364,7 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             )
             assert diagnostic is not None
             snapshot = diagnostic["native_boundary_snapshot"]["latest_state"]
-            self.assertEqual(snapshot["tick"], 25)
+            self.assertEqual(snapshot["tick"], 26)
             self.assertEqual(len(snapshot["entities"]), 2)
 
     def test_native_rejection_preserves_request_response_and_boundary(self) -> None:
@@ -365,7 +383,7 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             assert diagnostic is not None
             last = diagnostic["native_boundary_snapshot"]["recent_action_history"][-1]
             self.assertEqual(last["request"][0]["type"], "ability")
-            self.assertEqual(last["pre_action_state"]["tick"], 25)
+            self.assertEqual(last["pre_action_state"]["tick"], 26)
             self.assertEqual(
                 last["response"]["actions"][0]["result"]["result_code"], 17
             )

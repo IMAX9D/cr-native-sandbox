@@ -15,7 +15,11 @@ from expert_v1.tick_store_v1.schema import (
     TowerState,
     actor_projection,
 )
-from expert_v1.tick_store_v1.shard import AppendOnlyShardWriter, ShardReader
+from expert_v1.tick_store_v1.shard import (
+    AppendOnlyShardWriter,
+    ShardReader,
+    build_store_manifest,
+)
 from expert_v1.tick_store_v1.work_queue import TickStoreWorkQueue
 
 
@@ -104,6 +108,24 @@ class TickStoreV1Test(unittest.TestCase):
             self.assertEqual(manifest["episode_count"], 2)
             with ShardReader(root / "worker-00000.crts") as reader:
                 self.assertEqual(len(list(reader.actor_ticks("B", actor_side=1))), 60)
+            source_manifest = root / "selection.jsonl"
+            source_manifest.write_text("{}\n", encoding="utf-8")
+            global_manifest = build_store_manifest(
+                root,
+                source_manifest=source_manifest,
+                expected_episodes=2,
+                expected_ticks=140,
+                store_metadata={
+                    "native_teacher_forced_profile": {
+                        "name": "royaleapi_native_teacher_forced",
+                        "version": 1,
+                    }
+                },
+            )
+            self.assertEqual(
+                global_manifest["metadata"]["native_teacher_forced_profile"],
+                {"name": "royaleapi_native_teacher_forced", "version": 1},
+            )
 
     def test_lease_expiry_allows_work_stealing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -19,6 +19,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from expert_v1.native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    action_tick_provenance,
+    native_teacher_forced_profile,
+)
 from expert_v1.native_pilot import (
     PilotTask,
     execute_deployment_trace,
@@ -190,6 +195,9 @@ def _worker_loop(
                                     "action_tick_provenance": replay.audit[
                                         "action_tick_provenance"
                                     ],
+                                    "native_teacher_forced_profile": replay.audit[
+                                        "native_teacher_forced_profile"
+                                    ],
                                     "teacher_forced_success": True,
                                     "every_native_tick_present": True,
                                     "terminal_status": replay.audit["terminal_status"],
@@ -242,6 +250,11 @@ def _worker_loop(
                                 "usable_tick_trajectory": False,
                                 "action_execution_tick_offset": (
                                     action_execution_tick_offset
+                                ),
+                                "native_teacher_forced_profile": (
+                                    native_teacher_forced_profile(
+                                        action_execution_tick_offset
+                                    )
                                 ),
                                 "failure": f"{type(error).__name__}: {error}",
                             },
@@ -372,10 +385,13 @@ def main() -> int:
         "--action-execution-tick-offset",
         type=int,
         choices=(0, 1),
-        default=0,
+        default=(
+            ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+        ),
         help=(
-            "diagnostic only: execute at time_raw+offset while preserving the "
-            "source label; production default is 0"
+            "execute at time_raw+offset while preserving the source label; "
+            "RoyaleAPI native teacher-forced profile v1 defaults to 1; pass "
+            "0 only to reproduce the historical phase diagnostic"
         ),
     )
     args = parser.parse_args()
@@ -464,6 +480,11 @@ def main() -> int:
         source_manifest=selection_path,
         expected_episodes=len(successful),
         expected_ticks=total_ticks,
+        store_metadata={
+            "native_teacher_forced_profile": native_teacher_forced_profile(
+                args.action_execution_tick_offset
+            )
+        },
     )
 
     by_tag = {str(value["battle_tag"]): value for value in successful}
@@ -516,6 +537,9 @@ def main() -> int:
         "schema_version": 1,
         "kind": "expert_native_deployment_trace_pilot_summary_v1",
         "created_utc": datetime.now(timezone.utc).isoformat(),
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            args.action_execution_tick_offset
+        ),
         "configuration": {
             "episodes": args.episodes,
             "workers": args.workers,
@@ -535,9 +559,8 @@ def main() -> int:
             "action_execution_tick_offset": (
                 args.action_execution_tick_offset
             ),
-            "action_tick_provenance": (
-                "source labels remain RoyaleAPI time_raw; native execution Tick "
-                f"is source_tick+{args.action_execution_tick_offset}"
+            "action_tick_provenance": action_tick_provenance(
+                args.action_execution_tick_offset
             ),
         },
         "selection": selection,

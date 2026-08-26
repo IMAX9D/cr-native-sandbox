@@ -23,6 +23,11 @@ try:
 except ImportError:  # pragma: no cover - stdlib fallback is tested implicitly
     orjson = None
 
+from .native_profile import (
+    ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
+    action_tick_provenance,
+    native_teacher_forced_profile,
+)
 from .native_replay_plan import (
     BattlePlan,
     ReplayPlanError,
@@ -366,7 +371,9 @@ def execute_ability_task(
     seed: int,
     maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     trace_batch_steps: int = 64,
-    action_execution_tick_offset: int = 0,
+    action_execution_tick_offset: int = (
+        ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+    ),
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Execute one task and return a compact result plus full failure evidence."""
     recorder = RecordingNativeEnv(env)
@@ -419,6 +426,9 @@ def execute_ability_task(
                 "action_execution_tick_offset": int(
                     action_execution_tick_offset
                 ),
+                "native_teacher_forced_profile": native_teacher_forced_profile(
+                    action_execution_tick_offset
+                ),
             },
             trace_batch_steps=trace_batch_steps,
             action_execution_tick_offset=action_execution_tick_offset,
@@ -463,9 +473,8 @@ def execute_ability_task(
             error = RuntimeError("successful replay violated per-Tick store integrity")
             error_traceback = None
 
-    action_tick_provenance = (
-        "source label is RoyaleAPI time_raw; native execution Tick is "
-        f"source_tick+{action_execution_tick_offset}; source label unchanged"
+    action_tick_provenance_value = (
+        action_tick_provenance(action_execution_tick_offset)
         if result is None else result.action_tick_provenance
     )
     if result is not None:
@@ -502,7 +511,10 @@ def execute_ability_task(
             False if result is None else result.source_seed_recovered
         ),
         "action_execution_tick_offset": int(action_execution_tick_offset),
-        "action_tick_provenance": action_tick_provenance,
+        "action_tick_provenance": action_tick_provenance_value,
+        "native_teacher_forced_profile": native_teacher_forced_profile(
+            action_execution_tick_offset
+        ),
         "coordinate_provenance": coordinate_provenance,
         "coordinate_audit": coordinate_audit,
         "source_deploy_actions": task.deploy_action_count,
@@ -541,6 +553,9 @@ def execute_ability_task(
         "failure": record["failure"],
         "action_execution_tick_offset": int(action_execution_tick_offset),
         "action_tick_provenance": record["action_tick_provenance"],
+        "native_teacher_forced_profile": record[
+            "native_teacher_forced_profile"
+        ],
         "coordinate_provenance": record["coordinate_provenance"],
         "coordinate_audit": record["coordinate_audit"],
         "task": task.json(),
