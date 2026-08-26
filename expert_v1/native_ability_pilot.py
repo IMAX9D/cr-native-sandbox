@@ -27,10 +27,12 @@ from .native_replay_plan import (
     BattlePlan,
     ReplayPlanError,
     compile_battle,
-    materialize_replay,
-    native_layout_order,
 )
 from .native_replay_runner import NativeReplayResult, execute_plan
+from .native_seed_search import (
+    DEFAULT_MAXIMUM_SEEDS_TO_TEST,
+    NativeSeedSearchError,
+)
 
 
 TASK_KIND = "expert_native_ability_pilot_task_v1"
@@ -336,68 +338,10 @@ class RecordingNativeEnv:
         }
 
 
-class LayoutCalibrationError(RuntimeError):
-    def __init__(self, reports: Sequence[Mapping[str, Any]]) -> None:
-        self.reports = tuple(dict(item) for item in reports)
-        mismatches = self.reports[-1].get("mismatched_sides", []) if reports else []
-        super().__init__(
-            "native shuffle layout did not converge; mismatched sides="
-            f"{mismatches}"
-        )
-
-
-def converge_layout_calibration(
-    env: RecordingNativeEnv,
-    plan: BattlePlan,
-    template: Mapping[str, Any],
-    calibration: Sequence[Mapping[str, Any]],
-    *,
-    seed: int,
-    maximum_attempts: int = 3,
-) -> tuple[tuple[dict[str, Any], dict[str, Any]], tuple[dict[str, Any], ...]]:
-    """Measure plan-specific hero/evolution layout without guessing it."""
-    if maximum_attempts <= 0:
-        raise ValueError("maximum_attempts must be positive")
-    current: Sequence[Mapping[str, Any]] = calibration
-    reports: list[dict[str, Any]] = []
-    for attempt in range(1, maximum_attempts + 1):
-        replay, mappings = materialize_replay(plan, template, current, seed=seed)
-        state = env.reset(replay, warmup_steps=10)
-        players = sorted(state["players"], key=lambda item: int(item["side"]))
-        mismatched: list[int] = []
-        layouts: list[dict[str, Any]] = []
-        for side, player in enumerate(players):
-            actual = native_layout_order(player)
-            desired = tuple(
-                mappings[side][logical]
-                for logical in (
-                    plan.sides[side].cycle.initial_hand
-                    + plan.sides[side].cycle.initial_queue
-                )
-            )
-            if actual != desired:
-                mismatched.append(side)
-            layouts.append({
-                "side": side,
-                "actual": list(actual),
-                "desired": list(desired),
-            })
-        reports.append({
-            "attempt": attempt,
-            "state_hash": str(state.get("state_hash", "")),
-            "mismatched_sides": mismatched,
-            "layouts": layouts,
-        })
-        if not mismatched:
-            return (dict(players[0]), dict(players[1])), tuple(reports)
-        current = tuple(dict(player) for player in players)
-    raise LayoutCalibrationError(reports)
-
-
 def _failure_class(result: NativeReplayResult | None, error: Exception | None) -> str:
     if error is not None:
-        if isinstance(error, LayoutCalibrationError):
-            return "layout_calibration_failed"
+        if isinstance(error, NativeSeedSearchError):
+            return "native_seed_search_exhausted"
         return "exception"
     assert result is not None
     failure = str(result.failure or "unknown")
@@ -416,10 +360,11 @@ def execute_ability_task(
     env: Any,
     task: AbilityPilotTask,
     template: Mapping[str, Any],
-    calibration: Sequence[Mapping[str, Any]],
+    calibration: Sequence[Mapping[str, Any]] | None,
     tick_sink: Any,
     *,
     seed: int,
+    maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     trace_batch_steps: int = 64,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Execute one task and return a compact result plus full failure evidence."""
@@ -449,15 +394,13 @@ def execute_ability_task(
             or len(plan.ability_events) != task.ability_event_count
         ):
             raise RuntimeError("compiled source no longer matches selected task")
-        plan_calibration, layout_reports = converge_layout_calibration(
-            recorder, plan, template, calibration, seed=seed
-        )
         result = execute_plan(
             recorder,
             plan,
             template,
-            plan_calibration,
+            calibration,
             seed=seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
             capture_decisions=False,
             # Source markers do not identify one of several live copies.  The
             # pilot must branch or fail; this non-branching acceptance run
@@ -475,11 +418,26 @@ def execute_ability_task(
             },
             trace_batch_steps=trace_batch_steps,
         )
+        layout_reports = ({
+            "mode": "source_order_bounded_native_seed_search",
+            "preferred_seed": result.preferred_seed,
+            "chosen_seed": result.chosen_seed,
+            "seeds_tested": result.seeds_tested,
+            "cache_hit": result.seed_search_cache_hit,
+            "source_seed_recovered": result.source_seed_recovered,
+        },)
     except Exception as caught:
         error = caught
         error_traceback = traceback.format_exc()
-        if isinstance(caught, LayoutCalibrationError):
-            layout_reports = caught.reports
+        if isinstance(caught, NativeSeedSearchError):
+            layout_reports = ({
+                "mode": "source_order_bounded_native_seed_search",
+                "failure": str(caught),
+                "preferred_seed": caught.preferred_seed,
+                "seeds_tested": caught.seeds_tested,
+                "maximum_seeds_to_test": caught.maximum_seeds_to_test,
+                "source_seed_recovered": False,
+            },)
 
     success = bool(result is not None and result.teacher_forced_success)
     entry = None if result is None else result.tick_store_entry
@@ -512,7 +470,15 @@ def execute_ability_task(
             else f"{type(error).__name__}: {error}" if error is not None
             else result.failure
         ),
-        "layout_calibration_attempts": len(layout_reports),
+        "layout_calibration_attempts": 0,
+        "chosen_seed": None if result is None else result.chosen_seed,
+        "seeds_tested": 0 if result is None else result.seeds_tested,
+        "seed_search_cache_hit": (
+            False if result is None else result.seed_search_cache_hit
+        ),
+        "source_seed_recovered": (
+            False if result is None else result.source_seed_recovered
+        ),
         "source_deploy_actions": task.deploy_action_count,
         "accepted_deploy_actions": (
             0 if result is None else result.accepted_deploy_actions

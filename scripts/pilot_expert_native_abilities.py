@@ -27,7 +27,7 @@ from expert_v1.native_ability_pilot import (
     write_task_manifest,
 )
 from expert_v1.native_replay_plan import DEFAULT_NATIVE_SEED
-from expert_v1.native_replay_runner import calibrated_players, load_template
+from expert_v1.native_replay_runner import load_template
 from expert_v1.tick_store_v1.shard import WorkerShardSink, build_store_manifest
 from native_core.env import NativeRoyaleEnv
 
@@ -87,6 +87,7 @@ def _worker(
     output_root: Path,
     template_path: Path,
     seed: int,
+    maximum_seeds_to_test: int,
     trace_batch_steps: int,
 ) -> dict[str, Any]:
     worker_id = f"ability-worker-{worker_index:02d}"
@@ -105,7 +106,6 @@ def _worker(
             compression_level=1,
         )
         with NativeRoyaleEnv(port=port, timeout=60.0) as env:
-            calibration = calibrated_players(env, template, seed=seed)
             with result_path.open("a", encoding="utf-8", newline="\n") as output:
                 while True:
                     try:
@@ -117,9 +117,10 @@ def _worker(
                             env,
                             task,
                             template,
-                            calibration,
+                            None,
                             sink,
                             seed=seed,
+                            maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
                         )
                         record.update({
@@ -207,6 +208,7 @@ def run(args: argparse.Namespace) -> int:
                 output_root=output_root,
                 template_path=template_path,
                 seed=args.seed,
+                maximum_seeds_to_test=args.maximum_seeds,
                 trace_batch_steps=args.trace_batch_steps,
             )
             for index, port in enumerate(args.ports)
@@ -262,6 +264,8 @@ def run(args: argparse.Namespace) -> int:
         "template": str(template_path),
         "ports": args.ports,
         "seed": args.seed,
+        "seed_role": "legacy_preferred_only; chosen seed is searched per battle",
+        "maximum_seeds_to_test": args.maximum_seeds,
         "trace_batch_steps": args.trace_batch_steps,
         "selected_battles": len(tasks),
         "processed_battles": len(results),
@@ -324,6 +328,7 @@ def main() -> int:
         "--ports", type=int, nargs="+", default=[38031, 38032, 38033, 38034]
     )
     run_parser.add_argument("--seed", type=int, default=DEFAULT_NATIVE_SEED)
+    run_parser.add_argument("--maximum-seeds", type=int, default=4096)
     run_parser.add_argument("--trace-batch-steps", type=int, default=64)
     run_parser.set_defaults(function=run)
     args = parser.parse_args()

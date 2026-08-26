@@ -29,8 +29,10 @@ from .native_replay_plan import (
     ReplayPlanError,
     compile_battle,
     grouped_actions,
-    materialize_replay,
-    native_layout_order,
+)
+from .native_seed_search import (
+    DEFAULT_MAXIMUM_SEEDS_TO_TEST,
+    resolve_native_seed,
 )
 from .tick_store_v1.schema import TickState, normalize_native_state, require_consecutive
 
@@ -185,9 +187,10 @@ def execute_deployment_trace(
     env: NativeRoyaleEnv,
     plan: BattlePlan,
     template: Mapping[str, Any],
-    calibration: Sequence[Mapping[str, Any]],
+    calibration: Sequence[Mapping[str, Any]] | None = None,
     *,
     seed: int = DEFAULT_NATIVE_SEED,
+    maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     warmup_tick: int = 10,
     trace_batch_steps: int = 64,
     terminal_fence_ticks: int = 20,
@@ -214,41 +217,23 @@ def execute_deployment_trace(
     terminal_seen = False
     terminal_episode: Mapping[str, Any] | None = None
     previous_action_tick_by_side: list[int | None] = [None, None]
-    latest_state: Mapping[str, Any]
-    layout_calibration: Sequence[Mapping[str, Any]] = calibration
-    layout_calibration_attempts = 0
-    mismatched_sides: list[int] = []
-    for layout_calibration_attempts in range(1, 4):
-        replay, mappings = materialize_replay(
-            plan, template, layout_calibration, seed=seed
-        )
-        reset_started = time.perf_counter()
-        latest_state = env.reset(replay, warmup_steps=warmup_tick)
-        reset_seconds += time.perf_counter() - reset_started
-        players = sorted(
-            latest_state["players"], key=lambda item: int(item["side"])
-        )
-        mismatched_sides = []
-        for side, player in enumerate(players):
-            desired = tuple(
-                mappings[side][logical]
-                for logical in (
-                    plan.sides[side].cycle.initial_hand
-                    + plan.sides[side].cycle.initial_queue
-                )
-            )
-            if native_layout_order(player) != desired:
-                mismatched_sides.append(side)
-        if not mismatched_sides:
-            break
-        # Some hero/evolution decks perturb libg's effective 4+4 layout.
-        # Recalibrate from the actual deck once rather than rejecting a valid
-        # source or assuming the bootstrap deck's permutation is universal.
-        layout_calibration = tuple(dict(player) for player in players)
-    else:
-        failure = "native_shuffle_layout_did_not_converge_sides_" + "_".join(
-            str(side) for side in mismatched_sides
-        )
+    # ``calibration`` is a compatibility-only argument.  The old transform
+    # moved source form slots and assumed card-independent shuffle; authoritative
+    # libg evidence disproved that assumption.  Resolve the unobserved seed
+    # directly while preserving source deck order and every action Tick.
+    del calibration
+    reset_started = time.perf_counter()
+    seed_resolution = resolve_native_seed(
+        env,
+        plan,
+        template,
+        preferred_seed=seed,
+        maximum_seeds_to_test=maximum_seeds_to_test,
+        warmup_tick=warmup_tick,
+    )
+    reset_seconds += time.perf_counter() - reset_started
+    mappings = seed_resolution.mappings
+    latest_state: Mapping[str, Any] = seed_resolution.state
 
     current_tick = int(latest_state["tick"])
     normalization_started = time.perf_counter()
@@ -567,7 +552,8 @@ def execute_deployment_trace(
         "kind": "expert_native_deployment_trace_pilot_v1",
         "battle_tag": plan.battle_tag,
         "source_schema_version": plan.source_schema_version,
-        "seed": int(seed),
+        "seed": seed_resolution.chosen_seed,
+        **seed_resolution.audit(),
         "teacher_forced_success": teacher_forced_success,
         "usable_tick_trajectory": usable,
         "failure": failure,
@@ -595,7 +581,7 @@ def execute_deployment_trace(
         "source_crowns": plan.terminal_crowns,
         "observed_crowns": observed_crowns,
         "seed_shuffle_layout_calibrated": True,
-        "layout_calibration_attempts": layout_calibration_attempts,
+        "layout_calibration_attempts": 0,
         "logical_training_state_sha256": _logical_state_digest(states, mappings),
         "state_provenance": "native_teacher_forced_from_observed_actions",
         "action_provenance": plan.action_provenance,

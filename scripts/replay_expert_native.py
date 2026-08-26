@@ -19,7 +19,6 @@ except ImportError:  # pragma: no cover
 
 from expert_v1.native_replay_plan import compile_battle
 from expert_v1.native_replay_runner import (
-    calibrated_players,
     execute_plan,
     load_template,
 )
@@ -56,9 +55,8 @@ def main() -> int:
         )
     template = load_template(args.template)
     with NativeRoyaleEnv(port=args.port) as env:
-        calibration = calibrated_players(env, template)
         result = execute_plan(
-            env, plan, template, calibration,
+            env, plan, template,
             capture_decisions=not args.no_decision_records,
         )
     output = {

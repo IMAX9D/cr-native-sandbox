@@ -23,8 +23,11 @@ from .native_replay_plan import (
     DEFAULT_NATIVE_SEED,
     BattlePlan,
     grouped_replay_events,
-    materialize_replay,
-    native_layout_order,
+)
+from .native_seed_search import (
+    DEFAULT_MAXIMUM_SEEDS_TO_TEST,
+    layouts_accept_plan,
+    resolve_native_seed,
 )
 from .tick_store_v1 import TickTraceAccumulator
 
@@ -46,6 +49,13 @@ class NativeReplayResult:
     ability_replay_complete: bool
     ability_resolution_counts: dict[str, int]
     ability_resolutions: tuple[dict[str, Any], ...]
+    preferred_seed: int
+    chosen_seed: int
+    seeds_tested: int
+    maximum_seeds_to_test: int
+    seed_search_cache_hit: bool
+    seed_search_native_resets: int
+    source_seed_recovered: bool
     final_tick: int
     native_ticks_advanced: int
     reset_seconds: float
@@ -209,9 +219,11 @@ def execute_plan(
     env: NativeRoyaleEnv,
     plan: BattlePlan,
     template: Mapping[str, Any],
-    calibration: Sequence[Mapping[str, Any]],
+    calibration: Sequence[Mapping[str, Any]] | None = None,
     *,
     seed: int = DEFAULT_NATIVE_SEED,
+    maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
+    warmup_tick: int = 10,
     capture_decisions: bool = True,
     ability_branch_choices: Mapping[int, int] | None = None,
     tick_sink: Any | None = None,
@@ -235,9 +247,7 @@ def execute_plan(
     observed_crowns: tuple[int, int] | None = None
     tick_store_entry: dict[str, Any] | None = None
     tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
-    replay, mappings = materialize_replay(
-        plan, template, calibration, seed=seed
-    )
+    del calibration
     allowed_abilities = [ability_cards(side.deck) for side in plan.sides]
     missing_ability_events = sum(
         side.missing_ability_event_count for side in plan.sides
@@ -250,7 +260,16 @@ def execute_plan(
             None if exact_index is None else side_actions[exact_index].tick
         )
     reset_started = time.perf_counter()
-    state = env.reset(replay, warmup_steps=10)
+    seed_resolution = resolve_native_seed(
+        env,
+        plan,
+        template,
+        preferred_seed=seed,
+        maximum_seeds_to_test=maximum_seeds_to_test,
+        warmup_tick=warmup_tick,
+    )
+    mappings = seed_resolution.mappings
+    state = seed_resolution.state
     reset_seconds += time.perf_counter() - reset_started
     final_tick = int(state["tick"])
     if tick_accumulator is not None:
@@ -258,19 +277,18 @@ def execute_plan(
         tick_accumulator.start(env.observe_train())
         observe_seconds += time.perf_counter() - observe_started
 
-    # Verify that card identities did not perturb the calibrated shuffle.
+    # Revalidate the authoritative source-order layout at the execution
+    # boundary.  No deck slot or action Tick may be rewritten to make it pass.
     players = sorted(state["players"], key=lambda item: int(item["side"]))
-    for side, player in enumerate(players):
-        desired_native_order = tuple(
-            mappings[side][logical]
-            for logical in (
-                plan.sides[side].cycle.initial_hand
-                + plan.sides[side].cycle.initial_queue
-            )
+    compatible_layouts = layouts_accept_plan(plan, players)
+    if not all(compatible_layouts):
+        mismatched = [
+            side for side, compatible in enumerate(compatible_layouts)
+            if not compatible
+        ]
+        failure = "native_seed_search_layout_revalidation_failed_sides_" + "_".join(
+            str(side) for side in mismatched
         )
-        if native_layout_order(player) != desired_native_order:
-            failure = f"native_shuffle_layout_changed_side_{side}"
-            break
     if failure is None and missing_ability_events:
         failure = f"source_ability_ticks_missing_count_{missing_ability_events}"
 
@@ -482,6 +500,8 @@ def execute_plan(
         metadata = {
             **tick_accumulator.metadata(),
             **dict(tick_store_metadata or {}),
+            **seed_resolution.audit(),
+            "seed": seed_resolution.chosen_seed,
             "state_provenance": plan.state_provenance,
             "action_provenance": plan.action_provenance,
             "ability_provenance": plan.ability_provenance,
@@ -523,6 +543,13 @@ def execute_plan(
         ),
         ability_resolution_counts=dict(ability_resolution_counts),
         ability_resolutions=tuple(ability_resolutions),
+        preferred_seed=seed_resolution.preferred_seed,
+        chosen_seed=seed_resolution.chosen_seed,
+        seeds_tested=seed_resolution.seeds_tested,
+        maximum_seeds_to_test=seed_resolution.maximum_seeds_to_test,
+        seed_search_cache_hit=seed_resolution.cache_hit,
+        seed_search_native_resets=seed_resolution.native_resets,
+        source_seed_recovered=seed_resolution.source_seed_recovered,
         final_tick=final_tick,
         native_ticks_advanced=native_ticks,
         reset_seconds=reset_seconds,

@@ -27,7 +27,7 @@ from expert_v1.native_pilot import (
     sha256_file,
 )
 from expert_v1.native_replay_plan import compile_battle
-from expert_v1.native_replay_runner import calibrated_players, load_template
+from expert_v1.native_replay_runner import load_template
 from expert_v1.tick_store_v1.shard import WorkerShardSink, build_store_manifest
 from expert_v1.tick_store_v1.work_queue import TickStoreWorkQueue
 from native_core.env import NativeRoyaleEnv
@@ -76,6 +76,7 @@ def _worker_loop(
     output_root: Path,
     template_path: Path,
     seed: int,
+    maximum_seeds_to_test: int,
     trace_batch_steps: int,
 ) -> dict[str, Any]:
     worker_id = f"worker-{worker_index:02d}"
@@ -84,7 +85,6 @@ def _worker_loop(
     completed = failed = ticks = actions = 0
     started = time.perf_counter()
     with NativeRoyaleEnv(port=port, timeout=60.0) as env:
-        calibration = calibrated_players(env, template, seed=seed)
         with TickStoreWorkQueue(queue_path) as queue:
             sink = WorkerShardSink(
                 output_root / "shards",
@@ -121,8 +121,8 @@ def _worker_loop(
                             env,
                             plan,
                             template,
-                            calibration,
                             seed=seed,
+                            maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
                         )
                         audit = {
@@ -142,7 +142,10 @@ def _worker_loop(
                                     "source_path": str(source_path.resolve()),
                                     "source_sha256": actual_sha,
                                     "source_schema_version": plan.source_schema_version,
-                                    "seed": seed,
+                                    "seed": replay.audit["chosen_seed"],
+                                    "preferred_seed": replay.audit["preferred_seed"],
+                                    "seeds_tested": replay.audit["seeds_tested"],
+                                    "source_seed_recovered": False,
                                     "teacher_forced_success": True,
                                     "every_native_tick_present": True,
                                     "terminal_status": replay.audit["terminal_status"],
@@ -251,12 +254,10 @@ def _seed_probe(
             source, terminal_crowns=(task.team_crowns, task.opponent_crowns)
         )
         with NativeRoyaleEnv(port=port, timeout=60.0) as env:
-            calibration = calibrated_players(env, template, seed=alternate_seed)
             replay = execute_deployment_trace(
                 env,
                 plan,
                 template,
-                calibration,
                 seed=alternate_seed,
                 trace_batch_steps=trace_batch_steps,
             )
@@ -265,6 +266,7 @@ def _seed_probe(
             "battle_tag": task.battle_tag,
             "port": port,
             "alternate_seed": alternate_seed,
+            "alternate_chosen_seed": replay.audit.get("chosen_seed"),
             "alternate_teacher_forced_success": replay.audit[
                 "teacher_forced_success"
             ],
@@ -306,6 +308,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base-port", type=int, default=38031)
     parser.add_argument("--seed", type=int, default=424242)
+    parser.add_argument("--maximum-seeds", type=int, default=4096)
     parser.add_argument("--alternate-seed", type=int, default=1)
     parser.add_argument("--seed-probe-count", type=int, default=4)
     parser.add_argument("--trace-batch-steps", type=int, default=64)
@@ -354,6 +357,7 @@ def main() -> int:
                 output_root=output_root,
                 template_path=args.template.resolve(strict=True),
                 seed=args.seed,
+                maximum_seeds_to_test=args.maximum_seeds,
                 trace_batch_steps=args.trace_batch_steps,
             )
             for index, port in enumerate(ports)
@@ -433,6 +437,8 @@ def main() -> int:
             "workers": args.workers,
             "ports": ports,
             "seed": args.seed,
+            "seed_role": "legacy_preferred_only; chosen seed is searched per battle",
+            "maximum_seeds_to_test": args.maximum_seeds,
             "alternate_seed": args.alternate_seed,
             "trace_batch_steps": args.trace_batch_steps,
             "tick_hz": 20,

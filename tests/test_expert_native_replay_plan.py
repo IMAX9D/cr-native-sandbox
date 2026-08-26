@@ -74,7 +74,7 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         self.assertEqual(split_card_token("Knight-Hero"), ("knight", 2))
         self.assertEqual(split_card_token("Knight-hero-ev1"), ("knight", 3))
 
-    def test_compile_and_materialize_is_bijective(self) -> None:
+    def test_compile_and_materialize_preserves_source_form_slots(self) -> None:
         plan = compile_battle(battle())
         self.assertTrue(plan.native_replay_ready)
         self.assertFalse(plan.original_state_exact)
@@ -96,14 +96,17 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
             },
         ]
         replay, mappings = materialize_replay(plan, template, players)
-        self.assertEqual(set(mappings[0]), set(range(8)))
-        self.assertEqual(set(mappings[1]), set(range(8)))
+        self.assertEqual(mappings, (tuple(range(8)), tuple(range(8))))
         self.assertEqual(len(replay["battle"]["deck0"]["sp"]), 8)
         batches = list(grouped_actions(plan, mappings))
         self.assertEqual(len(batches), 16)
         self.assertTrue(all(len(actions) == 2 for _, actions in batches))
         self.assertEqual(
-            replay["battle"]["deck0"]["sp"][mappings[0][0]]["el"], 1
+            replay["battle"]["deck0"]["sp"][0]["el"], 1
+        )
+        self.assertEqual(
+            [row["d"] for row in replay["battle"]["deck0"]["sp"]],
+            [card.card_id for card in plan.sides[0].deck],
         )
 
     def test_missing_ability_is_fail_closed_from_native_candidate(self) -> None:

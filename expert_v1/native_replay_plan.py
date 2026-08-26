@@ -575,32 +575,30 @@ def native_layout_order(player: Mapping[str, Any]) -> tuple[int, ...]:
     return hand + queue
 
 
-def logical_to_native_mapping(
-    side_plan: SidePlan, player: Mapping[str, Any]
-) -> tuple[int, ...]:
-    """Map logical source cards to replay deck slots for one calibrated seed."""
-    native_order = native_layout_order(player)
-    desired_order = side_plan.cycle.initial_hand + side_plan.cycle.initial_queue
-    mapping = [-1] * 8
-    for native_index, logical_index in zip(native_order, desired_order, strict=True):
-        mapping[logical_index] = native_index
-    if set(mapping) != set(range(8)):
-        raise AssertionError("logical/native mapping is not bijective")
-    return tuple(mapping)
-
-
 def materialize_replay(
     plan: BattlePlan,
     template: Mapping[str, Any],
-    calibrated_players: Sequence[Mapping[str, Any]],
+    calibrated_players: Sequence[Mapping[str, Any]] | None = None,
     *,
     seed: int = DEFAULT_NATIVE_SEED,
     fallback_level: int = 11,
 ) -> tuple[dict[str, Any], tuple[tuple[int, ...], tuple[int, ...]]]:
-    """Build a libg replay whose shuffled 4+4 layout matches the plan."""
+    """Build a source-order libg replay without moving form-designated slots.
+
+    ``calibrated_players`` is retained as a compatibility-only parameter for
+    older callers.  The former implementation permuted the eight input deck
+    slots to force one arbitrarily selected compatible 4+4 state.  Real libg
+    evidence shows that shuffle order depends on card identity as well as the
+    slot, so that fixed-point transform can oscillate and, more importantly,
+    moves Evo/Hero form-slot semantics away from the source ``full_deck``.
+
+    The replay now preserves logical/source deck order exactly and returns an
+    identity logical-to-native mapping.  The missing initial-hand seed is
+    resolved separately against authoritative libg by bounded seed search.
+    """
     import copy
 
-    if len(calibrated_players) != 2:
+    if calibrated_players is not None and len(calibrated_players) != 2:
         raise ReplayPlanError("native calibration requires two player states")
     unsupported = sorted({
         spec.source_token
@@ -617,9 +615,9 @@ def materialize_replay(
     battle = replay["battle"]
     mappings: list[tuple[int, ...]] = []
     for side, side_plan in enumerate(plan.sides):
-        mapping = logical_to_native_mapping(side_plan, calibrated_players[side])
+        mapping = tuple(range(8))
         mappings.append(mapping)
-        native_deck: list[dict[str, int] | None] = [None] * 8
+        native_deck: list[dict[str, int]] = []
         for logical_index, spec in enumerate(side_plan.deck):
             row = {
                 "d": int(spec.card_id),
@@ -627,9 +625,9 @@ def materialize_replay(
             }
             if spec.form_flags:
                 row["el"] = int(spec.form_flags)
-            native_deck[mapping[logical_index]] = row
-        if any(item is None for item in native_deck):
-            raise AssertionError("materialized native deck has an empty slot")
+            if mapping[logical_index] != logical_index:
+                raise AssertionError("source-order mapping must remain identity")
+            native_deck.append(row)
         battle[f"deck{side}"]["sp"] = native_deck
         support = tower_troop(side_plan.tower_troop or "tower-princess")
         battle[f"deck{side}"]["sc"] = [{

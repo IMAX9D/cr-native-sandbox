@@ -100,7 +100,7 @@ Ability 统计。但 `ability_id` 目前仍为 unresolved；Tick 本身不能告
 应该按哪个存活实体的技能按钮。只有将 marker 解析到真实技能/实体，或在该 Tick
 由可靠状态锚点唯一解析，才可训练 Ability Head。
 
-## 3. 兼容手牌的确定性构造
+## 3. 兼容手牌的确定性解析
 
 每方八张牌的所有 4-card 初始 hand 与其余四张 queue 只有 1,680 种。编译器对
 整个专家出牌序列做状态过滤，选择一个兼容候选，并保留候选数。多个初始候选
@@ -115,10 +115,13 @@ Ability 统计。但 `ability_id` 目前仍为 unresolved；Tick 本身不能告
 关闭；从唯一收敛点开始才写 `hand_provenance=inferred_exact`。不能因为生成的
 libg replay 任意选了一副兼容初始手牌，就把开局歧义前缀升级成真人精确手牌。
 
-每个原生 Worker 首先用固定 seed 校准一次 `hand_deck_indices +
-cycle_deck_indices` 的 4+4 shuffle 布局。编译器随后重排 replay 的八个 deck slot，
-使 libg shuffle 后恰好等于所选兼容状态，并将逻辑卡索引双射到原生 deck index。
-这避免逐场暴力搜索 seed，也不会改变八卡循环规则。
+实机证据已证明 shuffle 同时依赖卡牌身份与 slot，不能把 bootstrap deck 的排列
+迁移到任意牌组。当前实现不再重排 deck slot：来源 `full_deck` 顺序和 Evo/Hero
+form slot 原样保留，并在未知 seed 空间按升序做有界原生搜索。每个候选 seed 都
+通过真实 `libg` reset 读取两方 4+4 布局，再用完整动作流验证八卡循环；两方同时
+兼容才接受。默认上限 4096，耗尽即 fail-closed。chosen seed 只是兼容的合成
+初始手牌变量，不是恢复出的真人原始 seed。详见
+`NATIVE_TEACHER_FORCED_GUARD_AND_SEED_SEARCH.zh-CN.md`。
 
 ## 4. 高效并发执行
 
@@ -148,7 +151,7 @@ joint_act（同 Tick 最多每方一次）
 - Tick 漂移；
 - 原生动作拒绝；
 - 生成场景提前终局；
-- shuffle 布局与校准不一致；
+- 有界 seed 空间内找不到两方同时兼容的真实 libg 4+4 布局；
 - 同方同 Tick 多动作；
 - 能力事件缺失或无法唯一解析。
 
