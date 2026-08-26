@@ -91,3 +91,26 @@ issues = validate_ingest_metadata(
 
 爬虫可以只按上述 JSON 读取面实现，避免依赖主工程 Python 包。
 
+## schema 5 回流主工程
+
+`expert_v1.native_replay_plan.compile_battle()` 对新的 authoritative
+`schema_version=5` 再做一次独立 fail-closed 验证。来源必须携带并匹配：
+
+- `numeric_game_mode_id`、`battle_index` 及各自列表页 join provenance；
+- `authoritative_native_contract` 的 game version、canonical SHA 与文件 SHA；
+- 每方 8 个 `deck_cards` 的 slot/slug/base/form/level；
+- 塔兵 slug 与**独立的塔兵等级**；
+- `final_tower_hp` 的 King、`princess0`、`princess1`、total；
+- 完整 raw `data_i` 坐标契约与精确技能事件数组。
+
+计划物化时直接写入来源 numeric game mode，并将来源塔兵等级转成原生的
+zero-based `sc[].l`。绝不把 King level、牌组最高等级或模板 avatar level 当成
+塔兵等级。schema 3 仍按原有 unanchored teacher-forced 兼容路径运行，不要求这些
+schema 5 字段。
+
+列表页只证明两个 Princess Tower 槽位 `princess0/1`，尚未证明它们各自对应
+native `x=3500/14500` 的哪一侧。因此终局诊断比较每方 King HP、两个 Princess
+HP 的多重集合与 total，并保留 `source_slots_unmapped` provenance；不猜左右 lane。
+
+即使 schema 5 元数据全部通过，也仍然不声明恢复了来源精确隐藏状态：原始 RNG、
+初始手牌、King Tower level、精确 game build 和逐 Tick 状态锚点仍未提供。

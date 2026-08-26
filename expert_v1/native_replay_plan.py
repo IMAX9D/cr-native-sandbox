@@ -13,6 +13,7 @@ one native shuffle-layout calibration per Worker.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
@@ -137,6 +138,24 @@ class CoordinateAudit:
 
 
 @dataclass(frozen=True)
+class FinalTowerHp:
+    """Authoritative source terminal HP without an invented lane mapping.
+
+    RoyaleAPI's list popup exposes two Princess Tower slots as ``princess0``
+    and ``princess1``.  Their mapping to native arena X coordinates has not
+    been proved, so the plan deliberately preserves the source slots and the
+    runner compares them as a multiset.
+    """
+
+    king: int
+    princess0: int
+    princess1: int
+    total: int
+    provenance: str
+    slot_mapping_provenance: str
+
+
+@dataclass(frozen=True)
 class SidePlan:
     side: int
     source_side: str
@@ -146,6 +165,9 @@ class SidePlan:
     observed_ability_event_count: int
     missing_ability_event_count: int
     tower_troop: str | None
+    tower_troop_level: int | None
+    tower_troop_level_provenance: str
+    final_tower_hp: FinalTowerHp | None
 
 
 @dataclass(frozen=True)
@@ -154,6 +176,14 @@ class BattlePlan:
     kind: str
     battle_tag: str
     source_schema_version: int
+    numeric_game_mode_id: int | None
+    numeric_game_mode_provenance: str
+    battle_index: int | None
+    battle_index_provenance: str
+    authoritative_contract_game_version: str | None
+    authoritative_contract_sha256: str | None
+    authoritative_contract_file_sha256: str | None
+    authoritative_contract_provenance: str
     duration_ticks: int
     sides: tuple[SidePlan, SidePlan]
     actions: tuple[ExpertAction, ...]
@@ -400,9 +430,171 @@ def _schema_two_player(
     return player
 
 
+def _strict_int(value: Any, *, minimum: int = 0) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= minimum
+    )
+
+
+@lru_cache(maxsize=1)
+def _default_native_ingest_contract() -> Any:
+    # Lazy import avoids the intentional dependency in the opposite direction:
+    # the contract generator derives RoyaleAPI aliases from this module.
+    from .native_ingest_contract import load_native_ingest_contract
+
+    return load_native_ingest_contract()
+
+
+def _schema_five_terminal_hp(
+    value: Mapping[str, Any], source_side: str,
+) -> FinalTowerHp:
+    root = value.get("final_tower_hp")
+    if not isinstance(root, Mapping):
+        raise ReplayPlanError("schema-v5 final_tower_hp is missing")
+    if root.get("provenance") != "list_hp_both_popup":
+        raise ReplayPlanError("schema-v5 final tower HP provenance is invalid")
+    if root.get("slot_mapping_provenance") != "source_slots_unmapped":
+        raise ReplayPlanError(
+            "schema-v5 Princess Tower slot mapping provenance is invalid"
+        )
+    raw_mapping = root.get("raw_princess_mapping")
+    if not isinstance(raw_mapping, Mapping) or set(raw_mapping) != {
+        "princess0", "princess1",
+    }:
+        raise ReplayPlanError("schema-v5 raw Princess Tower slot mapping is missing")
+    side = root.get(source_side)
+    if not isinstance(side, Mapping):
+        raise ReplayPlanError(f"schema-v5 {source_side} final tower HP is missing")
+    keys = ("king", "princess0", "princess1", "total")
+    if any(not _strict_int(side.get(key)) for key in keys):
+        raise ReplayPlanError(f"schema-v5 {source_side} final tower HP is invalid")
+    if int(side["total"]) != sum(int(side[key]) for key in keys[:3]):
+        raise ReplayPlanError(
+            f"schema-v5 {source_side} final tower HP total does not match"
+        )
+    return FinalTowerHp(
+        king=int(side["king"]),
+        princess0=int(side["princess0"]),
+        princess1=int(side["princess1"]),
+        total=int(side["total"]),
+        provenance="list_hp_both_popup",
+        slot_mapping_provenance="source_slots_unmapped",
+    )
+
+
+def _schema_five_metadata(
+    value: Mapping[str, Any], native_ingest_contract: Any | None,
+) -> dict[str, Any]:
+    """Validate the complete authoritative crawler/native contract boundary."""
+    contract = (
+        _default_native_ingest_contract()
+        if native_ingest_contract is None
+        else native_ingest_contract
+    )
+    stamp = value.get("authoritative_native_contract")
+    if not isinstance(stamp, Mapping):
+        raise ReplayPlanError("schema-v5 authoritative native contract is missing")
+    expected_game_version = str(contract.value.get("game_version") or "")
+    expected_contract_sha = str(contract.value.get("contract_sha256") or "")
+    if str(stamp.get("game_version") or "") != expected_game_version:
+        raise ReplayPlanError("schema-v5 authoritative game version mismatch")
+    if str(stamp.get("contract_sha256") or "") != expected_contract_sha:
+        raise ReplayPlanError("schema-v5 authoritative contract SHA-256 mismatch")
+    if str(stamp.get("contract_file_sha256") or "") != str(contract.file_sha256):
+        raise ReplayPlanError("schema-v5 authoritative contract file SHA-256 mismatch")
+    eligibility = value.get("authoritative_eligibility")
+    if not isinstance(eligibility, Mapping) or (
+        eligibility.get("status") != "accepted"
+        or eligibility.get("gate") != "native_static_v1"
+    ):
+        raise ReplayPlanError("schema-v5 authoritative eligibility stamp is invalid")
+
+    rounds = value.get("rounds")
+    deck_metadata = value.get("deck_metadata")
+    if (
+        value.get("draft") is not False
+        or value.get("matchup_players") != "1v1"
+        or value.get("normal_1v1") is not True
+        or value.get("battle_type") == "riverRaceDuel"
+        or not isinstance(rounds, list)
+        or len(rounds) != 1
+        or not isinstance(deck_metadata, Mapping)
+        or deck_metadata.get("authoritative_complete") is not True
+        or deck_metadata.get("source") != "battle_list_html"
+        or value.get("deck_crosscheck_complete") is not True
+    ):
+        raise ReplayPlanError("schema-v5 authoritative 1v1/deck metadata is incomplete")
+    timestamp = value.get("version_timestamp")
+    if (
+        not _strict_int(timestamp, minimum=1)
+        or value.get("version_timestamp_provenance")
+        != "battle_list_exact_timestamp"
+        or not isinstance(value.get("battle_time_utc"), str)
+        or not str(value["battle_time_utc"]).endswith("Z")
+        or value.get("battle_time_utc_provenance") not in {
+            "battle_timestamp_popup_utc",
+            "derived_from_exact_list_timestamp",
+        }
+    ):
+        raise ReplayPlanError("schema-v5 exact version timestamp is incomplete")
+
+    mode = value.get("numeric_game_mode_id")
+    if (
+        not _strict_int(mode, minimum=1)
+        or int(mode) not in contract.numeric_game_mode_ids
+    ):
+        raise ReplayPlanError("schema-v5 numeric game mode is missing or not allowed")
+    mode_provenance = str(value.get("numeric_game_mode_provenance") or "")
+    if mode_provenance != "list_matchup_button_joined_by_data_index":
+        raise ReplayPlanError("schema-v5 numeric game mode provenance is invalid")
+    battle_index = value.get("battle_index")
+    if not _strict_int(battle_index, minimum=1):
+        raise ReplayPlanError("schema-v5 battle index is missing")
+    battle_index_provenance = str(value.get("battle_index_provenance") or "")
+    if battle_index_provenance != "list_replay_and_matchup_button_data_index":
+        raise ReplayPlanError("schema-v5 battle index provenance is invalid")
+
+    coordinates = value.get("coordinate_provenance")
+    if not isinstance(coordinates, Mapping) or (
+        coordinates.get("transform_id")
+        != "royaleapi_data_i_to_libg_native_v1"
+        or coordinates.get("target") != "libg_native_arena"
+        or coordinates.get("missing_or_invalid_data_i") != "reject"
+    ):
+        raise ReplayPlanError("schema-v5 coordinate contract is invalid")
+    if not isinstance(value.get("ability_plays"), list):
+        raise ReplayPlanError("schema-v5 exact ability event array is missing")
+    elixir = value.get("elixir_stats")
+    for source_side in SIDE_NAMES:
+        try:
+            ability_count = elixir[source_side]["Ability"]["count"]
+        except (KeyError, TypeError):
+            raise ReplayPlanError(
+                f"schema-v5 {source_side} ability count is missing"
+            ) from None
+        if not _strict_int(ability_count):
+            raise ReplayPlanError(
+                f"schema-v5 {source_side} ability count is invalid"
+            )
+
+    return {
+        "contract": contract,
+        "numeric_game_mode_id": int(mode),
+        "numeric_game_mode_provenance": mode_provenance,
+        "battle_index": int(battle_index),
+        "battle_index_provenance": battle_index_provenance,
+        "contract_game_version": expected_game_version,
+        "contract_sha256": expected_contract_sha,
+        "contract_file_sha256": str(contract.file_sha256),
+        "contract_provenance": "schema5_authoritative_native_contract_verified",
+    }
+
+
 def _side_deck(
     value: Mapping[str, Any], source_side: str, source_schema: int
-) -> tuple[tuple[CardSpec, ...], str | None]:
+) -> tuple[tuple[CardSpec, ...], str | None, int | None, str]:
     if source_schema >= 2:
         player = _schema_two_player(value, source_side)
         tokens = player.get("full_deck")
@@ -411,6 +603,48 @@ def _side_deck(
             raise ReplayPlanError(f"{source_side} requires eight cards and levels")
         result = tuple(card_spec(str(token), int(levels[str(token)])) for token in tokens)
         tower = str(player.get("tower_troop") or "") or None
+        tower_level = (
+            int(player["tower_troop_level"])
+            if source_schema == 5
+            and _strict_int(player.get("tower_troop_level"), minimum=1)
+            else None
+        )
+        tower_level_provenance = (
+            "schema5_round_player_battle_list_tower_card"
+            if tower_level is not None
+            else "legacy_not_observed"
+        )
+        if source_schema == 5:
+            top_deck = value.get(f"{source_side}_deck")
+            if top_deck != tokens:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} top-level/round deck mismatch"
+                )
+            deck_cards = player.get("deck_cards")
+            if not isinstance(deck_cards, list) or len(deck_cards) != 8:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} deck_cards are missing"
+                )
+            for slot, (token, item) in enumerate(zip(tokens, deck_cards, strict=True)):
+                if not isinstance(item, Mapping):
+                    raise ReplayPlanError(
+                        f"schema-v5 {source_side} deck card {slot} is invalid"
+                    )
+                base, flags = split_card_token(str(token))
+                expected_form = (
+                    "ev1" if flags == 1 else
+                    "hero" if flags == 2 else "base"
+                )
+                if (
+                    item.get("slot") != slot
+                    or item.get("slug") != token
+                    or item.get("base_slug") != base
+                    or item.get("form") != expected_form
+                    or item.get("level") != levels.get(str(token))
+                ):
+                    raise ReplayPlanError(
+                        f"schema-v5 {source_side} deck card {slot} is inconsistent"
+                    )
     else:
         counts = value.get("card_counts")
         side_counts = counts.get(source_side) if isinstance(counts, Mapping) else None
@@ -418,16 +652,19 @@ def _side_deck(
             raise ReplayPlanError(f"{source_side} does not expose eight played cards")
         result = tuple(card_spec(str(token), None) for token in side_counts)
         tower = None
+        tower_level = None
+        tower_level_provenance = "legacy_not_observed"
     bases = [item.base_token for item in result]
     if len(set(bases)) != 8:
         raise ReplayPlanError(f"{source_side} deck has duplicate base-card identities")
-    return result, tower
+    return result, tower, tower_level, tower_level_provenance
 
 
 def compile_battle(
     value: Mapping[str, Any],
     *,
     terminal_crowns: Sequence[int] | None = None,
+    native_ingest_contract: Any | None = None,
 ) -> BattlePlan:
     battle_tag = str(value.get("battle_tag") or "")
     if not battle_tag:
@@ -444,11 +681,29 @@ def compile_battle(
             raise ReplayPlanError("terminal crowns must contain two values in 0..3")
         crowns = (int(terminal_crowns[0]), int(terminal_crowns[1]))
     source_schema = int(value.get("schema_version") or 1)
+    schema_five = (
+        _schema_five_metadata(value, native_ingest_contract)
+        if source_schema == 5
+        else None
+    )
+    if source_schema == 5:
+        source_crowns = (value.get("team_crowns"), value.get("opponent_crowns"))
+        if any(
+            not _strict_int(item) or int(item) > 3
+            for item in source_crowns
+        ):
+            raise ReplayPlanError("schema-v5 terminal crowns are missing or invalid")
+        exact_crowns = (int(source_crowns[0]), int(source_crowns[1]))
+        if crowns is not None and crowns != exact_crowns:
+            raise ReplayPlanError("schema-v5 terminal crowns disagree with caller")
+        crowns = exact_crowns
     if value.get("draft") is True:
         raise ReplayPlanError("draft battles are not supported")
     duration_seconds = value.get("duration_seconds")
     if not isinstance(duration_seconds, (int, float)) or not 1 <= duration_seconds <= 360:
         raise ReplayPlanError("battle duration is missing or outside 1..360 seconds")
+    if source_schema == 5 and not _strict_int(duration_seconds, minimum=1):
+        raise ReplayPlanError("schema-v5 battle duration must be an exact integer")
     duration_ticks = int(round(float(duration_seconds) * 20.0))
     plays = value.get("card_plays")
     if not isinstance(plays, list) or not plays:
@@ -456,12 +711,49 @@ def compile_battle(
 
     side_decks: list[tuple[CardSpec, ...]] = []
     tower_troops: list[str | None] = []
+    tower_troop_levels: list[int | None] = []
+    tower_troop_level_provenance: list[str] = []
+    final_tower_hp: list[FinalTowerHp | None] = []
     logical_indices: list[dict[str, int]] = []
     for source_side in SIDE_NAMES:
-        deck, tower = _side_deck(value, source_side, source_schema)
+        deck, tower, tower_level, tower_level_source = _side_deck(
+            value, source_side, source_schema
+        )
+        if source_schema == 5 and tower_level is None:
+            raise ReplayPlanError(
+                f"schema-v5 {source_side} tower troop level is missing"
+            )
         side_decks.append(deck)
         tower_troops.append(tower)
+        tower_troop_levels.append(tower_level)
+        tower_troop_level_provenance.append(tower_level_source)
+        final_tower_hp.append(
+            _schema_five_terminal_hp(value, source_side)
+            if source_schema == 5
+            else None
+        )
         logical_indices.append({item.base_token: index for index, item in enumerate(deck)})
+
+    if source_schema == 5:
+        assert schema_five is not None
+        contract = schema_five["contract"]
+        for side, source_side in enumerate(SIDE_NAMES):
+            for spec in side_decks[side]:
+                issues = contract.validate_card_token(spec.source_token)
+                if issues:
+                    raise ReplayPlanError(
+                        f"schema-v5 {source_side} card violates native contract: "
+                        f"{issues[0].code}:{spec.source_token}"
+                    )
+            if tower_troops[side] is None:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} tower troop is missing"
+                )
+            tower_issues = contract.validate_tower_troop(tower_troops[side])
+            if tower_issues:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} tower troop violates native contract"
+                )
 
     actions: list[ExpertAction] = []
     per_side_indices: list[list[int]] = [[], []]
@@ -469,6 +761,7 @@ def compile_battle(
     side_action_counts = [0, 0]
     coordinate_flag_counts = [0, 0]
     legacy_coordinate_events = 0
+    source_marker_indices: set[int] = set()
     for event_index, event in enumerate(plays):
         if not isinstance(event, Mapping):
             raise ReplayPlanError(f"event {event_index} is not an object")
@@ -495,6 +788,33 @@ def compile_battle(
         x, y, coordinate_flag = _native_event_coordinates(
             event, event_index=event_index
         )
+        marker_index = event.get("marker_index", event_index)
+        if source_schema == 5:
+            if not _strict_int(marker_index):
+                raise ReplayPlanError(
+                    f"schema-v5 event {event_index} marker index is missing"
+                )
+            if int(marker_index) in source_marker_indices:
+                raise ReplayPlanError(
+                    f"schema-v5 duplicate marker index {marker_index}"
+                )
+            source_marker_indices.add(int(marker_index))
+            expected_token = side_decks[side][logical_indices[side][base_token]].source_token
+            if event.get("card_form") != expected_token:
+                raise ReplayPlanError(
+                    f"schema-v5 event {event_index} card form is inconsistent"
+                )
+            expected_transform = "rotate_180" if coordinate_flag == 0 else "identity"
+            if (
+                event.get("coordinate_provenance")
+                != "royaleapi_data_i_to_libg_native_v1"
+                or event.get("coordinate_transform") != expected_transform
+                or event.get("x") != x
+                or event.get("y") != y
+            ):
+                raise ReplayPlanError(
+                    f"schema-v5 event {event_index} coordinate derivation mismatch"
+                )
         if coordinate_flag is None:
             legacy_coordinate_events += 1
         else:
@@ -502,7 +822,7 @@ def compile_battle(
         actions.append(ExpertAction(
             tick=tick, side=side, logical_card_index=logical,
             base_token=base_token, x=x, y=y, source_event_index=event_index,
-            source_marker_index=int(event.get("marker_index", event_index)),
+            source_marker_index=int(marker_index),
             side_action_index=side_action_counts[side],
         ))
         side_action_counts[side] += 1
@@ -511,6 +831,16 @@ def compile_battle(
         for index in range(len(actions) - 1)
     ):
         raise ReplayPlanError("card events are not sorted by tick")
+    if source_schema == 5:
+        for side, source_side in enumerate(SIDE_NAMES):
+            observed_bases = {
+                action.base_token for action in actions if action.side == side
+            }
+            expected_bases = {spec.base_token for spec in side_decks[side]}
+            if observed_bases != expected_bases:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} does not expose the complete eight-card cycle"
+                )
 
     raw_coordinate_events = sum(coordinate_flag_counts)
     if raw_coordinate_events and not legacy_coordinate_events:
@@ -542,11 +872,36 @@ def compile_battle(
     compiled_abilities = _compile_ability_events(
         value, duration_ticks=duration_ticks
     )
+    if source_schema == 5:
+        for event in compiled_abilities:
+            if event.source_marker_index in source_marker_indices:
+                raise ReplayPlanError(
+                    f"schema-v5 duplicate marker index {event.source_marker_index}"
+                )
+            source_marker_indices.add(event.source_marker_index)
     observed_ability_counts = [
         sum(1 for event in compiled_abilities if event.side == side)
         for side in range(2)
     ]
+    if source_schema == 5:
+        assert schema_five is not None
+        contract = schema_five["contract"]
+        for side, source_side in enumerate(SIDE_NAMES):
+            issues = contract.validate_ability_source(
+                [spec.source_token for spec in side_decks[side]],
+                observed_ability_events=observed_ability_counts[side],
+            )
+            if issues:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} ability source violates native contract"
+                )
     ability_tier = ability_log_tier(value)
+    if source_schema == 5 and ability_tier not in {
+        "source_reports_zero", "observed_ticks_identity_runtime_resolved",
+    }:
+        raise ReplayPlanError(
+            f"schema-v5 exact ability contract is incomplete: {ability_tier}"
+        )
     side_plans = tuple(
         SidePlan(
             side=side, source_side=SIDE_NAMES[side], deck=side_decks[side],
@@ -556,6 +911,9 @@ def compile_battle(
                 0, ability_counts[side] - observed_ability_counts[side]
             ),
             tower_troop=tower_troops[side],
+            tower_troop_level=tower_troop_levels[side],
+            tower_troop_level_provenance=tower_troop_level_provenance[side],
+            final_tower_hp=final_tower_hp[side],
         )
         for side in range(2)
     )
@@ -575,12 +933,17 @@ def compile_battle(
 
     limitations = [
         "source_native_rng_seed_missing",
-        "source_game_build_missing",
-        "source_numeric_game_mode_missing",
+        "source_exact_game_build_missing",
+        "source_king_tower_level_missing",
         "source_initial_hand_not_observed",
-        "source_tower_level_missing",
         "source_tick_state_anchors_missing",
     ]
+    if source_schema != 5:
+        limitations.extend((
+            "source_numeric_game_mode_missing",
+            "source_tower_troop_level_missing",
+            "source_final_six_tower_hp_missing",
+        ))
     if legacy_coordinate_events:
         limitations.append("legacy_precomputed_coordinates_unverified")
     if source_schema < 2:
@@ -646,6 +1009,37 @@ def compile_battle(
         kind="expert_native_replay_plan_v1",
         battle_tag=battle_tag,
         source_schema_version=source_schema,
+        numeric_game_mode_id=(
+            None if schema_five is None
+            else int(schema_five["numeric_game_mode_id"])
+        ),
+        numeric_game_mode_provenance=(
+            "legacy_unobserved" if schema_five is None
+            else str(schema_five["numeric_game_mode_provenance"])
+        ),
+        battle_index=(
+            None if schema_five is None else int(schema_five["battle_index"])
+        ),
+        battle_index_provenance=(
+            "legacy_unobserved" if schema_five is None
+            else str(schema_five["battle_index_provenance"])
+        ),
+        authoritative_contract_game_version=(
+            None if schema_five is None
+            else str(schema_five["contract_game_version"])
+        ),
+        authoritative_contract_sha256=(
+            None if schema_five is None
+            else str(schema_five["contract_sha256"])
+        ),
+        authoritative_contract_file_sha256=(
+            None if schema_five is None
+            else str(schema_five["contract_file_sha256"])
+        ),
+        authoritative_contract_provenance=(
+            "legacy_unobserved" if schema_five is None
+            else str(schema_five["contract_provenance"])
+        ),
         duration_ticks=duration_ticks,
         sides=side_plans,  # type: ignore[arg-type]
         actions=tuple(actions),
@@ -656,8 +1050,14 @@ def compile_battle(
         # No current RoyaleAPI artifact has the seed/build/state anchors needed
         # to make this claim, even when all deployment actions are accepted.
         original_state_exact=False,
-        state_provenance="native_generated_unanchored",
-        action_provenance="observed_deployments",
+        state_provenance=(
+            "native_generated_schema5_authoritative_metadata_anchored"
+            if source_schema == 5 else "native_generated_unanchored"
+        ),
+        action_provenance=(
+            "schema5_observed_exact_tick_deployments"
+            if source_schema == 5 else "observed_deployments"
+        ),
         coordinate_provenance=coordinate_provenance,
         coordinate_audit=coordinate_audit,
         hand_provenance=(
@@ -667,7 +1067,11 @@ def compile_battle(
         ),
         ability_provenance=_ability_provenance(value, ability_counts),
         terminal_provenance=(
-            "source_index_crowns" if crowns is not None else "unknown_no_source_anchor"
+            "schema5_source_crowns_and_final_six_tower_hp"
+            if source_schema == 5
+            else "source_index_crowns"
+            if crowns is not None
+            else "unknown_no_source_anchor"
         ),
         terminal_crowns=crowns,
         limitations=tuple(limitations),
@@ -723,6 +1127,10 @@ def materialize_replay(
     replay = copy.deepcopy(dict(template))
     replay["rndSeed"] = int(seed)
     battle = replay["battle"]
+    if plan.numeric_game_mode_id is not None:
+        # Schema 5 joins the numeric mode from the list page by battle index.
+        # Older sources deliberately retain the template mode instead.
+        battle["gamemode"] = int(plan.numeric_game_mode_id)
     mappings: list[tuple[int, ...]] = []
     for side, side_plan in enumerate(plan.sides):
         mapping = tuple(range(8))
@@ -740,9 +1148,17 @@ def materialize_replay(
             native_deck.append(row)
         battle[f"deck{side}"]["sp"] = native_deck
         support = tower_troop(side_plan.tower_troop or "tower-princess")
+        support_level = (
+            side_plan.tower_troop_level
+            if side_plan.tower_troop_level is not None
+            else max((spec.level or fallback_level) for spec in side_plan.deck)
+        )
         battle[f"deck{side}"]["sc"] = [{
             "d": support.support_card_id,
-            "l": int(max((spec.level or fallback_level) for spec in side_plan.deck) - 1),
+            # Tower Troop level is not King level and is not inferred from the
+            # highest card in authoritative schema 5.  The legacy fallback is
+            # retained only for schema 1..4 compatibility.
+            "l": int(support_level - 1),
             "t": 0,
             "c": 0,
         }]

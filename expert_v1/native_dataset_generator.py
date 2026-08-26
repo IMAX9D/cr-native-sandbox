@@ -205,8 +205,9 @@ def _validate_candidate_row(value: Mapping[str, Any], line_number: int) -> None:
         raise ValueError(f"candidate line {line_number} has no battle_tag")
     if value.get("authoritative_native_full_candidate") is not True:
         raise ValueError(f"candidate {tag} is not authoritative-native-full")
-    if int(value.get("source_schema_version") or 0) != 3:
-        raise ValueError(f"candidate {tag} is not source schema 3")
+    source_schema = int(value.get("source_schema_version") or 0)
+    if source_schema not in {3, 5}:
+        raise ValueError(f"candidate {tag} is not source schema 3 or 5")
     if str(value.get("coordinate_tier")) != "all_card_events_raw_data_i":
         raise ValueError(f"candidate {tag} lacks exact raw data_i coordinates")
     if str(value.get("ability_log_tier")) not in EXACT_ABILITY_TIERS:
@@ -214,6 +215,27 @@ def _validate_candidate_row(value: Mapping[str, Any], line_number: int) -> None:
     source_sha = str(value.get("source_sha256") or "")
     if len(source_sha) != 64:
         raise ValueError(f"candidate {tag} has invalid source SHA-256")
+    if source_schema == 5:
+        required = (
+            "schema5_authoritative_contract_verified",
+            "tower_troop_levels_complete",
+            "final_tower_hp_complete",
+        )
+        missing = [name for name in required if value.get(name) is not True]
+        if missing:
+            raise ValueError(
+                f"candidate {tag} lacks authoritative schema5 fields: {missing}"
+            )
+        mode = value.get("numeric_game_mode_id")
+        if not isinstance(mode, int) or isinstance(mode, bool) or mode <= 0:
+            raise ValueError(f"candidate {tag} lacks schema5 numeric game mode")
+        battle_index = value.get("battle_index")
+        if (
+            not isinstance(battle_index, int)
+            or isinstance(battle_index, bool)
+            or battle_index <= 0
+        ):
+            raise ValueError(f"candidate {tag} lacks schema5 battle index")
 
 
 def select_tasks(
@@ -785,8 +807,21 @@ def _verify_plan(task: NativeDatasetTask, source: Mapping[str, Any]) -> BattlePl
     plan = compile_battle(source, terminal_crowns=crowns)
     if not plan.native_replay_ready:
         raise RuntimeError(f"compiled plan is not native ready: {plan.replay_tier}")
-    if plan.source_schema_version != 3:
-        raise RuntimeError("compiled plan is not schema 3")
+    if plan.source_schema_version not in {3, 5}:
+        raise RuntimeError("compiled plan is not schema 3 or 5")
+    if plan.source_schema_version == 5:
+        if (
+            plan.authoritative_contract_provenance
+            != "schema5_authoritative_native_contract_verified"
+            or plan.numeric_game_mode_id is None
+            or plan.battle_index is None
+            or any(
+                side.tower_troop_level is None
+                or side.final_tower_hp is None
+                for side in plan.sides
+            )
+        ):
+            raise RuntimeError("compiled schema5 authoritative metadata is incomplete")
     if plan.coordinate_provenance != COORDINATE_PROVENANCE:
         raise RuntimeError(
             f"coordinate provenance changed: {plan.coordinate_provenance}"
@@ -1031,6 +1066,7 @@ def execute_task(
         "source_path": task.source_path,
         "source_sha256": task.source_sha256,
         "source_sha_verified": source_sha_verified,
+        "source_schema_version": task.source_schema_version,
         "source_json_copied": False,
         "teacher_forced_success": success,
         "failure_class": failure_class,
@@ -1049,6 +1085,19 @@ def execute_task(
         ),
         "coordinate_provenance": coordinate_provenance,
         "coordinate_audit": coordinate_audit,
+        "numeric_game_mode_id": (
+            None if plan is None else plan.numeric_game_mode_id
+        ),
+        "numeric_game_mode_provenance": (
+            None if plan is None else plan.numeric_game_mode_provenance
+        ),
+        "battle_index": None if plan is None else plan.battle_index,
+        "battle_index_provenance": (
+            None if plan is None else plan.battle_index_provenance
+        ),
+        "authoritative_contract_sha256": (
+            None if plan is None else plan.authoritative_contract_sha256
+        ),
         "ability_log_tier": task.ability_log_tier,
         "ability_branch_policy": "branch_required fails closed; no guessed entity",
         "ability_resolution_counts": (
@@ -1083,6 +1132,23 @@ def execute_task(
         ),
         "terminal_diagnostic_status": (
             "not_reached" if result is None else result.terminal_diagnostic_status
+        ),
+        "terminal_tower_hp_diagnostic_status": (
+            "not_reached"
+            if result is None
+            else result.terminal_tower_hp_diagnostic_status
+        ),
+        "terminal_tower_hp_validated": (
+            False if result is None else result.terminal_tower_hp_validated
+        ),
+        "terminal_tower_hp_match": (
+            None if result is None else result.terminal_tower_hp_match
+        ),
+        "source_final_tower_hp": (
+            None if result is None else result.source_final_tower_hp
+        ),
+        "observed_final_tower_hp": (
+            None if result is None else result.observed_final_tower_hp
         ),
         "tick_store_entry": store_entry,
         "wall_seconds": time.perf_counter() - started,

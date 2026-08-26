@@ -83,6 +83,11 @@ class NativeReplayResult:
     terminal_diagnostic_status: str
     source_crowns: tuple[int, int] | None
     observed_crowns: tuple[int, int] | None
+    terminal_tower_hp_validated: bool
+    terminal_tower_hp_match: bool | None
+    terminal_tower_hp_diagnostic_status: str
+    source_final_tower_hp: tuple[dict[str, Any], dict[str, Any]] | None
+    observed_final_tower_hp: tuple[dict[str, Any], dict[str, Any]] | None
     decision_records: tuple[dict[str, Any], ...]
     tick_trace_batches: int
     tick_trace_complete_frames: int
@@ -201,6 +206,69 @@ def _compact_decision_state(
     }
 
 
+def _source_final_tower_hp(
+    plan: BattlePlan,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    values = [side.final_tower_hp for side in plan.sides]
+    if any(value is None for value in values):
+        return None
+    return tuple(asdict(value) for value in values)  # type: ignore[return-value]
+
+
+def _observed_final_tower_hp(
+    episode: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Project native tower HP without assigning Princess slots to lanes."""
+    raw_towers = episode.get("crown_towers")
+    if not isinstance(raw_towers, list):
+        return None
+    result: list[dict[str, Any]] = []
+    for side in (0, 1):
+        towers = [
+            item for item in raw_towers
+            if isinstance(item, Mapping) and int(item.get("side", -1)) == side
+        ]
+        kings = [
+            item for item in towers
+            if "king" in str(item.get("type") or "").lower()
+        ]
+        princesses = [
+            item for item in towers
+            if "princess" in str(item.get("type") or "").lower()
+        ]
+        if len(kings) != 1 or len(princesses) != 2:
+            return None
+        king = max(0, int(kings[0].get("hp", 0)))
+        princess_hp = sorted(max(0, int(item.get("hp", 0))) for item in princesses)
+        result.append({
+            "king": king,
+            "princess_multiset": princess_hp,
+            "total": king + sum(princess_hp),
+            "slot_mapping_provenance": "native_princess_lanes_compared_as_multiset",
+        })
+    return (result[0], result[1])
+
+
+def _tower_hp_matches(
+    source: Sequence[Mapping[str, Any]],
+    observed: Sequence[Mapping[str, Any]],
+) -> bool:
+    if len(source) != 2 or len(observed) != 2:
+        return False
+    for expected, actual in zip(source, observed, strict=True):
+        expected_princess = sorted((
+            int(expected["princess0"]), int(expected["princess1"]),
+        ))
+        if (
+            int(expected["king"]) != int(actual["king"])
+            or expected_princess
+            != [int(item) for item in actual["princess_multiset"]]
+            or int(expected["total"]) != int(actual["total"])
+        ):
+            return False
+    return True
+
+
 def _advance_native(
     env: NativeRoyaleEnv,
     steps: int,
@@ -307,6 +375,10 @@ def execute_plan(
     terminal_validated = False
     terminal_match: bool | None = None
     observed_crowns: tuple[int, int] | None = None
+    source_final_tower_hp = _source_final_tower_hp(plan)
+    observed_final_tower_hp: tuple[dict[str, Any], dict[str, Any]] | None = None
+    terminal_tower_hp_validated = False
+    terminal_tower_hp_match: bool | None = None
     tick_store_entry: dict[str, Any] | None = None
     logic_freeze_diagnostic: dict[str, Any] | None = None
     tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
@@ -629,6 +701,15 @@ def execute_plan(
                         ),
                         "ability_provenance": plan.ability_provenance,
                         "terminal_provenance": plan.terminal_provenance,
+                        "numeric_game_mode_id": plan.numeric_game_mode_id,
+                        "numeric_game_mode_provenance": (
+                            plan.numeric_game_mode_provenance
+                        ),
+                        "battle_index": plan.battle_index,
+                        "battle_index_provenance": plan.battle_index_provenance,
+                        "authoritative_contract_sha256": (
+                            plan.authoritative_contract_sha256
+                        ),
                     })
                     records.append(record)
             action_started = time.perf_counter()
@@ -697,6 +778,16 @@ def execute_plan(
             observed_crowns = (int(crowns[0]), int(crowns[1]))
             terminal_validated = True
             terminal_match = observed_crowns == plan.terminal_crowns
+            if source_final_tower_hp is not None:
+                observed_final_tower_hp = _observed_final_tower_hp(episode)
+                terminal_tower_hp_validated = observed_final_tower_hp is not None
+                terminal_tower_hp_match = (
+                    False
+                    if observed_final_tower_hp is None
+                    else _tower_hp_matches(
+                        source_final_tower_hp, observed_final_tower_hp
+                    )
+                )
         else:
             terminal_match = False
 
@@ -723,6 +814,18 @@ def execute_plan(
             "coordinate_audit": coordinate_audit,
             "ability_provenance": plan.ability_provenance,
             "terminal_provenance": plan.terminal_provenance,
+            "numeric_game_mode_id": plan.numeric_game_mode_id,
+            "numeric_game_mode_provenance": plan.numeric_game_mode_provenance,
+            "battle_index": plan.battle_index,
+            "battle_index_provenance": plan.battle_index_provenance,
+            "authoritative_contract_game_version": (
+                plan.authoritative_contract_game_version
+            ),
+            "authoritative_contract_sha256": plan.authoritative_contract_sha256,
+            "authoritative_contract_file_sha256": (
+                plan.authoritative_contract_file_sha256
+            ),
+            "source_final_tower_hp": source_final_tower_hp,
             "source_actions": len(plan.actions) + len(plan.ability_events),
         }
         try:
@@ -744,6 +847,14 @@ def execute_plan(
         terminal_diagnostic_status = "crowns_mismatch"
     else:
         terminal_diagnostic_status = "native_terminal_missing"
+    if source_final_tower_hp is None:
+        terminal_tower_hp_diagnostic_status = "not_requested"
+    elif terminal_tower_hp_validated and terminal_tower_hp_match:
+        terminal_tower_hp_diagnostic_status = "match_unmapped_princess_slots"
+    elif terminal_tower_hp_validated:
+        terminal_tower_hp_diagnostic_status = "tower_hp_mismatch"
+    else:
+        terminal_tower_hp_diagnostic_status = "native_terminal_tower_hp_missing"
 
     return NativeReplayResult(
         battle_tag=plan.battle_tag,
@@ -787,6 +898,13 @@ def execute_plan(
         terminal_diagnostic_status=terminal_diagnostic_status,
         source_crowns=plan.terminal_crowns,
         observed_crowns=observed_crowns,
+        terminal_tower_hp_validated=terminal_tower_hp_validated,
+        terminal_tower_hp_match=terminal_tower_hp_match,
+        terminal_tower_hp_diagnostic_status=(
+            terminal_tower_hp_diagnostic_status
+        ),
+        source_final_tower_hp=source_final_tower_hp,
+        observed_final_tower_hp=observed_final_tower_hp,
         decision_records=tuple(records),
         tick_trace_batches=(
             0 if tick_accumulator is None else tick_accumulator.batches

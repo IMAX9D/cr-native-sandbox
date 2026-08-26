@@ -1,0 +1,119 @@
+{
+  "schema_version": 5,
+  "battle_tag": "SCHEMA5FIXTURE",
+  "battle_type": "PvP",
+  "matchup_players": "1v1",
+  "normal_1v1": true,
+  "draft": false,
+  "duration_seconds": 60,
+  "numeric_game_mode_id": 72000006,
+  "numeric_game_mode_provenance": "list_matchup_button_joined_by_data_index",
+  "battle_index": 1787218979,
+  "battle_index_provenance": "list_replay_and_matchup_button_data_index",
+  "version_timestamp": 1787218979,
+  "version_timestamp_provenance": "battle_list_exact_timestamp",
+  "battle_time_utc": "2026-08-20T09:42:59Z",
+  "battle_time_utc_provenance": "battle_timestamp_popup_utc",
+  "team_crowns": 1,
+  "opponent_crowns": 0,
+  "coordinate_provenance": {
+    "schema_version": 1,
+    "transform_id": "royaleapi_data_i_to_libg_native_v1",
+    "source": "royaleapi_replay_marker",
+    "source_fields": ["data-x", "data-y", "data-i"],
+    "target": "libg_native_arena",
+    "arena_width": 18000,
+    "arena_height": 32000,
+    "data_i_0": "rotate_180",
+    "data_i_1": "identity",
+    "missing_or_invalid_data_i": "reject"
+  },
+  "final_tower_hp": {
+    "team": {"king": 4824, "princess0": 3052, "princess1": 2500, "total": 10376},
+    "opponent": {"king": 4824, "princess0": 0, "princess1": 2200, "total": 7024},
+    "provenance": "list_hp_both_popup",
+    "slot_mapping_provenance": "source_slots_unmapped",
+    "raw_princess_mapping": {
+      "princess0": "data-*-princess0",
+      "princess1": "data-*-princess1"
+    }
+  },
+  "team_deck": ["knight-ev1", "archers", "giant", "skeletons", "musketeer", "hog-rider", "cannon", "arrows"],
+  "opponent_deck": ["knight", "archers", "giant", "skeletons", "musketeer", "hog-rider", "cannon", "arrows"],
+  "deck_crosscheck_complete": true,
+  "deck_metadata": {
+    "complete": true,
+    "authoritative_complete": true,
+    "source": "battle_list_html",
+    "schema_version": 2
+  },
+  "rounds": [{
+    "team": [{
+      "full_deck": ["knight-ev1", "archers", "giant", "skeletons", "musketeer", "hog-rider", "cannon", "arrows"],
+      "deck_cards": [
+        {"slot": 0, "slug": "knight-ev1", "base_slug": "knight", "form": "ev1", "level": 14},
+        {"slot": 1, "slug": "archers", "base_slug": "archers", "form": "base", "level": 14},
+        {"slot": 2, "slug": "giant", "base_slug": "giant", "form": "base", "level": 14},
+        {"slot": 3, "slug": "skeletons", "base_slug": "skeletons", "form": "base", "level": 14},
+        {"slot": 4, "slug": "musketeer", "base_slug": "musketeer", "form": "base", "level": 14},
+        {"slot": 5, "slug": "hog-rider", "base_slug": "hog-rider", "form": "base", "level": 14},
+        {"slot": 6, "slug": "cannon", "base_slug": "cannon", "form": "base", "level": 14},
+        {"slot": 7, "slug": "arrows", "base_slug": "arrows", "form": "base", "level": 14}
+      ],
+      "card_levels": {"knight-ev1": 14, "archers": 14, "giant": 14, "skeletons": 14, "musketeer": 14, "hog-rider": 14, "cannon": 14, "arrows": 14},
+      "tower_troop": "tower-princess",
+      "tower_troop_level": 13,
+      "complete": true
+    }],
+    "opponent": [{
+      "full_deck": ["knight", "archers", "giant", "skeletons", "musketeer", "hog-rider", "cannon", "arrows"],
+      "deck_cards": [
+        {"slot": 0, "slug": "knight", "base_slug": "knight", "form": "base", "level": 12},
+        {"slot": 1, "slug": "archers", "base_slug": "archers", "form": "base", "level": 12},
+        {"slot": 2, "slug": "giant", "base_slug": "giant", "form": "base", "level": 12},
+        {"slot": 3, "slug": "skeletons", "base_slug": "skeletons", "form": "base", "level": 12},
+        {"slot": 4, "slug": "musketeer", "base_slug": "musketeer", "form": "base", "level": 12},
+        {"slot": 5, "slug": "hog-rider", "base_slug": "hog-rider", "form": "base", "level": 12},
+        {"slot": 6, "slug": "cannon", "base_slug": "cannon", "form": "base", "level": 12},
+        {"slot": 7, "slug": "arrows", "base_slug": "arrows", "form": "base", "level": 12}
+      ],
+      "card_levels": {"knight": 12, "archers": 12, "giant": 12, "skeletons": 12, "musketeer": 12, "hog-rider": 12, "cannon": 12, "arrows": 12},
+      "tower_troop": "cannoneer",
+      "tower_troop_level": 10,
+      "complete": true
+    }]
+  }],
+  "card_plays": [
+    {"time_raw": 120, "marker_index": 0, "side": "team", "card": "knight", "card_form": "knight-ev1", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 120, "marker_index": 1, "side": "opponent", "card": "knight", "card_form": "knight", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 140, "marker_index": 2, "side": "team", "card": "archers", "card_form": "archers", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 140, "marker_index": 3, "side": "opponent", "card": "archers", "card_form": "archers", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 160, "marker_index": 4, "side": "team", "card": "giant", "card_form": "giant", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 160, "marker_index": 5, "side": "opponent", "card": "giant", "card_form": "giant", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 180, "marker_index": 6, "side": "team", "card": "skeletons", "card_form": "skeletons", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 180, "marker_index": 7, "side": "opponent", "card": "skeletons", "card_form": "skeletons", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 200, "marker_index": 8, "side": "team", "card": "musketeer", "card_form": "musketeer", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 200, "marker_index": 9, "side": "opponent", "card": "musketeer", "card_form": "musketeer", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 220, "marker_index": 10, "side": "team", "card": "hog-rider", "card_form": "hog-rider", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 220, "marker_index": 11, "side": "opponent", "card": "hog-rider", "card_form": "hog-rider", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 240, "marker_index": 12, "side": "team", "card": "cannon", "card_form": "cannon", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 240, "marker_index": 13, "side": "opponent", "card": "cannon", "card_form": "cannon", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500},
+    {"time_raw": 260, "marker_index": 14, "side": "team", "card": "arrows", "card_form": "arrows", "x_raw": 8500, "y_raw": 10500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 10500},
+    {"time_raw": 260, "marker_index": 15, "side": "opponent", "card": "arrows", "card_form": "arrows", "x_raw": 8500, "y_raw": 21500, "data_i": 1, "coordinate_provenance": "royaleapi_data_i_to_libg_native_v1", "coordinate_transform": "identity", "x": 8500, "y": 21500}
+  ],
+  "ability_plays": [],
+  "elixir_stats": {
+    "team": {"Ability": {"count": 0}},
+    "opponent": {"Ability": {"count": 0}}
+  },
+  "authoritative_native_contract": {
+    "game_version": "__GAME_VERSION__",
+    "contract_sha256": "__CONTRACT_SHA256__",
+    "contract_file_sha256": "__CONTRACT_FILE_SHA256__"
+  },
+  "authoritative_eligibility": {
+    "status": "accepted",
+    "gate": "native_static_v1",
+    "source_kind": "fresh"
+  }
+}

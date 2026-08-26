@@ -2,7 +2,8 @@
 
 ## 1. 目的与边界
 
-本工具把已经通过静态资格审计的 26,385 场 schema-3 专家对局，逐场送入原版 `libg.so`：
+本工具把已经通过静态资格审计的专家对局逐场送入原版 `libg.so`。旧
+schema 3 队列继续可恢复运行；新抓取的 authoritative schema 5 队列使用同一生成器：
 
 1. 按 RoyaleAPI 原始 `time_raw` 标签读取出牌和技能事件；
 2. 按 profile v1 在 `T+1` 原生执行边界提交事件；
@@ -19,13 +20,23 @@
 D:\AI_data\cr-native-core\expert-v1\native-eligibility-v1\queues\authoritative-native-full.jsonl
 ```
 
-它包含：
+旧冻结队列包含：
 
 - 24,026 场带精确技能 Tick 的对局；
 - 2,359 场来源明确报告没有技能事件的对局；
 - 全部使用 schema 3 完整八卡、等级、形态、塔兵信息；
 - 全部部署事件都有原始 `x/y/data_i`；
 - 不包含旧 schema 的近似技能时间或 legacy 坐标。
+
+新 schema 5 候选除了上述动作条件，还必须在候选验证和实际执行前两次通过：
+
+- 冻结 native contract 三元组匹配；
+- numeric game mode 与 battle index 完整；
+- 双方塔兵等级完整；
+- 来源最终六塔 HP 完整；
+- `compile_battle()` 重新验证所有 schema 5 字段，不能只相信队列布尔值。
+
+schema 3 任务格式和已有 SQLite 队列不变，因此无需迁移正在运行的旧任务。
 
 ## 2. 数据语义
 
@@ -69,7 +80,11 @@ data_i=1 -> identity
 
 ### 2.4 原生状态声明
 
-输出是“同版本 libg + 专家原始动作序列”的原生 teacher-forced 轨迹，不声明恢复 RoyaleAPI 未提供的原始 RNG/隐藏状态。每场 seed 只用于寻找与已观察八卡循环兼容的初始手牌布局。
+输出是“同版本 libg + 专家原始动作序列”的原生 teacher-forced 轨迹，不声明恢复 RoyaleAPI 未提供的原始 RNG/隐藏状态。每场 seed 只用于寻找与已观察八卡循环兼容的初始手牌布局。schema 5 会把来源 numeric game mode 与塔兵等级准确送入 replay；King Tower level 和 exact source build 仍是缺失字段，不能由此宣称原始状态完全一致。
+
+schema 5 的终局六塔 HP 是诊断锚点，不影响 teacher-forced 动作接受的定义。由于
+来源 Princess 槽位 0/1 尚无 native 左右映射证据，比较采用 King 精确值、两个
+Princess HP 多重集合和 total；结果单独写入 tower-HP diagnostic 字段。
 
 ## 3. 输入不复制
 

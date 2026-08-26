@@ -141,6 +141,7 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
     schema = int(value.get("schema_version") or 1)
     rounds = value.get("rounds")
     deck_complete = levels_complete = forms_complete = towers_complete = True
+    tower_levels_complete = schema == 5
     tower_tokens: list[str | None] = []
     if schema < 2 or not isinstance(rounds, list) or len(rounds) != 1:
         deck_complete = levels_complete = forms_complete = towers_complete = False
@@ -172,12 +173,49 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
             tower = str(player.get("tower_troop") or "") or None
             tower_tokens.append(tower)
             towers_complete &= tower is not None
+            if schema == 5:
+                tower_level = player.get("tower_troop_level")
+                tower_levels_complete &= (
+                    isinstance(tower_level, int)
+                    and not isinstance(tower_level, bool)
+                    and tower_level >= 1
+                )
+    terminal = value.get("final_tower_hp")
+    final_tower_hp_complete = False
+    if schema == 5 and isinstance(terminal, Mapping):
+        final_tower_hp_complete = (
+            terminal.get("provenance") == "list_hp_both_popup"
+            and terminal.get("slot_mapping_provenance") == "source_slots_unmapped"
+        )
+        for side in ("team", "opponent"):
+            hp = terminal.get(side)
+            keys = ("king", "princess0", "princess1", "total")
+            valid = isinstance(hp, Mapping) and all(
+                isinstance(hp.get(key), int)
+                and not isinstance(hp.get(key), bool)
+                and int(hp[key]) >= 0
+                for key in keys
+            )
+            final_tower_hp_complete &= bool(
+                valid and int(hp["total"]) == sum(int(hp[key]) for key in keys[:3])
+            )
+    contract_stamp = value.get("authoritative_native_contract")
+    schema5_contract_stamp_complete = bool(
+        schema == 5
+        and isinstance(contract_stamp, Mapping)
+        and str(contract_stamp.get("game_version") or "")
+        and len(str(contract_stamp.get("contract_sha256") or "")) == 64
+        and len(str(contract_stamp.get("contract_file_sha256") or "")) == 64
+    )
     return {
         "eight_card_decks_complete": deck_complete,
         "card_levels_complete": levels_complete,
         "card_forms_complete_by_schema_contract": forms_complete,
         "tower_troops_complete": towers_complete,
         "tower_troops": tower_tokens,
+        "tower_troop_levels_complete": tower_levels_complete,
+        "final_tower_hp_complete": final_tower_hp_complete,
+        "schema5_contract_stamp_complete": schema5_contract_stamp_complete,
     }
 
 
@@ -204,7 +242,9 @@ def _failure_class(message: str) -> str:
     return "other_compile_rejected"
 
 
-def audit_one(manifest_row: Mapping[str, Any]) -> dict[str, Any]:
+def audit_one(
+    manifest_row: Mapping[str, Any], *, native_ingest_contract: Any | None = None,
+) -> dict[str, Any]:
     source = Path(str(manifest_row["source_path"]))
     raw = source.read_bytes()
     source_sha = hashlib.sha256(raw).hexdigest()
@@ -238,7 +278,10 @@ def audit_one(manifest_row: Mapping[str, Any]) -> dict[str, Any]:
         crowns = (
             int(manifest_row["team_crowns"]), int(manifest_row["opponent_crowns"])
         ) if "team_crowns" in manifest_row and "opponent_crowns" in manifest_row else None
-        plan = compile_battle(value, terminal_crowns=crowns)
+        plan = compile_battle(
+            value, terminal_crowns=crowns,
+            native_ingest_contract=native_ingest_contract,
+        )
     except (ReplayPlanError, KeyError, TypeError, ValueError) as error:
         return {
             **base,
@@ -266,9 +309,25 @@ def audit_one(manifest_row: Mapping[str, Any]) -> dict[str, Any]:
     exact_ability = ability_tier in {
         "source_reports_zero", "observed_ticks_identity_runtime_resolved",
     }
+    schema5_contract_verified = bool(
+        schema == 5
+        and plan.authoritative_contract_provenance
+        == "schema5_authoritative_native_contract_verified"
+    )
+    schema_specific_complete = bool(
+        schema == 3
+        or (
+            schema == 5
+            and metadata["tower_troop_levels_complete"]
+            and metadata["final_tower_hp_complete"]
+            and metadata["schema5_contract_stamp_complete"]
+            and schema5_contract_verified
+        )
+    )
     authoritative = bool(
-        plan.native_replay_ready and schema >= 3 and exact_coordinates
+        plan.native_replay_ready and schema in {3, 5} and exact_coordinates
         and all_metadata and exact_ability and not mapping_limitations
+        and schema_specific_complete
     )
     if authoritative and ability_count == 0:
         tier = "authoritative_native_deployment_only"
@@ -296,6 +355,10 @@ def audit_one(manifest_row: Mapping[str, Any]) -> dict[str, Any]:
         "eligibility_tier": tier,
         "replay_tier": plan.replay_tier,
         "mapping_complete": not mapping_limitations,
+        "schema5_authoritative_contract_verified": schema5_contract_verified,
+        "numeric_game_mode_id": plan.numeric_game_mode_id,
+        "battle_index": plan.battle_index,
+        "terminal_provenance": plan.terminal_provenance,
         "mapping_limitations": mapping_limitations,
         "all_limitations": list(plan.limitations),
         "compiled_deployment_actions": len(plan.actions),
@@ -441,6 +504,8 @@ def run_audit(
                 for metadata_key in (
                     "eight_card_decks_complete", "card_levels_complete",
                     "card_forms_complete_by_schema_contract", "tower_troops_complete",
+                    "tower_troop_levels_complete", "final_tower_hp_complete",
+                    "schema5_contract_stamp_complete",
                 ):
                     counters[metadata_key][str(bool(audited[metadata_key])).lower()] += 1
                 mapping_value = audited.get("mapping_complete")
@@ -487,6 +552,20 @@ def run_audit(
                         "compiler_native_replay_ready", "authoritative_native_full_candidate",
                     )
                 }
+                if schema == 5:
+                    queue_row.update({
+                        "schema5_authoritative_contract_verified": bool(
+                            audited.get("schema5_authoritative_contract_verified")
+                        ),
+                        "tower_troop_levels_complete": bool(
+                            audited.get("tower_troop_levels_complete")
+                        ),
+                        "final_tower_hp_complete": bool(
+                            audited.get("final_tower_hp_complete")
+                        ),
+                        "numeric_game_mode_id": audited.get("numeric_game_mode_id"),
+                        "battle_index": audited.get("battle_index"),
+                    })
                 queue_encoded = _canonical(queue_row)
                 for name in selected_queues:
                     queue_handles[name].write(queue_encoded)
@@ -550,8 +629,10 @@ def run_audit(
             "does_not_call_libg": True,
             "does_not_copy_source_battles": True,
             "authoritative_native_full_candidate": (
-                "schema>=3 + every deployment has raw x/y/data_i + complete 8-card/level/form/tower metadata "
-                "+ current card/form/tower/ability mapping + zero ability or exact ability ticks"
+                "schema3 legacy-exact or contract-verified schema5 + every deployment has raw x/y/data_i "
+                "+ complete 8-card/level/form/tower metadata + current card/form/tower/ability mapping "
+                "+ zero ability or exact ability ticks; schema5 additionally requires numeric mode, battle index, "
+                "tower troop levels and final six-tower HP"
             ),
             "compiler_native_replay_ready_warning": (
                 "includes schema2 zero-ability rows whose legacy x/y lacks raw data_i and is therefore approximate"
