@@ -25,6 +25,7 @@ class ExpertPolicyConfig:
     card_vocab_size: int
     ability_vocab_size: int
     max_ability_slots: int
+    entity_numeric_size: int = 3
     card_embedding_size: int = 64
     spatial_size: int = 64
     hidden_size: int = 256
@@ -78,6 +79,12 @@ class RecurrentExpertPolicy(nn.Module):
                 nn.SiLU(),
             )
             self.cell_features = nn.Conv2d(spatial, embed, 1)
+            self.entity_relation_embedding = nn.Embedding(2, 8)
+            self.entity_encoder = nn.Sequential(
+                nn.Linear(embed + 8 + config.entity_numeric_size, spatial),
+                nn.SiLU(),
+                nn.Linear(spatial, spatial),
+            )
             recurrent_spatial = spatial
         else:
             if config.grid_channels != 0:
@@ -157,6 +164,11 @@ class RecurrentExpertPolicy(nn.Module):
         revealed_enemy_tokens: Tensor,
         ability_tokens: Tensor | None,
         delta_ticks: Tensor,
+        entity_tokens: Tensor | None = None,
+        entity_positions: Tensor | None = None,
+        entity_relations: Tensor | None = None,
+        entity_numeric: Tensor | None = None,
+        entity_mask: Tensor | None = None,
         previous_event_card_token: Tensor | None = None,
         previous_event_side: Tensor | None = None,
         previous_event_position: Tensor | None = None,
@@ -170,6 +182,51 @@ class RecurrentExpertPolicy(nn.Module):
                 raise ValueError("arena shape must be 32x18")
             assert self.spatial is not None
             flat_spatial = self.spatial(grid.flatten(0, 1))
+            if any(
+                value is None
+                for value in (
+                    entity_tokens,
+                    entity_positions,
+                    entity_relations,
+                    entity_numeric,
+                    entity_mask,
+                )
+            ):
+                raise ValueError("native-state model requires public ragged entity tokens")
+            assert entity_tokens is not None
+            assert entity_positions is not None
+            assert entity_relations is not None
+            assert entity_numeric is not None
+            assert entity_mask is not None
+            if entity_tokens.shape[:2] != (batch, steps):
+                raise ValueError("entity token prefix must match [batch,time]")
+            entities = self.entity_encoder(
+                torch.cat(
+                    (
+                        self.card_embedding(entity_tokens),
+                        self.entity_relation_embedding(entity_relations),
+                        entity_numeric,
+                    ),
+                    dim=-1,
+                )
+            )
+            entities = entities * entity_mask.unsqueeze(-1)
+            flat_entities = entities.flatten(0, 1)
+            positions = entity_positions.flatten(0, 1).clamp(0, POSITION_COUNT - 1)
+            public_entity_cells = flat_entities.new_zeros(
+                batch * steps, POSITION_COUNT, flat_entities.shape[-1]
+            )
+            public_entity_cells.scatter_add_(
+                1,
+                positions.unsqueeze(-1).expand_as(flat_entities),
+                flat_entities,
+            )
+            flat_spatial = flat_spatial + public_entity_cells.transpose(1, 2).reshape(
+                batch * steps,
+                flat_spatial.shape[1],
+                ARENA_ROWS,
+                ARENA_COLUMNS,
+            )
             pooled = flat_spatial.mean(dim=(-2, -1)).reshape(batch, steps, -1)
         else:
             if grid is not None:
@@ -284,10 +341,23 @@ class RecurrentExpertPolicy(nn.Module):
             values.update(
                 grid=None,
                 ability_tokens=None,
+                entity_tokens=None,
+                entity_positions=None,
+                entity_relations=None,
+                entity_numeric=None,
+                entity_mask=None,
                 previous_event_card_token=batch["previous_event_card_token"],
                 previous_event_side=batch["previous_event_side"],
                 previous_event_position=batch["previous_event_position"],
             )
         else:
-            values.update(grid=batch["grid"], ability_tokens=batch["ability_tokens"])
+            values.update(
+                grid=batch["grid"],
+                ability_tokens=batch["ability_tokens"],
+                entity_tokens=batch["entity_tokens"],
+                entity_positions=batch["entity_positions"],
+                entity_relations=batch["entity_relations"],
+                entity_numeric=batch["entity_numeric"],
+                entity_mask=batch["entity_mask"],
+            )
         return self.forward_sequence(**values)

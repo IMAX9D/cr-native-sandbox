@@ -46,6 +46,13 @@ LABEL_FIELDS = (
     "ability_slot",
     "ability_position",
 )
+ENTITY_WINDOW_FIELDS = (
+    "entity_tokens",
+    "entity_positions",
+    "entity_relations",
+    "entity_numeric",
+    "entity_mask",
+)
 
 
 class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
@@ -173,6 +180,48 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
                 item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).long()
             for name in MASK_FIELDS:
                 item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
+            entity_offsets = arrays["entity_offsets"]
+            starts = np.asarray(
+                entity_offsets[read_start : target_stop + 1], dtype=np.int64
+            )
+            counts = np.diff(starts)
+            maximum_entities = max(1, int(counts.max(initial=0)))
+            entity_tokens = torch.zeros((count, maximum_entities), dtype=torch.long)
+            entity_positions = torch.zeros((count, maximum_entities), dtype=torch.long)
+            entity_relations = torch.zeros((count, maximum_entities), dtype=torch.long)
+            entity_numeric = torch.zeros(
+                (
+                    count,
+                    maximum_entities,
+                    int(self.manifest["dimensions"]["entity_numeric_size"]),
+                ),
+                dtype=torch.float32,
+            )
+            entity_mask = torch.zeros((count, maximum_entities), dtype=torch.bool)
+            for local_row, (start, stop) in enumerate(zip(starts, starts[1:])):
+                length = int(stop - start)
+                if not length:
+                    continue
+                entity_tokens[local_row, :length] = torch.from_numpy(
+                    np.asarray(arrays["entity_tokens"][start:stop]).copy()
+                ).long()
+                entity_positions[local_row, :length] = torch.from_numpy(
+                    np.asarray(arrays["entity_positions"][start:stop]).copy()
+                ).long()
+                entity_relations[local_row, :length] = torch.from_numpy(
+                    np.asarray(arrays["entity_relations"][start:stop]).copy()
+                ).long()
+                entity_numeric[local_row, :length] = torch.from_numpy(
+                    np.asarray(arrays["entity_numeric"][start:stop]).copy()
+                ).float()
+                entity_mask[local_row, :length] = True
+            item.update(
+                entity_tokens=entity_tokens,
+                entity_positions=entity_positions,
+                entity_relations=entity_relations,
+                entity_numeric=entity_numeric,
+                entity_mask=entity_mask,
+            )
         loss_mask = torch.ones(count, dtype=torch.bool)
         loss_mask[:burn] = False
         item["loss_mask"] = loss_mask
@@ -183,15 +232,25 @@ def collate_sequences(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.T
     if not items:
         raise ValueError("cannot collate an empty batch")
     maximum = max(int(item["loss_mask"].shape[0]) for item in items)
+    maximum_entities = max(
+        (int(item["entity_tokens"].shape[1]) for item in items if "entity_tokens" in item),
+        default=0,
+    )
     output: dict[str, list[torch.Tensor]] = {key: [] for key in items[0]}
     for item in items:
         steps = int(item["loss_mask"].shape[0])
         for key, value in item.items():
-            shape = (maximum,) + tuple(value.shape[1:])
+            if key in ENTITY_WINDOW_FIELDS:
+                shape = (maximum, maximum_entities) + tuple(value.shape[2:])
+            else:
+                shape = (maximum,) + tuple(value.shape[1:])
             if key in LABEL_FIELDS:
                 padded = torch.full(shape, -100, dtype=value.dtype)
             else:
                 padded = torch.zeros(shape, dtype=value.dtype)
-            padded[:steps] = value
+            if key in ENTITY_WINDOW_FIELDS:
+                padded[:steps, : value.shape[1]] = value
+            else:
+                padded[:steps] = value
             output[key].append(padded)
     return {key: torch.stack(values) for key, values in output.items()}

@@ -6,9 +6,12 @@ hands, exact opponent elixir and any privileged libg state are prohibited.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 import numpy as np
@@ -36,6 +39,13 @@ NATIVE_REQUIRED_ARRAYS = {
     "hand_tokens",
     "next_card_token",
     "revealed_enemy_tokens",
+    # Public native entities use a ragged categorical representation.  Card
+    # identity is never written into a continuous grid channel.
+    "entity_offsets",
+    "entity_tokens",
+    "entity_positions",
+    "entity_relations",
+    "entity_numeric",
     "ability_tokens",
     "delta_ticks",
     "timing_exposure_ticks",
@@ -101,10 +111,20 @@ FORBIDDEN_FRAGMENTS = (
     "native_rng",
     "unrevealed",
 )
+CONTINUOUS_IDENTIFIER_FRAGMENTS = (
+    "card_id",
+    "card_token",
+    "entity_id",
+    "native_id",
+    "data_id",
+)
 
 
 class DatasetContractError(ValueError):
     """The compiled training data violates the actor data contract."""
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def sha256_file(path: Path) -> str:
@@ -113,6 +133,102 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_dataset_integrity(
+    root: Path,
+    *,
+    workers: int = 0,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fail closed unless the immutable compiled dataset is byte-exact.
+
+    This is intentionally a separate, one-shot startup gate rather than part
+    of :func:`read_manifest`: the trainer constructs three mmap datasets and
+    must not hash every shard three times.  Every referenced ``.npy`` file
+    must be covered by ``shard_file_sha256`` and every declared digest is
+    checked before a model or DataLoader is created.
+    """
+
+    root = root.resolve()
+    manifest_path = root / "manifest.json"
+    sidecar_path = root / "manifest.sha256"
+    if not manifest_path.is_file():
+        raise DatasetContractError(f"dataset manifest is missing: {manifest_path}")
+    if not sidecar_path.is_file():
+        raise DatasetContractError(f"dataset manifest checksum is missing: {sidecar_path}")
+    fields = sidecar_path.read_text(encoding="ascii").split()
+    if (
+        len(fields) != 2
+        or fields[1] != "manifest.json"
+        or not _SHA256_RE.fullmatch(fields[0].lower())
+    ):
+        raise DatasetContractError(f"invalid manifest.sha256 format: {sidecar_path}")
+    manifest_digest = sha256_file(manifest_path)
+    if fields[0].lower() != manifest_digest:
+        raise DatasetContractError(
+            f"manifest checksum mismatch: expected {fields[0].lower()}, got {manifest_digest}"
+        )
+
+    value = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    validate_manifest(value, root=root)
+    declared_value = value.get("shard_file_sha256")
+    if not isinstance(declared_value, Mapping) or not declared_value:
+        raise DatasetContractError("manifest lacks shard_file_sha256 coverage")
+
+    declared: dict[str, str] = {}
+    for raw_relative, raw_digest in declared_value.items():
+        relative = str(raw_relative).replace("\\", "/")
+        digest = str(raw_digest).lower()
+        if relative in declared:
+            raise DatasetContractError(f"duplicate shard checksum path: {relative}")
+        if not _SHA256_RE.fullmatch(digest):
+            raise DatasetContractError(f"invalid shard SHA-256 for {relative}")
+        path = (root / relative).resolve()
+        if root not in path.parents or path.suffix != ".npy":
+            raise DatasetContractError(f"invalid shard checksum path: {relative}")
+        declared[relative] = digest
+
+    actual: set[str] = set()
+    for shards in value["splits"].values():
+        for relative_shard in shards:
+            shard = (root / str(relative_shard)).resolve()
+            for path in shard.glob("*.npy"):
+                actual.add(path.relative_to(root).as_posix())
+    missing_coverage = sorted(actual - declared.keys())
+    stale_entries = sorted(declared.keys() - actual)
+    if missing_coverage or stale_entries:
+        raise DatasetContractError(
+            "shard checksum coverage mismatch: "
+            f"missing={missing_coverage[:5]}, stale={stale_entries[:5]}"
+        )
+
+    paths = sorted(declared)
+    maximum_workers = int(workers) if workers > 0 else min(32, max(1, (os.cpu_count() or 1) * 2))
+
+    def digest_one(relative: str) -> tuple[str, str]:
+        path = root / relative
+        if not path.is_file():
+            raise DatasetContractError(f"checksummed shard file is missing: {path}")
+        return relative, sha256_file(path)
+
+    mismatches: list[tuple[str, str, str]] = []
+    with ThreadPoolExecutor(max_workers=maximum_workers) as executor:
+        for relative, digest in executor.map(digest_one, paths):
+            expected = declared[relative]
+            if digest != expected:
+                mismatches.append((relative, expected, digest))
+    if mismatches:
+        relative, expected, actual_digest = mismatches[0]
+        raise DatasetContractError(
+            "shard checksum mismatch: "
+            f"{relative}: expected {expected}, got {actual_digest} "
+            f"({len(mismatches)} mismatched file(s))"
+        )
+    return value, {
+        "manifest_sha256": manifest_digest,
+        "shard_files": len(paths),
+        "integrity_workers": maximum_workers,
+    }
 
 
 def read_manifest(root: Path) -> dict[str, Any]:
@@ -200,6 +316,32 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
         raise DatasetContractError(
             f"privileged actor features are forbidden: {forbidden_features}"
         )
+    if observation_mode == OBSERVATION_NATIVE:
+        if feature_schema.get("entity_identity") != "categorical_card_vocabulary_v1":
+            raise DatasetContractError(
+                "native entity identity must use categorical card-vocabulary tokens"
+            )
+        entity_numeric = feature_schema.get("entity_numeric")
+        if (
+            not isinstance(entity_numeric, list)
+            or len(entity_numeric) != int(dimensions.get("entity_numeric_size", 0))
+        ):
+            raise DatasetContractError(
+                "entity numeric names must describe every continuous entity feature"
+            )
+        continuous_names = [
+            str(name).lower() for name in grid_names + scalar_names + entity_numeric
+        ]
+        identifiers = sorted(
+            name
+            for name in continuous_names
+            if any(fragment in name for fragment in CONTINUOUS_IDENTIFIER_FRAGMENTS)
+        )
+        if identifiers:
+            raise DatasetContractError(
+                "discrete identifiers are forbidden in continuous features: "
+                f"{identifiers}"
+            )
 
 
 def required_arrays(manifest: Mapping[str, Any]) -> set[str]:
@@ -261,7 +403,27 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         "selected_position_mask_packed": (rows, POSITION_MASK_BYTES),
         "ability_position_mask_packed": (rows, POSITION_MASK_BYTES),
     }
-    one_dimensional = REQUIRED_ARRAYS - set(shapes) - {"sequence_offsets"}
+    entity_offsets = arrays["entity_offsets"]
+    if (
+        entity_offsets.ndim != 1
+        or tuple(entity_offsets.shape) != (rows + 1,)
+        or int(entity_offsets[0]) != 0
+        or np.any(np.diff(entity_offsets) < 0)
+    ):
+        raise DatasetContractError("entity_offsets must be monotonic rows+1 ragged offsets")
+    entities = int(entity_offsets[-1])
+    entity_numeric_size = int(dimensions.get("entity_numeric_size", 0))
+    if entity_numeric_size <= 0:
+        raise DatasetContractError("native-state datasets require entity_numeric_size")
+    shapes.update({
+        "entity_tokens": (entities,),
+        "entity_positions": (entities,),
+        "entity_relations": (entities,),
+        "entity_numeric": (entities, entity_numeric_size),
+    })
+    one_dimensional = REQUIRED_ARRAYS - set(shapes) - {
+        "sequence_offsets", "entity_offsets"
+    }
     shapes.update({name: (rows,) for name in one_dimensional})
     for name, expected in shapes.items():
         if tuple(arrays[name].shape) != expected:
@@ -276,6 +438,23 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         values = arrays[name]
         if values.min(initial=0) < 0 or values.max(initial=0) >= int(dimensions["card_vocab_size"]):
             raise DatasetContractError(f"card token outside vocabulary: {name}")
+    entity_tokens = arrays["entity_tokens"]
+    if (
+        entity_tokens.min(initial=1) <= 0
+        or entity_tokens.max(initial=0) >= int(dimensions["card_vocab_size"])
+    ):
+        raise DatasetContractError("native entity token outside non-PAD card vocabulary")
+    entity_positions = arrays["entity_positions"]
+    if (
+        entity_positions.min(initial=0) < 0
+        or entity_positions.max(initial=0) >= POSITION_COUNT
+    ):
+        raise DatasetContractError("native entity position outside arena")
+    entity_relations = arrays["entity_relations"]
+    if np.any((entity_relations < 0) | (entity_relations > 1)):
+        raise DatasetContractError("native entity relation outside own/enemy")
+    if np.any(~np.isfinite(arrays["entity_numeric"])):
+        raise DatasetContractError("native entity numeric feature contains NaN/Inf")
     ability_tokens = arrays["ability_tokens"]
     if ability_tokens.min(initial=0) < 0 or ability_tokens.max(initial=0) >= int(dimensions["ability_vocab_size"]):
         raise DatasetContractError("ability token outside vocabulary")
@@ -323,8 +502,8 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         raise DatasetContractError("deploy availability disagrees with card mask")
     if np.any(available_kinds[:, 1] != ability_mask_values.any(axis=-1)):
         raise DatasetContractError("ability availability disagrees with ability mask")
-    if np.any(valid & ~available_kinds.any(axis=-1)):
-        raise DatasetContractError("timing label exists when no action kind is legal")
+    if np.any(play_now & ~valid):
+        raise DatasetContractError("an observed expert action requires a timing label")
     if np.any(kind_rows & ~play_now):
         raise DatasetContractError("conditional action-kind label requires play_now")
     card_rows = arrays["card_label_mask"].astype(bool)
