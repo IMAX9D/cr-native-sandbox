@@ -194,16 +194,26 @@ def verify_dataset_integrity(
         if not _SHA256_RE.fullmatch(digest):
             raise DatasetContractError(f"invalid shard SHA-256 for {relative}")
         path = (root / relative).resolve()
-        if root not in path.parents or path.suffix != ".npy":
+        if root not in path.parents or (
+            path.suffix != ".npy" and path.name != "shard.json"
+        ):
             raise DatasetContractError(f"invalid shard checksum path: {relative}")
         declared[relative] = digest
 
     actual: set[str] = set()
+    require_shard_metadata = bool(
+        value.get("production_ready") is True
+        and str(value.get("observation_mode") or OBSERVATION_NATIVE)
+        == OBSERVATION_NATIVE
+    )
     for shards in value["splits"].values():
         for relative_shard in shards:
             shard = (root / str(relative_shard)).resolve()
             for path in shard.glob("*.npy"):
                 actual.add(path.relative_to(root).as_posix())
+            metadata_path = shard / "shard.json"
+            if require_shard_metadata and metadata_path.is_file():
+                actual.add(metadata_path.relative_to(root).as_posix())
     missing_coverage = sorted(actual - declared.keys())
     stale_entries = sorted(declared.keys() - actual)
     if missing_coverage or stale_entries:
@@ -356,6 +366,28 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
                 )
             if not _SHA256_RE.fullmatch(capacity_sha) or sha256_file(capacity_path) != capacity_sha:
                 raise DatasetContractError("capacity preflight checksum changed")
+            shard_metadata = value.get("shard_metadata_sha256")
+            if not isinstance(shard_metadata, Mapping):
+                raise DatasetContractError(
+                    "production native dataset lacks shard metadata hashes"
+                )
+            expected_shards = {
+                str(relative).replace("\\", "/")
+                for paths in value["splits"].values()
+                for relative in paths
+            }
+            if set(str(key) for key in shard_metadata) != expected_shards:
+                raise DatasetContractError("shard metadata hash coverage changed")
+            shard_files = value.get("shard_file_sha256") or {}
+            for relative, digest in shard_metadata.items():
+                normalized = str(relative).replace("\\", "/")
+                if (
+                    not _SHA256_RE.fullmatch(str(digest))
+                    or shard_files.get(f"{normalized}/shard.json") != digest
+                ):
+                    raise DatasetContractError(
+                        "shard metadata hash disagrees with file coverage"
+                    )
         if feature_schema.get("entity_identity") != "categorical_card_vocabulary_v1":
             raise DatasetContractError(
                 "native entity identity must use categorical card-vocabulary tokens"
@@ -666,7 +698,113 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     )
     if np.any(arrays["sample_weight"][any_supervision] <= 0):
         raise DatasetContractError("every supervised row requires positive sample weight")
+    if manifest.get("production_ready") is True:
+        _validate_native_shard_metadata(
+            shard,
+            arrays,
+            rows=rows,
+            sequences=len(offsets) - 1,
+        )
     return {"sequences": len(offsets) - 1, "rows": rows}
+
+
+def _validate_native_shard_metadata(
+    shard: Path,
+    arrays: Mapping[str, np.ndarray],
+    *,
+    rows: int,
+    sequences: int,
+) -> None:
+    path = shard / "shard.json"
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except Exception as error:
+        raise DatasetContractError(f"native shard metadata is missing/invalid: {path}") from error
+    if not isinstance(value, Mapping):
+        raise DatasetContractError("native shard metadata is not an object")
+    expected_fields = {
+        "kind", "schema_version", "metadata_content_sha256", "content_sha256",
+        "split", "shard_index", "rows", "sequences", "battles",
+        "max_entities", "max_ability_slots", "sequence_identity",
+        "storage_bytes", "file_sha256",
+    }
+    if set(value) != expected_fields:
+        raise DatasetContractError("native shard metadata fields changed")
+    canonical = (
+        json.dumps(
+            dict(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if canonical != raw:
+        raise DatasetContractError("native shard metadata is not canonical")
+    content_sha = str(value.get("metadata_content_sha256") or "")
+    body = {
+        key: item
+        for key, item in value.items()
+        if key != "metadata_content_sha256"
+    }
+    body_sha = hashlib.sha256(
+        (
+            json.dumps(
+                body,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+    ).hexdigest()
+    identities = value.get("sequence_identity")
+    if not isinstance(identities, list) or len(identities) != sequences:
+        raise DatasetContractError("native shard sequence identity count changed")
+    battle_tags: list[str] = []
+    for index in range(0, len(identities), 2):
+        pair = identities[index : index + 2]
+        if (
+            len(pair) != 2
+            or not all(isinstance(item, Mapping) for item in pair)
+            or pair[0].get("actor_side") != 0
+            or pair[1].get("actor_side") != 1
+            or pair[0].get("battle_tag") != pair[1].get("battle_tag")
+            or pair[0].get("source_sha256") != pair[1].get("source_sha256")
+            or pair[0].get("source_group") != pair[1].get("source_group")
+            or pair[0].get("player_tags") != pair[1].get("player_tags")
+        ):
+            raise DatasetContractError("native shard actor sequence pairing changed")
+        battle_tags.append(str(pair[0].get("battle_tag") or ""))
+    hashes = value.get("file_sha256")
+    actual_npy = {file.name for file in shard.glob("*.npy") if file.is_file()}
+    if not isinstance(hashes, Mapping) or set(str(key) for key in hashes) != actual_npy:
+        raise DatasetContractError("native shard NPY hash coverage changed")
+    storage_bytes = sum((shard / name).stat().st_size for name in actual_npy)
+    maximum_entities = int(np.diff(arrays["entity_offsets"]).max(initial=0))
+    if (
+        value.get("kind") != SHARD_KIND
+        or int(value.get("schema_version", -1)) != SCHEMA_VERSION
+        or not _SHA256_RE.fullmatch(str(value.get("content_sha256") or ""))
+        or not _SHA256_RE.fullmatch(content_sha)
+        or body_sha != content_sha
+        or int(value.get("rows", -1)) != rows
+        or int(value.get("sequences", -1)) != sequences
+        or int(value.get("battles", -1)) * 2 != sequences
+        or len(set(battle_tags)) != len(battle_tags)
+        or int(value.get("max_entities", -1)) != maximum_entities
+        or int(value.get("max_ability_slots", -1))
+        != int(arrays["ability_tokens"].shape[1])
+        or int(value.get("storage_bytes", -1)) != storage_bytes
+    ):
+        raise DatasetContractError("native shard metadata disagrees with arrays")
+    for name, digest in hashes.items():
+        if (
+            not _SHA256_RE.fullmatch(str(digest))
+            or sha256_file(shard / str(name)) != str(digest)
+        ):
+            raise DatasetContractError("native shard NPY digest changed")
 
 
 def unpack_position_masks(packed: np.ndarray) -> np.ndarray:

@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -13,8 +14,13 @@ import numpy as np
 from native_core.card_catalog import card_cost, metadata as card_metadata
 
 from expert_v1.compile_native_bc_dataset import (
+    CAPACITY_MINIMUM_RESERVE_BYTES,
+    EpisodeInput,
     NativeBcCompileError,
+    _acquire_capacity_reservation,
     _assign_components,
+    _release_capacity_reservation,
+    _stratified_capacity_sample,
     compile_planned_shards,
     create_compile_plan,
     finalize_dataset,
@@ -445,6 +451,41 @@ class NativeBcCompilerTests(unittest.TestCase):
             with self.assertRaises(DeploymentMaskContractError):
                 create_compile_plan(tick_root, source, root / "compiled", contract)
 
+    def test_fully_resigned_shard_metadata_forgery_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            plan = create_compile_plan(
+                tick_root, source, output, contract,
+                maximum_rows_per_shard=10_000,
+            )
+            compile_planned_shards(plan, process_workers=1)
+            shard = output / plan["shards"][0]["relative_path"]
+            path = shard / "shard.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["rows"] += 1
+            body = {
+                key: item for key, item in value.items()
+                if key != "metadata_content_sha256"
+            }
+            value["metadata_content_sha256"] = hashlib.sha256(
+                (
+                    json.dumps(body, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            ).hexdigest()
+            path.write_bytes(
+                (
+                    json.dumps(value, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")) + "\n"
+                ).encode("utf-8")
+            )
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "metadata disagrees"
+            ):
+                finalize_dataset(plan)
+
     def test_capacity_preflight_is_bound_and_low_disk_fails_before_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -488,6 +529,154 @@ class NativeBcCompilerTests(unittest.TestCase):
             path.write_text(json.dumps(value), encoding="utf-8")
             with self.assertRaisesRegex(NativeBcCompileError, "capacity preflight"):
                 load_compile_plan(output / "compile-plan.json")
+
+    def test_fully_resigned_capacity_arithmetic_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            create_compile_plan(
+                tick_root, source, output, contract,
+                maximum_rows_per_shard=10_000,
+            )
+            capacity_path = output / "capacity-preflight.json"
+            plan_path = output / "compile-plan.json"
+            base_capacity = json.loads(capacity_path.read_text(encoding="utf-8"))
+            base_plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+            def canonical(item: object) -> bytes:
+                return (
+                    json.dumps(item, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":")).encode("utf-8") + b"\n"
+                )
+
+            mutations = {
+                "safety": lambda value: value.__setitem__("safety_factor", 1.36),
+                "projected": lambda value: value.__setitem__(
+                    "projected_output_bytes", int(value["projected_output_bytes"]) + 1
+                ),
+                "safe": lambda value: value.__setitem__(
+                    "projected_output_with_safety_bytes",
+                    int(value["projected_output_with_safety_bytes"]) + 1,
+                ),
+                "reserve": lambda value: value.__setitem__(
+                    "minimum_reserve_bytes", int(value["minimum_reserve_bytes"]) + 1
+                ),
+                "required": lambda value: value.__setitem__(
+                    "required_free_bytes", int(value["required_free_bytes"]) + 1
+                ),
+                "episode_upper": lambda value: value["sample_episodes"][0].__setitem__(
+                    "array_payload_bytes",
+                    int(value["sample_episodes"][0]["array_payload_bytes"]) + 1,
+                ),
+            }
+            for name, mutate in mutations.items():
+                with self.subTest(name=name):
+                    capacity = deepcopy(base_capacity)
+                    mutate(capacity)
+                    capacity_body = {
+                        key: item for key, item in capacity.items()
+                        if key != "content_sha256"
+                    }
+                    capacity["content_sha256"] = hashlib.sha256(
+                        canonical(capacity_body)
+                    ).hexdigest()
+                    capacity_raw = canonical(capacity)
+                    capacity_path.write_bytes(capacity_raw)
+                    plan = deepcopy(base_plan)
+                    reference = plan["capacity_preflight"]
+                    reference["file_sha256"] = hashlib.sha256(capacity_raw).hexdigest()
+                    reference["content_sha256"] = capacity["content_sha256"]
+                    for field in (
+                        "sample_actor_rows", "sample_bytes_per_actor_row",
+                        "sample_max_episode_bytes_per_actor_row",
+                        "projected_output_bytes", "required_free_bytes",
+                    ):
+                        reference[field] = capacity[field]
+                    plan["plan_content_sha256"] = hashlib.sha256(
+                        canonical({
+                            key: item for key, item in plan.items()
+                            if key != "plan_content_sha256"
+                        })
+                    ).hexdigest()
+                    plan_raw = canonical(plan)
+                    plan_path.write_bytes(plan_raw)
+                    (output / "compile-plan.sha256").write_text(
+                        f"{hashlib.sha256(plan_raw).hexdigest()}  compile-plan.json\n",
+                        encoding="ascii",
+                    )
+                    with self.assertRaisesRegex(
+                        NativeBcCompileError, "capacity"
+                    ):
+                        load_compile_plan(plan_path)
+
+    def test_capacity_sample_is_hash_duration_density_stratified(self) -> None:
+        episodes = [
+            EpisodeInput(
+                battle_tag=f"B{index:04d}", tick_data_path="x", tick_index_path="y",
+                tick_count=100 + (index % 20) * 100,
+                tick_payload_sha256="a" * 64,
+                tick_payload_size=(100 + (index % 20) * 100) * (5 + index % 17),
+                source_path="z", source_sha256="b" * 64,
+                source_group=f"g{index}", player_tags=("p", "q"),
+                split="train", component_sha256="c" * 64,
+            )
+            for index in range(240)
+        ]
+        first = _stratified_capacity_sample(episodes)
+        second = _stratified_capacity_sample(list(reversed(episodes)))
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 100)
+        self.assertGreater(len({value.tick_count for value in first}), 10)
+        self.assertGreater(
+            len({value.tick_payload_size / value.tick_count for value in first}), 10
+        )
+
+    def test_cross_process_disk_reservations_cannot_oversell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = SimpleNamespace(
+                total=100 * 1024**3,
+                used=0,
+                free=CAPACITY_MINIMUM_RESERVE_BYTES + 1_500,
+            )
+            with patch(
+                "expert_v1.compile_native_bc_dataset.shutil.disk_usage",
+                return_value=fake,
+            ):
+                first = _acquire_capacity_reservation(
+                    root, relative_path="shards/a", requested_bytes=1_000
+                )
+                try:
+                    with self.assertRaisesRegex(
+                        NativeBcCompileError, "reservation failed"
+                    ):
+                        _acquire_capacity_reservation(
+                            root, relative_path="shards/b", requested_bytes=1_000
+                        )
+                finally:
+                    _release_capacity_reservation(root, first)
+            self.assertFalse(list((root / ".capacity-reservations-v1").glob("*.json")))
+
+    def test_worker_count_is_capacity_clamped_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            plan = create_compile_plan(
+                tick_root, source, output, contract,
+                maximum_rows_per_shard=10_000,
+            )
+            compile_planned_shards(plan, process_workers=64)
+            receipt = json.loads(
+                (output / "worker-receipts" / "worker-00000-of-00001.json").read_text()
+            )
+            self.assertEqual(receipt["requested_process_workers"], 64)
+            self.assertLess(receipt["effective_process_workers"], 64)
+            self.assertLessEqual(
+                receipt["effective_process_workers"],
+                receipt["capacity_recommended_partition_process_workers"],
+            )
 
     def test_resigned_legacy_dense_multi_terabyte_plan_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -599,7 +788,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "created_utc", "2099-01-01T00:00:00+00:00"
                 ),
                 "kind": lambda value: value.__setitem__("kind", "forged"),
-                "schema": lambda value: value.__setitem__("schema_version", 3),
+                "schema": lambda value: value.__setitem__("schema_version", 4),
                 "count": lambda value: value.__setitem__(
                     "episodes", int(value["episodes"]) + 1
                 ),

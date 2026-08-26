@@ -19,6 +19,7 @@ import argparse
 from array import array
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -30,6 +31,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -62,8 +64,8 @@ from .training_v1.schema import (
 )
 
 
-COMPILER_KIND = "cr_native_tick_store_bc_compiler_v2"
-PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v2"
+COMPILER_KIND = "cr_native_tick_store_bc_compiler_v3"
+PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v3"
 ASSIGNMENT_KIND = "cr_native_tick_store_bc_split_assignment_v1"
 OBSERVATION_MODE = "native_state_v1"
 ACTION_EXECUTION_OFFSET_METADATA = "action_execution_tick_offset"
@@ -74,6 +76,16 @@ CAPACITY_PREFLIGHT_FILENAME = "capacity-preflight.json"
 CAPACITY_SAMPLE_BATTLES = 100
 CAPACITY_SAFETY_FACTOR = 1.35
 CAPACITY_MINIMUM_RESERVE_BYTES = 10 * 1024**3
+CAPACITY_FILESYSTEM_RESERVE_FRACTION = 0.05
+CAPACITY_SHARD_OVERHEAD_BYTES = 64 * 1024
+CAPACITY_MEMORY_SCALE = 1.25
+CAPACITY_MEMORY_BUDGET_FRACTION = 0.75
+CAPACITY_MEMORY_GATE_FRACTION = 0.80
+CAPACITY_SELECTION_STRATEGY = (
+    "sha256_tick_count_payload_density_stratified_v1"
+)
+CAPACITY_STRATA_PER_DIMENSION = 4
+CAPACITY_RESERVATION_DIRECTORY = ".capacity-reservations-v1"
 GRID_CHANNELS = (
     "own_tower_occupancy",
     "own_tower_hp_ratio",
@@ -115,6 +127,7 @@ class EpisodeInput:
     tick_index_path: str
     tick_count: int
     tick_payload_sha256: str
+    tick_payload_size: int
     source_path: str
     source_sha256: str
     source_group: str
@@ -573,7 +586,7 @@ def validate_compile_plan(
     if (
         plan.get("kind") != PLAN_KIND
         or _require_integer(plan.get("schema_version"), "plan.schema_version", minimum=1)
-        != 2
+        != 3
     ):
         raise NativeBcCompileError("compile-plan kind/schema changed")
     if not isinstance(plan.get("created_utc"), str) or not plan["created_utc"]:
@@ -609,7 +622,7 @@ def validate_compile_plan(
         or _require_integer(
             compiler.get("schema_version"), "compiler.schema_version", minimum=1
         )
-        != 2
+        != 3
         or compiler.get("actor_information") != "public_only_v1"
         or compiler.get("action_alignment") != "source_tick_plus_episode_metadata_offset"
         or compiler.get("entity_identity") != "discrete_native_card_token_v1"
@@ -690,7 +703,8 @@ def validate_compile_plan(
         capacity_reference,
         {
             "path", "file_sha256", "content_sha256", "sample_actor_rows",
-            "sample_bytes_per_actor_row", "projected_output_bytes",
+            "sample_bytes_per_actor_row",
+            "sample_max_episode_bytes_per_actor_row", "projected_output_bytes",
             "required_free_bytes",
         },
         "compile-plan capacity preflight",
@@ -722,6 +736,12 @@ def validate_compile_plan(
         )
         or float(capacity_value["sample_bytes_per_actor_row"])
         != float(capacity_reference.get("sample_bytes_per_actor_row", -1))
+        or float(capacity_value["sample_max_episode_bytes_per_actor_row"])
+        != float(
+            capacity_reference.get(
+                "sample_max_episode_bytes_per_actor_row", -1
+            )
+        )
         or int(capacity_value["projected_output_bytes"])
         != _require_integer(
             capacity_reference.get("projected_output_bytes"),
@@ -742,7 +762,7 @@ def validate_compile_plan(
         raise NativeBcCompileError("compile-plan has no output shards")
     episode_fields = {
         "battle_tag", "tick_data_path", "tick_index_path", "tick_count",
-        "tick_payload_sha256", "source_path", "source_sha256", "source_group",
+        "tick_payload_sha256", "tick_payload_size", "source_path", "source_sha256", "source_group",
         "player_tags", "split", "component_sha256",
     }
     shard_fields = {
@@ -785,6 +805,11 @@ def validate_compile_plan(
             ):
                 raise NativeBcCompileError(f"compile-plan episode identity is invalid: {tag}")
             _require_integer(item.get("tick_count"), "episode.tick_count", minimum=1)
+            _require_integer(
+                item.get("tick_payload_size"),
+                "episode.tick_payload_size",
+                minimum=1,
+            )
             for name in ("tick_payload_sha256", "source_sha256", "component_sha256"):
                 _require_sha(item.get(name), f"episode.{name}")
             for name in ("tick_data_path", "tick_index_path", "source_path"):
@@ -877,6 +902,28 @@ def validate_compile_plan(
         or int(capacity_value["planned_shards"]) != len(raw_shards)
     ):
         raise NativeBcCompileError("capacity preflight does not cover this exact plan")
+    expected_capacity_sample = _stratified_capacity_sample(
+        [EpisodeInput(**value) for value in all_episodes]
+    )
+    actual_capacity_sample = capacity_value["sample_episodes"]
+    if [
+        (
+            value.battle_tag,
+            value.tick_count,
+            value.tick_payload_size,
+        )
+        for value in expected_capacity_sample
+    ] != [
+        (
+            str(value["battle_tag"]),
+            int(value["tick_count"]),
+            int(value["tick_payload_size"]),
+        )
+        for value in actual_capacity_sample
+    ]:
+        raise NativeBcCompileError(
+            "capacity preflight sample is not the deterministic stratified plan sample"
+        )
 
     contract_path = Path(str(inputs["native_contract_path"])).resolve()
     if verify_live_inputs:
@@ -1091,6 +1138,75 @@ def _authenticate_plan_argument(
     return authenticated
 
 
+def _stratified_capacity_sample(
+    episodes: Sequence[EpisodeInput], *, limit: int = CAPACITY_SAMPLE_BATTLES
+) -> list[EpisodeInput]:
+    """Deterministically cover duration and encoded state-density strata."""
+    if limit <= 0:
+        raise ValueError("capacity sample limit must be positive")
+    values = list(episodes)
+    if len(values) <= limit:
+        return sorted(values, key=lambda value: value.battle_tag)
+
+    def rank_bins(key: Any) -> dict[str, int]:
+        ordered = sorted(
+            values,
+            key=lambda value: (key(value), value.battle_tag),
+        )
+        return {
+            value.battle_tag: min(
+                CAPACITY_STRATA_PER_DIMENSION - 1,
+                index * CAPACITY_STRATA_PER_DIMENSION // len(ordered),
+            )
+            for index, value in enumerate(ordered)
+        }
+
+    tick_bins = rank_bins(lambda value: value.tick_count)
+    density_bins = rank_bins(
+        lambda value: value.tick_payload_size / value.tick_count
+    )
+    strata: dict[tuple[int, int], list[EpisodeInput]] = defaultdict(list)
+    for episode in values:
+        strata[(tick_bins[episode.battle_tag], density_bins[episode.battle_tag])].append(
+            episode
+        )
+    for group in strata.values():
+        group.sort(
+            key=lambda value: (
+                _digest({"capacity_sample_battle_tag": value.battle_tag}),
+                value.battle_tag,
+            )
+        )
+    selected: list[EpisodeInput] = []
+    depth = 0
+    keys = sorted(strata)
+    while len(selected) < limit:
+        changed = False
+        for key in keys:
+            group = strata[key]
+            if depth < len(group):
+                selected.append(group[depth])
+                changed = True
+                if len(selected) == limit:
+                    break
+        if not changed:
+            break
+        depth += 1
+    if len(selected) != limit:
+        raise NativeBcCompileError("capacity stratified sampler under-filled")
+    return selected
+
+
+def _float_equal(left: Any, right: float) -> bool:
+    try:
+        value = float(left)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and math.isclose(
+        value, right, rel_tol=1e-12, abs_tol=1e-12
+    )
+
+
 def _read_capacity_preflight(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
@@ -1100,15 +1216,20 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
     if not isinstance(value, Mapping) or _canonical_bytes(value) != raw:
         raise NativeBcCompileError("capacity preflight is not canonical JSON")
     expected = {
-        "kind", "schema_version", "content_sha256", "sample_battles",
-        "sample_battle_tags_sha256", "sample_actor_rows", "sample_output_bytes",
+        "kind", "schema_version", "content_sha256", "sample_selection_strategy",
+        "sample_episodes", "sample_battles", "sample_battle_tags_sha256",
+        "sample_actor_rows", "sample_array_payload_bytes", "sample_output_bytes",
         "sample_bytes_per_actor_row", "sample_compile_seconds",
         "sample_actor_rows_per_second", "sample_peak_rss_bytes",
-        "sample_peak_rss_delta_bytes", "maximum_rows_per_shard",
+        "sample_baseline_rss_bytes", "sample_peak_rss_delta_bytes",
+        "sample_max_episode_bytes_per_actor_row", "maximum_rows_per_shard",
         "planned_shards", "estimated_total_actor_rows", "projected_output_bytes",
-        "safety_factor", "projected_output_with_safety_bytes",
+        "per_shard_overhead_bytes", "safety_factor",
+        "projected_output_with_safety_bytes",
         "filesystem_total_bytes", "filesystem_free_bytes",
-        "minimum_reserve_bytes", "required_free_bytes",
+        "filesystem_reserve_fraction", "minimum_reserve_bytes",
+        "required_free_bytes", "memory_scale", "memory_budget_fraction",
+        "memory_gate_fraction",
         "estimated_peak_worker_rss_bytes", "system_available_memory_bytes",
         "recommended_max_parallel_compile_workers", "disk_gate_passed",
         "memory_gate_passed", "passed",
@@ -1124,6 +1245,185 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
     body = {key: item for key, item in value.items() if key != "content_sha256"}
     if content_sha != _digest(body):
         raise NativeBcCompileError("capacity preflight canonical content SHA changed")
+    episodes = value.get("sample_episodes")
+    if (
+        value.get("sample_selection_strategy") != CAPACITY_SELECTION_STRATEGY
+        or not isinstance(episodes, list)
+        or not episodes
+        or len(episodes) != int(value.get("sample_battles", -1))
+    ):
+        raise NativeBcCompileError("capacity sample selection contract changed")
+    episode_fields = {
+        "battle_tag", "tick_count", "tick_payload_size",
+        "tick_payload_bytes_per_tick", "actor_rows", "array_payload_bytes",
+        "array_payload_bytes_per_actor_row", "mean_entities_per_actor_row",
+        "max_entities_per_actor_row",
+    }
+    tags: list[str] = []
+    total_rows = 0
+    total_payload = 0
+    episode_rates: list[float] = []
+    for episode in episodes:
+        if not isinstance(episode, Mapping):
+            raise NativeBcCompileError("capacity sample episode is malformed")
+        _require_keys(episode, episode_fields, "capacity sample episode")
+        tag = str(episode.get("battle_tag") or "")
+        ticks = _require_integer(
+            episode.get("tick_count"), "capacity.episode.tick_count", minimum=1
+        )
+        payload_size = _require_integer(
+            episode.get("tick_payload_size"),
+            "capacity.episode.tick_payload_size",
+            minimum=1,
+        )
+        rows = _require_integer(
+            episode.get("actor_rows"), "capacity.episode.actor_rows", minimum=1
+        )
+        payload = _require_integer(
+            episode.get("array_payload_bytes"),
+            "capacity.episode.array_payload_bytes",
+            minimum=1,
+        )
+        maximum_entities = _require_integer(
+            episode.get("max_entities_per_actor_row"),
+            "capacity.episode.max_entities_per_actor_row",
+        )
+        if (
+            not tag
+            or tag in tags
+            or rows != ticks * 2
+            or not _float_equal(
+                episode.get("tick_payload_bytes_per_tick"), payload_size / ticks
+            )
+            or not _float_equal(
+                episode.get("array_payload_bytes_per_actor_row"), payload / rows
+            )
+            or not math.isfinite(float(episode.get("mean_entities_per_actor_row", -1)))
+            or not 0 <= float(episode["mean_entities_per_actor_row"]) <= maximum_entities
+        ):
+            raise NativeBcCompileError("capacity sample episode arithmetic changed")
+        tags.append(tag)
+        total_rows += rows
+        total_payload += payload
+        episode_rates.append(payload / rows)
+    if str(value.get("sample_battle_tags_sha256")) != _digest(
+        {"battle_tags": tags}
+    ):
+        raise NativeBcCompileError("capacity sample battle selection SHA changed")
+    sample_output = _require_integer(
+        value.get("sample_output_bytes"), "capacity.sample_output_bytes", minimum=1
+    )
+    sample_seconds = float(value.get("sample_compile_seconds", -1))
+    if (
+        int(value.get("sample_actor_rows", -1)) != total_rows
+        or int(value.get("sample_array_payload_bytes", -1)) != total_payload
+        or sample_output < total_payload
+        or not _float_equal(
+            value.get("sample_bytes_per_actor_row"), sample_output / total_rows
+        )
+        or not math.isfinite(sample_seconds)
+        or sample_seconds <= 0
+        or not _float_equal(
+            value.get("sample_actor_rows_per_second"), total_rows / sample_seconds
+        )
+        or not _float_equal(
+            value.get("sample_max_episode_bytes_per_actor_row"), max(episode_rates)
+        )
+    ):
+        raise NativeBcCompileError("capacity sample aggregate arithmetic changed")
+    estimated_rows = _require_integer(
+        value.get("estimated_total_actor_rows"),
+        "capacity.estimated_total_actor_rows",
+        minimum=1,
+    )
+    planned_shards = _require_integer(
+        value.get("planned_shards"), "capacity.planned_shards", minimum=1
+    )
+    if int(value.get("per_shard_overhead_bytes", -1)) != CAPACITY_SHARD_OVERHEAD_BYTES:
+        raise NativeBcCompileError("capacity per-shard overhead changed")
+    projected = math.ceil(max(episode_rates) * estimated_rows) + (
+        planned_shards * CAPACITY_SHARD_OVERHEAD_BYTES
+    )
+    if (
+        int(value.get("projected_output_bytes", -1)) != projected
+        or not _float_equal(value.get("safety_factor"), CAPACITY_SAFETY_FACTOR)
+    ):
+        raise NativeBcCompileError("capacity projection arithmetic changed")
+    projected_safe = math.ceil(projected * CAPACITY_SAFETY_FACTOR)
+    filesystem_total = _require_integer(
+        value.get("filesystem_total_bytes"), "capacity.filesystem_total_bytes", minimum=1
+    )
+    filesystem_free = _require_integer(
+        value.get("filesystem_free_bytes"), "capacity.filesystem_free_bytes"
+    )
+    reserve = max(
+        CAPACITY_MINIMUM_RESERVE_BYTES,
+        math.ceil(filesystem_total * CAPACITY_FILESYSTEM_RESERVE_FRACTION),
+    )
+    required_free = projected_safe + reserve
+    if (
+        int(value.get("projected_output_with_safety_bytes", -1)) != projected_safe
+        or not _float_equal(
+            value.get("filesystem_reserve_fraction"),
+            CAPACITY_FILESYSTEM_RESERVE_FRACTION,
+        )
+        or int(value.get("minimum_reserve_bytes", -1)) != reserve
+        or int(value.get("required_free_bytes", -1)) != required_free
+    ):
+        raise NativeBcCompileError("capacity disk arithmetic changed")
+    baseline = _require_integer(
+        value.get("sample_baseline_rss_bytes"),
+        "capacity.sample_baseline_rss_bytes",
+        minimum=1,
+    )
+    peak = _require_integer(
+        value.get("sample_peak_rss_bytes"),
+        "capacity.sample_peak_rss_bytes",
+        minimum=baseline,
+    )
+    delta = peak - baseline
+    maximum_rows = _require_integer(
+        value.get("maximum_rows_per_shard"),
+        "capacity.maximum_rows_per_shard",
+        minimum=1,
+    )
+    available_memory = _require_integer(
+        value.get("system_available_memory_bytes"),
+        "capacity.system_available_memory_bytes",
+        minimum=1,
+    )
+    estimated_peak = baseline + math.ceil(
+        delta * (maximum_rows / total_rows) * CAPACITY_MEMORY_SCALE
+    )
+    recommended_workers = max(
+        1,
+        int(
+            (available_memory * CAPACITY_MEMORY_BUDGET_FRACTION)
+            // max(estimated_peak, 1)
+        ),
+    )
+    disk_passed = filesystem_free >= required_free
+    memory_passed = estimated_peak <= int(
+        available_memory * CAPACITY_MEMORY_GATE_FRACTION
+    )
+    if (
+        int(value.get("sample_peak_rss_delta_bytes", -1)) != delta
+        or not _float_equal(value.get("memory_scale"), CAPACITY_MEMORY_SCALE)
+        or not _float_equal(
+            value.get("memory_budget_fraction"),
+            CAPACITY_MEMORY_BUDGET_FRACTION,
+        )
+        or not _float_equal(
+            value.get("memory_gate_fraction"), CAPACITY_MEMORY_GATE_FRACTION
+        )
+        or int(value.get("estimated_peak_worker_rss_bytes", -1)) != estimated_peak
+        or int(value.get("recommended_max_parallel_compile_workers", -1))
+        != recommended_workers
+        or value.get("disk_gate_passed") is not disk_passed
+        or value.get("memory_gate_passed") is not memory_passed
+        or value.get("passed") is not bool(disk_passed and memory_passed)
+    ):
+        raise NativeBcCompileError("capacity memory/gate arithmetic changed")
     if value.get("passed") is not True:
         raise NativeBcCompileError("capacity preflight did not pass")
     return dict(value)
@@ -1137,9 +1437,149 @@ def _capacity_reference(path: Path) -> dict[str, Any]:
         "content_sha256": value["content_sha256"],
         "sample_actor_rows": int(value["sample_actor_rows"]),
         "sample_bytes_per_actor_row": float(value["sample_bytes_per_actor_row"]),
+        "sample_max_episode_bytes_per_actor_row": float(
+            value["sample_max_episode_bytes_per_actor_row"]
+        ),
         "projected_output_bytes": int(value["projected_output_bytes"]),
         "required_free_bytes": int(value["required_free_bytes"]),
     }
+
+
+@contextmanager
+def _capacity_reservation_lock(output_root: Path) -> Iterable[None]:
+    """OS-released cross-process lock for the reservation ledger."""
+    path = output_root / f"{CAPACITY_RESERVATION_DIRECTORY}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _active_capacity_reservations(output_root: Path) -> tuple[int, list[Path]]:
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception as error:
+        raise NativeBcCompileError("psutil is required for disk reservations") from error
+    root = output_root / CAPACITY_RESERVATION_DIRECTORY
+    root.mkdir(parents=True, exist_ok=True)
+    total = 0
+    active: list[Path] = []
+    for path in sorted(root.glob("*.json")):
+        try:
+            raw = path.read_bytes()
+            value = json.loads(raw)
+        except Exception as error:
+            raise NativeBcCompileError(
+                f"capacity reservation ledger is corrupt: {path}"
+            ) from error
+        if (
+            not isinstance(value, Mapping)
+            or _canonical_bytes(value) != raw
+            or set(value) != {
+                "kind", "schema_version", "pid", "process_create_time",
+                "token", "relative_path", "reserved_bytes",
+            }
+            or value.get("kind") != "cr_native_bc_disk_reservation_v1"
+            or int(value.get("schema_version", -1)) != 1
+        ):
+            raise NativeBcCompileError(
+                f"capacity reservation contract changed: {path}"
+            )
+        pid = _require_integer(value.get("pid"), "reservation.pid", minimum=1)
+        process_create_time = float(value.get("process_create_time", -1))
+        alive = psutil.pid_exists(pid)
+        if alive:
+            try:
+                alive = math.isclose(
+                    float(psutil.Process(pid).create_time()),
+                    process_create_time,
+                    rel_tol=0.0,
+                    abs_tol=1e-3,
+                )
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                alive = False
+        if not alive:
+            path.unlink()
+            continue
+        total += _require_integer(
+            value.get("reserved_bytes"), "reservation.reserved_bytes", minimum=1
+        )
+        active.append(path)
+    return total, active
+
+
+def _acquire_capacity_reservation(
+    output_root: Path,
+    *,
+    relative_path: str,
+    requested_bytes: int,
+) -> Path:
+    if requested_bytes <= 0:
+        raise ValueError("capacity reservation must be positive")
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception as error:
+        raise NativeBcCompileError("psutil is required for disk reservations") from error
+    token = uuid.uuid4().hex
+    reservation_root = output_root / CAPACITY_RESERVATION_DIRECTORY
+    path = reservation_root / f"{os.getpid()}-{token}.json"
+    with _capacity_reservation_lock(output_root):
+        active_bytes, _active = _active_capacity_reservations(output_root)
+        usage = shutil.disk_usage(output_root)
+        reserve = max(
+            CAPACITY_MINIMUM_RESERVE_BYTES,
+            math.ceil(
+                int(usage.total) * CAPACITY_FILESYSTEM_RESERVE_FRACTION
+            ),
+        )
+        if int(usage.free) - active_bytes - requested_bytes < reserve:
+            raise NativeBcCompileError(
+                "cross-process shard disk reservation failed: "
+                f"free={usage.free}, active_reserved={active_bytes}, "
+                f"requested={requested_bytes}, mandatory_reserve={reserve}"
+            )
+        value = {
+            "kind": "cr_native_bc_disk_reservation_v1",
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "process_create_time": float(psutil.Process(os.getpid()).create_time()),
+            "token": token,
+            "relative_path": relative_path,
+            "reserved_bytes": int(requested_bytes),
+        }
+        _atomic_json(path, value)
+    return path
+
+
+def _release_capacity_reservation(output_root: Path, path: Path | None) -> None:
+    if path is None:
+        return
+    with _capacity_reservation_lock(output_root):
+        if not path.is_file():
+            raise NativeBcCompileError(
+                f"capacity reservation disappeared before release: {path}"
+            )
+        path.unlink()
 
 
 def _build_capacity_preflight(
@@ -1155,9 +1595,7 @@ def _build_capacity_preflight(
     """Compile a deterministic <=100-battle sample before full shard writes."""
     if not episodes or estimated_total_rows <= 0:
         raise NativeBcCompileError("capacity sample requires non-empty native episodes")
-    selected = sorted(episodes, key=lambda value: value.battle_tag)[
-        : min(CAPACITY_SAMPLE_BATTLES, len(episodes))
-    ]
+    selected = _stratified_capacity_sample(episodes)
     sample_root = output_root / f".capacity-sample-{os.getpid()}"
     if sample_root.exists():
         shutil.rmtree(sample_root)
@@ -1206,16 +1644,47 @@ def _build_capacity_preflight(
         sample_rows = int(metadata["rows"])
         if sample_rows <= 0 or output_bytes <= 0:
             raise NativeBcCompileError("capacity sample produced no actor rows/bytes")
+        episode_estimates = metadata.get("capacity_episode_estimates")
+        if (
+            not isinstance(episode_estimates, list)
+            or len(episode_estimates) != len(selected)
+        ):
+            raise NativeBcCompileError(
+                "capacity sample lacks per-episode storage estimates"
+            )
+        selected_by_tag = {value.battle_tag: value for value in selected}
+        if [value.get("battle_tag") for value in episode_estimates] != [
+            value.battle_tag for value in selected
+        ]:
+            raise NativeBcCompileError(
+                "capacity per-episode estimate order changed"
+            )
+        for estimate in episode_estimates:
+            episode = selected_by_tag[str(estimate["battle_tag"])]
+            if (
+                int(estimate["tick_count"]) != episode.tick_count
+                or int(estimate["tick_payload_size"]) != episode.tick_payload_size
+            ):
+                raise NativeBcCompileError(
+                    "capacity estimate/source episode identity changed"
+                )
         bytes_per_row = output_bytes / sample_rows
-        projected = math.ceil(bytes_per_row * estimated_total_rows)
-        # NPY headers and shard metadata are already represented by the sample;
-        # add a small explicit per-shard allowance before the global margin.
-        projected += int(planned_shards) * 64 * 1024
+        sample_array_payload_bytes = sum(
+            int(value["array_payload_bytes"]) for value in episode_estimates
+        )
+        maximum_episode_rate = max(
+            float(value["array_payload_bytes_per_actor_row"])
+            for value in episode_estimates
+        )
+        projected = math.ceil(maximum_episode_rate * estimated_total_rows)
+        projected += int(planned_shards) * CAPACITY_SHARD_OVERHEAD_BYTES
         projected_safe = math.ceil(projected * CAPACITY_SAFETY_FACTOR)
         usage = shutil.disk_usage(output_root)
         reserve = max(
             CAPACITY_MINIMUM_RESERVE_BYTES,
-            math.ceil(int(usage.total) * 0.05),
+            math.ceil(
+                int(usage.total) * CAPACITY_FILESYSTEM_RESERVE_FRACTION
+            ),
         )
         required_free = projected_safe + reserve
         available_memory = int(psutil.virtual_memory().available)
@@ -1223,38 +1692,53 @@ def _build_capacity_preflight(
         estimated_peak_worker = baseline_rss + math.ceil(
             delta_rss
             * (maximum_rows_per_shard / max(1, sample_rows))
-            * 1.25
+            * CAPACITY_MEMORY_SCALE
         )
         recommended_workers = max(
             1,
-            int((available_memory * 0.75) // max(estimated_peak_worker, 1)),
+            int(
+                (available_memory * CAPACITY_MEMORY_BUDGET_FRACTION)
+                // max(estimated_peak_worker, 1)
+            ),
         )
         disk_passed = int(usage.free) >= required_free
-        memory_passed = estimated_peak_worker <= int(available_memory * 0.80)
+        memory_passed = estimated_peak_worker <= int(
+            available_memory * CAPACITY_MEMORY_GATE_FRACTION
+        )
         body: dict[str, Any] = {
             "kind": CAPACITY_PREFLIGHT_KIND,
             "schema_version": 1,
+            "sample_selection_strategy": CAPACITY_SELECTION_STRATEGY,
+            "sample_episodes": episode_estimates,
             "sample_battles": len(selected),
             "sample_battle_tags_sha256": _digest(
                 {"battle_tags": [value.battle_tag for value in selected]}
             ),
             "sample_actor_rows": sample_rows,
+            "sample_array_payload_bytes": sample_array_payload_bytes,
             "sample_output_bytes": output_bytes,
             "sample_bytes_per_actor_row": bytes_per_row,
             "sample_compile_seconds": elapsed,
             "sample_actor_rows_per_second": sample_rows / elapsed,
+            "sample_baseline_rss_bytes": baseline_rss,
             "sample_peak_rss_bytes": peak_rss[0],
             "sample_peak_rss_delta_bytes": delta_rss,
+            "sample_max_episode_bytes_per_actor_row": maximum_episode_rate,
             "maximum_rows_per_shard": int(maximum_rows_per_shard),
             "planned_shards": int(planned_shards),
             "estimated_total_actor_rows": int(estimated_total_rows),
             "projected_output_bytes": int(projected),
+            "per_shard_overhead_bytes": CAPACITY_SHARD_OVERHEAD_BYTES,
             "safety_factor": CAPACITY_SAFETY_FACTOR,
             "projected_output_with_safety_bytes": int(projected_safe),
             "filesystem_total_bytes": int(usage.total),
             "filesystem_free_bytes": int(usage.free),
+            "filesystem_reserve_fraction": CAPACITY_FILESYSTEM_RESERVE_FRACTION,
             "minimum_reserve_bytes": int(reserve),
             "required_free_bytes": int(required_free),
+            "memory_scale": CAPACITY_MEMORY_SCALE,
+            "memory_budget_fraction": CAPACITY_MEMORY_BUDGET_FRACTION,
+            "memory_gate_fraction": CAPACITY_MEMORY_GATE_FRACTION,
             "estimated_peak_worker_rss_bytes": int(estimated_peak_worker),
             "system_available_memory_bytes": int(available_memory),
             "recommended_max_parallel_compile_workers": int(recommended_workers),
@@ -1404,6 +1888,7 @@ def create_compile_plan(
                 "tick_index_path": entry["tick_index_path"],
                 "tick_count": int(entry["ticks"]),
                 "tick_payload_sha256": str(entry["payload_sha256"]),
+                "tick_payload_size": int(entry["payload_size"]),
                 "source_path": str(path),
                 "source_sha256": source_sha,
                 "source_group": source_group,
@@ -1497,7 +1982,7 @@ def create_compile_plan(
     }
     compiler_contract = {
         "kind": COMPILER_KIND,
-        "schema_version": 2,
+        "schema_version": 3,
         "seed": int(seed),
         "validation_fraction": float(validation_fraction),
         "test_fraction": float(test_fraction),
@@ -1526,7 +2011,7 @@ def create_compile_plan(
     )
     plan = {
         "kind": PLAN_KIND,
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input_content_sha256": input_content_sha256,
         "inputs": input_contract,
@@ -2007,20 +2492,104 @@ def _save_npy(path: Path, value: np.ndarray) -> str:
     return sha256_file(path)
 
 
-def _verify_existing_shard(path: Path, content_sha256: str) -> dict[str, Any] | None:
+def _verify_existing_shard(
+    path: Path, raw_spec: Mapping[str, Any]
+) -> dict[str, Any] | None:
     metadata_path = path / "shard.json"
     if not metadata_path.is_file():
         return None
-    value = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
-    if value.get("kind") != SHARD_KIND or value.get("content_sha256") != content_sha256:
+    try:
+        raw_metadata = metadata_path.read_bytes()
+        value = json.loads(raw_metadata)
+    except Exception as error:
+        raise NativeBcCompileError(f"existing shard metadata is invalid: {path}") from error
+    if not isinstance(value, Mapping) or _canonical_bytes(value) != raw_metadata:
+        raise NativeBcCompileError(f"existing shard metadata is not canonical: {path}")
+    _require_keys(
+        value,
+        {
+            "kind", "schema_version", "metadata_content_sha256",
+            "content_sha256", "split", "shard_index", "rows", "sequences",
+            "battles", "max_entities", "max_ability_slots",
+            "sequence_identity", "storage_bytes", "file_sha256",
+        },
+        "compiled shard metadata",
+    )
+    metadata_content_sha = _require_sha(
+        value.get("metadata_content_sha256"),
+        "shard.metadata_content_sha256",
+    )
+    if metadata_content_sha != _digest(
+        {
+            key: item
+            for key, item in value.items()
+            if key != "metadata_content_sha256"
+        }
+    ):
+        raise NativeBcCompileError(f"existing shard metadata content SHA changed: {path}")
+    if (
+        value.get("kind") != SHARD_KIND
+        or int(value.get("schema_version", -1)) != SCHEMA_VERSION
+        or value.get("content_sha256") != raw_spec.get("content_sha256")
+        or value.get("split") != raw_spec.get("split")
+        or int(value.get("shard_index", -1)) != int(raw_spec.get("index", -2))
+    ):
         raise NativeBcCompileError(f"existing shard belongs to different inputs: {path}")
     hashes = value.get("file_sha256")
-    if not isinstance(hashes, Mapping):
+    actual_files = {
+        file.name for file in path.glob("*.npy") if file.is_file()
+    }
+    if (
+        not isinstance(hashes, Mapping)
+        or set(str(name) for name in hashes) != actual_files
+    ):
         raise NativeBcCompileError(f"existing shard lacks file hashes: {path}")
     for name, expected in hashes.items():
         file = path / str(name)
-        if not file.is_file() or sha256_file(file) != str(expected):
+        if (
+            not file.is_file()
+            or not _SHA256_RE.fullmatch(str(expected))
+            or sha256_file(file) != str(expected)
+        ):
             raise NativeBcCompileError(f"existing shard is corrupt: {file}")
+    offsets = np.load(path / "sequence_offsets.npy", mmap_mode="r")
+    entity_offsets = np.load(path / "entity_offsets.npy", mmap_mode="r")
+    ability_tokens = np.load(path / "ability_tokens.npy", mmap_mode="r")
+    expected_identity = [
+        {
+            "battle_tag": str(episode["battle_tag"]),
+            "actor_side": side,
+            "source_sha256": str(episode["source_sha256"]),
+            "source_group": str(episode["source_group"]),
+            "player_tags": list(episode["player_tags"]),
+        }
+        for episode in raw_spec["episodes"]
+        for side in (0, 1)
+    ]
+    expected_rows = sum(
+        int(episode["tick_count"]) * 2 for episode in raw_spec["episodes"]
+    )
+    expected_sequences = len(expected_identity)
+    maximum_entities = int(np.diff(entity_offsets).max(initial=0))
+    storage_bytes = sum((path / name).stat().st_size for name in actual_files)
+    if (
+        offsets.ndim != 1
+        or len(offsets) != expected_sequences + 1
+        or int(offsets[0]) != 0
+        or int(offsets[-1]) != expected_rows
+        or np.any(np.diff(offsets) <= 0)
+        or int(value.get("rows", -1)) != expected_rows
+        or int(value.get("sequences", -1)) != expected_sequences
+        or int(value.get("battles", -1)) != len(raw_spec["episodes"])
+        or int(value.get("max_entities", -1)) != maximum_entities
+        or ability_tokens.ndim != 2
+        or int(value.get("max_ability_slots", -1)) != int(ability_tokens.shape[1])
+        or value.get("sequence_identity") != expected_identity
+        or int(value.get("storage_bytes", -1)) != storage_bytes
+    ):
+        raise NativeBcCompileError(
+            f"existing shard metadata disagrees with plan/arrays: {path}"
+        )
     return value
 
 
@@ -2034,7 +2603,7 @@ def _compile_output_shard(
     tick_store_root = Path(tick_store_root_text)
     relative = str(raw_spec["relative_path"])
     final = output_root / relative
-    existing = _verify_existing_shard(final, str(raw_spec["content_sha256"]))
+    existing = _verify_existing_shard(final, raw_spec)
     if existing is not None:
         return {**existing, "resumed": True, "relative_path": relative}
     temporary = final.with_name(final.name + f".{os.getpid()}.partial")
@@ -2054,13 +2623,16 @@ def _compile_output_shard(
         Path(str(raw_plan["native_contract_path"])).resolve(strict=True)
     )
     compiled: list[dict[str, np.ndarray]] = []
+    capacity_episode_estimates: list[dict[str, Any]] = []
     sequence_identity: list[dict[str, Any]] = []
     maximum_entities = 0
     maximum_abilities = MAX_ABILITY_SLOTS
     readers: dict[tuple[str, str], ShardReader] = {}
+    reservation_path: Path | None = None
     try:
         for raw_episode in raw_spec["episodes"]:
             episode = EpisodeInput(**raw_episode)
+            episode_compiled: list[dict[str, np.ndarray]] = []
             source_path = Path(episode.source_path)
             if sha256_file(source_path) != episode.source_sha256:
                 raise NativeBcCompileError(f"source changed during compilation: {episode.battle_tag}")
@@ -2117,6 +2689,7 @@ def _compile_output_shard(
                     max_ability_slots=maximum_abilities,
                 )
                 compiled.append(arrays)
+                episode_compiled.append(arrays)
                 sequence_identity.append(
                     {
                         "battle_tag": episode.battle_tag,
@@ -2126,9 +2699,82 @@ def _compile_output_shard(
                         "player_tags": list(episode.player_tags),
                     }
                 )
+            actor_rows = sum(len(value["play_now"]) for value in episode_compiled)
+            entity_observations = sum(
+                int(value["entity_offsets"][-1]) for value in episode_compiled
+            )
+            maximum_episode_entities = max(
+                (
+                    int(np.diff(value["entity_offsets"]).max(initial=0))
+                    for value in episode_compiled
+                ),
+                default=0,
+            )
+            sparse_mask_row_bytes = sum(
+                8
+                * (
+                    len(value["selected_position_mask_packed"])
+                    + len(value["ability_position_mask_packed"])
+                )
+                for value in episode_compiled
+            )
+            array_payload_bytes = (
+                sum(
+                    int(array_value.nbytes)
+                    for value in episode_compiled
+                    for array_value in value.values()
+                )
+                + sparse_mask_row_bytes
+                + 3 * np.dtype(np.int64).itemsize
+            )
+            capacity_episode_estimates.append({
+                "battle_tag": episode.battle_tag,
+                "tick_count": int(episode.tick_count),
+                "tick_payload_size": int(episode.tick_payload_size),
+                "tick_payload_bytes_per_tick": (
+                    episode.tick_payload_size / episode.tick_count
+                ),
+                "actor_rows": actor_rows,
+                "array_payload_bytes": array_payload_bytes,
+                "array_payload_bytes_per_actor_row": (
+                    array_payload_bytes / actor_rows
+                ),
+                "mean_entities_per_actor_row": (
+                    entity_observations / actor_rows
+                ),
+                "max_entities_per_actor_row": maximum_episode_entities,
+            })
             # Actor arrays are now self-contained; release decoded TickState
             # objects before moving to the next battle in this shard.
             del states
+        if raw_plan.get("capacity_preflight_path"):
+            capacity = _read_capacity_preflight(
+                Path(str(raw_plan["capacity_preflight_path"]))
+            )
+            logical_payload_bytes = sum(
+                int(array_value.nbytes)
+                for sequence in compiled
+                for array_value in sequence.values()
+            )
+            logical_payload_bytes += sum(
+                8
+                * (
+                    len(sequence["selected_position_mask_packed"])
+                    + len(sequence["ability_position_mask_packed"])
+                )
+                for sequence in compiled
+            )
+            sampled_upper = math.ceil(
+                float(capacity["sample_max_episode_bytes_per_actor_row"])
+                * int(raw_spec["estimated_rows"])
+                * CAPACITY_SAFETY_FACTOR
+            ) + CAPACITY_SHARD_OVERHEAD_BYTES
+            exact_upper = logical_payload_bytes + CAPACITY_SHARD_OVERHEAD_BYTES
+            reservation_path = _acquire_capacity_reservation(
+                output_root,
+                relative_path=relative,
+                requested_bytes=max(sampled_upper, exact_upper),
+            )
         lengths = [len(value["play_now"]) for value in compiled]
         offsets = np.concatenate(
             (np.zeros(1, dtype=np.int64), np.cumsum(lengths, dtype=np.int64))
@@ -2170,18 +2816,26 @@ def _compile_output_shard(
             hashes[f"{rows_name}.npy"] = _save_npy(
                 temporary / f"{rows_name}.npy", sparse_rows
             )
-        metadata = {
+        metadata_body = {
             "kind": SHARD_KIND,
             "schema_version": SCHEMA_VERSION,
             "content_sha256": raw_spec["content_sha256"],
             "split": raw_spec["split"],
+            "shard_index": int(raw_spec["index"]),
             "rows": int(offsets[-1]),
             "sequences": len(compiled),
             "battles": len(raw_spec["episodes"]),
             "max_entities": maximum_entities,
             "max_ability_slots": maximum_abilities,
             "sequence_identity": sequence_identity,
+            "storage_bytes": sum(
+                (temporary / name).stat().st_size for name in hashes
+            ),
             "file_sha256": hashes,
+        }
+        metadata = {
+            **metadata_body,
+            "metadata_content_sha256": _digest(metadata_body),
         }
         _atomic_json(temporary / "shard.json", metadata)
         final.parent.mkdir(parents=True, exist_ok=True)
@@ -2189,15 +2843,23 @@ def _compile_output_shard(
             os.replace(temporary, final)
         except OSError:
             # Another equivalent worker may have won the atomic publish race.
-            existing = _verify_existing_shard(final, str(raw_spec["content_sha256"]))
+            existing = _verify_existing_shard(final, raw_spec)
             if existing is None:
                 raise
             shutil.rmtree(temporary, ignore_errors=True)
             return {**existing, "resumed": True, "relative_path": relative}
-        return {**metadata, "resumed": False, "relative_path": relative}
+        result = {
+            **metadata,
+            "resumed": False,
+            "relative_path": relative,
+        }
+        if not raw_plan.get("capacity_preflight_path"):
+            result["capacity_episode_estimates"] = capacity_episode_estimates
+        return result
     finally:
         for reader in readers.values():
             reader.close()
+        _release_capacity_reservation(output_root, reservation_path)
         if temporary.exists():
             shutil.rmtree(temporary, ignore_errors=True)
 
@@ -2219,26 +2881,19 @@ def compile_planned_shards(
         Path(str(plan["capacity_preflight"]["path"]))
     )
     output_root = Path(str(plan["output_root"]))
-    already_written = sum(
-        path.stat().st_size
-        for path in (output_root / "shards").rglob("*.npy")
-        if path.is_file()
-    ) if (output_root / "shards").is_dir() else 0
-    free_bytes = int(shutil.disk_usage(output_root).free)
-    remaining_gate = max(
-        0, int(capacity["required_free_bytes"]) - int(already_written)
+    usage = shutil.disk_usage(output_root)
+    mandatory_reserve = max(
+        CAPACITY_MINIMUM_RESERVE_BYTES,
+        math.ceil(
+            int(usage.total) * CAPACITY_FILESYSTEM_RESERVE_FRACTION
+        ),
     )
-    if free_bytes < remaining_gate:
+    if int(usage.free) < mandatory_reserve:
         raise NativeBcCompileError(
-            "capacity gate no longer passes before shard compilation: "
-            f"free={free_bytes}, required_remaining={remaining_gate}"
+            "capacity reserve is already breached before shard compilation: "
+            f"free={usage.free}, mandatory_reserve={mandatory_reserve}"
         )
     recommended_workers = int(capacity["recommended_max_parallel_compile_workers"])
-    if process_workers > recommended_workers:
-        raise NativeBcCompileError(
-            "requested compile workers exceed measured memory gate: "
-            f"requested={process_workers}, recommended_max={recommended_workers}"
-        )
     if worker_count <= 0 or worker_index < 0 or worker_index >= worker_count:
         raise ValueError("invalid worker partition")
     specs = [
@@ -2246,8 +2901,16 @@ def compile_planned_shards(
         for index, value in enumerate(plan["shards"])
         if index % worker_count == worker_index
     ]
+    requested_process_workers = max(1, int(process_workers))
+    recommended_for_partition = max(1, recommended_workers // worker_count)
+    effective_process_workers = min(
+        requested_process_workers,
+        recommended_for_partition,
+        max(1, len(specs)),
+    )
     worker_contract = {
         "native_contract_path": plan["inputs"]["native_contract_path"],
+        "capacity_preflight_path": plan["capacity_preflight"]["path"],
         "native_card_id_to_token": plan["native_card_id_to_token"],
         "source_card_to_token": plan["source_card_to_token"],
         "native_ability_id_to_token": plan["native_ability_id_to_token"],
@@ -2261,10 +2924,33 @@ def compile_planned_shards(
         )
         for value in specs
     ]
-    if process_workers <= 1:
-        return [_compile_output_shard(*value) for value in arguments]
-    with ProcessPoolExecutor(max_workers=process_workers) as executor:
-        return list(executor.map(_compile_output_shard_star, arguments))
+    if effective_process_workers <= 1:
+        completed = [_compile_output_shard(*value) for value in arguments]
+    else:
+        with ProcessPoolExecutor(max_workers=effective_process_workers) as executor:
+            completed = list(executor.map(_compile_output_shard_star, arguments))
+    receipt = {
+        "kind": "cr_native_bc_compile_worker_receipt_v1",
+        "schema_version": 1,
+        "worker_index": int(worker_index),
+        "worker_count": int(worker_count),
+        "requested_process_workers": requested_process_workers,
+        "capacity_recommended_total_process_workers": recommended_workers,
+        "capacity_recommended_partition_process_workers": (
+            recommended_for_partition
+        ),
+        "effective_process_workers": effective_process_workers,
+        "planned_shards": len(specs),
+        "completed_shards": len(completed),
+        "rows": sum(int(value["rows"]) for value in completed),
+    }
+    _atomic_json(
+        output_root
+        / "worker-receipts"
+        / f"worker-{worker_index:05d}-of-{worker_count:05d}.json",
+        receipt,
+    )
+    return completed
 
 
 def _compile_output_shard_star(arguments: Sequence[Any]) -> dict[str, Any]:
@@ -2315,6 +3001,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         name: Counter() for name in ("train", "validation", "test")
     }
     file_hashes: dict[str, str] = {}
+    shard_metadata_hashes: dict[str, str] = {}
     maximum_entities = 1
     maximum_abilities = 1
     assignments: list[dict[str, Any]] = []
@@ -2325,7 +3012,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     for raw in plan["shards"]:
         relative = str(raw["relative_path"])
         path = output / relative
-        metadata = _verify_existing_shard(path, str(raw["content_sha256"]))
+        metadata = _verify_existing_shard(path, raw)
         if metadata is None:
             raise NativeBcCompileError(f"planned shard is not complete: {path}")
         split = str(raw["split"])
@@ -2339,6 +3026,9 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         maximum_abilities = max(maximum_abilities, int(metadata["max_ability_slots"]))
         for name, digest in metadata["file_sha256"].items():
             file_hashes[f"{relative}/{name}"] = str(digest)
+        shard_metadata_digest = sha256_file(path / "shard.json")
+        file_hashes[f"{relative}/shard.json"] = shard_metadata_digest
+        shard_metadata_hashes[relative] = shard_metadata_digest
         for episode in raw["episodes"]:
             tag = str(episode["battle_tag"])
             if tag in seen_tags:
@@ -2468,6 +3158,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "resumability": "deterministic_atomic_output_shards_v1",
         },
         "shard_file_sha256": file_hashes,
+        "shard_metadata_sha256": shard_metadata_hashes,
     }
     validate_manifest(manifest, root=output)
     for split, paths in split_paths.items():
@@ -2550,12 +3241,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if args.worker_count == 1:
         return finalize_dataset(plan)
+    worker_receipt = json.loads(
+        (
+            Path(str(plan["output_root"]))
+            / "worker-receipts"
+            / f"worker-{args.worker_index:05d}-of-{args.worker_count:05d}.json"
+        ).read_text(encoding="utf-8")
+    )
     return {
         "kind": "cr_native_tick_store_bc_worker_result_v1",
         "worker_index": args.worker_index,
         "worker_count": args.worker_count,
         "completed_shards": len(completed),
         "rows": sum(int(value["rows"]) for value in completed),
+        "requested_process_workers": worker_receipt[
+            "requested_process_workers"
+        ],
+        "effective_process_workers": worker_receipt[
+            "effective_process_workers"
+        ],
     }
 
 
