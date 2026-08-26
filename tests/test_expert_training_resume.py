@@ -158,6 +158,8 @@ class ExpertTrainingResumeTests(unittest.TestCase):
                 "scheduler_state",
                 "normalizer_state",
                 "rng",
+                "run_id",
+                "optimizer_identity_sha256",
             ):
                 self.assertIn(key, first)
             self.assertEqual(first["scheduler_state"]["last_epoch"], 1)
@@ -204,6 +206,65 @@ class ExpertTrainingResumeTests(unittest.TestCase):
                 with redirect_stdout(io.StringIO()):
                     self.assertEqual(training.run(resumed_args), run_root)
             self.assertEqual((run_root / "result.json").stat().st_mtime_ns, result_mtime)
+
+            # Both checkpoint roles are authenticated, even when the other one
+            # would otherwise win the resume-progress ordering.
+            latest_path = run_root / "checkpoints" / "latest.pt"
+            original_latest = latest_path.read_bytes()
+            forged_latest = torch.load(
+                latest_path, map_location="cpu", weights_only=False
+            )
+            forged_latest["dataset_manifest_sha256"] = "0" * 64
+            torch.save(forged_latest, latest_path)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    RuntimeError, "checkpoint dataset_manifest_sha256 mismatch"
+                ):
+                    training.run(resumed_args)
+            latest_path.write_bytes(original_latest)
+
+            best_path = run_root / "checkpoints" / "best.pt"
+            original_best = best_path.read_bytes()
+            foreign_optimizer = torch.load(
+                best_path, map_location="cpu", weights_only=False
+            )
+            foreign_optimizer["run_id"] = "foreign-run"
+            foreign_optimizer["optimizer_identity_sha256"] = "f" * 64
+            torch.save(foreign_optimizer, best_path)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    RuntimeError, "checkpoint run_id mismatch"
+                ):
+                    training.run(resumed_args)
+            best_path.write_bytes(original_best)
+            foreign_optimizer = torch.load(
+                best_path, map_location="cpu", weights_only=False
+            )
+            foreign_optimizer["optimizer_identity_sha256"] = "f" * 64
+            torch.save(foreign_optimizer, best_path)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    RuntimeError, "checkpoint optimizer_identity_sha256 mismatch"
+                ):
+                    training.run(resumed_args)
+            best_path.write_bytes(original_best)
+
+            # A copied/older best checkpoint can carry compatible model and
+            # optimizer fields.  result.json's exact best SHA/progress binding
+            # must still reject it on completed resume.
+            forged_best = torch.load(
+                best_path, map_location="cpu", weights_only=False
+            )
+            forged_best["epoch"] = 0
+            forged_best["step"] = 0
+            forged_best["global_step"] = 0
+            torch.save(forged_best, best_path)
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "does not reference the authenticated best/latest checkpoints",
+                ):
+                    training.run(resumed_args)
 
     def test_resume_without_run_id_is_stable(self) -> None:
         args = training.build_parser().parse_args(["--resume"])

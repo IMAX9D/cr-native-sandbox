@@ -16,8 +16,10 @@ from expert_v1.one_click_v1 import (
     _crawler_active,
     _default_config,
     build_parser,
+    main,
     StageJournal,
     compile_command,
+    evaluate_ability_positive_coverage,
     file_fingerprint,
     formal_training_command,
     native_contract_binding,
@@ -365,7 +367,13 @@ class ExpertOneClickV1Test(unittest.TestCase):
             queue = root / "queue.jsonl"
             queue.write_text(
                 "".join(
-                    json.dumps({"battle_tag": tag}) + "\n"
+                    json.dumps(
+                        {
+                            "battle_tag": tag,
+                            "ability_events_observed": 1 if tag == "A" else 0,
+                        }
+                    )
+                    + "\n"
                     for tag in ("A", "B")
                 ),
                 encoding="utf-8",
@@ -399,8 +407,36 @@ class ExpertOneClickV1Test(unittest.TestCase):
                     "successes": 1,
                     "failures": 1,
                     "failure_class_counts": {"semantic": 1},
+                    "ability_positive": {
+                        "candidates": 1,
+                        "attempted": 1,
+                        "successes": 1,
+                        "failures": 0,
+                        "failure_class_counts": {},
+                        "success_rate": 1.0,
+                    },
+                    "ability_zero": {
+                        "candidates": 1,
+                        "attempted": 1,
+                        "successes": 0,
+                        "failures": 1,
+                        "failure_class_counts": {"semantic": 1},
+                        "success_rate": 0.0,
+                    },
                 },
             )
+            audit = validate_native_result_records(
+                results, queue, expected_rows=2
+            )
+            admitted = evaluate_ability_positive_coverage(
+                {"ability_positive": 1, "ability_zero": 1},
+                audit,
+                minimum_success_count=1,
+                minimum_success_rate=0.10,
+                waived=False,
+                waiver_reason=None,
+            )
+            self.assertTrue(admitted["gate"]["admitted"])
             rows[1]["final_attempt"] = False
             results.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),
@@ -410,6 +446,83 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 validate_native_result_records(
                     results, queue, expected_rows=2
                 )
+
+    def test_ability_positive_failures_cannot_hide_behind_overall_success(self) -> None:
+        result = {
+            "ability_positive": {
+                "candidates": 2,
+                "attempted": 2,
+                "successes": 0,
+                "failures": 2,
+                "failure_class_counts": {"semantic": 2},
+                "success_rate": 0.0,
+            },
+            "ability_zero": {
+                "candidates": 98,
+                "attempted": 98,
+                "successes": 98,
+                "failures": 0,
+                "failure_class_counts": {},
+                "success_rate": 1.0,
+            },
+        }
+        coverage = evaluate_ability_positive_coverage(
+            {"ability_positive": 2, "ability_zero": 98},
+            result,
+            minimum_success_count=1,
+            minimum_success_rate=0.10,
+            waived=False,
+            waiver_reason=None,
+        )
+        self.assertFalse(coverage["gate"]["raw_passed"])
+        self.assertFalse(coverage["gate"]["admitted"])
+        waived = evaluate_ability_positive_coverage(
+            {"ability_positive": 2, "ability_zero": 98},
+            result,
+            minimum_success_count=1,
+            minimum_success_rate=0.10,
+            waived=True,
+            waiver_reason="known native ability replay defect CR-123",
+        )
+        self.assertTrue(waived["gate"]["admitted"])
+        self.assertTrue(waived["gate"]["waiver_applied"])
+
+    def test_ability_positive_waiver_requires_a_reason(self) -> None:
+        result = {
+            "ability_positive": {
+                "candidates": 1,
+                "attempted": 1,
+                "successes": 0,
+                "failures": 1,
+                "failure_class_counts": {"semantic": 1},
+            },
+            "ability_zero": {
+                "candidates": 0,
+                "attempted": 0,
+                "successes": 0,
+                "failures": 0,
+                "failure_class_counts": {},
+            },
+        }
+        with self.assertRaisesRegex(OneClickError, "requires a reason"):
+            evaluate_ability_positive_coverage(
+                {"ability_positive": 1, "ability_zero": 0},
+                result,
+                minimum_success_count=1,
+                minimum_success_rate=0.10,
+                waived=True,
+                waiver_reason=None,
+            )
+
+    def test_one_click_defaults_keep_ability_gate_enabled(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertEqual(args.minimum_ability_positive_success_count, 1)
+        self.assertEqual(args.minimum_ability_positive_success_rate, 0.10)
+        self.assertFalse(args.waive_ability_positive_coverage)
+        with self.assertRaisesRegex(OneClickError, "lowering ability-positive"):
+            main(["--minimum-ability-positive-success-rate", "0"])
+        with self.assertRaisesRegex(OneClickError, "requires.*reason"):
+            main(["--waive-ability-positive-coverage"])
 
     def test_active_crawler_lock_must_match_config_and_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -494,6 +607,12 @@ class ExpertOneClickV1Test(unittest.TestCase):
             self.assertEqual(
                 compile_args[compile_args.index("--schema5-manifest") + 1],
                 str(config.frozen_manifest),
+            )
+            self.assertEqual(
+                compile_args[
+                    compile_args.index("--native-generation-receipt") + 1
+                ],
+                str(config.native_generation_receipt),
             )
             smoke = training_smoke_command(config)
             self.assertIn("--smoke", smoke)

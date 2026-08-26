@@ -192,4 +192,4 @@ D:\AI_data\runtime\venv\Scripts\python.exe -m expert_v1.training_v1.train `
   --output-root D:\AI_data\cr-native-core\expert-v1\runs
 ```
 
-每个 Run 原子写入 `manifest.json`、`events.jsonl`、`checkpoints/latest.pt`、`checkpoints/best.pt` 和 `result.json`；checkpoint 包含模型、optimizer、全部 RNG 状态及数据 manifest SHA-256。
+每个 Run 原子写入 `manifest.json`、`events.jsonl`、`checkpoints/latest.pt`、`checkpoints/best.pt` 和 `result.json`；checkpoint 包含模型、optimizer、全部 RNG 状态及数据 manifest SHA-256。恢复时会分别认证 `latest.pt` 和 `best.pt` 的数据 SHA、Run signature、模型配置、Run ID 与 optimizer identity，不能因其中一个较新就跳过另一个。完成态 `result.json` 还绑定已认证 best/latest 的文件 SHA 和进度；替换成另一个 Run 或伪造的旧 `best.pt` 会 fail-closed。

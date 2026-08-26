@@ -32,9 +32,9 @@ from .smoke_data import create_smoke_dataset
 
 
 CHECKPOINT_KIND = "cr_native_expert_bc_checkpoint_v1"
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 RUN_KIND = "cr_native_expert_bc_run_v1"
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 CHECKPOINT_REQUIRED_FIELDS = {
     "epoch",
     "step",
@@ -49,6 +49,9 @@ CHECKPOINT_REQUIRED_FIELDS = {
     "epochs_without_improvement",
     "dataset_manifest_sha256",
     "run_signature_sha256",
+    "run_id",
+    "optimizer_identity_sha256",
+    "checkpoint_role",
 }
 
 
@@ -243,6 +246,44 @@ def _run_signature(
     return hashlib.sha256(encoded).hexdigest(), payload
 
 
+def _optimizer_identity(
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    model_config: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Return the immutable optimizer/run identity stored in every checkpoint.
+
+    ``optimizer_state`` alone is not an identity: it can be copied between two
+    otherwise compatible runs.  This contract binds the optimizer algorithm
+    and hyperparameters to the exact run and model topology before any resume
+    artifact is accepted.
+    """
+
+    payload = {
+        "kind": "expert_bc_adamw_optimizer_identity_v1",
+        "run_id": str(run_id),
+        "algorithm": "torch.optim.AdamW",
+        "torch_version": str(torch.__version__),
+        "learning_rate": float(args.learning_rate),
+        "weight_decay": float(args.weight_decay),
+        "betas": [0.9, 0.999],
+        "eps": 1e-8,
+        "amsgrad": False,
+        "maximize": False,
+        "capturable": False,
+        "differentiable": False,
+        "foreach": None,
+        "fused": None,
+        "scheduler": "constant_lr_v1",
+        "model_config": dict(model_config),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
 def _stable_run_id(
     *,
     observation_mode: str,
@@ -420,6 +461,8 @@ def _checkpoint_payload(
     train_generator: torch.Generator,
     dataset_manifest_sha256: str,
     run_signature_sha256: str,
+    run_id: str,
+    optimizer_identity_sha256: str,
     best_validation_loss: float,
     epochs_without_improvement: int,
     is_best: bool,
@@ -440,6 +483,8 @@ def _checkpoint_payload(
         "normalizer_state": normalizer.state_dict(),
         "dataset_manifest_sha256": dataset_manifest_sha256,
         "run_signature_sha256": run_signature_sha256,
+        "run_id": run_id,
+        "optimizer_identity_sha256": optimizer_identity_sha256,
         "best_validation_loss": float(best_validation_loss),
         "epochs_without_improvement": int(epochs_without_improvement),
         "is_best": bool(is_best),
@@ -449,32 +494,130 @@ def _checkpoint_payload(
     }
 
 
-def _load_resume_checkpoint(run_root: Path, device: torch.device) -> tuple[Path, dict[str, Any]]:
+def _certify_checkpoint(
+    path: Path,
+    value: Any,
+    *,
+    dataset_manifest_sha256: str | None = None,
+    run_signature_sha256: str | None = None,
+    model_config: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+    optimizer_identity_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Authenticate one checkpoint without mutating any runtime state."""
+
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid checkpoint payload: {path}")
+    if value.get("kind") != CHECKPOINT_KIND:
+        raise RuntimeError(f"unexpected checkpoint kind: {path}")
+    if int(value.get("schema_version", -1)) != CHECKPOINT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"checkpoint is not fully resumable schema v{CHECKPOINT_SCHEMA_VERSION}: {path}"
+        )
+    missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(value))
+    if missing:
+        raise RuntimeError(f"checkpoint is incomplete: {path}: {missing}")
+    expected = {
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "run_signature_sha256": run_signature_sha256,
+        "run_id": run_id,
+        "optimizer_identity_sha256": optimizer_identity_sha256,
+    }
+    for field, wanted in expected.items():
+        if wanted is not None and value.get(field) != wanted:
+            raise RuntimeError(f"checkpoint {field} mismatch: {path}")
+    if model_config is not None and value.get("model_config") != dict(model_config):
+        raise RuntimeError(f"checkpoint model configuration mismatch: {path}")
+    expected_role = "latest" if path.name == "latest.pt" else "best"
+    if value.get("checkpoint_role") != expected_role:
+        raise RuntimeError(f"checkpoint role mismatch: {path}")
+    if not isinstance(value.get("model_state"), Mapping):
+        raise RuntimeError(f"checkpoint model state is malformed: {path}")
+    optimizer_state = value.get("optimizer_state")
+    if (
+        not isinstance(optimizer_state, Mapping)
+        or not isinstance(optimizer_state.get("state"), Mapping)
+        or not isinstance(optimizer_state.get("param_groups"), list)
+        or not optimizer_state["param_groups"]
+    ):
+        raise RuntimeError(f"checkpoint optimizer state is malformed: {path}")
+    epoch = int(value.get("epoch", -1))
+    step = int(value.get("step", -1))
+    global_step = int(value.get("global_step", -1))
+    if epoch < 0 or step < 0 or global_step < 0 or step != global_step:
+        raise RuntimeError(f"checkpoint progress counters are invalid: {path}")
+    return value
+
+
+def _load_certified_checkpoints(
+    run_root: Path,
+    device: torch.device,
+    *,
+    dataset_manifest_sha256: str | None = None,
+    run_signature_sha256: str | None = None,
+    model_config: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+    optimizer_identity_sha256: str | None = None,
+) -> dict[str, tuple[Path, dict[str, Any]]]:
+    """Load and independently certify latest.pt and every present best.pt."""
+
     candidates = [run_root / "checkpoints" / "latest.pt"]
     best = run_root / "checkpoints" / "best.pt"
     if best.is_file():
         candidates.append(best)
-    loaded: list[tuple[Path, dict[str, Any]]] = []
+    loaded: dict[str, tuple[Path, dict[str, Any]]] = {}
     for path in candidates:
         if not path.is_file():
             if path.name == "latest.pt":
                 raise RuntimeError(f"resume checkpoint is missing: {path}")
             continue
         value = torch.load(path, map_location=device, weights_only=False)
-        if not isinstance(value, dict):
-            raise RuntimeError(f"invalid checkpoint payload: {path}")
-        if value.get("kind") != CHECKPOINT_KIND:
-            raise RuntimeError(f"unexpected checkpoint kind: {path}")
-        if int(value.get("schema_version", -1)) != CHECKPOINT_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"checkpoint is not fully resumable schema v{CHECKPOINT_SCHEMA_VERSION}: {path}"
-            )
-        missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(value))
-        if missing:
-            raise RuntimeError(f"checkpoint is incomplete: {path}: {missing}")
-        loaded.append((path, value))
+        certified = _certify_checkpoint(
+            path,
+            value,
+            dataset_manifest_sha256=dataset_manifest_sha256,
+            run_signature_sha256=run_signature_sha256,
+            model_config=model_config,
+            run_id=run_id,
+            optimizer_identity_sha256=optimizer_identity_sha256,
+        )
+        loaded[path.name] = (path, certified)
+    if "best.pt" in loaded:
+        latest_value = loaded["latest.pt"][1]
+        best_value = loaded["best.pt"][1]
+        if best_value.get("is_best") is not True:
+            raise RuntimeError("best.pt is not marked as a best checkpoint")
+        if (
+            int(best_value["epoch"]) > int(latest_value["epoch"])
+            or int(best_value["global_step"]) > int(latest_value["global_step"])
+            or float(best_value["best_validation_loss"])
+            != float(latest_value["best_validation_loss"])
+        ):
+            raise RuntimeError("latest.pt/best.pt progress identity mismatch")
+    return loaded
+
+
+def _load_resume_checkpoint(
+    run_root: Path,
+    device: torch.device,
+    *,
+    dataset_manifest_sha256: str | None = None,
+    run_signature_sha256: str | None = None,
+    model_config: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+    optimizer_identity_sha256: str | None = None,
+) -> tuple[Path, dict[str, Any]]:
+    loaded = _load_certified_checkpoints(
+        run_root,
+        device,
+        dataset_manifest_sha256=dataset_manifest_sha256,
+        run_signature_sha256=run_signature_sha256,
+        model_config=model_config,
+        run_id=run_id,
+        optimizer_identity_sha256=optimizer_identity_sha256,
+    )
     return max(
-        loaded,
+        loaded.values(),
         key=lambda item: (
             int(item[1].get("epoch", -1)),
             int(item[1].get("global_step", -1)),
@@ -493,6 +636,8 @@ def _restore_checkpoint(
     train_generator: torch.Generator,
     dataset_manifest_sha256: str,
     run_signature_sha256: str,
+    run_id: str,
+    optimizer_identity_sha256: str,
 ) -> tuple[int, int, float, int]:
     missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(checkpoint))
     if missing:
@@ -501,6 +646,10 @@ def _restore_checkpoint(
         raise RuntimeError("checkpoint dataset manifest SHA-256 mismatch")
     if checkpoint.get("run_signature_sha256") != run_signature_sha256:
         raise RuntimeError("checkpoint training signature mismatch")
+    if checkpoint.get("run_id") != run_id:
+        raise RuntimeError("checkpoint run identity mismatch")
+    if checkpoint.get("optimizer_identity_sha256") != optimizer_identity_sha256:
+        raise RuntimeError("checkpoint optimizer identity mismatch")
     if checkpoint["model_config"] != model.config.to_dict():
         raise RuntimeError("checkpoint model configuration mismatch")
     model.load_state_dict(checkpoint["model_state"], strict=True)
@@ -583,6 +732,11 @@ def run(args: argparse.Namespace) -> Path:
             lambda_initial=args.lambda_initial,
             observation_mode=observation_mode,
         )
+        optimizer_identity_sha256, optimizer_contract = _optimizer_identity(
+            args,
+            run_id=run_id,
+            model_config=config.to_dict(),
+        )
         run_manifest = {
             "schema_version": RUN_SCHEMA_VERSION,
             "kind": RUN_KIND,
@@ -594,6 +748,10 @@ def run(args: argparse.Namespace) -> Path:
             "source_manifest": manifest.get("source_manifest"),
             "dataset_shards": shard_summary,
             "model": config.to_dict(),
+            "optimizer": {
+                **optimizer_contract,
+                "identity_sha256": optimizer_identity_sha256,
+            },
             "training": signature_payload,
             "run_signature_sha256": run_signature_sha256,
             "semantics": {
@@ -637,6 +795,7 @@ def run(args: argparse.Namespace) -> Path:
                 "dataset_root",
                 "dataset_manifest_sha256",
                 "model",
+                "optimizer",
                 "training",
                 "run_signature_sha256",
                 "device",
@@ -647,25 +806,60 @@ def run(args: argparse.Namespace) -> Path:
             if result_path.is_file():
                 if not (run_root / "checkpoints" / "best.pt").is_file():
                     raise RuntimeError("completed run is missing its best checkpoint")
-                _completed_path, completed_checkpoint = _load_resume_checkpoint(
-                    run_root, device
+                completed_checkpoints = _load_certified_checkpoints(
+                    run_root,
+                    device,
+                    dataset_manifest_sha256=integrity["manifest_sha256"],
+                    run_signature_sha256=run_signature_sha256,
+                    model_config=config.to_dict(),
+                    run_id=run_id,
+                    optimizer_identity_sha256=optimizer_identity_sha256,
                 )
-                if (
-                    completed_checkpoint.get("dataset_manifest_sha256")
-                    != integrity["manifest_sha256"]
-                    or completed_checkpoint.get("run_signature_sha256")
-                    != run_signature_sha256
-                    or completed_checkpoint.get("model_config") != config.to_dict()
-                ):
-                    raise RuntimeError("completed run checkpoint does not match this run")
+                latest_path, latest_checkpoint = completed_checkpoints["latest.pt"]
+                best_path, best_checkpoint = completed_checkpoints["best.pt"]
                 completed_result = json.loads(result_path.read_text(encoding="utf-8"))
                 if (
                     completed_result.get("dataset_manifest_sha256")
                     != integrity["manifest_sha256"]
                     or completed_result.get("run_signature_sha256")
                     != run_signature_sha256
+                    or completed_result.get("run_id") != run_id
+                    or completed_result.get("optimizer_identity_sha256")
+                    != optimizer_identity_sha256
                 ):
                     raise RuntimeError("completed run result does not match this run")
+                expected_best_reference = {
+                    "path": str(best_path.resolve()),
+                    "sha256": sha256_file(best_path),
+                    "epoch": int(best_checkpoint["epoch"]),
+                    "global_step": int(best_checkpoint["global_step"]),
+                    "best_validation_loss": float(
+                        best_checkpoint["best_validation_loss"]
+                    ),
+                }
+                expected_latest_reference = {
+                    "path": str(latest_path.resolve()),
+                    "sha256": sha256_file(latest_path),
+                    "epoch": int(latest_checkpoint["epoch"]),
+                    "global_step": int(latest_checkpoint["global_step"]),
+                }
+                if (
+                    completed_result.get("checkpoint") != str(best_path.resolve())
+                    or completed_result.get("best_checkpoint")
+                    != expected_best_reference
+                    or completed_result.get("latest_checkpoint")
+                    != expected_latest_reference
+                    or int(completed_result.get("epochs_completed", -1))
+                    != int(latest_checkpoint["epoch"])
+                    or int(completed_result.get("global_step", -1))
+                    != int(latest_checkpoint["global_step"])
+                    or float(completed_result.get("best_validation_loss", float("nan")))
+                    != float(best_checkpoint["best_validation_loss"])
+                ):
+                    raise RuntimeError(
+                        "completed run result does not reference the authenticated "
+                        "best/latest checkpoints"
+                    )
                 print(result_path.read_text(encoding="utf-8").strip(), flush=True)
                 return run_root
         else:
@@ -675,7 +869,17 @@ def run(args: argparse.Namespace) -> Path:
         _seed(args.seed)
         model = RecurrentExpertPolicy(config).to(device)
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+            model.parameters(),
+            lr=args.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=args.weight_decay,
+            amsgrad=False,
+            foreach=None,
+            maximize=False,
+            capturable=False,
+            differentiable=False,
+            fused=None,
         )
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _epoch: 1.0)
         normalizer = DatasetPrecomputedNormalizer(config.public_scalar_size)
@@ -703,7 +907,15 @@ def run(args: argparse.Namespace) -> Path:
         completed_epoch = 0
         latest_exists = (run_root / "checkpoints" / "latest.pt").is_file()
         if continuing and latest_exists:
-            checkpoint_path, checkpoint = _load_resume_checkpoint(run_root, device)
+            checkpoint_path, checkpoint = _load_resume_checkpoint(
+                run_root,
+                device,
+                dataset_manifest_sha256=integrity["manifest_sha256"],
+                run_signature_sha256=run_signature_sha256,
+                model_config=config.to_dict(),
+                run_id=run_id,
+                optimizer_identity_sha256=optimizer_identity_sha256,
+            )
             (
                 completed_epoch,
                 updates,
@@ -718,6 +930,8 @@ def run(args: argparse.Namespace) -> Path:
                 train_generator=train_generator,
                 dataset_manifest_sha256=integrity["manifest_sha256"],
                 run_signature_sha256=run_signature_sha256,
+                run_id=run_id,
+                optimizer_identity_sha256=optimizer_identity_sha256,
             )
             latest_path = run_root / "checkpoints" / "latest.pt"
             if checkpoint_path != latest_path:
@@ -814,6 +1028,8 @@ def run(args: argparse.Namespace) -> Path:
                     train_generator=train_generator,
                     dataset_manifest_sha256=integrity["manifest_sha256"],
                     run_signature_sha256=run_signature_sha256,
+                    run_id=run_id,
+                    optimizer_identity_sha256=optimizer_identity_sha256,
                     best_validation_loss=best_validation,
                     epochs_without_improvement=epochs_without_improvement,
                     is_best=improved,
@@ -821,8 +1037,14 @@ def run(args: argparse.Namespace) -> Path:
                     validation_metrics=validation_metrics,
                 )
                 if improved:
-                    _atomic_torch(run_root / "checkpoints" / "best.pt", checkpoint)
-                _atomic_torch(run_root / "checkpoints" / "latest.pt", checkpoint)
+                    _atomic_torch(
+                        run_root / "checkpoints" / "best.pt",
+                        {**checkpoint, "checkpoint_role": "best"},
+                    )
+                _atomic_torch(
+                    run_root / "checkpoints" / "latest.pt",
+                    {**checkpoint, "checkpoint_role": "latest"},
+                )
                 _append_jsonl(events, epoch_event)
                 print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
                 if epochs_without_improvement >= args.early_stopping_patience:
@@ -840,22 +1062,17 @@ def run(args: argparse.Namespace) -> Path:
         best_path = run_root / "checkpoints" / "best.pt"
         if not best_path.is_file():
             raise RuntimeError("training has no complete best checkpoint")
-        best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-        if not isinstance(best_checkpoint, dict):
-            raise RuntimeError("best checkpoint payload is invalid")
-        missing_best = sorted(CHECKPOINT_REQUIRED_FIELDS - set(best_checkpoint))
-        if missing_best:
-            raise RuntimeError(f"best checkpoint is incomplete: {missing_best}")
-        if (
-            best_checkpoint.get("kind") != CHECKPOINT_KIND
-            or int(best_checkpoint.get("schema_version", -1))
-            != CHECKPOINT_SCHEMA_VERSION
-            or best_checkpoint.get("dataset_manifest_sha256")
-            != integrity["manifest_sha256"]
-            or best_checkpoint.get("run_signature_sha256") != run_signature_sha256
-            or best_checkpoint.get("model_config") != config.to_dict()
-        ):
-            raise RuntimeError("best checkpoint is incompatible with this run")
+        final_checkpoints = _load_certified_checkpoints(
+            run_root,
+            device,
+            dataset_manifest_sha256=integrity["manifest_sha256"],
+            run_signature_sha256=run_signature_sha256,
+            model_config=config.to_dict(),
+            run_id=run_id,
+            optimizer_identity_sha256=optimizer_identity_sha256,
+        )
+        latest_path, latest_checkpoint = final_checkpoints["latest.pt"]
+        best_path, best_checkpoint = final_checkpoints["best.pt"]
         model.load_state_dict(best_checkpoint["model_state"], strict=True)
         test_metrics = _evaluate(
             model,
@@ -877,8 +1094,25 @@ def run(args: argparse.Namespace) -> Path:
             "best_validation_loss": best_validation,
             "test": test_metrics,
             "checkpoint": str(best_path),
+            "best_checkpoint": {
+                "path": str(best_path.resolve()),
+                "sha256": sha256_file(best_path),
+                "epoch": int(best_checkpoint["epoch"]),
+                "global_step": int(best_checkpoint["global_step"]),
+                "best_validation_loss": float(
+                    best_checkpoint["best_validation_loss"]
+                ),
+            },
+            "latest_checkpoint": {
+                "path": str(latest_path.resolve()),
+                "sha256": sha256_file(latest_path),
+                "epoch": int(latest_checkpoint["epoch"]),
+                "global_step": int(latest_checkpoint["global_step"]),
+            },
             "dataset_manifest_sha256": integrity["manifest_sha256"],
             "run_signature_sha256": run_signature_sha256,
+            "run_id": run_id,
+            "optimizer_identity_sha256": optimizer_identity_sha256,
         }
         _append_jsonl(events, final)
         _atomic_json(run_root / "result.json", final)

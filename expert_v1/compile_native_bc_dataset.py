@@ -541,6 +541,142 @@ def _require_integer(value: Any, label: str, *, minimum: int = 0) -> int:
     return int(value)
 
 
+def _verify_coverage_fingerprint(
+    value: Any,
+    label: str,
+    *,
+    expected_path: Path | None = None,
+) -> Path:
+    if not isinstance(value, Mapping):
+        raise NativeBcCompileError(f"native coverage {label} fingerprint is missing")
+    path = Path(str(value.get("path") or "")).resolve(strict=True)
+    if expected_path is not None and path != expected_path.resolve(strict=True):
+        raise NativeBcCompileError(f"native coverage {label} path changed")
+    if (
+        value.get("kind") != "file_sha256_v1"
+        or int(value.get("bytes", -1)) != path.stat().st_size
+        or _require_sha(value.get("sha256"), f"native coverage {label} SHA")
+        != sha256_file(path)
+    ):
+        raise NativeBcCompileError(f"native coverage {label} bytes changed")
+    return path
+
+
+def _authenticate_native_generation_receipt(
+    receipt_path: Path,
+    *,
+    schema5_manifest: Path,
+    native_contract: Path,
+    contract_sha256: str,
+    contract_file_sha256: str,
+    expected_episodes: int,
+) -> dict[str, Any]:
+    """Recompute ability cohort coverage before any BC shard is admitted."""
+
+    receipt_path = receipt_path.resolve(strict=True)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+    except Exception as error:
+        raise NativeBcCompileError("native generation coverage receipt is invalid") from error
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("kind") != "cr_expert_native_generation_coverage_v2"
+        or int(receipt.get("schema_version", -1)) != 2
+    ):
+        raise NativeBcCompileError("native generation coverage receipt kind/schema changed")
+    _verify_coverage_fingerprint(
+        receipt.get("frozen_manifest"),
+        "frozen manifest",
+        expected_path=schema5_manifest,
+    )
+    candidate_queue = _verify_coverage_fingerprint(
+        receipt.get("candidate_queue"), "candidate queue"
+    )
+    results_path = _verify_coverage_fingerprint(receipt.get("results"), "results")
+    contract_binding = receipt.get("native_contract")
+    if not isinstance(contract_binding, Mapping) or (
+        Path(str(contract_binding.get("path") or "")).resolve()
+        != native_contract.resolve()
+        or contract_binding.get("canonical_sha256") != contract_sha256
+        or contract_binding.get("file_sha256") != contract_file_sha256
+    ):
+        raise NativeBcCompileError("native coverage contract identity changed")
+    target = _require_integer(receipt.get("target_battles"), "coverage target", minimum=1)
+    selected = _require_integer(receipt.get("selected_battles"), "coverage selected")
+    processed = _require_integer(receipt.get("processed_battles"), "coverage processed")
+    successes = _require_integer(
+        receipt.get("teacher_forced_successes"), "coverage successes"
+    )
+    failures = _require_integer(
+        receipt.get("teacher_forced_failures"), "coverage failures"
+    )
+    stored = _require_integer(receipt.get("stored_episodes"), "coverage stored")
+    if (
+        selected != target
+        or processed != target
+        or successes + failures != target
+        or stored != successes
+        or stored != expected_episodes
+        or float(receipt.get("success_rate", -1)) != successes / target
+        or successes / target < float(receipt.get("minimum_success_rate", 2))
+    ):
+        raise NativeBcCompileError(
+            "native generation coverage does not match compiled episode admission"
+        )
+    ability = receipt.get("ability_coverage")
+    if not isinstance(ability, Mapping):
+        raise NativeBcCompileError("native ability coverage is missing")
+    gate = ability.get("gate")
+    if not isinstance(gate, Mapping):
+        raise NativeBcCompileError("native ability coverage gate is missing")
+    minimum_count = _require_integer(
+        gate.get("minimum_success_count"), "ability minimum success count"
+    )
+    minimum_rate = float(gate.get("minimum_success_rate", -1))
+    waived = gate.get("waiver_applied") is True
+    waiver_reason = str(gate.get("waiver_reason") or "").strip() or None
+    if not 0 <= minimum_rate <= 1:
+        raise NativeBcCompileError("native ability minimum success rate is invalid")
+    if (minimum_count < 1 or minimum_rate < 0.10) and not waived:
+        raise NativeBcCompileError(
+            "native ability coverage is below the default gate without a waiver"
+        )
+    try:
+        from .one_click_v1 import (
+            evaluate_ability_positive_coverage,
+            validate_native_result_records,
+        )
+
+        audit = validate_native_result_records(
+            results_path, candidate_queue, expected_rows=target
+        )
+        recomputed = evaluate_ability_positive_coverage(
+            {
+                "ability_positive": int(audit["ability_positive"]["candidates"]),
+                "ability_zero": int(audit["ability_zero"]["candidates"]),
+            },
+            audit,
+            minimum_success_count=minimum_count,
+            minimum_success_rate=minimum_rate,
+            waived=waived,
+            waiver_reason=waiver_reason,
+        )
+    except Exception as error:
+        raise NativeBcCompileError(
+            "native ability coverage candidate/result join failed"
+        ) from error
+    if dict(ability) != recomputed or (recomputed.get("gate") or {}).get(
+        "admitted"
+    ) is not True:
+        raise NativeBcCompileError("native ability coverage receipt is not admitted")
+    return {
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+        "ability_coverage": recomputed,
+        "stored_episodes": stored,
+    }
+
+
 def _validate_plan_vocabulary(
     plan: Mapping[str, Any], contract: Mapping[str, Any]
 ) -> None:
@@ -603,7 +739,8 @@ def validate_compile_plan(
             "schema5_manifest_sha256", "native_contract_path",
             "native_contract_file_sha256", "native_contract_sha256",
             "referenced_deployment_mask_sha256", "deployment_mask_manifest_sha256",
-            "deployment_mask_content_sha256",
+            "deployment_mask_content_sha256", "native_generation_receipt_path",
+            "native_generation_receipt_sha256",
         },
         "compile-plan inputs",
     )
@@ -654,7 +791,10 @@ def validate_compile_plan(
         raise NativeBcCompileError("compile-plan component hashes are malformed")
     _require_keys(
         components,
-        {"compiler_sha256", "training_schema_sha256", "deployment_masks_sha256"},
+        {
+            "compiler_sha256", "training_schema_sha256",
+            "deployment_masks_sha256", "native_coverage_validator_sha256",
+        },
         "compile-plan components",
     )
     for name, value in components.items():
@@ -674,7 +814,7 @@ def validate_compile_plan(
         "tick_store_manifest_sha256", "tick_store_content_sha256",
         "schema5_manifest_sha256", "native_contract_file_sha256",
         "native_contract_sha256", "deployment_mask_manifest_sha256",
-        "deployment_mask_content_sha256",
+        "deployment_mask_content_sha256", "native_generation_receipt_sha256",
     ):
         _require_sha(inputs.get(name), f"inputs.{name}")
     referenced_masks = inputs.get("referenced_deployment_mask_sha256")
@@ -931,6 +1071,11 @@ def validate_compile_plan(
             (Path(str(inputs["tick_store_manifest_path"])), inputs["tick_store_manifest_sha256"], "Tick Store manifest"),
             (Path(str(inputs["schema5_manifest_path"])), inputs["schema5_manifest_sha256"], "Schema5 manifest"),
             (contract_path, inputs["native_contract_file_sha256"], "native contract"),
+            (
+                Path(str(inputs["native_generation_receipt_path"])),
+                inputs["native_generation_receipt_sha256"],
+                "native generation receipt",
+            ),
             (tick_root / "deployment-masks-v1" / "manifest.json", inputs["deployment_mask_manifest_sha256"], "mask manifest"),
         )
         for path, expected, label in files:
@@ -947,6 +1092,18 @@ def validate_compile_plan(
             or contract.get("contract_sha256") != inputs["native_contract_sha256"]
         ):
             raise NativeBcCompileError("compile-plan native contract identity changed")
+        native_coverage = _authenticate_native_generation_receipt(
+            Path(str(inputs["native_generation_receipt_path"])),
+            schema5_manifest=Path(str(inputs["schema5_manifest_path"])),
+            native_contract=contract_path,
+            contract_sha256=str(inputs["native_contract_sha256"]),
+            contract_file_sha256=str(inputs["native_contract_file_sha256"]),
+            expected_episodes=len(all_episodes),
+        )
+        if native_coverage["receipt_sha256"] != inputs[
+            "native_generation_receipt_sha256"
+        ]:
+            raise NativeBcCompileError("compile-plan native coverage receipt changed")
         _validate_plan_vocabulary(plan, contract)
         mask_store = DeploymentMaskStore(tick_root, create=False)
         mask_manifest = mask_store.verify_manifest()
@@ -1076,6 +1233,9 @@ def validate_compile_plan(
             ).resolve(),
             "deployment_masks_sha256": (
                 Path(__file__).parent / "tick_store_v1" / "deployment_masks.py"
+            ).resolve(),
+            "native_coverage_validator_sha256": (
+                Path(__file__).parent / "one_click_v1.py"
             ).resolve(),
         }
         for name, path in component_paths.items():
@@ -1780,6 +1940,7 @@ def create_compile_plan(
     schema5_manifest: Path,
     output_root: Path,
     native_contract: Path,
+    native_generation_receipt: Path,
     *,
     seed: int = 20260827,
     validation_fraction: float = 0.05,
@@ -1791,6 +1952,7 @@ def create_compile_plan(
     tick_store_root = tick_store_root.resolve(strict=True)
     schema5_manifest = schema5_manifest.resolve(strict=True)
     native_contract = native_contract.resolve(strict=True)
+    native_generation_receipt = native_generation_receipt.resolve(strict=True)
     output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     existing_plan_path = output_root / "compile-plan.json"
@@ -1805,6 +1967,14 @@ def create_compile_plan(
     contract_sha256 = str(contract["contract_sha256"])
     store, shards = _validate_tick_store(tick_store_root, workers=io_workers)
     episode_entries = _episode_index(shards)
+    native_generation_coverage = _authenticate_native_generation_receipt(
+        native_generation_receipt,
+        schema5_manifest=schema5_manifest,
+        native_contract=native_contract,
+        contract_sha256=contract_sha256,
+        contract_file_sha256=contract_file_sha256,
+        expected_episodes=len(episode_entries),
+    )
     index_rows = _json_lines(schema5_manifest)
     indexed: dict[str, Mapping[str, Any]] = {}
     for row in index_rows:
@@ -1979,6 +2149,10 @@ def create_compile_plan(
             mask_store.root / "manifest.json"
         ),
         "deployment_mask_content_sha256": mask_manifest["content_sha256"],
+        "native_generation_receipt_path": str(native_generation_receipt),
+        "native_generation_receipt_sha256": native_generation_coverage[
+            "receipt_sha256"
+        ],
     }
     compiler_contract = {
         "kind": COMPILER_KIND,
@@ -2003,6 +2177,9 @@ def create_compile_plan(
             ),
             "deployment_masks_sha256": sha256_file(
                 (Path(__file__).parent / "tick_store_v1" / "deployment_masks.py").resolve()
+            ),
+            "native_coverage_validator_sha256": sha256_file(
+                (Path(__file__).parent / "one_click_v1.py").resolve()
             ),
         },
     }
@@ -2976,6 +3153,11 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "native ingest contract",
         ),
         (
+            Path(str(plan["inputs"]["native_generation_receipt_path"])),
+            str(plan["inputs"]["native_generation_receipt_sha256"]),
+            "native generation receipt",
+        ),
+        (
             Path(str(plan["tick_store_root"]))
             / "deployment-masks-v1"
             / "manifest.json",
@@ -2991,6 +3173,9 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         "training_schema_sha256": (Path(__file__).parent / "training_v1" / "schema.py").resolve(),
         "deployment_masks_sha256": (
             Path(__file__).parent / "tick_store_v1" / "deployment_masks.py"
+        ).resolve(),
+        "native_coverage_validator_sha256": (
+            Path(__file__).parent / "one_click_v1.py"
         ).resolve(),
     }
     for name, path in component_paths.items():
@@ -3064,6 +3249,16 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     _atomic_bytes(output / "split-assignments.jsonl", assignment_raw)
     total_rows = sum(value["rows"] for value in split_stats.values())
     total_sequences = sum(value["sequences"] for value in split_stats.values())
+    native_generation_coverage = _authenticate_native_generation_receipt(
+        Path(str(plan["inputs"]["native_generation_receipt_path"])),
+        schema5_manifest=source,
+        native_contract=Path(str(plan["inputs"]["native_contract_path"])),
+        contract_sha256=str(plan["inputs"]["native_contract_sha256"]),
+        contract_file_sha256=str(
+            plan["inputs"]["native_contract_file_sha256"]
+        ),
+        expected_episodes=len(seen_tags),
+    )
     manifest: dict[str, Any] = {
         "kind": DATASET_KIND,
         "schema_version": SCHEMA_VERSION,
@@ -3085,6 +3280,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         },
         "source_inputs": plan["inputs"],
         "capacity_preflight": plan["capacity_preflight"],
+        "native_generation_coverage": native_generation_coverage,
         "dataset_content_sha256": _digest(
             {
                 "input": plan["input_content_sha256"],
@@ -3194,6 +3390,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schema5-manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--native-contract", type=Path, required=True)
+    parser.add_argument("--native-generation-receipt", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--test-fraction", type=float, default=0.05)
@@ -3217,6 +3414,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.schema5_manifest,
         args.output_root,
         args.native_contract,
+        args.native_generation_receipt,
         seed=args.seed,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,

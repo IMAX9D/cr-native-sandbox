@@ -52,6 +52,8 @@ DEFAULT_CONTRACT = Path(
 DEFAULT_TEMPLATE = PROJECT_ROOT / "examples" / "eight-card-bootstrap.json"
 DEFAULT_TARGET = 100_000
 DEFAULT_PORTS = tuple(range(38_031, 38_039))
+DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT = 1
+DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_RATE = 0.10
 DEFAULT_NATIVE_HARDWARE_LOCK = Path(
     r"D:\AI_data\cr-native-core\locks\native-hardware-v1.lock"
 )
@@ -447,6 +449,14 @@ class OneClickConfig:
     workers_per_avd: int = 4
     ports: tuple[int, ...] = DEFAULT_PORTS
     minimum_native_success_rate: float = 0.50
+    minimum_ability_positive_success_count: int = (
+        DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT
+    )
+    minimum_ability_positive_success_rate: float = (
+        DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_RATE
+    )
+    waive_ability_positive_coverage: bool = False
+    ability_positive_waiver_reason: str | None = None
     native_layout_reason: str = "explicit_or_test"
     available_ram_at_selection: int = 0
     requested_workers: int | None = None
@@ -684,6 +694,8 @@ def compile_command(config: OneClickConfig) -> tuple[str, ...]:
         str(config.compiled_root),
         "--native-contract",
         str(config.native_contract),
+        "--native-generation-receipt",
+        str(config.native_generation_receipt),
         "--io-workers",
         str(config.compile_io_workers),
         "--process-workers",
@@ -1054,18 +1066,39 @@ def validate_native_result_records(
 ) -> dict[str, Any]:
     """Prove every frozen candidate has exactly one final native attempt."""
 
-    expected: set[str] = set()
+    expected: dict[str, bool] = {}
     with candidate_queue.resolve(strict=True).open(
         "r", encoding="utf-8-sig"
     ) as source:
         for line in source:
-            if line.strip():
-                expected.add(str(json.loads(line).get("battle_tag") or ""))
-    if len(expected) != expected_rows or "" in expected:
+            if not line.strip():
+                continue
+            candidate = json.loads(line)
+            tag = str(candidate.get("battle_tag") or "")
+            if not tag or tag in expected:
+                raise OneClickError("candidate queue tag set is malformed")
+            expected[tag] = int(candidate.get("ability_events_observed") or 0) > 0
+    if len(expected) != expected_rows:
         raise OneClickError("candidate queue tag set is malformed")
     seen: set[str] = set()
     successes = 0
     failure_classes: dict[str, int] = {}
+    cohorts: dict[str, dict[str, Any]] = {
+        "ability_positive": {
+            "candidates": sum(expected.values()),
+            "attempted": 0,
+            "successes": 0,
+            "failures": 0,
+            "failure_class_counts": {},
+        },
+        "ability_zero": {
+            "candidates": len(expected) - sum(expected.values()),
+            "attempted": 0,
+            "successes": 0,
+            "failures": 0,
+            "failure_class_counts": {},
+        },
+    }
     with results_path.resolve(strict=True).open(
         "r", encoding="utf-8-sig"
     ) as source:
@@ -1077,6 +1110,7 @@ def validate_native_result_records(
             if (
                 row.get("kind") != "expert_authoritative_native_tick_result_v1"
                 or not tag
+                or tag not in expected
                 or tag in seen
                 or row.get("final_attempt") is not True
                 or not isinstance(row.get("teacher_forced_success"), bool)
@@ -1085,23 +1119,127 @@ def validate_native_result_records(
                     f"native result is not a unique final attempt at line {line_number}"
                 )
             seen.add(tag)
+            cohort_name = (
+                "ability_positive" if expected[tag] else "ability_zero"
+            )
+            cohort = cohorts[cohort_name]
+            cohort["attempted"] += 1
             if row["teacher_forced_success"]:
                 successes += 1
+                cohort["successes"] += 1
             else:
+                cohort["failures"] += 1
                 failure_class = str(row.get("failure_class") or "unknown")
                 failure_classes[failure_class] = (
                     failure_classes.get(failure_class, 0) + 1
                 )
-    if seen != expected:
+                cohort_failures = cohort["failure_class_counts"]
+                cohort_failures[failure_class] = (
+                    cohort_failures.get(failure_class, 0) + 1
+                )
+    if seen != set(expected):
         raise OneClickError(
             f"native result/candidate exact join failed: "
             f"results={len(seen)}, candidates={len(expected)}"
+        )
+    for cohort in cohorts.values():
+        attempted = int(cohort["attempted"])
+        cohort["success_rate"] = (
+            float(cohort["successes"]) / attempted if attempted else None
+        )
+        cohort["failure_class_counts"] = dict(
+            sorted(cohort["failure_class_counts"].items())
         )
     return {
         "rows": len(seen),
         "successes": successes,
         "failures": len(seen) - successes,
         "failure_class_counts": dict(sorted(failure_classes.items())),
+        **cohorts,
+    }
+
+
+def evaluate_ability_positive_coverage(
+    queue_summary: Mapping[str, Any],
+    result_audit: Mapping[str, Any],
+    *,
+    minimum_success_count: int,
+    minimum_success_rate: float,
+    waived: bool,
+    waiver_reason: str | None,
+) -> dict[str, Any]:
+    """Build the immutable ability/non-ability admission classification."""
+
+    positive = dict(result_audit.get("ability_positive") or {})
+    zero = dict(result_audit.get("ability_zero") or {})
+    candidate_positive = int(queue_summary.get("ability_positive", -1))
+    candidate_zero = int(queue_summary.get("ability_zero", -1))
+    if (
+        candidate_positive < 0
+        or candidate_zero < 0
+        or int(positive.get("candidates", -2)) != candidate_positive
+        or int(positive.get("attempted", -2)) != candidate_positive
+        or int(zero.get("candidates", -2)) != candidate_zero
+        or int(zero.get("attempted", -2)) != candidate_zero
+    ):
+        raise OneClickError(
+            "ability-positive/zero attempt classification does not cover candidates"
+        )
+    positive_successes = int(positive.get("successes", -1))
+    positive_failures = int(positive.get("failures", -1))
+    if positive_successes < 0 or positive_successes + positive_failures != candidate_positive:
+        raise OneClickError("ability-positive success/failure classification is open")
+    applicable = candidate_positive > 0
+    positive_rate = (
+        positive_successes / candidate_positive if applicable else None
+    )
+    raw_passed = (
+        not applicable
+        or (
+            positive_successes >= int(minimum_success_count)
+            and positive_rate is not None
+            and positive_rate >= float(minimum_success_rate)
+        )
+    )
+    reason = str(waiver_reason or "").strip() or None
+    if waived and reason is None:
+        raise OneClickError("ability-positive coverage waiver requires a reason")
+    return {
+        "schema_version": 1,
+        "kind": "cr_expert_ability_native_coverage_v1",
+        "candidate_counts": {
+            "ability_positive": candidate_positive,
+            "ability_zero": candidate_zero,
+        },
+        "attempt_counts": {
+            "ability_positive": int(positive["attempted"]),
+            "ability_zero": int(zero["attempted"]),
+        },
+        "success_counts": {
+            "ability_positive": positive_successes,
+            "ability_zero": int(zero["successes"]),
+        },
+        "failure_counts": {
+            "ability_positive": positive_failures,
+            "ability_zero": int(zero["failures"]),
+        },
+        "success_rates": {
+            "ability_positive": positive_rate,
+            "ability_zero": zero.get("success_rate"),
+        },
+        "failure_class_counts": {
+            "ability_positive": positive.get("failure_class_counts") or {},
+            "ability_zero": zero.get("failure_class_counts") or {},
+        },
+        "gate": {
+            "applicable": applicable,
+            "minimum_success_count": int(minimum_success_count),
+            "minimum_success_rate": float(minimum_success_rate),
+            "raw_passed": raw_passed,
+            "waiver_applied": bool(waived),
+            "waiver_reason": reason,
+            "admitted": bool(raw_passed or waived),
+        },
     }
 
 
@@ -1495,33 +1633,21 @@ class OneClickOrchestrator:
             failures = int(summary.get("teacher_forced_failures", -1))
             stored = int(summary.get("stored_episodes", -1))
             success_rate = successes / config.target
-            if (
-                summary.get("publication_ready") is not True
-                or summary.get("infrastructure_complete") is not True
-                or selected != config.target
-                or processed != config.target
-                or successes + failures != config.target
-                or stored != successes
-                or summary.get("missing_result_tags") != []
-                or summary.get("unexpected_result_tags") != []
-                or success_rate < config.minimum_native_success_rate
-                or int(result_audit["successes"]) != successes
-                or int(result_audit["failures"]) != failures
-                or result_audit["failure_class_counts"]
-                != (summary.get("failure_class_counts") or {})
-                or ((native_manifest.get("content") or {}).get("results_sha256"))
-                != sha256_file(results_path)
-            ):
-                raise OneClickError(
-                    "native generator failed complete-attempt/success coverage: "
-                    f"selected={selected}, processed={processed}, "
-                    f"successes={successes}, failures={failures}, stored={stored}, "
-                    f"rate={success_rate:.6f}, "
-                    f"minimum={config.minimum_native_success_rate:.6f}"
-                )
+            ability_coverage = evaluate_ability_positive_coverage(
+                queue_summary,
+                result_audit,
+                minimum_success_count=(
+                    config.minimum_ability_positive_success_count
+                ),
+                minimum_success_rate=(
+                    config.minimum_ability_positive_success_rate
+                ),
+                waived=config.waive_ability_positive_coverage,
+                waiver_reason=config.ability_positive_waiver_reason,
+            )
             coverage_receipt = {
-                "schema_version": 1,
-                "kind": "cr_expert_native_generation_coverage_v1",
+                "schema_version": 2,
+                "kind": "cr_expert_native_generation_coverage_v2",
                 "created_utc": utc_now(),
                 "frozen_manifest": file_fingerprint(config.frozen_manifest),
                 "candidate_queue": file_fingerprint(config.candidate_queue),
@@ -1537,6 +1663,7 @@ class OneClickOrchestrator:
                 "stored_episodes": stored,
                 "success_rate": success_rate,
                 "minimum_success_rate": config.minimum_native_success_rate,
+                "ability_coverage": ability_coverage,
                 "failure_class_counts": summary.get("failure_class_counts") or {},
                 "failure_domain_counts": summary.get("failure_domain_counts") or {},
                 "terminal_diagnostic_counts": summary.get(
@@ -1550,7 +1677,35 @@ class OneClickOrchestrator:
                     summary.get("native_actions_accepted", 0)
                 ),
             }
+            # Publish the classification even when a gate fails so the failed
+            # one-click stage preserves exact evidence for diagnosis/waiver.
             _atomic_json(config.native_generation_receipt, coverage_receipt)
+            if (
+                summary.get("publication_ready") is not True
+                or summary.get("infrastructure_complete") is not True
+                or selected != config.target
+                or processed != config.target
+                or successes + failures != config.target
+                or stored != successes
+                or summary.get("missing_result_tags") != []
+                or summary.get("unexpected_result_tags") != []
+                or success_rate < config.minimum_native_success_rate
+                or (ability_coverage.get("gate") or {}).get("admitted") is not True
+                or int(result_audit["successes"]) != successes
+                or int(result_audit["failures"]) != failures
+                or result_audit["failure_class_counts"]
+                != (summary.get("failure_class_counts") or {})
+                or ((native_manifest.get("content") or {}).get("results_sha256"))
+                != sha256_file(results_path)
+            ):
+                raise OneClickError(
+                    "native generator failed complete-attempt/success coverage: "
+                    f"selected={selected}, processed={processed}, "
+                    f"successes={successes}, failures={failures}, stored={stored}, "
+                    f"rate={success_rate:.6f}, "
+                    f"minimum={config.minimum_native_success_rate:.6f}, "
+                    f"ability={json.dumps(ability_coverage, ensure_ascii=False)}"
+                )
             return fingerprint_files(
                 [
                     summary_path,
@@ -1569,6 +1724,7 @@ class OneClickOrchestrator:
                 "failure_class_counts": coverage_receipt[
                     "failure_class_counts"
                 ],
+                "ability_coverage": ability_coverage,
                 "stored_episodes": stored,
                 "stored_ticks": int(summary["stored_ticks"]),
             }
@@ -1618,6 +1774,12 @@ class OneClickOrchestrator:
                 or int(coverage.get("processed_battles", -1)) != config.target
                 or int(coverage.get("stored_episodes", -1))
                 != physical["episodes"]
+                or coverage.get("kind")
+                != "cr_expert_native_generation_coverage_v2"
+                or ((coverage.get("ability_coverage") or {}).get("gate") or {}).get(
+                    "admitted"
+                )
+                is not True
             ):
                 raise OneClickError(
                     "Tick Store/Mask physical validation disagrees with summary"
@@ -1643,6 +1805,7 @@ class OneClickOrchestrator:
                 config.tick_store_root / "deployment-masks-v1" / "manifest.json",
                 config.frozen_manifest,
                 config.native_contract,
+                config.native_generation_receipt,
             ]
         ) + component_fingerprints(
             config,
@@ -1674,6 +1837,14 @@ class OneClickOrchestrator:
                 or source.get("sha256") != sha256_file(config.frozen_manifest)
                 or int((manifest.get("coverage") or {}).get("battles", -1))
                 != int(coverage_receipt.get("stored_episodes", -2))
+                or (manifest.get("native_generation_coverage") or {}).get(
+                    "receipt_sha256"
+                )
+                != sha256_file(config.native_generation_receipt)
+                or (manifest.get("native_generation_coverage") or {}).get(
+                    "ability_coverage"
+                )
+                != coverage_receipt.get("ability_coverage")
             ):
                 raise OneClickError("compiled dataset failed production admission")
             required_zero = (
@@ -2038,6 +2209,14 @@ def _default_config(args: argparse.Namespace) -> OneClickConfig:
         workers_per_avd=workers_per_avd,
         ports=selected_ports,
         minimum_native_success_rate=args.minimum_native_success_rate,
+        minimum_ability_positive_success_count=(
+            args.minimum_ability_positive_success_count
+        ),
+        minimum_ability_positive_success_rate=(
+            args.minimum_ability_positive_success_rate
+        ),
+        waive_ability_positive_coverage=args.waive_ability_positive_coverage,
+        ability_positive_waiver_reason=args.ability_positive_waiver_reason,
         native_layout_reason=layout_reason,
         available_ram_at_selection=available_ram,
         requested_workers=args.workers,
@@ -2098,6 +2277,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicit waiver required to lower the default 50%% coverage gate",
     )
+    parser.add_argument(
+        "--minimum-ability-positive-success-count",
+        type=int,
+        default=DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT,
+        help="minimum successful native replays among ability-positive candidates",
+    )
+    parser.add_argument(
+        "--minimum-ability-positive-success-rate",
+        type=float,
+        default=DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_RATE,
+        help="minimum native success rate within the ability-positive cohort",
+    )
+    parser.add_argument(
+        "--waive-ability-positive-coverage",
+        action="store_true",
+        help=(
+            "explicitly waive the ability-positive native coverage gate; "
+            "requires --ability-positive-waiver-reason"
+        ),
+    )
+    parser.add_argument("--ability-positive-waiver-reason")
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument(
         "--audit-workers", type=int, default=max(8, os.cpu_count() or 8)
@@ -2125,6 +2325,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.compile_io_workers <= 0
         or args.compile_process_workers <= 0
         or not 0 < args.minimum_native_success_rate <= 1
+        or args.minimum_ability_positive_success_count < 0
+        or not 0 <= args.minimum_ability_positive_success_rate <= 1
     ):
         raise OneClickError("invalid one-click concurrency/target configuration")
     if (
@@ -2134,6 +2336,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise OneClickError(
             "lowering native success coverage below 50% requires "
             "--allow-lower-native-success-rate"
+        )
+    lowered_ability_gate = (
+        args.minimum_ability_positive_success_count
+        < DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT
+        or args.minimum_ability_positive_success_rate
+        < DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_RATE
+    )
+    waiver_reason = str(args.ability_positive_waiver_reason or "").strip()
+    if lowered_ability_gate and not args.waive_ability_positive_coverage:
+        raise OneClickError(
+            "lowering ability-positive native coverage requires "
+            "--waive-ability-positive-coverage"
+        )
+    if args.waive_ability_positive_coverage and not waiver_reason:
+        raise OneClickError(
+            "--waive-ability-positive-coverage requires "
+            "--ability-positive-waiver-reason"
+        )
+    if waiver_reason and not args.waive_ability_positive_coverage:
+        raise OneClickError(
+            "--ability-positive-waiver-reason requires "
+            "--waive-ability-positive-coverage"
         )
     config = _default_config(args)
     if config.avds != 0 and (

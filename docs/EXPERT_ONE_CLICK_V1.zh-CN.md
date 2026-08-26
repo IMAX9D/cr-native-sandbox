@@ -9,10 +9,10 @@
 3. 正好达到 100,000 场后停止 crawler、checkpoint SQLite；此后才读取可用物理内存并把原生布局永久固化到 journal（可用内存至少 16 GiB 时为 2 AVD × 4 Worker，否则为 1 AVD × 4 Worker），随后冻结内容寻址 Schema5 manifest。
 4. 从该冻结 manifest 重新生成 eligibility audit。native 候选队列会逐行验证：只能是 Schema5、必须有权威 contract-v3 标记、源文件必须位于 `authoritative-schema5-v3` 根目录且 SHA 相同。任何旧 contract 或 Schema3 行立即 fail-closed。
 5. 获取跨所有 `--data-root` 共用的原生硬件 OS 锁，启动固化布局的 direct Worker，准备或恢复原生 Tick 生成。已有工作队列、结果和 CRTS shard 会原地续跑。
-6. 候选、selected 和 processed 必须全部为 100,000；每个 JSON 都必须形成原生 attempt 终态。默认要求 teacher-forced 成功率至少 50%，完整成功/失败分布写入 coverage receipt。
+6. 候选、selected 和 processed 必须全部为 100,000；每个 JSON 都必须形成原生 attempt 终态。默认要求 teacher-forced 总成功率至少 50%。此外候选会按 `ability_events_observed > 0` 分为能力正样本和能力零样本，并分别记录尝试、成功、失败、成功率与失败类别；只要冻结候选中存在能力正样本，默认还要求至少 1 场成功且该组成功率至少 10%。因此普通对局的高成功率不能掩盖技能局全部失败。完整分类写入 `native-generation-coverage.json`。
 7. 生成结束后先逐实例关闭全部 Worker 和 AVD；异常路径也会 best-effort 关闭，然后才释放全局硬件锁。
 8. 对 Tick Store 做完整物理扫描：校验全部 CRTS/index SHA、帧计数，以及每场成功样本引用的内容寻址部署 Mask。
-9. 并行编译 native BC 数据集。编译器按确定性 shard 续跑，最终检查 split、Mask、标签、非有限值、原生拒绝和终局等 quality gates。
+9. 并行编译 native BC 数据集。编译器必须重新认证上述 coverage receipt，并把 receipt SHA 与完全相同的能力覆盖对象写入最终 manifest；不满足能力门或编译后成功样本数不一致时拒绝发布。随后按确定性 shard 续跑，检查 split、Mask、标签、非有限值、原生拒绝和终局等 quality gates。
 10. 使用正式编译数据而不是合成数据，运行 2 个 train batch 的真实小 smoke。
 11. smoke 通过后调用 `expert_v1.training_v1.train --resume`，启动或恢复固定 Run `expert-v1-schema5-v3-100k`。
 
@@ -51,6 +51,8 @@ scripts\start_expert_one_click_v1.ps1 -Smoke
 ```
 
 日志保存在 `...\one-click-schema5-v3\logs`。失败时不要删除状态或产物；修复外部原因后重新双击，流程会从当前阶段恢复。`--smoke` 不会启动 crawler 或 AVD，也不会用合成数据填补缺失产物。
+
+能力正样本门只能通过命令行显式豁免，并且必须留下原因：`--waive-ability-positive-coverage --ability-positive-waiver-reason "问题编号/原因"`。双击入口不会传入该参数。降低 `--minimum-ability-positive-success-count` 或 `--minimum-ability-positive-success-rate` 同样必须显式豁免；receipt 会永久记录 `waiver_applied` 和原因。
 
 正式 v2→v3 迁移 apply 完成前，canonical contract 仍是 v2；此时入口会有意拒绝运行。只有 canonical contract、SQLite contract binding 和 crawler v3 输出目录三者一致后才能启动，禁止为了提前运行而关闭该检查。
 

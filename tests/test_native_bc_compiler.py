@@ -31,6 +31,12 @@ from expert_v1.native_ingest_contract import (
     write_native_ingest_contract,
 )
 from expert_v1.native_replay_plan import compile_battle
+from expert_v1.one_click_v1 import (
+    evaluate_ability_positive_coverage,
+    file_fingerprint,
+    native_contract_binding,
+    validate_native_result_records,
+)
 from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
     DeploymentMaskStore,
@@ -179,7 +185,7 @@ class NativeBcCompilerTests(unittest.TestCase):
         episode_contract_mismatch: bool = False,
         source_contract_file_mismatch: bool = False,
         episode_contract_file_mismatch: bool = False,
-    ) -> tuple[Path, Path, Path]:
+    ) -> tuple[Path, Path, Path, Path]:
         contract = root / "native-contract.json"
         published = write_native_ingest_contract(contract)
         loaded_contract = load_native_ingest_contract(contract)
@@ -346,18 +352,92 @@ class NativeBcCompilerTests(unittest.TestCase):
             expected_episodes=3,
             expected_ticks=3 * 181,
         )
-        return tick_root, index, contract
+        candidate_queue = root / "candidate-queue.jsonl"
+        candidate_queue.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "battle_tag": f"SCHEMA5FIXTURE{number}",
+                        "ability_events_observed": 1 if number == 0 else 0,
+                    }
+                )
+                + "\n"
+                for number in range(3)
+            ),
+            encoding="utf-8",
+        )
+        results_path = root / "native-results.jsonl"
+        results_path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "kind": "expert_authoritative_native_tick_result_v1",
+                        "battle_tag": f"SCHEMA5FIXTURE{number}",
+                        "final_attempt": True,
+                        "teacher_forced_success": True,
+                    }
+                )
+                + "\n"
+                for number in range(3)
+            ),
+            encoding="utf-8",
+        )
+        audit = validate_native_result_records(
+            results_path, candidate_queue, expected_rows=3
+        )
+        ability_coverage = evaluate_ability_positive_coverage(
+            {"ability_positive": 1, "ability_zero": 2},
+            audit,
+            minimum_success_count=1,
+            minimum_success_rate=0.10,
+            waived=False,
+            waiver_reason=None,
+        )
+        receipt = root / "native-generation-coverage.json"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "kind": "cr_expert_native_generation_coverage_v2",
+                    "created_utc": "2026-08-27T00:00:00+00:00",
+                    "frozen_manifest": file_fingerprint(index),
+                    "candidate_queue": file_fingerprint(candidate_queue),
+                    "results": file_fingerprint(results_path),
+                    "native_contract": native_contract_binding(contract),
+                    "target_battles": 3,
+                    "selected_battles": 3,
+                    "processed_battles": 3,
+                    "teacher_forced_successes": 3,
+                    "teacher_forced_failures": 0,
+                    "stored_episodes": 3,
+                    "success_rate": 1.0,
+                    "minimum_success_rate": 0.50,
+                    "ability_coverage": ability_coverage,
+                    "failure_class_counts": {},
+                    "failure_domain_counts": {},
+                    "terminal_diagnostic_counts": {},
+                    "queue_counts": {},
+                    "native_actions_attempted": 0,
+                    "native_actions_accepted": 0,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return tick_root, index, contract, receipt
 
     def test_end_to_end_actor_safe_content_addressed_compile(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             plan = create_compile_plan(
                 tick_root,
                 source,
                 output,
                 contract,
+                receipt,
                 maximum_rows_per_shard=10_000,
                 io_workers=2,
             )
@@ -366,6 +446,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                 source,
                 output,
                 contract,
+                receipt,
                 maximum_rows_per_shard=10_000,
                 io_workers=2,
             )
@@ -400,6 +481,15 @@ class NativeBcCompilerTests(unittest.TestCase):
             self.assertLess(capacity["sample_bytes_per_actor_row"], 4_608)
             self.assertEqual(
                 manifest["capacity_preflight"], plan["capacity_preflight"]
+            )
+            published_coverage = manifest["native_generation_coverage"]
+            self.assertEqual(
+                published_coverage["receipt_sha256"],
+                hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(
+                published_coverage["ability_coverage"],
+                json.loads(receipt.read_text())["ability_coverage"],
             )
             self.assertEqual(manifest["quality_gates"]["split_collisions"], 0)
             assignments = [
@@ -445,19 +535,21 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_missing_mask_sidecar_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             sidecar = next((tick_root / "deployment-masks-v1").glob("[0-9a-f][0-9a-f]/*.json"))
             sidecar.unlink()
             with self.assertRaises(DeploymentMaskContractError):
-                create_compile_plan(tick_root, source, root / "compiled", contract)
+                create_compile_plan(
+                    tick_root, source, root / "compiled", contract, receipt
+                )
 
     def test_fully_resigned_shard_metadata_forgery_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             plan = create_compile_plan(
-                tick_root, source, output, contract,
+                tick_root, source, output, contract, receipt,
                 maximum_rows_per_shard=10_000,
             )
             compile_planned_shards(plan, process_workers=1)
@@ -489,7 +581,7 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_capacity_preflight_is_bound_and_low_disk_fails_before_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             disk_usage = type("DiskUsage", (), {"total": 1024**4, "used": 0, "free": 1})()
             with patch(
@@ -502,6 +594,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                         source,
                         output,
                         contract,
+                        receipt,
                         maximum_rows_per_shard=10_000,
                     )
             self.assertFalse((output / "compile-plan.json").exists())
@@ -514,13 +607,14 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_capacity_preflight_mutation_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             create_compile_plan(
                 tick_root,
                 source,
                 output,
                 contract,
+                receipt,
                 maximum_rows_per_shard=10_000,
             )
             path = output / "capacity-preflight.json"
@@ -530,13 +624,118 @@ class NativeBcCompilerTests(unittest.TestCase):
             with self.assertRaisesRegex(NativeBcCompileError, "capacity preflight"):
                 load_compile_plan(output / "compile-plan.json")
 
+    def test_native_coverage_receipt_sha_is_bound_to_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(root)
+            output = root / "compiled"
+            create_compile_plan(
+                tick_root, source, output, contract, receipt,
+                maximum_rows_per_shard=10_000,
+            )
+            receipt.write_text(receipt.read_text() + " ", encoding="utf-8")
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "native generation receipt changed"
+            ):
+                load_compile_plan(output / "compile-plan.json")
+
+    def test_ability_failures_require_explicit_waiver_at_compiler_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(root)
+            value = json.loads(receipt.read_text())
+            candidate_queue = Path(value["candidate_queue"]["path"])
+            results_path = Path(value["results"]["path"])
+            candidate_rows = [
+                {
+                    "battle_tag": f"SCHEMA5FIXTURE{number}",
+                    "ability_events_observed": 0,
+                }
+                for number in range(3)
+            ] + [{"battle_tag": "ABILITYFAIL", "ability_events_observed": 1}]
+            result_rows = [
+                {
+                    "kind": "expert_authoritative_native_tick_result_v1",
+                    "battle_tag": f"SCHEMA5FIXTURE{number}",
+                    "final_attempt": True,
+                    "teacher_forced_success": True,
+                }
+                for number in range(3)
+            ] + [
+                {
+                    "kind": "expert_authoritative_native_tick_result_v1",
+                    "battle_tag": "ABILITYFAIL",
+                    "final_attempt": True,
+                    "teacher_forced_success": False,
+                    "failure_class": "semantic",
+                }
+            ]
+            candidate_queue.write_text(
+                "".join(json.dumps(row) + "\n" for row in candidate_rows),
+                encoding="utf-8",
+            )
+            results_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in result_rows),
+                encoding="utf-8",
+            )
+            audit = validate_native_result_records(
+                results_path, candidate_queue, expected_rows=4
+            )
+            ability = evaluate_ability_positive_coverage(
+                {"ability_positive": 1, "ability_zero": 3},
+                audit,
+                minimum_success_count=1,
+                minimum_success_rate=0.10,
+                waived=False,
+                waiver_reason=None,
+            )
+            value.update(
+                target_battles=4,
+                selected_battles=4,
+                processed_battles=4,
+                teacher_forced_successes=3,
+                teacher_forced_failures=1,
+                stored_episodes=3,
+                success_rate=0.75,
+                ability_coverage=ability,
+                candidate_queue=file_fingerprint(candidate_queue),
+                results=file_fingerprint(results_path),
+                failure_class_counts={"semantic": 1},
+            )
+            receipt.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "ability coverage receipt is not admitted"
+            ):
+                create_compile_plan(
+                    tick_root, source, root / "rejected", contract, receipt,
+                    maximum_rows_per_shard=10_000,
+                )
+
+            value["ability_coverage"] = evaluate_ability_positive_coverage(
+                {"ability_positive": 1, "ability_zero": 3},
+                audit,
+                minimum_success_count=1,
+                minimum_success_rate=0.10,
+                waived=True,
+                waiver_reason="known issue CR-ABILITY-1",
+            )
+            receipt.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            plan = create_compile_plan(
+                tick_root, source, root / "waived", contract, receipt,
+                maximum_rows_per_shard=10_000,
+            )
+            self.assertEqual(
+                plan["inputs"]["native_generation_receipt_sha256"],
+                hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            )
+
     def test_fully_resigned_capacity_arithmetic_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             create_compile_plan(
-                tick_root, source, output, contract,
+                tick_root, source, output, contract, receipt,
                 maximum_rows_per_shard=10_000,
             )
             capacity_path = output / "capacity-preflight.json"
@@ -661,10 +860,10 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_worker_count_is_capacity_clamped_and_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             plan = create_compile_plan(
-                tick_root, source, output, contract,
+                tick_root, source, output, contract, receipt,
                 maximum_rows_per_shard=10_000,
             )
             compile_planned_shards(plan, process_workers=64)
@@ -681,13 +880,14 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_resigned_legacy_dense_multi_terabyte_plan_cannot_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
             create_compile_plan(
                 tick_root,
                 source,
                 output,
                 contract,
+                receipt,
                 maximum_rows_per_shard=10_000,
             )
             path = output / "compile-plan.json"
@@ -742,7 +942,7 @@ class NativeBcCompilerTests(unittest.TestCase):
         ):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                tick_root, source, contract = self._inputs(
+                tick_root, source, contract, receipt = self._inputs(
                     root,
                     source_contract_mismatch=field == "source_canonical",
                     source_contract_file_mismatch=field == "source_file",
@@ -754,15 +954,18 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "contract differs from CLI contract",
                 ):
                     create_compile_plan(
-                        tick_root, source, root / "compiled", contract, io_workers=2
+                        tick_root, source, root / "compiled", contract, receipt,
+                        io_workers=2
                     )
 
     def test_resigned_hand_edited_compile_plan_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             output = root / "compiled"
-            create_compile_plan(tick_root, source, output, contract, io_workers=2)
+            create_compile_plan(
+                tick_root, source, output, contract, receipt, io_workers=2
+            )
             path = output / "compile-plan.json"
             sidecar = output / "compile-plan.sha256"
             original = json.loads(path.read_text(encoding="utf-8"))
@@ -845,7 +1048,7 @@ class NativeBcCompilerTests(unittest.TestCase):
     def test_source_mutation_after_tick_capture_fails_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tick_root, source, contract = self._inputs(root)
+            tick_root, source, contract, receipt = self._inputs(root)
             # Make battle 1 share a player with battle 0.  The corresponding
             # Tick source SHA must change too, so this mutation correctly trips
             # content identity before a leaky split can be published.
@@ -858,7 +1061,9 @@ class NativeBcCompilerTests(unittest.TestCase):
             rows[1]["source_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
             source.write_text("".join(json.dumps(row) + "\n" for row in rows))
             with self.assertRaises(NativeBcCompileError):
-                create_compile_plan(tick_root, source, root / "compiled", contract)
+                create_compile_plan(
+                    tick_root, source, root / "compiled", contract, receipt
+                )
 
 
 if __name__ == "__main__":
