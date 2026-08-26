@@ -192,17 +192,29 @@ class NativeRoyaleEnv:
         state = self._request({"op": "observe_train_v1"})["state"]
         return self._enrich_training_state(state)
 
-    def _enrich_training_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _validate_training_state(state: Mapping[str, Any]) -> None:
+        """Validate the raw compact observation without expanding it.
+
+        The batched Tick-store path intentionally keeps this transport form:
+        enriching every frame with names and duplicated hand objects costs
+        memory and CPU but adds no native state.
+        """
         if (
             state.get("schema_version") != 1
             or state.get("kind") != "libg_native_train_state_v1"
             or state.get("coherent") is not True
+            or not isinstance(state.get("tick"), int)
+            or isinstance(state.get("tick"), bool)
             or not isinstance(state.get("entities"), list)
             or not isinstance(state.get("players"), list)
             or len(state["players"]) != 2
             or not isinstance(state.get("episode"), Mapping)
         ):
             raise NativeHostError("compact training observation contract mismatch")
+
+    def _enrich_training_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        self._validate_training_state(state)
         return self._enrich_state(state)
 
     def _enrich_state(self, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -475,6 +487,121 @@ class NativeRoyaleEnv:
             steps=steps,
             max_response_bytes=max_response_bytes,
         )
+
+    def trace_train(
+        self,
+        steps: int = 1,
+        *,
+        trace_schema_version: int = TRACE_SCHEMA_VERSION,
+        max_response_bytes: int = MAX_TRACE_RESPONSE_BYTES,
+    ) -> dict[str, Any]:
+        """Advance up to 64 native 20 Hz Ticks in one compact RPC.
+
+        Frames stay in raw ``observe_train_v1`` form so the Tick-store can
+        normalize and delta-encode them without first allocating GUI/debug
+        enrichments.  The initial frame is the pre-transition boundary and
+        each complete frame is one authoritative 50 ms transition later.
+        """
+        if not 1 <= steps <= MAX_TRACE_STEPS:
+            raise ValueError("trace steps must be in 1..64")
+        if trace_schema_version != TRACE_SCHEMA_VERSION:
+            raise ValueError("trace_schema_version must be 1")
+        if not (
+            MIN_TRACE_RESPONSE_BYTES
+            <= max_response_bytes
+            <= MAX_TRACE_RESPONSE_BYTES
+        ):
+            raise ValueError(
+                "max_response_bytes must be in 65536..33554432"
+            )
+        raw = self._request(
+            {
+                "op": "step_train_trace_v1",
+                "steps": steps,
+                "trace_schema_version": trace_schema_version,
+                "max_response_bytes": max_response_bytes,
+            }
+        )["result"]
+        return self._decode_train_trace_result(
+            raw,
+            steps=steps,
+            max_response_bytes=max_response_bytes,
+        )
+
+    def _decode_train_trace_result(
+        self,
+        raw: Any,
+        *,
+        steps: int,
+        max_response_bytes: int,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, Mapping):
+            raise NativeHostError("compact Tick trace result must be an object")
+        result = deepcopy(dict(raw))
+        if (
+            result.get("schema_version") != 1
+            or result.get("trace_schema_version") != TRACE_SCHEMA_VERSION
+            or result.get("kind") != "libg_native_train_tick_trace_v1"
+            or result.get("encoding") != "compact-train-v1"
+            or result.get("fixed_dt") != 0.05
+            or result.get("requested_steps") != steps
+            or result.get("max_response_bytes") != max_response_bytes
+        ):
+            raise NativeHostError("compact Tick trace protocol/version mismatch")
+        stepped = result.get("stepped")
+        frames = result.get("frames")
+        initial = result.get("initial_frame")
+        if (
+            not isinstance(stepped, int)
+            or isinstance(stepped, bool)
+            or not 0 <= stepped <= steps
+            or not isinstance(frames, list)
+            or len(frames) != stepped
+            or not isinstance(initial, Mapping)
+            or result.get("final_frame_index") != stepped
+        ):
+            raise NativeHostError("compact Tick trace frame count mismatch")
+
+        previous_tick: int | None = None
+        for index, frame in enumerate([initial, *frames]):
+            if (
+                not isinstance(frame, Mapping)
+                or frame.get("frame_index") != index
+                or frame.get("advanced_steps") != index
+                or not isinstance(frame.get("observation_complete"), bool)
+                or not isinstance(frame.get("state"), Mapping)
+                or "step" in frame
+            ):
+                raise NativeHostError("compact Tick trace frame contract mismatch")
+            state = frame["state"]
+            if frame["observation_complete"]:
+                self._validate_training_state(state)
+                tick = int(state["tick"])
+                if previous_tick is not None and tick != previous_tick + 1:
+                    raise NativeHostError(
+                        f"compact Tick trace is not consecutive: "
+                        f"{previous_tick}->{tick}"
+                    )
+                previous_tick = tick
+            elif index != stepped or result.get("terminal") is not True:
+                raise NativeHostError(
+                    "incomplete compact observation is only valid at terminal"
+                )
+
+        if result.get("initial_tick") != int(initial["state"]["tick"]):
+            raise NativeHostError("compact Tick trace initial tick mismatch")
+        final = frames[-1] if frames else initial
+        if result.get("final_tick") != int(final["state"]["tick"]):
+            raise NativeHostError("compact Tick trace final tick mismatch")
+        final_episode = final["state"].get("episode")
+        if result.get("terminal") is True and (
+            not isinstance(final_episode, Mapping)
+            or not final_episode.get("terminated", False)
+        ):
+            raise NativeHostError("compact Tick trace terminal frame is missing")
+        if isinstance(final_episode, Mapping):
+            self.last_episode = self._enrich_episode(final_episode)
+        return result
 
     def joint_transition_trace(
         self,

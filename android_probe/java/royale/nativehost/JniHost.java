@@ -65,6 +65,10 @@ public final class JniHost {
         String libgPath, int steps, int traceSchemaVersion,
         int maxResponseBytes
     );
+    private static native String nativeStepTrainTrace(
+        String libgPath, int steps, int traceSchemaVersion,
+        int maxResponseBytes
+    );
     private static native String nativeObserve(String libgPath);
     private static native String nativeObserveTrain(String libgPath);
     private static native String nativeAct(
@@ -661,7 +665,17 @@ public final class JniHost {
                                 .getJSONObject("episode")
                                 .optBoolean("terminated", false);
                         } else if ("step_trace".equals(op)) {
-                            JSONObject traceResult = executeStepTrace(root, request);
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, false
+                            );
+                            response.put("result", traceResult);
+                            terminalEpisodeLatched = traceResult.optBoolean(
+                                "terminal", false
+                            );
+                        } else if ("step_train_trace_v1".equals(op)) {
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, true
+                            );
                             response.put("result", traceResult);
                             terminalEpisodeLatched = traceResult.optBoolean(
                                 "terminal", false
@@ -674,7 +688,9 @@ public final class JniHost {
                                     root, request.getJSONArray("actions")
                                 )
                             );
-                            JSONObject traceResult = executeStepTrace(root, request);
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, false
+                            );
                             result.put("trace", traceResult);
                             result.put("episode", finalTraceEpisode(traceResult));
                             response.put("result", result);
@@ -834,7 +850,7 @@ public final class JniHost {
     }
 
     private static JSONObject executeStepTrace(
-        String root, JSONObject request
+        String root, JSONObject request, boolean compactTraining
     ) throws Exception {
         int traceSchemaVersion = request.optInt("trace_schema_version", -1);
         if (traceSchemaVersion != TRACE_SCHEMA_VERSION) {
@@ -857,9 +873,15 @@ public final class JniHost {
                 "step_trace max_response_bytes must be in 65536..33554432"
             );
         }
-        String traceJson = nativeStepTrace(
-            root + "/libg.so", steps, traceSchemaVersion, maxResponseBytes
-        );
+        String traceJson = compactTraining
+            ? nativeStepTrainTrace(
+                root + "/libg.so", steps, traceSchemaVersion,
+                maxResponseBytes
+            )
+            : nativeStepTrace(
+                root + "/libg.so", steps, traceSchemaVersion,
+                maxResponseBytes
+            );
         if (traceJson.getBytes(StandardCharsets.UTF_8).length
             > maxResponseBytes) {
             throw new IllegalStateException(
@@ -873,8 +895,17 @@ public final class JniHost {
         if (traceResult.getInt("schema_version") != 1
             || traceResult.getInt("trace_schema_version")
                 != TRACE_SCHEMA_VERSION
-            || !"libg_native_tick_trace".equals(traceResult.getString("kind"))
-            || !"full-v1".equals(traceResult.getString("encoding"))
+            || !(compactTraining
+                ? "libg_native_train_tick_trace_v1"
+                : "libg_native_tick_trace").equals(
+                    traceResult.getString("kind")
+                )
+            || !(compactTraining ? "compact-train-v1" : "full-v1").equals(
+                traceResult.getString("encoding")
+            )
+            || traceResult.getDouble("fixed_dt") != 0.05d
+            || traceResult.getInt("initial_tick")
+                != initialFrame.getJSONObject("state").getInt("tick")
             || traceResult.getInt("requested_steps") != steps
             || traceResult.getInt("max_response_bytes") != maxResponseBytes
             || stepped < 0 || stepped > steps || frames.length() != stepped
@@ -892,7 +923,9 @@ public final class JniHost {
             if (frame.getInt("frame_index") != index + 1
                 || frame.getInt("advanced_steps") != index + 1
                 || !frame.has("observation_complete")
-                || !frame.has("step") || !frame.has("state")) {
+                || (!compactTraining && !frame.has("step"))
+                || (compactTraining && frame.has("step"))
+                || !frame.has("state")) {
                 throw new IllegalStateException(
                     "native step_trace frame mismatch"
                 );
@@ -902,6 +935,14 @@ public final class JniHost {
             && !finalTraceEpisode(traceResult).optBoolean("terminated", false)) {
             throw new IllegalStateException(
                 "native step_trace terminal frame mismatch"
+            );
+        }
+        JSONObject finalFrame = stepped == 0
+            ? initialFrame : frames.getJSONObject(stepped - 1);
+        if (traceResult.getInt("final_tick")
+            != finalFrame.getJSONObject("state").getInt("tick")) {
+            throw new IllegalStateException(
+                "native step_trace final tick mismatch"
             );
         }
         return traceResult;

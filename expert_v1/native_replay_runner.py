@@ -26,6 +26,7 @@ from .native_replay_plan import (
     materialize_replay,
     native_layout_order,
 )
+from .tick_store_v1 import TickTraceAccumulator
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,10 @@ class NativeReplayResult:
     source_crowns: tuple[int, int] | None
     observed_crowns: tuple[int, int] | None
     decision_records: tuple[dict[str, Any], ...]
+    tick_trace_batches: int
+    tick_trace_complete_frames: int
+    tick_trace_incomplete_terminal_frames: int
+    tick_store_entry: dict[str, Any] | None
 
     def json(self) -> dict[str, Any]:
         return {
@@ -156,6 +161,50 @@ def _compact_decision_state(
     }
 
 
+def _advance_native(
+    env: NativeRoyaleEnv,
+    steps: int,
+    accumulator: TickTraceAccumulator | None,
+    *,
+    trace_batch_steps: int,
+) -> dict[str, Any]:
+    """Advance normally or capture every Tick through compact batch RPCs."""
+    if steps <= 0:
+        raise ValueError("native advance must be positive")
+    if accumulator is None:
+        return env.step(steps)
+    remaining = steps
+    stepped_total = 0
+    final_state: Mapping[str, Any] | None = None
+    terminal = False
+    while remaining > 0 and not terminal:
+        requested = min(remaining, trace_batch_steps)
+        trace = env.trace_train(requested)
+        accumulator.extend(trace)
+        stepped = int(trace["stepped"])
+        if stepped <= 0 and not trace.get("terminal", False):
+            raise RuntimeError("compact native Tick trace made no progress")
+        stepped_total += stepped
+        remaining -= stepped
+        terminal = bool(trace.get("terminal", False))
+        final_frame = (
+            trace["frames"][-1]
+            if trace["frames"]
+            else trace["initial_frame"]
+        )
+        final_state = final_frame["state"]
+    if final_state is None:
+        raise RuntimeError("compact native Tick trace returned no state")
+    return {
+        "requested_steps": steps,
+        "stepped": stepped_total,
+        "battle_active": not terminal,
+        "fixed_dt": 0.05,
+        "tick_after": int(final_state["tick"]),
+        "episode": dict(final_state["episode"]),
+    }
+
+
 def execute_plan(
     env: NativeRoyaleEnv,
     plan: BattlePlan,
@@ -165,8 +214,13 @@ def execute_plan(
     seed: int = DEFAULT_NATIVE_SEED,
     capture_decisions: bool = True,
     ability_branch_choices: Mapping[int, int] | None = None,
+    tick_sink: Any | None = None,
+    tick_store_metadata: Mapping[str, Any] | None = None,
+    trace_batch_steps: int = 64,
 ) -> NativeReplayResult:
     """Replay one battle with gap-batched native stepping."""
+    if tick_sink is not None and not 1 <= trace_batch_steps <= 64:
+        raise ValueError("trace_batch_steps must be in 1..64")
     started = time.perf_counter()
     reset_seconds = step_seconds = observe_seconds = action_seconds = 0.0
     native_ticks = accepted_actions = 0
@@ -179,6 +233,8 @@ def execute_plan(
     terminal_validated = False
     terminal_match: bool | None = None
     observed_crowns: tuple[int, int] | None = None
+    tick_store_entry: dict[str, Any] | None = None
+    tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
     replay, mappings = materialize_replay(
         plan, template, calibration, seed=seed
     )
@@ -197,6 +253,10 @@ def execute_plan(
     state = env.reset(replay, warmup_steps=10)
     reset_seconds += time.perf_counter() - reset_started
     final_tick = int(state["tick"])
+    if tick_accumulator is not None:
+        observe_started = time.perf_counter()
+        tick_accumulator.start(env.observe_train())
+        observe_seconds += time.perf_counter() - observe_started
 
     # Verify that card identities did not perturb the calibrated shuffle.
     players = sorted(state["players"], key=lambda item: int(item["side"]))
@@ -225,7 +285,10 @@ def execute_plan(
             gap = source_tick - final_tick
             if gap:
                 step_started = time.perf_counter()
-                native_step = env.step(gap)
+                native_step = _advance_native(
+                    env, gap, tick_accumulator,
+                    trace_batch_steps=trace_batch_steps,
+                )
                 step_seconds += time.perf_counter() - step_started
                 native_ticks += gap
                 episode = native_step.get("episode", {})
@@ -389,7 +452,10 @@ def execute_plan(
         # libg emit the terminal object without accepting an unbounded run.
         remaining = max(1, plan.duration_ticks + 20 - final_tick)
         step_started = time.perf_counter()
-        final_step = env.step(remaining)
+        final_step = _advance_native(
+            env, remaining, tick_accumulator,
+            trace_batch_steps=trace_batch_steps,
+        )
         step_seconds += time.perf_counter() - step_started
         native_ticks += max(0, int(final_step.get("stepped", remaining)))
         final_tick = int(final_step.get("tick_after", final_tick + remaining))
@@ -411,6 +477,24 @@ def execute_plan(
         and accepted_actions == len(plan.actions) + len(plan.ability_events)
         and missing_ability_events == 0
     )
+    if teacher_forced_success and tick_sink is not None:
+        assert tick_accumulator is not None
+        metadata = {
+            **tick_accumulator.metadata(),
+            **dict(tick_store_metadata or {}),
+            "state_provenance": plan.state_provenance,
+            "action_provenance": plan.action_provenance,
+            "ability_provenance": plan.ability_provenance,
+            "terminal_provenance": plan.terminal_provenance,
+            "source_actions": len(plan.actions) + len(plan.ability_events),
+        }
+        try:
+            tick_store_entry = dict(tick_sink.append(
+                plan.battle_tag, tick_accumulator.states, metadata
+            ))
+        except Exception as error:
+            failure = f"tick_store_write_{type(error).__name__}:{error}"
+            teacher_forced_success = False
     if plan.terminal_crowns is None:
         terminal_diagnostic_status = "not_requested"
     elif terminal_validated and terminal_match:
@@ -452,6 +536,18 @@ def execute_plan(
         source_crowns=plan.terminal_crowns,
         observed_crowns=observed_crowns,
         decision_records=tuple(records),
+        tick_trace_batches=(
+            0 if tick_accumulator is None else tick_accumulator.batches
+        ),
+        tick_trace_complete_frames=(
+            0 if tick_accumulator is None
+            else tick_accumulator.complete_frames
+        ),
+        tick_trace_incomplete_terminal_frames=(
+            0 if tick_accumulator is None
+            else tick_accumulator.incomplete_terminal_frames
+        ),
+        tick_store_entry=tick_store_entry,
     )
 
 

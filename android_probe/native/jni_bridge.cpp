@@ -1479,18 +1479,19 @@ static jstring observe_state_json(
   size_t emitted = 0;
   for (const ObservedEntity& entity : observed) {
     if (compact_training) {
-      char compact_row[384];
+      char compact_row[512];
       std::snprintf(
           compact_row, sizeof(compact_row),
           "%s{\"category\":%d,\"side\":%d,\"x\":%d,\"y\":%d,"
-          "\"card_id\":%d,\"hp\":%d,\"max_hp\":%d,"
+          "\"card_id\":%d,\"level\":%d,\"hp\":%d,\"max_hp\":%d,"
           "\"behavior_state\":%d,\"ability_slot\":%d,"
           "\"ability_state_code\":%d,\"ability_available\":%s,"
           "\"ability_cooldown_remaining_ms\":%d,"
           "\"ability_charges_remaining\":%d,\"ability_pending_ms\":%d,"
           "\"ability_mana_cost\":%d}",
           emitted == 0 ? "" : ",", entity.category, entity.side,
-          entity.x, entity.y, entity.card_id, entity.hp, entity.max_hp,
+          entity.x, entity.y, entity.card_id, entity.level,
+          entity.hp, entity.max_hp,
           entity.behavior, entity.ability_slot, entity.ability_state_code,
           entity.ability_available ? "true" : "false",
           entity.ability_cooldown_remaining_ms,
@@ -2194,31 +2195,36 @@ bool take_jstring(JNIEnv* env, jstring value, std::string* output) {
   return !env->ExceptionCheck();
 }
 
-std::string terminal_trace_observation() {
-  std::string result =
-      "{\"schema_version\":1,\"kind\":\"libg_native_terminal_state\",";
+std::string terminal_trace_observation(bool compact_training) {
+  std::string result = compact_training
+      ? "{\"schema_version\":1,\"kind\":"
+        "\"libg_native_terminal_train_state_v1\","
+      : "{\"schema_version\":1,\"kind\":\"libg_native_terminal_state\",";
   result += "\"tick\":" + std::to_string(g_episode.tick);
   result += ",\"applied_replay_tick\":-1,\"entities\":[],\"effects\":[]";
   result += ",\"projectiles\":[],\"players\":[]";
   result += ",\"entity_count\":0,\"coherent\":false";
   result += ",\"tick_after\":" + std::to_string(g_episode.tick);
-  result += ",\"rng_algorithm\":\"libg_xorshift32_v150535029\"";
-  result += ",\"rng_state\":null,\"state_hash\":\"unavailable\"";
-  result += ",\"state_hash_scope\":\"public-observe-v6\"";
-  result += ",\"state_hash_certificate\":false,\"episode\":";
+  if (!compact_training) {
+    result += ",\"rng_algorithm\":\"libg_xorshift32_v150535029\"";
+    result += ",\"rng_state\":null,\"state_hash\":\"unavailable\"";
+    result += ",\"state_hash_scope\":\"public-observe-v6\"";
+    result += ",\"state_hash_certificate\":false";
+  }
+  result += ",\"episode\":";
   result += episode_json();
   result.push_back('}');
   return result;
 }
 
 // One JNI boundary advances up to 64 authoritative 50 ms ticks and samples
-// the public nativeObserve contract after every completed tick.  full-v1 is
-// intentionally lossless; a future delta encoding can be added under a new
-// trace schema/encoding without changing nativeStep or nativeObserve.
-extern "C" JNIEXPORT jstring JNICALL
-Java_royale_nativehost_JniHost_nativeStepTrace(
+// either the full public debug observation or the compact training
+// observation after every completed tick.  The compact transport omits the
+// duplicate nativeStep JSON because the episode is embedded in each state.
+static jstring native_step_trace(
     JNIEnv* env, jclass clazz, jstring libg_path, jint steps,
-    jint trace_schema_version, jint max_response_bytes) {
+    jint trace_schema_version, jint max_response_bytes,
+    bool compact_training) {
   if (trace_schema_version != kTraceSchemaVersion) {
     throw_state(env, "unsupported native tick trace schema_version");
     return nullptr;
@@ -2234,8 +2240,11 @@ Java_royale_nativehost_JniHost_nativeStepTrace(
     return nullptr;
   }
   const size_t response_limit = static_cast<size_t>(max_response_bytes);
-  jstring initial_value = Java_royale_nativehost_JniHost_nativeObserve(
-      env, clazz, libg_path);
+  jstring initial_value = compact_training
+      ? Java_royale_nativehost_JniHost_nativeObserveTrain(
+            env, clazz, libg_path)
+      : Java_royale_nativehost_JniHost_nativeObserve(
+            env, clazz, libg_path);
   std::string initial_state;
   if (!take_jstring(env, initial_value, &initial_state)) {
     return nullptr;
@@ -2247,15 +2256,20 @@ Java_royale_nativehost_JniHost_nativeStepTrace(
   result.reserve(std::min(
       response_limit, initial_state.size() * static_cast<size_t>(steps + 1) +
                           static_cast<size_t>(4096)));
-  char header[256];
+  const int32_t initial_tick = g_episode.tick;
+  char header[384];
   std::snprintf(
       header, sizeof(header),
-      "{\"schema_version\":1,\"kind\":\"libg_native_tick_trace\","
-      "\"trace_schema_version\":1,\"encoding\":\"full-v1\","
+      "{\"schema_version\":1,\"kind\":\"%s\","
+      "\"trace_schema_version\":1,\"encoding\":\"%s\","
+      "\"fixed_dt\":0.05,\"initial_tick\":%d,"
       "\"requested_steps\":%d,\"max_response_bytes\":%d,"
       "\"initial_frame\":{\"frame_index\":0,\"advanced_steps\":0,"
       "\"observation_complete\":%s,\"state\":",
-      steps, max_response_bytes,
+      compact_training ? "libg_native_train_tick_trace_v1"
+                       : "libg_native_tick_trace",
+      compact_training ? "compact-train-v1" : "full-v1",
+      initial_tick, steps, max_response_bytes,
       initial_observation_complete ? "true" : "false");
   if (!append_trace_literal(env, &result, header, response_limit) ||
       !append_trace_part(env, &result, initial_state, response_limit) ||
@@ -2267,6 +2281,7 @@ Java_royale_nativehost_JniHost_nativeStepTrace(
   bool terminal = g_episode.terminated;
   for (jint frame_index = 1; frame_index <= steps && !terminal;
        ++frame_index) {
+    const int32_t tick_before_step = g_episode.tick;
     jstring step_value = Java_royale_nativehost_JniHost_nativeStep(
         env, clazz, libg_path, 1);
     std::string step_result;
@@ -2276,8 +2291,11 @@ Java_royale_nativehost_JniHost_nativeStepTrace(
     ++completed;
     terminal = g_episode.terminated;
 
-    jstring observation_value = Java_royale_nativehost_JniHost_nativeObserve(
-        env, clazz, libg_path);
+    jstring observation_value = compact_training
+        ? Java_royale_nativehost_JniHost_nativeObserveTrain(
+              env, clazz, libg_path)
+        : Java_royale_nativehost_JniHost_nativeObserve(
+              env, clazz, libg_path);
     std::string observation;
     bool observation_available = take_jstring(
         env, observation_value, &observation);
@@ -2291,35 +2309,65 @@ Java_royale_nativehost_JniHost_nativeStepTrace(
       if (env->ExceptionCheck()) {
         env->ExceptionClear();
       }
-      observation = terminal_trace_observation();
+      observation = terminal_trace_observation(compact_training);
     }
     const bool observation_complete = observation_available &&
-        observation.find("\"coherent\":true") != std::string::npos;
-    char frame_header[192];
-    std::snprintf(
-        frame_header, sizeof(frame_header),
-        "%s{\"frame_index\":%d,\"advanced_steps\":%d,"
-        "\"observation_complete\":%s,\"step\":",
-        completed == 1 ? "" : ",", frame_index, completed,
-        observation_complete ? "true" : "false");
-    if (!append_trace_literal(
-            env, &result, frame_header, response_limit) ||
-        !append_trace_part(env, &result, step_result, response_limit) ||
-        !append_trace_literal(env, &result, ",\"state\":", response_limit) ||
+        observation.find("\"coherent\":true") != std::string::npos &&
+        (!compact_training || g_episode.tick == tick_before_step + 1);
+    char frame_header[224];
+    if (compact_training) {
+      std::snprintf(
+          frame_header, sizeof(frame_header),
+          "%s{\"frame_index\":%d,\"advanced_steps\":%d,"
+          "\"observation_complete\":%s,\"state\":",
+          completed == 1 ? "" : ",", frame_index, completed,
+          observation_complete ? "true" : "false");
+    } else {
+      std::snprintf(
+          frame_header, sizeof(frame_header),
+          "%s{\"frame_index\":%d,\"advanced_steps\":%d,"
+          "\"observation_complete\":%s,\"step\":",
+          completed == 1 ? "" : ",", frame_index, completed,
+          observation_complete ? "true" : "false");
+    }
+    if (!append_trace_literal(env, &result, frame_header, response_limit) ||
+        (!compact_training &&
+         (!append_trace_part(env, &result, step_result, response_limit) ||
+          !append_trace_literal(
+              env, &result, ",\"state\":", response_limit))) ||
         !append_trace_part(env, &result, observation, response_limit) ||
         !append_trace_literal(env, &result, "}", response_limit)) {
       return nullptr;
     }
   }
-  char footer[160];
+  char footer[224];
   std::snprintf(
       footer, sizeof(footer),
-      "],\"stepped\":%d,\"terminal\":%s,\"final_frame_index\":%d}",
-      completed, terminal ? "true" : "false", completed);
+      "],\"stepped\":%d,\"terminal\":%s,\"final_frame_index\":%d,"
+      "\"final_tick\":%d}",
+      completed, terminal ? "true" : "false", completed, g_episode.tick);
   if (!append_trace_literal(env, &result, footer, response_limit)) {
     return nullptr;
   }
   return env->NewStringUTF(result.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeStepTrace(
+    JNIEnv* env, jclass clazz, jstring libg_path, jint steps,
+    jint trace_schema_version, jint max_response_bytes) {
+  return native_step_trace(
+      env, clazz, libg_path, steps, trace_schema_version,
+      max_response_bytes, false);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeStepTrainTrace(
+    JNIEnv* env, jclass clazz, jstring libg_path, jint steps,
+    jint trace_schema_version, jint max_response_bytes) {
+  return native_step_trace(
+      env, clazz, libg_path, steps, trace_schema_version,
+      max_response_bytes, true);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
