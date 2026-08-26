@@ -8,12 +8,16 @@ import unittest
 from unittest import mock
 
 from expert_v1.one_click_v1 import (
+    CollectionRuntimeFence,
     OneClickConfig,
     OneClickError,
     OneClickLock,
     OneClickOrchestrator,
     STAGES,
     _crawler_active,
+    _crawler_process_runtime_evidence,
+    _supervisor_process_runtime_evidence,
+    _patchright_browser_runtime_files,
     _default_config,
     build_parser,
     main,
@@ -28,6 +32,7 @@ from expert_v1.one_click_v1 import (
     training_smoke_command,
     validate_native_result_records,
     validate_schema5_candidate_queue,
+    runtime_tree_fingerprint,
     value_fingerprint,
 )
 
@@ -620,6 +625,331 @@ class ExpertOneClickV1Test(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(OneClickError, "another config"):
                     _crawler_active(config)
+
+    def test_collect_poll_fails_closed_on_runtime_sha_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crawler-runtime.py"
+            runtime.write_text("value=1\n", encoding="utf-8")
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root / "crawler",
+                crawler_python=root / "crawler-python.exe",
+                training_python=root / "python.exe",
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+                target=2,
+                poll_seconds=0.01,
+            )
+            fingerprint = file_fingerprint(runtime)
+            fence = CollectionRuntimeFence(
+                inputs=(fingerprint,),
+                legacy_inputs=(fingerprint,),
+                crawler_runtime_inputs=(fingerprint,),
+                supervisor_runtime_inputs=(fingerprint,),
+                supervisor_process_evidence={"runtime_files_predate_process": True},
+            )
+            orchestrator = OneClickOrchestrator(config)
+
+            def tamper(_seconds: float) -> None:
+                # Same byte length proves this is content SHA, not a size gate.
+                runtime.write_text("value=2\n", encoding="utf-8")
+
+            with (
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_settings",
+                    return_value={},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_db_invariants",
+                    return_value={},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._collection_runtime_fence",
+                    return_value=fence,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_count",
+                    return_value=0,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._crawler_active",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._crawler_process_runtime_evidence",
+                    return_value={"runtime_files_predate_process": True},
+                ),
+                mock.patch.object(orchestrator, "sleep", side_effect=tamper),
+            ):
+                with self.assertRaisesRegex(OneClickError, "artifact SHA changed"):
+                    orchestrator.collect()
+            state = json.loads(config.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                state["last_error"]["stage"], "collect_schema5_v3"
+            )
+
+    def test_collect_target_fence_catches_same_iteration_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crawler-runtime.py"
+            runtime.write_text("value=1\n", encoding="utf-8")
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root / "crawler",
+                crawler_python=root / "crawler-python.exe",
+                training_python=root / "python.exe",
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+                target=1,
+            )
+            fingerprint = file_fingerprint(runtime)
+            fence = CollectionRuntimeFence(
+                inputs=(fingerprint,),
+                legacy_inputs=(fingerprint,),
+                crawler_runtime_inputs=(fingerprint,),
+                supervisor_runtime_inputs=(fingerprint,),
+                supervisor_process_evidence={"runtime_files_predate_process": True},
+            )
+            orchestrator = OneClickOrchestrator(config)
+
+            def reach_target_and_tamper(_config: OneClickConfig) -> int:
+                runtime.write_text("value=2\n", encoding="utf-8")
+                return 1
+
+            with (
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_settings",
+                    return_value={},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_db_invariants",
+                    return_value={},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._collection_runtime_fence",
+                    return_value=fence,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_count",
+                    side_effect=reach_target_and_tamper,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._crawler_active",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._crawler_process_runtime_evidence",
+                    return_value={"runtime_files_predate_process": True},
+                ),
+            ):
+                with self.assertRaisesRegex(OneClickError, "artifact SHA changed"):
+                    orchestrator.collect()
+
+    def test_running_collect_state_migration_archives_exact_old_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_file = root / "legacy.py"
+            runtime_file = root / "runtime.py"
+            legacy_file.write_text("legacy=1\n", encoding="utf-8")
+            runtime_file.write_text("runtime=1\n", encoding="utf-8")
+            journal = StageJournal(root / "state.json")
+            legacy = [file_fingerprint(legacy_file)]
+            runtime = [*legacy, file_fingerprint(runtime_file)]
+            self.assertTrue(journal.begin("collect_schema5_v3", legacy))
+            old_bytes = journal.path.read_bytes()
+            evidence = {
+                "kind": "crawler-runtime-evidence",
+                "runtime_files_predate_process": True,
+            }
+            self.assertTrue(journal.migrate_legacy_running_collect_inputs(
+                legacy_inputs=legacy,
+                runtime_inputs=runtime,
+                crawler_process_evidence=evidence,
+                supervisor_process_evidence=evidence,
+            ))
+            receipt = journal.value["collect_runtime_fingerprint_migration"]
+            archive = Path(receipt["legacy_state_archive"])
+            self.assertEqual(archive.read_bytes(), old_bytes)
+            self.assertEqual(
+                journal.value["stages"]["collect_schema5_v3"]["inputs"],
+                runtime,
+            )
+            self.assertFalse(journal.migrate_legacy_running_collect_inputs(
+                legacy_inputs=legacy,
+                runtime_inputs=runtime,
+                crawler_process_evidence=evidence,
+                supervisor_process_evidence=evidence,
+            ))
+
+    def test_running_collect_migration_rejects_any_downstream_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_file = root / "legacy.py"
+            runtime_file = root / "runtime.py"
+            legacy_file.write_text("legacy=1\n", encoding="utf-8")
+            runtime_file.write_text("runtime=1\n", encoding="utf-8")
+            journal = StageJournal(root / "state.json")
+            legacy = [file_fingerprint(legacy_file)]
+            runtime = [*legacy, file_fingerprint(runtime_file)]
+            journal.begin("collect_schema5_v3", legacy)
+            journal.value["stages"]["freeze_schema5_v3"] = {
+                "status": "running", "inputs": [], "outputs": [],
+            }
+            journal.save()
+            with self.assertRaisesRegex(OneClickError, "only the sole running"):
+                journal.migrate_legacy_running_collect_inputs(
+                    legacy_inputs=legacy,
+                    runtime_inputs=runtime,
+                    crawler_process_evidence={
+                        "runtime_files_predate_process": True
+                    },
+                    supervisor_process_evidence={
+                        "runtime_files_predate_process": True
+                    },
+                )
+
+    def test_runtime_tree_detects_same_size_content_tamper(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "package"
+            package.mkdir()
+            source = package / "module.py"
+            source.write_text("value=1\n", encoding="utf-8")
+            fingerprint = runtime_tree_fingerprint("runtime", [package])
+            source.write_text("value=2\n", encoding="utf-8")
+            journal = StageJournal(root / "state.json")
+            with self.assertRaisesRegex(
+                OneClickError, "runtime dependency tree SHA changed"
+            ):
+                journal.begin("collect_schema5_v3", [fingerprint])
+
+    def test_crawler_process_must_not_predate_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "logs").mkdir()
+            runtime = root / "runtime.py"
+            runtime.write_text("runtime=1\n", encoding="utf-8")
+            import os
+
+            os.utime(runtime, (150.0, 150.0))
+            (root / "logs" / "authoritative-production.lock").write_text(
+                json.dumps({"pid": 123, "started_at": 100.0}),
+                encoding="utf-8",
+            )
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root,
+                crawler_python=root / "python.exe",
+                training_python=root / "python.exe",
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+            )
+            inputs = [file_fingerprint(runtime)]
+            with (
+                mock.patch(
+                    "expert_v1.one_click_v1._pid_alive", return_value=True
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._pid_started_at", return_value=100.0
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    OneClickError, "predates a runtime dependency"
+                ):
+                    _crawler_process_runtime_evidence(config, inputs)
+            (root / "logs" / "authoritative-production.lock").write_text(
+                json.dumps({"pid": 123, "started_at": 200.0}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "expert_v1.one_click_v1._pid_alive", return_value=True
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._pid_started_at", return_value=200.0
+                ),
+            ):
+                evidence = _crawler_process_runtime_evidence(config, inputs)
+            self.assertTrue(evidence["runtime_files_predate_process"])
+
+    def test_one_click_process_must_not_predate_its_runtime_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "one_click.py"
+            runtime.write_text("runtime=1\n", encoding="utf-8")
+            import os
+
+            os.utime(runtime, (150.0, 150.0))
+            inputs = [file_fingerprint(runtime)]
+            with mock.patch(
+                "expert_v1.one_click_v1._pid_started_at", return_value=100.0
+            ):
+                with self.assertRaisesRegex(
+                    OneClickError, "supervisor predates"
+                ):
+                    _supervisor_process_runtime_evidence(inputs)
+            with mock.patch(
+                "expert_v1.one_click_v1._pid_started_at", return_value=200.0
+            ):
+                evidence = _supervisor_process_runtime_evidence(inputs)
+            self.assertTrue(evidence["runtime_files_predate_process"])
+
+    def test_patchright_browser_runtime_is_revision_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            python = root / "Python" / "python.exe"
+            python.parent.mkdir()
+            python.write_bytes(b"python")
+            package = (
+                python.parent / "Lib" / "site-packages" / "patchright"
+                / "driver" / "package"
+            )
+            package.mkdir(parents=True)
+            (package / "browsers.json").write_text(
+                json.dumps({"browsers": [{
+                    "name": "chromium", "revision": "42",
+                    "installByDefault": True,
+                }]}),
+                encoding="utf-8",
+            )
+            browser = (
+                root / "Local" / "ms-playwright" / "chromium-42"
+                / "chrome-win64"
+            )
+            browser.mkdir(parents=True)
+            (browser / "chrome.exe").write_bytes(b"exe")
+            (browser / "chrome.dll").write_bytes(b"dll")
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root / "crawler",
+                crawler_python=python,
+                training_python=python,
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+            )
+            with mock.patch.dict(
+                "os.environ", {"LOCALAPPDATA": str(root / "Local")}
+            ):
+                files = _patchright_browser_runtime_files(config)
+            self.assertEqual(
+                {path.name for path in files}, {"chrome.exe", "chrome.dll"}
+            )
 
     def test_commands_use_isolated_schema5_queue_and_resume_training(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -26,6 +26,10 @@ D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3\control\state.json
 
 每个阶段在开始时写入输入文件 SHA-256，在完成时写入输出文件 SHA-256。重新双击时，已完成阶段只有在输入、输出逐字节未变化时才跳过；任何漂移都会停止并保留现场。单实例 OS 文件锁阻止两个入口同时写同一批数据，另一个固定的全局锁阻止不同数据根同时争用 AVD/ADB/direct ports。
 
+采集阶段另外固化 `collection-runtime-fence-v1`：包含 one-click 自身、原生契约读取器、从 `authoritative_production/main/lane_watchdog/cf_recover` 静态递归得到的全部 crawler 项目模块、配置引用的种子/排除/升级清单、crawler Python/DLL、requirements，以及 curl_cffi、selectolax、patchright、PyYAML、ruyipage 的内容树 SHA。每次 30 秒轮询、命中 100,000 的同一轮、停止 crawler 前后、SQLite checkpoint 前后都会重新验签。活跃 crawler 的 OS 创建时间还必须不早于这些运行文件的最新 mtime；配置、契约、代码或依赖漂移会在旧 inputs 被标记 completed 前 fail-closed。
+
+早期 state-schema-v2 曾在没有完整 runtime closure 的情况下启动采集。新版只对一种状态执行一次安全迁移：`collect_schema5_v3` 必须是唯一且仍为 `running` 的阶段，原六项 inputs 必须逐字节仍匹配，不得存在 native layout、后续阶段或 completed 输出，并且活跃 crawler 必须通过上述 OS 启动时间证据。迁移会先把原始 `state.json` 字节归档为 `state.pre-runtime-fence-v1.<sha16>.json`，再写入新 inputs 和迁移 receipt。任何条件不满足都会拒绝迁移；应保留现场并换新 data root。因为已经运行的 Python 不会热加载新代码，部署该加固后必须先正常停止旧 one-click 监督器，再重新双击；crawler 可保持运行，由新入口核验并接管。
+
 v3 使用新的 state schema 和阶段名（`collect/freeze/audit_schema5_v3`）。把 v2 的 `state.json` 复制到 v3 根目录，或显式把 `--data-root` 指向 `one-click-schema5-v2`，都会拒绝启动；不能通过改目录名续跑旧 manifest、shard 或 checkpoint。
 
 耗时阶段均具备恢复边界：crawler 使用原 SQLite 队列，native generator 使用自己的 SQLite work queue 和不可变 shard，编译器使用确定性 `compile-plan.json`/shard，训练使用完整 optimizer、normalizer 和 RNG checkpoint。
@@ -68,3 +72,27 @@ scripts\start_expert_one_click_v1.ps1 -Smoke
 - 训练数据加载和 CUDA 设备选择沿用正式 `training_v1` 配置。
 
 原生布局首次选择后单独写入 journal，恢复时直接读取，绝不会因当前 RAM 波动重新选择。非默认端口会 fail-closed；若要改变语义或并发，应使用新的 `--data-root`，避免拿新参数静默续跑旧产物。
+
+## 逐 Token 训练覆盖门
+
+冻结阶段会从 100,000 个已验签 Schema5 源文件重新计算并保存
+`receipts/source-token-coverage-v1.json`。统计严格区分 180 个 deck/play token、
+42 个 Evo 形态、16 个 Hero 形态和 25 个主动技能候选 token。原始
+`ability_plays` 只形成候选与 Tick 注册表，绝不被当作具体技能身份。
+
+完整 teacher-forced 成功局会在 generator 结果中留下两个 actor 的内容寻址
+证据。部署标签绑定实际 Tick 的 Mask sidecar 与 `resolved_data_id`；技能标签
+绑定冻结 source marker、libg candidate entity/card、selected entity，以及
+Tick Store 中该实体的精确 native form。失败 Prefix 的证据数组必须为空，
+它永远不能增加训练覆盖。
+
+BC compiler 会再次读取 frozen source、generator result、Tick Store 和 Mask，
+独立重建这些连接。每个观察到的 token 至少需要一条完整成功且最终编译的
+监督样本，同时执行来源频率自适应门：Card 上限 16 局/64 标签，运行时形态
+上限 8/16，主动技能上限 8/32。最终证据写入
+`compiled/native-bc-v1/token-coverage-receipt.json`，其 file SHA、canonical
+SHA 和无缺口 gate 一并绑定最终 dataset manifest。
+
+本版不进行无限 repair loop。任一 token、形态或技能仍有缺口时，compiler
+先持久化完整 deficit receipt，再以 `FAILED_COVERAGE` 停止；one-click journal
+会保留该路径作为证据，不会发布 manifest，也不会进入 smoke 或正式训练。

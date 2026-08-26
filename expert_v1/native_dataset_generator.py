@@ -30,6 +30,7 @@ except ImportError:  # pragma: no cover - stdlib fallback is supported
 
 from native_core.env import NativeRoyaleEnv
 
+from .native_capabilities import ability_cards
 from .native_ingest_contract import load_native_ingest_contract
 from .native_freeze import NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
 from .native_profile import (
@@ -53,6 +54,8 @@ from .tick_store_v1.deployment_masks import (
     MASK_STORE_DIRECTORY,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    resolve_deployment_reference,
+    validate_episode_mask_metadata,
 )
 from .tick_store_v1.schema import TickState, require_consecutive
 from .tick_store_v1.shard import (
@@ -869,6 +872,240 @@ class StagedTickSink:
         }
 
 
+def build_full_success_token_evidence(
+    plan: BattlePlan,
+    result: NativeReplayResult,
+    episode: StagedEpisode,
+) -> list[dict[str, Any]]:
+    """Bind source markers to accepted libg actions for later BC coverage.
+
+    This evidence is emitted only for a complete teacher-forced replay.  It is
+    still *native* evidence rather than compiled supervision: the compiler
+    independently joins it to the frozen source, Tick Store and final shard
+    labels before setting ``compiled=true``.
+    """
+
+    if (
+        not result.teacher_forced_success
+        or result.accepted_actions != result.source_actions
+        or result.tick_store_entry is None
+        or episode.battle_tag != plan.battle_tag
+    ):
+        raise RuntimeError("token evidence requires one complete native replay")
+    raw_masks = episode.metadata.get(EPISODE_METADATA_KEY)
+    if not isinstance(raw_masks, Mapping):
+        raise RuntimeError("token evidence requires deployment-mask metadata")
+    masks = validate_episode_mask_metadata(raw_masks)
+    entries = list(masks["entries"])
+    payloads = episode.deployment_mask_payloads
+    state_by_tick = {state.tick: state for state in episode.states}
+    if len(state_by_tick) != len(episode.states):
+        raise RuntimeError("token evidence Tick Store contains duplicate Ticks")
+
+    acceptance: dict[tuple[str, int, int, int], Mapping[str, Any]] = {}
+    for raw in result.action_acceptance_sequence:
+        row = _mapping_for_token_evidence(raw, "native action acceptance")
+        key = (
+            str(row.get("type") or ""),
+            int(row.get("side", -1)),
+            int(row.get("source_event_index", -1)),
+            int(row.get("source_tick", -1)),
+        )
+        if key in acceptance or row.get("accepted") is not True:
+            raise RuntimeError("token evidence action acceptance is open/duplicate")
+        acceptance[key] = row
+    if len(acceptance) != result.source_actions:
+        raise RuntimeError("token evidence does not cover every native action")
+
+    actor_rows = [
+        {
+            "schema_version": 1,
+            "kind": "cr_native_full_success_actor_token_evidence_v1",
+            "battle_tag": plan.battle_tag,
+            "actor_side": side,
+            "full_success": True,
+            "prefix_admission": False,
+            "deck_tokens": [card.source_token for card in plan.sides[side].deck],
+            "deploy_labels": [],
+            "ability_labels": [],
+        }
+        for side in (0, 1)
+    ]
+
+    for action in plan.actions:
+        side = int(action.side)
+        spec = plan.sides[side].deck[int(action.logical_card_index)]
+        execution_tick = int(action.tick) + int(result.action_execution_tick_offset)
+        action_key = ("play", side, int(action.source_event_index), int(action.tick))
+        accepted = acceptance.get(action_key)
+        if (
+            accepted is None
+            or int(accepted.get("execution_tick", -1)) != execution_tick
+        ):
+            raise RuntimeError("deployment evidence/source acceptance join failed")
+        matching = [
+            entry
+            for entry in entries
+            if int(entry["side"]) == side
+            and int(entry["card_id"]) == int(spec.card_id)
+            and int(entry["form_flags"]) == int(spec.form_flags)
+        ]
+        if len(matching) != 1:
+            raise RuntimeError("deployment evidence deck-slot identity is ambiguous")
+        reference = resolve_deployment_reference(
+            matching[0], tick=execution_tick, require_dynamic_exact=True
+        )
+        if reference is None:
+            raise RuntimeError("deployment evidence has no exact Tick mask")
+        digest = str(reference.get("content_sha256") or "")
+        payload = payloads.get(digest)
+        if not isinstance(payload, Mapping):
+            raise RuntimeError("deployment evidence mask payload is missing")
+        label = {
+            "source_event_index": int(action.source_event_index),
+            "source_marker_index": int(action.source_marker_index),
+            "source_tick": int(action.tick),
+            "execution_tick": execution_tick,
+            "source_token": str(spec.source_token),
+            "resolved_native_form_id": int(payload["resolved_data_id"]),
+            "mask_content_sha256": digest,
+            "identity_provenance": (
+                "libg_dynamic_choice_exact_v1"
+                if str(spec.source_token) == "mirror"
+                else "libg_deployment_mask_exact_v1"
+            ),
+            "accepted": True,
+            "mask_legal": True,
+            "compiled": False,
+        }
+        label["native_evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                label, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        actor_rows[side]["deploy_labels"].append(label)
+
+    resolution_by_marker: dict[int, Mapping[str, Any]] = {}
+    for raw in result.ability_resolutions:
+        row = _mapping_for_token_evidence(raw, "native ability resolution")
+        marker = int(row.get("source_marker_index", -1))
+        if marker < 0 or marker in resolution_by_marker:
+            raise RuntimeError("ability evidence marker is invalid/duplicate")
+        resolution_by_marker[marker] = row
+    for event in plan.ability_events:
+        side = int(event.side)
+        execution_tick = int(event.tick) + int(result.action_execution_tick_offset)
+        resolution = resolution_by_marker.get(int(event.source_marker_index))
+        accepted = acceptance.get(
+            ("ability", side, int(event.source_event_index), int(event.tick))
+        )
+        if (
+            resolution is None
+            or accepted is None
+            or int(resolution.get("source_tick", -1)) != int(event.tick)
+            or int(resolution.get("execution_tick", -1)) != execution_tick
+            or int(accepted.get("execution_tick", -1)) != execution_tick
+        ):
+            raise RuntimeError("ability evidence source/native join failed")
+        execution = str(resolution.get("execution") or "")
+        if execution not in {"unique_executed", "explicit_branch_executed"}:
+            raise RuntimeError("ability evidence is not an executed native branch")
+        entity_id = int(resolution.get("selected_entity_id", -1))
+        candidate_entities = tuple(
+            int(value) for value in resolution.get("candidate_entity_ids") or ()
+        )
+        candidate_cards = tuple(
+            int(value) for value in resolution.get("candidate_card_ids") or ()
+        )
+        if (
+            entity_id < 0
+            or len(candidate_entities) != len(candidate_cards)
+            or entity_id not in candidate_entities
+        ):
+            raise RuntimeError("ability evidence selected entity is not a candidate")
+        state = state_by_tick.get(execution_tick)
+        if state is None:
+            raise RuntimeError("ability evidence Tick is absent from full Tick Store")
+        entities = [entity for entity in state.entities if entity.key == entity_id]
+        if len(entities) != 1:
+            raise RuntimeError("ability evidence selected entity is absent/duplicate")
+        entity = entities[0]
+        if (
+            entity.side != side
+            or entity.ability_slot <= 0
+            or entity.ability_available != 1
+        ):
+            raise RuntimeError("ability evidence selected entity was not legally usable")
+        allowed = [
+            card
+            for card in ability_cards(plan.sides[side].deck)
+            if int(entity.card_id) == int(card.native_form_id)
+        ]
+        if len(allowed) != 1:
+            raise RuntimeError("ability evidence native form does not identify one token")
+        card = allowed[0]
+        selected_index = candidate_entities.index(entity_id)
+        if int(candidate_cards[selected_index]) != int(card.base_card_id):
+            raise RuntimeError("ability evidence entity/base-card transcript changed")
+        label = {
+            "source_event_index": int(event.source_event_index),
+            "source_marker_index": int(event.source_marker_index),
+            "source_tick": int(event.tick),
+            "execution_tick": execution_tick,
+            "resolved_token": str(card.source_token),
+            "resolved_native_form_id": int(entity.card_id),
+            "selected_entity_id": entity_id,
+            "identity_provenance": (
+                "libg_live_entity_unique_v1"
+                if execution == "unique_executed"
+                else "libg_live_entity_explicit_branch_v1"
+            ),
+            "branch_verified": execution == "explicit_branch_executed",
+            "accepted": True,
+            "legal": True,
+            "compiled": False,
+            "libg_resolution": {
+                "status": str(resolution.get("status") or ""),
+                "execution": execution,
+                "side": side,
+                "source_tick": int(event.tick),
+                "execution_tick": execution_tick,
+                "source_event_index": int(event.source_event_index),
+                "source_marker_index": int(event.source_marker_index),
+                "candidate_entity_ids": list(candidate_entities),
+                "candidate_card_ids": list(candidate_cards),
+                "selected_entity_id": entity_id,
+                "selected_native_form_id": int(entity.card_id),
+            },
+        }
+        label["native_evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                label, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        actor_rows[side]["ability_labels"].append(label)
+    if len(resolution_by_marker) != len(plan.ability_events):
+        raise RuntimeError("ability evidence has unexpected native resolutions")
+
+    for row in actor_rows:
+        body = {
+            key: value for key, value in row.items()
+            if key != "native_evidence_sha256"
+        }
+        row["native_evidence_sha256"] = hashlib.sha256(
+            json.dumps(
+                body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+    return actor_rows
+
+
+def _mapping_for_token_evidence(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{label} is not an object")
+    return value
+
+
 class StoredFrameRegistry:
     """Detect/reuse a checksummed orphan frame after a hard-process crash."""
 
@@ -1603,6 +1840,7 @@ def execute_task(
     full_trace_seconds = 0.0
     failure_prefix_seconds = 0.0
     semantic_diff: dict[str, Any] | None = None
+    token_coverage_actor_evidence: list[dict[str, Any]] = []
     phase_state: dict[str, Any] = {}
     started = time.perf_counter()
     try:
@@ -1725,6 +1963,9 @@ def execute_task(
                 raise RuntimeError(
                     "successful replay deployment-mask base/dynamic accounting is open"
                 )
+            token_coverage_actor_evidence = build_full_success_token_evidence(
+                plan, result, staged.episode
+            )
             stage = "immutable_tick_store_commit"
             if commit_guard is not None and not commit_guard():
                 raise RuntimeError(
@@ -1813,6 +2054,9 @@ def execute_task(
         "source_schema_version": task.source_schema_version,
         "source_json_copied": False,
         "teacher_forced_success": success,
+        "token_coverage_actor_evidence": (
+            token_coverage_actor_evidence if success else []
+        ),
         "failure_class": failure_class,
         "failure_domain": failure_domain,
         "failure": failure,

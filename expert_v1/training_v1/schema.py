@@ -202,9 +202,15 @@ def verify_dataset_integrity(
 
     actual: set[str] = set()
     require_shard_metadata = bool(
-        value.get("production_ready") is True
-        and str(value.get("observation_mode") or OBSERVATION_NATIVE)
+        str(value.get("observation_mode") or OBSERVATION_NATIVE)
         == OBSERVATION_NATIVE
+        and (
+            value.get("production_ready") is True
+            or any(
+                str(path).replace("\\", "/").endswith("/shard.json")
+                for path in declared
+            )
+        )
     )
     for shards in value["splits"].values():
         for relative_shard in shards:

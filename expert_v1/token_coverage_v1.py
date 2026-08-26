@@ -11,9 +11,11 @@ hard boundary:
 * Schema5 ability markers expose only ``side + time_raw + marker_index``.
   Candidate-token association is useful for scheduling, but never establishes
   the identity of the pressed ability.
-* An ability label is counted only when frozen libg selected a live entity and
-  the normalized record carries one of the explicit native identity
-  provenances accepted below.
+* An ability label is counted only when it references a content-addressed
+  transcript from frozen libg.  The transcript is independently joined to the
+  exact frozen Schema5 event and contains the live candidate entity/form set.
+  Human-readable provenance strings in a normalized label are never an
+  authentication mechanism.
 
 Normalized successful actor record contract
 --------------------------------------------
@@ -30,11 +32,11 @@ Each record represents one actor side of one native replay::
         "accepted": true, "mask_legal": true, "compiled": true
       }],
       "ability_labels": [{
-        "source_event_index": 9,
+        "source_event_index": 2,
         "resolved_token": "rune-giant",
         "resolved_native_form_id": 26000101,
         "selected_entity_id": 123,
-        "identity_provenance": "libg_live_entity_unique_v1",
+        "resolution_transcript_sha256": "<sha256>",
         "accepted": true, "legal": true, "compiled": true
       }]
     }
@@ -54,26 +56,28 @@ import math
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
+from .native_ingest_contract import contract_payload_sha256
+
 
 COVERAGE_SCHEMA_VERSION = 1
 SOURCE_KIND = "cr_expert_source_token_coverage_v1"
 SUCCESS_KIND = "cr_expert_success_token_coverage_v1"
 QUOTA_KIND = "cr_expert_adaptive_token_quota_v1"
 RECEIPT_KIND = "cr_expert_token_coverage_receipt_v1"
+SOURCE_ABILITY_EVENTS_KIND = "cr_expert_source_ability_events_v1"
+ABILITY_TRANSCRIPT_KIND = "cr_expert_libg_ability_resolution_transcript_v1"
+AUTHENTICATED_ABILITY_TRANSCRIPTS_KIND = (
+    "cr_expert_authenticated_ability_resolution_transcripts_v1"
+)
 
 EXPECTED_CARD_TOKENS = 180
 EXPECTED_EVOLUTION_TOKENS = 42
 EXPECTED_HERO_TOKENS = 16
 EXPECTED_ABILITY_TOKENS = 25
 
-NATIVE_ABILITY_IDENTITY_PROVENANCE = frozenset({
-    "libg_live_entity_unique_v1",
-    "libg_live_entity_explicit_branch_v1",
-})
-EXPLICIT_BRANCH_PROVENANCE = "libg_live_entity_explicit_branch_v1"
-
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _SIDE_NAMES = ("team", "opponent")
+_SIDE_TO_ACTOR = {"team": 0, "opponent": 1}
 
 
 class TokenCoverageError(ValueError):
@@ -120,6 +124,14 @@ def _contract_index(contract: Mapping[str, Any]) -> dict[str, Any]:
     contract_sha = str(contract.get("contract_sha256") or "")
     if not _SHA256_RE.fullmatch(contract_sha):
         raise TokenCoverageError("native contract canonical SHA-256 is invalid")
+    try:
+        recomputed_contract_sha = contract_payload_sha256(contract)
+    except (TypeError, ValueError) as error:
+        raise TokenCoverageError(
+            "native contract payload is not canonical JSON"
+        ) from error
+    if not hmac.compare_digest(contract_sha, recomputed_contract_sha):
+        raise TokenCoverageError("native contract canonical SHA-256 mismatch")
     allowed = _unique_strings(
         contract.get("allowed_card_tokens"), "allowed_card_tokens"
     )
@@ -201,10 +213,18 @@ def _contract_index(contract: Mapping[str, Any]) -> dict[str, Any]:
         ability_specs[token] = {
             "base_card_id": base_id,
             "native_form_id": native_id,
-            "allowed_resolved_ids": frozenset({base_id, native_id}),
         }
     if set(ability_specs) != set(ability):
         raise TokenCoverageError("native contract ability rows are incomplete")
+
+    runtime_libg_sha256 = str(
+        _mapping(contract.get("runtime"), "native contract runtime").get(
+            "libg_sha256"
+        )
+        or ""
+    )
+    if not _SHA256_RE.fullmatch(runtime_libg_sha256):
+        raise TokenCoverageError("native contract runtime libg SHA-256 is invalid")
 
     return {
         "contract_sha256": contract_sha,
@@ -218,6 +238,7 @@ def _contract_index(contract: Mapping[str, Any]) -> dict[str, Any]:
         "token_specs": token_specs,
         "ability_specs": ability_specs,
         "all_native_card_ids": frozenset(all_native_card_ids),
+        "runtime_libg_sha256": runtime_libg_sha256,
     }
 
 
@@ -265,6 +286,123 @@ def _source_side_deck(
     return tuple(slugs)
 
 
+def _content_addressed_sha256(
+    value: Mapping[str, Any], *, digest_field: str
+) -> str:
+    payload = {key: item for key, item in value.items() if key != digest_field}
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _seal_content_addressed(
+    value: Mapping[str, Any], *, digest_field: str
+) -> dict[str, Any]:
+    result = dict(value)
+    if digest_field in result:
+        raise TokenCoverageError(
+            f"content-addressed payload already contains {digest_field}"
+        )
+    result[digest_field] = _content_addressed_sha256(
+        result, digest_field=digest_field
+    )
+    return result
+
+
+def _verify_content_addressed(
+    value: Any, *, label: str, digest_field: str
+) -> Mapping[str, Any]:
+    result = _mapping(value, label)
+    claimed = str(result.get(digest_field) or "")
+    if not _SHA256_RE.fullmatch(claimed):
+        raise TokenCoverageError(f"{label} SHA-256 is invalid")
+    actual = _content_addressed_sha256(result, digest_field=digest_field)
+    if not hmac.compare_digest(claimed, actual):
+        raise TokenCoverageError(f"{label} SHA-256 mismatch")
+    return result
+
+
+def _require_expected_digest(value: Any, *, label: str) -> str:
+    digest = str(value or "")
+    if not _SHA256_RE.fullmatch(digest):
+        raise TokenCoverageError(f"trusted {label} SHA-256 anchor is invalid")
+    return digest
+
+
+def _source_ability_event_key(
+    battle_tag: str, actor_side: int, source_event_index: int
+) -> tuple[str, int, int]:
+    return str(battle_tag), int(actor_side), int(source_event_index)
+
+
+def _validated_source_ability_event_index(
+    source: Mapping[str, Any], index: Mapping[str, Any]
+) -> tuple[Mapping[str, Any], dict[tuple[str, int, int], Mapping[str, Any]]]:
+    source = _mapping(source, "source coverage")
+    if (
+        source.get("kind") != SOURCE_KIND
+        or source.get("schema_version") != COVERAGE_SCHEMA_VERSION
+        or source.get("contract_sha256") != index["contract_sha256"]
+    ):
+        raise TokenCoverageError("source coverage contract binding is invalid")
+    registry = _verify_content_addressed(
+        source.get("ability_event_registry"),
+        label="frozen source ability-event registry",
+        digest_field="source_events_sha256",
+    )
+    if (
+        registry.get("kind") != SOURCE_ABILITY_EVENTS_KIND
+        or registry.get("schema_version") != COVERAGE_SCHEMA_VERSION
+        or registry.get("contract_sha256") != index["contract_sha256"]
+    ):
+        raise TokenCoverageError(
+            "frozen source ability-event registry contract binding is invalid"
+        )
+    rows: dict[tuple[str, int, int], Mapping[str, Any]] = {}
+    seen_markers: set[tuple[str, int]] = set()
+    for raw_event in _sequence(
+        registry.get("events"), "frozen source ability events"
+    ):
+        event = _mapping(raw_event, "frozen source ability event")
+        tag = str(event.get("battle_tag") or "")
+        actor_side = _integer(event.get("actor_side"), "source actor_side")
+        event_index = _integer(
+            event.get("source_event_index"), "source ability event index"
+        )
+        marker = _integer(
+            event.get("source_marker_index"), "source ability marker index"
+        )
+        tick = _integer(event.get("source_tick"), "source ability tick")
+        side_name = str(event.get("side") or "")
+        candidates = _unique_strings(
+            event.get("candidate_tokens"), "source ability candidate_tokens"
+        )
+        if (
+            not tag
+            or actor_side not in (0, 1)
+            or side_name not in _SIDE_NAMES
+            or _SIDE_TO_ACTOR[side_name] != actor_side
+            or not candidates
+            or not set(candidates) <= index["ability_set"]
+        ):
+            raise TokenCoverageError("frozen source ability event is invalid")
+        key = _source_ability_event_key(tag, actor_side, event_index)
+        marker_key = (tag, marker)
+        if key in rows or marker_key in seen_markers:
+            raise TokenCoverageError("duplicate frozen source ability event")
+        rows[key] = {
+            "battle_tag": tag,
+            "actor_side": actor_side,
+            "side": side_name,
+            "source_event_index": event_index,
+            "source_marker_index": marker,
+            "source_tick": tick,
+            "candidate_tokens": candidates,
+        }
+        seen_markers.add(marker_key)
+    if _integer(registry.get("event_count"), "source ability event_count") != len(rows):
+        raise TokenCoverageError("frozen source ability event count mismatch")
+    return registry, rows
+
+
 def freeze_source_token_coverage(
     battles: Iterable[Mapping[str, Any]], contract: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -288,6 +426,7 @@ def freeze_source_token_coverage(
     seen_battles: set[str] = set()
     total_ability_events = 0
     ambiguous_ability_events = 0
+    frozen_ability_events: list[dict[str, Any]] = []
 
     for raw_battle in battles:
         battle = _mapping(raw_battle, "source battle")
@@ -311,9 +450,9 @@ def freeze_source_token_coverage(
         events: list[tuple[int, int, str, str]] = []
         side_ability_counts = Counter[str]()
         for event_kind, field in (("deploy", "card_plays"), ("ability", "ability_plays")):
-            for raw_event in _sequence(
+            for source_event_index, raw_event in enumerate(_sequence(
                 battle.get(field), f"source battle {field}"
-            ):
+            )):
                 event = _mapping(raw_event, f"source {event_kind} event")
                 side = str(event.get("side") or "")
                 if side not in _SIDE_NAMES:
@@ -341,6 +480,15 @@ def freeze_source_token_coverage(
                     )
                 if len(candidates) > 1:
                     ambiguous_ability_events += 1
+                frozen_ability_events.append({
+                    "battle_tag": tag,
+                    "actor_side": _SIDE_TO_ACTOR[side],
+                    "side": side,
+                    "source_event_index": source_event_index,
+                    "source_marker_index": marker,
+                    "source_tick": tick,
+                    "candidate_tokens": sorted(candidates),
+                })
                 for token in candidates:
                     # Scheduling upper bound only.  This is never consumed by
                     # summarize_success_token_coverage as resolved identity.
@@ -413,6 +561,20 @@ def freeze_source_token_coverage(
     observed_abilities = [
         token for token in index["ability"] if ability_candidate_sides[token] > 0
     ]
+    ability_event_registry = _seal_content_addressed({
+        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "kind": SOURCE_ABILITY_EVENTS_KIND,
+        "contract_sha256": index["contract_sha256"],
+        "event_count": len(frozen_ability_events),
+        "events": sorted(
+            frozen_ability_events,
+            key=lambda row: (
+                str(row["battle_tag"]),
+                int(row["actor_side"]),
+                int(row["source_event_index"]),
+            ),
+        ),
+    }, digest_field="source_events_sha256")
     return {
         "schema_version": COVERAGE_SCHEMA_VERSION,
         "kind": SOURCE_KIND,
@@ -430,6 +592,7 @@ def freeze_source_token_coverage(
         "card_tokens": cards,
         "form_tokens": forms,
         "ability_tokens": abilities,
+        "ability_event_registry": ability_event_registry,
         "totals": {
             "play_labels": sum(play_labels.values()),
             "ability_events": total_ability_events,
@@ -481,32 +644,525 @@ def _successful_deploy_label(
     return event_index, token, resolved_id
 
 
+def ability_resolution_transcript_sha256(
+    transcript: Mapping[str, Any]
+) -> str:
+    """Hash one libg resolution transcript, excluding only its self-hash."""
+
+    return _content_addressed_sha256(
+        _mapping(transcript, "libg ability resolution transcript"),
+        digest_field="transcript_sha256",
+    )
+
+
+def seal_ability_resolution_transcript(
+    transcript_payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Content-address a generator-produced transcript.
+
+    Sealing establishes immutability, not truth.  Truth is established by
+    :func:`authenticate_ability_resolution_transcripts`, which joins the
+    payload to the frozen source event and the frozen contract/runtime.
+    """
+
+    return _seal_content_addressed(
+        _mapping(transcript_payload, "libg ability resolution transcript"),
+        digest_field="transcript_sha256",
+    )
+
+
+_TRANSCRIPT_FIELDS = frozenset({
+    "schema_version",
+    "kind",
+    "contract_sha256",
+    "runtime_libg_sha256",
+    "battle_tag",
+    "actor_side",
+    "source_event_index",
+    "source_marker_index",
+    "source_tick",
+    "execution_tick",
+    "execution_tick_offset",
+    "generator_actor_evidence_sha256",
+    "generator_ability_evidence_sha256",
+    "resolution_status",
+    "candidate_entity_ids",
+    "candidate_card_ids",
+    "selected_entity_id",
+    "selected_native_form_id",
+    "resolved_token",
+    "execution",
+    "branch_verified",
+    "action_accepted",
+    "transcript_sha256",
+})
+
+
+def _validate_ability_resolution_transcript(
+    raw_transcript: Any,
+    *,
+    index: Mapping[str, Any],
+    source_events: Mapping[tuple[str, int, int], Mapping[str, Any]],
+) -> dict[str, Any]:
+    transcript = _verify_content_addressed(
+        raw_transcript,
+        label="libg ability resolution transcript",
+        digest_field="transcript_sha256",
+    )
+    if set(transcript) != _TRANSCRIPT_FIELDS:
+        raise TokenCoverageError(
+            "libg ability resolution transcript fields are not schema-exact"
+        )
+    if (
+        transcript.get("schema_version") != COVERAGE_SCHEMA_VERSION
+        or transcript.get("kind") != ABILITY_TRANSCRIPT_KIND
+        or transcript.get("contract_sha256") != index["contract_sha256"]
+        or transcript.get("runtime_libg_sha256")
+        != index["runtime_libg_sha256"]
+    ):
+        raise TokenCoverageError(
+            "libg ability resolution transcript contract/runtime binding is invalid"
+        )
+
+    tag = str(transcript.get("battle_tag") or "")
+    actor_side = _integer(transcript.get("actor_side"), "transcript actor_side")
+    event_index = _integer(
+        transcript.get("source_event_index"), "transcript source_event_index"
+    )
+    if not tag or actor_side not in (0, 1):
+        raise TokenCoverageError("libg ability resolution transcript identity is invalid")
+    event_key = _source_ability_event_key(tag, actor_side, event_index)
+    source_event = source_events.get(event_key)
+    if source_event is None:
+        raise TokenCoverageError(
+            "libg ability resolution transcript does not bind a frozen source event"
+        )
+    source_marker = _integer(
+        transcript.get("source_marker_index"), "transcript source marker"
+    )
+    source_tick = _integer(transcript.get("source_tick"), "transcript source tick")
+    if (
+        source_marker != source_event["source_marker_index"]
+        or source_tick != source_event["source_tick"]
+    ):
+        raise TokenCoverageError(
+            "libg ability resolution transcript source event/tick mismatch"
+        )
+    execution_tick = _integer(
+        transcript.get("execution_tick"), "transcript execution tick"
+    )
+    execution_offset = _integer(
+        transcript.get("execution_tick_offset"),
+        "transcript execution tick offset",
+    )
+    if execution_tick != source_tick + execution_offset:
+        raise TokenCoverageError(
+            "libg ability resolution transcript execution tick mismatch"
+        )
+    for field in (
+        "generator_actor_evidence_sha256",
+        "generator_ability_evidence_sha256",
+    ):
+        if not _SHA256_RE.fullmatch(str(transcript.get(field) or "")):
+            raise TokenCoverageError(
+                f"libg ability resolution transcript {field} is invalid"
+            )
+
+    candidate_tokens = tuple(source_event["candidate_tokens"])
+    allowed_base_ids = {
+        int(index["ability_specs"][token]["base_card_id"])
+        for token in candidate_tokens
+    }
+    candidate_entities = tuple(
+        _integer(value, "candidate entity_id", minimum=1)
+        for value in _sequence(
+            transcript.get("candidate_entity_ids"),
+            "transcript candidate_entity_ids",
+        )
+    )
+    candidate_cards = tuple(
+        _integer(value, "candidate base_card_id", minimum=1)
+        for value in _sequence(
+            transcript.get("candidate_card_ids"),
+            "transcript candidate_card_ids",
+        )
+    )
+    if len(candidate_entities) != len(candidate_cards):
+        raise TokenCoverageError(
+            "libg ability candidate entity/card transcript lengths differ"
+        )
+    candidates: dict[int, int] = {}
+    for entity_id, base_card_id in zip(
+        candidate_entities, candidate_cards, strict=True
+    ):
+        if entity_id in candidates:
+            raise TokenCoverageError(
+                "duplicate entity in libg ability resolution transcript"
+            )
+        if base_card_id not in allowed_base_ids:
+            raise TokenCoverageError(
+                "libg ability candidate is not a legal frozen-source candidate"
+            )
+        candidates[entity_id] = base_card_id
+    if not candidates:
+        raise TokenCoverageError("libg ability resolution transcript has no candidates")
+
+    selected_entity = _integer(
+        transcript.get("selected_entity_id"),
+        "transcript selected_entity_id",
+        minimum=1,
+    )
+    selected_native_form = _integer(
+        transcript.get("selected_native_form_id"),
+        "transcript selected_native_form_id",
+        minimum=1,
+    )
+    selected_base_id = candidates.get(selected_entity)
+    if selected_base_id is None:
+        raise TokenCoverageError(
+            "libg ability resolution transcript selected entity is not a candidate"
+        )
+    matching_tokens = [
+        token
+        for token in candidate_tokens
+        if (
+            int(index["ability_specs"][token]["base_card_id"])
+            == selected_base_id
+            and int(index["ability_specs"][token]["native_form_id"])
+            == selected_native_form
+        )
+    ]
+    if len(matching_tokens) != 1:
+        raise TokenCoverageError(
+            "libg selected native form does not uniquely identify a source token"
+        )
+    resolved_token = matching_tokens[0]
+    if transcript.get("resolved_token") != resolved_token:
+        raise TokenCoverageError(
+            "libg ability resolution transcript resolved token mismatch"
+        )
+
+    status = str(transcript.get("resolution_status") or "")
+    execution = str(transcript.get("execution") or "")
+    branch_verified = transcript.get("branch_verified")
+    if status == "unique":
+        if (
+            len(candidates) != 1
+            or execution != "unique_executed"
+            or branch_verified is not False
+        ):
+            raise TokenCoverageError("unique libg ability transcript is inconsistent")
+    elif status == "branch_required":
+        if (
+            len(candidates) < 2
+            or execution != "explicit_branch_executed"
+            or branch_verified is not True
+        ):
+            raise TokenCoverageError("branched libg ability transcript is unverified")
+    else:
+        raise TokenCoverageError("libg ability transcript resolution is not executable")
+    if transcript.get("action_accepted") is not True:
+        raise TokenCoverageError("libg ability transcript action was not accepted")
+    return {
+        "event_key": event_key,
+        "source_marker_index": source_marker,
+        "source_tick": source_tick,
+        "execution_tick": execution_tick,
+        "resolved_token": resolved_token,
+        "selected_entity_id": selected_entity,
+        "selected_native_form_id": selected_native_form,
+        "transcript_sha256": str(transcript["transcript_sha256"]),
+    }
+
+
+def authenticate_ability_resolution_transcripts(
+    transcripts: Iterable[Mapping[str, Any]],
+    contract: Mapping[str, Any],
+    source: Mapping[str, Any],
+    *,
+    expected_source_events_sha256: str,
+) -> dict[str, Any]:
+    """Validate and freeze libg transcripts against exact Schema5 events.
+
+    The returned bundle is suitable for content-addressed persistence by the
+    native generator and later verification by the compiler/coverage gate.
+    """
+
+    index = _contract_index(contract)
+    source_registry, source_events = _validated_source_ability_event_index(
+        source, index
+    )
+    trusted_source_sha = _require_expected_digest(
+        expected_source_events_sha256, label="source ability events"
+    )
+    if not hmac.compare_digest(
+        str(source_registry["source_events_sha256"]), trusted_source_sha
+    ):
+        raise TokenCoverageError(
+            "frozen source ability-event registry does not match trusted anchor"
+        )
+    sealed: list[Mapping[str, Any]] = []
+    seen_digests: set[str] = set()
+    seen_events: set[tuple[str, int, int]] = set()
+    for raw_transcript in transcripts:
+        evidence = _validate_ability_resolution_transcript(
+            raw_transcript, index=index, source_events=source_events
+        )
+        digest = evidence["transcript_sha256"]
+        event_key = evidence["event_key"]
+        if digest in seen_digests:
+            raise TokenCoverageError("duplicate libg ability transcript SHA-256")
+        if event_key in seen_events:
+            raise TokenCoverageError("duplicate libg ability transcript source event")
+        seen_digests.add(digest)
+        seen_events.add(event_key)
+        sealed.append(dict(_mapping(raw_transcript, "libg ability transcript")))
+    result = {
+        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "kind": AUTHENTICATED_ABILITY_TRANSCRIPTS_KIND,
+        "contract_sha256": index["contract_sha256"],
+        "source_events_sha256": source_registry["source_events_sha256"],
+        "transcript_count": len(sealed),
+        "transcripts": sorted(
+            sealed, key=lambda row: str(row["transcript_sha256"])
+        ),
+    }
+    return _seal_content_addressed(
+        result, digest_field="authenticated_transcripts_sha256"
+    )
+
+
+def authenticate_generator_ability_evidence(
+    actor_records: Iterable[Mapping[str, Any]],
+    contract: Mapping[str, Any],
+    source: Mapping[str, Any],
+    *,
+    expected_source_events_sha256: str,
+) -> dict[str, Any]:
+    """Authenticate the native generator's actor/``libg_resolution`` rows.
+
+    This is the zero-copy integration surface for
+    ``build_full_success_token_evidence``.  Both the actor envelope and each
+    ability row must retain their generator ``native_evidence_sha256``.  The
+    normalized identity/provenance fields are only cross-checks; identity is
+    derived again from the nested candidate entity/base-card transcript plus
+    the selected entity/native form and the frozen source event.
+    """
+
+    index = _contract_index(contract)
+    transcripts: list[dict[str, Any]] = []
+    seen_actors: set[tuple[str, int]] = set()
+    required_resolution_fields = {
+        "status",
+        "execution",
+        "side",
+        "source_tick",
+        "execution_tick",
+        "source_event_index",
+        "source_marker_index",
+        "candidate_entity_ids",
+        "candidate_card_ids",
+        "selected_entity_id",
+        "selected_native_form_id",
+    }
+    for raw_record in actor_records:
+        record = _verify_content_addressed(
+            raw_record,
+            label="native generator actor evidence",
+            digest_field="native_evidence_sha256",
+        )
+        tag = str(record.get("battle_tag") or "")
+        actor_side = _integer(record.get("actor_side"), "generator actor_side")
+        actor_key = (tag, actor_side)
+        if (
+            not tag
+            or actor_side not in (0, 1)
+            or actor_key in seen_actors
+            or record.get("full_success") is not True
+            or record.get("prefix_admission") is not False
+        ):
+            raise TokenCoverageError("native generator actor evidence is invalid")
+        seen_actors.add(actor_key)
+        actor_sha = str(record["native_evidence_sha256"])
+        for raw_label in _sequence(
+            record.get("ability_labels"), "generator ability labels"
+        ):
+            label = _verify_content_addressed(
+                raw_label,
+                label="native generator ability evidence",
+                digest_field="native_evidence_sha256",
+            )
+            resolution = _mapping(
+                label.get("libg_resolution"), "generator libg_resolution"
+            )
+            if set(resolution) != required_resolution_fields:
+                raise TokenCoverageError(
+                    "generator libg_resolution fields are not schema-exact"
+                )
+            event_index = _integer(
+                resolution.get("source_event_index"),
+                "generator ability source_event_index",
+            )
+            source_marker = _integer(
+                resolution.get("source_marker_index"),
+                "generator ability source_marker_index",
+            )
+            source_tick = _integer(
+                resolution.get("source_tick"), "generator ability source_tick"
+            )
+            execution_tick = _integer(
+                resolution.get("execution_tick"),
+                "generator ability execution_tick",
+            )
+            selected_entity = _integer(
+                resolution.get("selected_entity_id"),
+                "generator ability selected_entity_id",
+                minimum=1,
+            )
+            selected_form = _integer(
+                resolution.get("selected_native_form_id"),
+                "generator ability selected_native_form_id",
+                minimum=1,
+            )
+            resolved_token = str(label.get("resolved_token") or "")
+            execution = str(resolution.get("execution") or "")
+            if (
+                _integer(resolution.get("side"), "generator ability side")
+                != actor_side
+                or execution_tick < source_tick
+                or label.get("source_event_index") != event_index
+                or label.get("source_marker_index") != source_marker
+                or label.get("source_tick") != source_tick
+                or label.get("execution_tick") != execution_tick
+                or label.get("selected_entity_id") != selected_entity
+                or label.get("resolved_native_form_id") != selected_form
+                or resolved_token not in index["ability_set"]
+                or label.get("accepted") is not True
+                or label.get("legal") is not True
+                or label.get("compiled") is not False
+                or label.get("branch_verified")
+                is not (execution == "explicit_branch_executed")
+            ):
+                raise TokenCoverageError(
+                    "generator ability label disagrees with its libg transcript"
+                )
+            transcripts.append(seal_ability_resolution_transcript({
+                "schema_version": COVERAGE_SCHEMA_VERSION,
+                "kind": ABILITY_TRANSCRIPT_KIND,
+                "contract_sha256": index["contract_sha256"],
+                "runtime_libg_sha256": index["runtime_libg_sha256"],
+                "battle_tag": tag,
+                "actor_side": actor_side,
+                "source_event_index": event_index,
+                "source_marker_index": source_marker,
+                "source_tick": source_tick,
+                "execution_tick": execution_tick,
+                "execution_tick_offset": execution_tick - source_tick,
+                "generator_actor_evidence_sha256": actor_sha,
+                "generator_ability_evidence_sha256": str(
+                    label["native_evidence_sha256"]
+                ),
+                "resolution_status": str(resolution.get("status") or ""),
+                "candidate_entity_ids": list(_sequence(
+                    resolution.get("candidate_entity_ids"),
+                    "generator candidate_entity_ids",
+                )),
+                "candidate_card_ids": list(_sequence(
+                    resolution.get("candidate_card_ids"),
+                    "generator candidate_card_ids",
+                )),
+                "selected_entity_id": selected_entity,
+                "selected_native_form_id": selected_form,
+                "resolved_token": resolved_token,
+                "execution": execution,
+                "branch_verified": bool(label.get("branch_verified")),
+                "action_accepted": True,
+            }))
+    return authenticate_ability_resolution_transcripts(
+        transcripts,
+        contract,
+        source,
+        expected_source_events_sha256=expected_source_events_sha256,
+    )
+
+
+def _validated_authenticated_transcript_index(
+    bundle: Any,
+    *,
+    contract: Mapping[str, Any],
+    source: Mapping[str, Any],
+    index: Mapping[str, Any],
+    expected_source_events_sha256: str,
+    expected_authenticated_transcripts_sha256: str,
+) -> dict[str, dict[str, Any]]:
+    bundle = _verify_content_addressed(
+        bundle,
+        label="authenticated libg ability transcript bundle",
+        digest_field="authenticated_transcripts_sha256",
+    )
+    trusted_bundle_sha = _require_expected_digest(
+        expected_authenticated_transcripts_sha256,
+        label="authenticated ability transcripts",
+    )
+    if not hmac.compare_digest(
+        str(bundle["authenticated_transcripts_sha256"]), trusted_bundle_sha
+    ):
+        raise TokenCoverageError(
+            "authenticated libg ability transcript bundle does not match trusted anchor"
+        )
+    rebuilt = authenticate_ability_resolution_transcripts(
+        _sequence(bundle.get("transcripts"), "authenticated transcripts"),
+        contract,
+        source,
+        expected_source_events_sha256=expected_source_events_sha256,
+    )
+    if canonical_json_bytes(bundle) != canonical_json_bytes(rebuilt):
+        raise TokenCoverageError(
+            "authenticated libg ability transcript bundle was changed"
+        )
+    _, source_events = _validated_source_ability_event_index(source, index)
+    result: dict[str, dict[str, Any]] = {}
+    for transcript in rebuilt["transcripts"]:
+        evidence = _validate_ability_resolution_transcript(
+            transcript, index=index, source_events=source_events
+        )
+        result[evidence["transcript_sha256"]] = evidence
+    return result
+
+
 def _successful_ability_label(
     raw_label: Any,
     *,
     deck: set[str],
     index: Mapping[str, Any],
+    record_key: tuple[str, int],
+    authenticated_transcripts: Mapping[str, Mapping[str, Any]],
 ) -> tuple[int, str, int]:
     label = _mapping(raw_label, "successful ability label")
     event_index = _integer(
         label.get("source_event_index"), "ability source_event_index"
     )
-    token = str(label.get("resolved_token") or "")
+    transcript_sha = str(label.get("resolution_transcript_sha256") or "")
+    if not _SHA256_RE.fullmatch(transcript_sha):
+        raise TokenCoverageError(
+            "ability label lacks an authenticated libg resolution transcript"
+        )
+    evidence = authenticated_transcripts.get(transcript_sha)
+    if evidence is None:
+        raise TokenCoverageError(
+            "ability label references an unauthenticated libg resolution transcript"
+        )
+    if evidence["event_key"] != _source_ability_event_key(
+        record_key[0], record_key[1], event_index
+    ):
+        raise TokenCoverageError(
+            "ability label/transcript frozen source event mismatch"
+        )
+    token = str(evidence["resolved_token"])
     if token not in deck or token not in index["ability_set"]:
         raise TokenCoverageError(
             "ability identity is missing or is not a deck ability token; "
             "offline candidate association is not identity"
-        )
-    provenance = str(label.get("identity_provenance") or "")
-    if provenance not in NATIVE_ABILITY_IDENTITY_PROVENANCE:
-        raise TokenCoverageError(
-            f"ability token lacks accepted libg identity provenance: {token}"
-        )
-    if provenance == EXPLICIT_BRANCH_PROVENANCE and (
-        label.get("branch_verified") is not True
-    ):
-        raise TokenCoverageError(
-            f"explicit ability branch is not verified: {token}"
         )
     if any(label.get(field) is not True for field in (
         "accepted", "legal", "compiled"
@@ -514,25 +1170,73 @@ def _successful_ability_label(
         raise TokenCoverageError(
             f"successful ability label is not accepted/legal/compiled: {token}"
         )
-    _integer(label.get("selected_entity_id"), "ability selected_entity_id", minimum=1)
+    selected_entity = _integer(
+        label.get("selected_entity_id"),
+        "ability selected_entity_id",
+        minimum=1,
+    )
     resolved_id = _integer(
         label.get("resolved_native_form_id"),
         "ability resolved_native_form_id",
         minimum=1,
     )
-    if resolved_id not in index["ability_specs"][token]["allowed_resolved_ids"]:
+    if (
+        label.get("resolved_token") != token
+        or selected_entity != evidence["selected_entity_id"]
+        or resolved_id != evidence["selected_native_form_id"]
+    ):
         raise TokenCoverageError(
-            f"ability native form does not belong to resolved token {token}"
+            "ability normalized identity disagrees with authenticated transcript"
+        )
+    if resolved_id != index["ability_specs"][token]["native_form_id"]:
+        raise TokenCoverageError(
+            f"ability native form is not the exact contract form for token {token}"
         )
     return event_index, token, resolved_id
 
 
 def summarize_success_token_coverage(
-    records: Iterable[Mapping[str, Any]], contract: Mapping[str, Any]
+    records: Iterable[Mapping[str, Any]],
+    contract: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any] | None = None,
+    authenticated_ability_transcripts: Mapping[str, Any] | None = None,
+    expected_source_events_sha256: str | None = None,
+    expected_authenticated_transcripts_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Count only full-success, accepted, compiled native supervision."""
+    """Count only full-success, accepted, compiled native supervision.
+
+    Ability labels are fail-closed unless both ``source`` and an authenticated
+    transcript bundle are supplied.  This intentionally prevents a compiler
+    row from manufacturing identity with normalized token/entity/provenance
+    fields alone.
+    """
 
     index = _contract_index(contract)
+    evidence_inputs = (
+        source,
+        authenticated_ability_transcripts,
+        expected_source_events_sha256,
+        expected_authenticated_transcripts_sha256,
+    )
+    if any(value is not None for value in evidence_inputs) and not all(
+        value is not None for value in evidence_inputs
+    ):
+        raise TokenCoverageError(
+            "source/transcript artifacts and their trusted SHA-256 anchors are inseparable"
+        )
+    transcript_index: dict[str, dict[str, Any]] = {}
+    if source is not None and authenticated_ability_transcripts is not None:
+        transcript_index = _validated_authenticated_transcript_index(
+            authenticated_ability_transcripts,
+            contract=contract,
+            source=source,
+            index=index,
+            expected_source_events_sha256=str(expected_source_events_sha256),
+            expected_authenticated_transcripts_sha256=str(
+                expected_authenticated_transcripts_sha256
+            ),
+        )
     card_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
     card_label_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
     card_labels: Counter[str] = Counter()
@@ -571,16 +1275,17 @@ def summarize_success_token_coverage(
         for token in deck:
             card_episodes[token].add(key)
 
-        seen_events: set[int] = set()
+        seen_events: set[tuple[str, int]] = set()
         for raw_label in deploy_rows:
             event_index, token, resolved_id = _successful_deploy_label(
                 raw_label, deck=deck, index=index
             )
-            if event_index in seen_events:
+            event_key = ("deploy", event_index)
+            if event_key in seen_events:
                 raise TokenCoverageError(
                     f"duplicate successful event index: {tag}/{side}/{event_index}"
                 )
-            seen_events.add(event_index)
+            seen_events.add(event_key)
             card_labels[token] += 1
             card_label_episodes[token].add(key)
             resolved_form_ids[token][resolved_id] += 1
@@ -593,13 +1298,18 @@ def summarize_success_token_coverage(
                 form_episodes[token].add(key)
         for raw_label in ability_rows:
             event_index, token, resolved_id = _successful_ability_label(
-                raw_label, deck=deck, index=index
+                raw_label,
+                deck=deck,
+                index=index,
+                record_key=key,
+                authenticated_transcripts=transcript_index,
             )
-            if event_index in seen_events:
+            event_key = ("ability", event_index)
+            if event_key in seen_events:
                 raise TokenCoverageError(
                     f"duplicate successful event index: {tag}/{side}/{event_index}"
                 )
-            seen_events.add(event_index)
+            seen_events.add(event_key)
             ability_labels[token] += 1
             ability_episodes[token].add(key)
             resolved_ability_ids[token][resolved_id] += 1
@@ -1024,13 +1734,18 @@ def verify_coverage_receipt_sha256(
 
 
 __all__ = [
+    "ABILITY_TRANSCRIPT_KIND",
+    "AUTHENTICATED_ABILITY_TRANSCRIPTS_KIND",
     "COVERAGE_SCHEMA_VERSION",
-    "NATIVE_ABILITY_IDENTITY_PROVENANCE",
     "QUOTA_KIND",
     "RECEIPT_KIND",
+    "SOURCE_ABILITY_EVENTS_KIND",
     "SOURCE_KIND",
     "SUCCESS_KIND",
     "TokenCoverageError",
+    "ability_resolution_transcript_sha256",
+    "authenticate_ability_resolution_transcripts",
+    "authenticate_generator_ability_evidence",
     "build_adaptive_token_quotas",
     "build_token_coverage_receipt",
     "canonical_coverage_receipt_bytes",
@@ -1038,6 +1753,7 @@ __all__ = [
     "coverage_receipt_sha256",
     "evaluate_token_coverage",
     "freeze_source_token_coverage",
+    "seal_ability_resolution_transcript",
     "summarize_success_token_coverage",
     "verify_coverage_receipt_sha256",
 ]

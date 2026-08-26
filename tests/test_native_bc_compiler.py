@@ -33,6 +33,7 @@ from expert_v1.native_ingest_contract import (
 )
 from expert_v1.native_replay_plan import compile_battle
 from expert_v1.one_click_v1 import (
+    build_frozen_source_token_coverage_receipt,
     evaluate_ability_positive_coverage,
     file_fingerprint,
     native_contract_binding,
@@ -42,6 +43,7 @@ from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    resolve_deployment_reference,
 )
 from expert_v1.tick_store_v1.schema import (
     EntityState,
@@ -54,6 +56,7 @@ from expert_v1.tick_store_v1.shard import (
     AUDIT_PREFIX_STORE_KIND,
     AppendOnlyShardWriter,
     build_store_manifest,
+    ShardReader,
 )
 from expert_v1.training_v1.dataset import NativeExpertSequenceDataset, collate_sequences
 from expert_v1.training_v1.schema import (
@@ -187,6 +190,7 @@ class NativeBcCompilerTests(unittest.TestCase):
         episode_contract_mismatch: bool = False,
         source_contract_file_mismatch: bool = False,
         episode_contract_file_mismatch: bool = False,
+        include_ability: bool = True,
     ) -> tuple[Path, Path, Path, Path]:
         contract = root / "native-contract.json"
         published = write_native_ingest_contract(contract)
@@ -216,7 +220,7 @@ class NativeBcCompilerTests(unittest.TestCase):
             source["deck_metadata"]["source_list_url"] = (
                 f"https://royaleapi.com/player/TEAM{number}/battles/history?before=1"
             )
-            if number == 0:
+            if number == 0 and include_ability:
                 # Exercise the conditional ability head in the same compiled
                 # Tick Store path (identity is resolved from the exact native
                 # entity at the expert Tick, never from opponent-private data).
@@ -370,7 +374,9 @@ class NativeBcCompilerTests(unittest.TestCase):
                 json.dumps(
                     {
                         "battle_tag": f"SCHEMA5FIXTURE{number}",
-                        "ability_events_observed": 1 if number == 0 else 0,
+                        "ability_events_observed": (
+                            1 if number == 0 and include_ability else 0
+                        ),
                     }
                 )
                 + "\n"
@@ -398,7 +404,10 @@ class NativeBcCompilerTests(unittest.TestCase):
             results_path, candidate_queue, expected_rows=3
         )
         ability_coverage = evaluate_ability_positive_coverage(
-            {"ability_positive": 1, "ability_zero": 2},
+            {
+                "ability_positive": 1 if include_ability else 0,
+                "ability_zero": 2 if include_ability else 3,
+            },
             audit,
             minimum_success_count=1,
             minimum_success_rate=0.10,
@@ -484,6 +493,8 @@ class NativeBcCompilerTests(unittest.TestCase):
             self.assertEqual((output / "manifest.json").read_bytes(), first_manifest_bytes)
             self.assertEqual((output / "manifest.sha256").read_bytes(), first_manifest_sha)
             manifest = read_manifest(output)
+            self.assertFalse(manifest["production_ready"])
+            self.assertFalse(manifest["token_coverage"]["enforced"])
             verified_manifest, integrity = verify_dataset_integrity(output, workers=2)
             self.assertEqual(
                 verified_manifest["dataset_content_sha256"],
@@ -594,6 +605,182 @@ class NativeBcCompilerTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(
                 NativeBcCompileError, "metadata disagrees"
+            ):
+                finalize_dataset(plan)
+
+    def test_token_coverage_is_recomputed_from_final_bc_label_arrays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(
+                root, include_ability=False
+            )
+            generation_receipt = json.loads(receipt.read_text())
+            results_path = Path(generation_receipt["results"]["path"])
+            contract_value = load_native_ingest_contract(contract)
+            mask_store = DeploymentMaskStore(tick_root, create=False)
+            store_manifest = json.loads(
+                (tick_root / "manifest.json").read_text()
+            )
+            episode_locations: dict[str, tuple[Path, Path]] = {}
+            for shard_row in store_manifest["shards"]:
+                index_path = tick_root / shard_row["index_file"]
+                for line in index_path.read_text().splitlines():
+                    row = json.loads(line)
+                    episode_locations[str(row["battle_tag"])] = (
+                        tick_root / shard_row["data_file"], index_path
+                    )
+            result_rows = []
+            for source_row in (
+                json.loads(line) for line in source.read_text().splitlines()
+            ):
+                tag = str(source_row["battle_tag"])
+                value = json.loads(Path(source_row["source_path"]).read_text())
+                native_plan = compile_battle(
+                    value, native_ingest_contract=contract_value
+                )
+                data_path, index_path = episode_locations[tag]
+                with ShardReader(data_path, index_path) as reader:
+                    episode = reader.episode(tag)
+                    masks = mask_store.verify_episode_metadata(episode.metadata)
+                actors = []
+                for side in (0, 1):
+                    actor = {
+                        "schema_version": 1,
+                        "kind": "cr_native_full_success_actor_token_evidence_v1",
+                        "battle_tag": tag,
+                        "actor_side": side,
+                        "full_success": True,
+                        "prefix_admission": False,
+                        "deck_tokens": [
+                            card.source_token for card in native_plan.sides[side].deck
+                        ],
+                        "deploy_labels": [],
+                        "ability_labels": [],
+                    }
+                    for action in native_plan.actions:
+                        if int(action.side) != side:
+                            continue
+                        card = native_plan.sides[side].deck[
+                            int(action.logical_card_index)
+                        ]
+                        entry = next(
+                            row for row in masks["entries"]
+                            if int(row["side"]) == side
+                            and int(row["card_id"]) == int(card.card_id)
+                            and int(row["form_flags"]) == int(card.form_flags)
+                        )
+                        execution_tick = int(action.tick) + 1
+                        reference = resolve_deployment_reference(
+                            entry, tick=execution_tick, require_dynamic_exact=True
+                        )
+                        payload = mask_store.load(
+                            str(reference["content_sha256"]), allow_cached=True
+                        )
+                        label = {
+                            "source_event_index": int(action.source_event_index),
+                            "source_marker_index": int(action.source_marker_index),
+                            "source_tick": int(action.tick),
+                            "execution_tick": execution_tick,
+                            "source_token": str(card.source_token),
+                            "resolved_native_form_id": int(payload["resolved_data_id"]),
+                            "mask_content_sha256": str(reference["content_sha256"]),
+                            "identity_provenance": "libg_deployment_mask_exact_v1",
+                            "accepted": True,
+                            "mask_legal": True,
+                            "compiled": False,
+                        }
+                        label["native_evidence_sha256"] = hashlib.sha256(
+                            json.dumps(label, sort_keys=True, separators=(",", ":")).encode()
+                        ).hexdigest()
+                        actor["deploy_labels"].append(label)
+                    actor["native_evidence_sha256"] = hashlib.sha256(
+                        json.dumps(actor, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+                    actors.append(actor)
+                result_rows.append({
+                    "kind": "expert_authoritative_native_tick_result_v1",
+                    "battle_tag": tag,
+                    "final_attempt": True,
+                    "teacher_forced_success": True,
+                    "token_coverage_actor_evidence": actors,
+                })
+            results_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in result_rows),
+                encoding="utf-8",
+            )
+            generation_receipt["results"] = file_fingerprint(results_path)
+            receipt.write_text(
+                json.dumps(generation_receipt, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            source_receipt = root / "source-token-coverage.json"
+            source_receipt.write_text(
+                json.dumps(
+                    build_frozen_source_token_coverage_receipt(source, contract),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            generation_receipt = json.loads(receipt.read_text())
+            generation_receipt["source_token_coverage"] = file_fingerprint(
+                source_receipt
+            )
+            receipt.write_text(
+                json.dumps(generation_receipt, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            output = root / "compiled"
+            plan = create_compile_plan(
+                tick_root,
+                source,
+                output,
+                contract,
+                receipt,
+                source_receipt,
+                maximum_rows_per_shard=10_000,
+            )
+            compile_planned_shards(plan, process_workers=1)
+            shard = output / plan["shards"][0]["relative_path"]
+            labels_path = shard / "card_label_mask.npy"
+            labels = np.load(labels_path)
+            labels[:] = 0
+            np.save(labels_path, labels, allow_pickle=False)
+            metadata_path = shard / "shard.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["file_sha256"]["card_label_mask.npy"] = hashlib.sha256(
+                labels_path.read_bytes()
+            ).hexdigest()
+            body = {
+                key: value
+                for key, value in metadata.items()
+                if key != "metadata_content_sha256"
+            }
+            canonical_body = (
+                json.dumps(
+                    body,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            metadata["metadata_content_sha256"] = hashlib.sha256(
+                canonical_body
+            ).hexdigest()
+            metadata_path.write_bytes(
+                json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            with self.assertRaisesRegex(
+                NativeBcCompileError,
+                "compiled label-row coverage|compiled deploy supervision",
             ):
                 finalize_dataset(plan)
 

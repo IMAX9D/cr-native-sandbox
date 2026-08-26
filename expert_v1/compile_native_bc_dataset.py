@@ -63,6 +63,16 @@ from .training_v1.schema import (
     validate_manifest,
     validate_shard,
 )
+from .token_coverage_v1 import (
+    authenticate_generator_ability_evidence,
+    build_adaptive_token_quotas,
+    build_token_coverage_receipt,
+    canonical_json_bytes,
+    coverage_receipt_sha256,
+    evaluate_token_coverage,
+    freeze_source_token_coverage,
+    summarize_success_token_coverage,
+)
 
 
 COMPILER_KIND = "cr_native_tick_store_bc_compiler_v3"
@@ -675,7 +685,12 @@ def _authenticate_native_generation_receipt(
         )
 
         audit = validate_native_result_records(
-            results_path, candidate_queue, expected_rows=target
+            results_path,
+            candidate_queue,
+            expected_rows=target,
+            require_token_evidence=isinstance(
+                receipt.get("source_token_coverage"), Mapping
+            ),
         )
         recomputed = evaluate_ability_positive_coverage(
             {
@@ -707,8 +722,96 @@ def _authenticate_native_generation_receipt(
     return {
         "receipt_path": str(receipt_path),
         "receipt_sha256": sha256_file(receipt_path),
+        "results_path": str(results_path),
+        "results_sha256": sha256_file(results_path),
+        "source_token_coverage": receipt.get("source_token_coverage"),
         "ability_coverage": recomputed,
         "stored_episodes": stored,
+    }
+
+
+def _authenticate_source_token_coverage_receipt(
+    receipt_path: Path,
+    *,
+    schema5_manifest: Path,
+    native_contract: Path,
+    contract_sha256: str,
+    contract_file_sha256: str,
+) -> dict[str, Any]:
+    """Independently recompute source statistics from every frozen JSON."""
+
+    receipt_path = receipt_path.resolve(strict=True)
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8-sig"))
+    except Exception as error:
+        raise NativeBcCompileError(
+            "source token coverage receipt is invalid"
+        ) from error
+    if not isinstance(receipt, Mapping):
+        raise NativeBcCompileError("source token coverage receipt is not an object")
+    body = dict(receipt)
+    claimed = str(body.pop("canonical_sha256", ""))
+    if (
+        body.get("kind") != "cr_expert_frozen_source_token_coverage_v1"
+        or int(body.get("schema_version", -1)) != 1
+        or claimed != hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    ):
+        raise NativeBcCompileError(
+            "source token coverage receipt canonical identity changed"
+        )
+    _verify_coverage_fingerprint(
+        body.get("frozen_manifest"),
+        "source token frozen manifest",
+        expected_path=schema5_manifest,
+    )
+    contract_binding = body.get("native_contract")
+    if not isinstance(contract_binding, Mapping) or (
+        Path(str(contract_binding.get("path") or "")).resolve()
+        != native_contract.resolve()
+        or contract_binding.get("canonical_sha256") != contract_sha256
+        or contract_binding.get("file_sha256") != contract_file_sha256
+    ):
+        raise NativeBcCompileError("source token coverage contract binding changed")
+    contract = json.loads(native_contract.read_bytes())
+
+    def battles() -> Iterable[Mapping[str, Any]]:
+        seen: set[str] = set()
+        for line_number, row in enumerate(_json_lines(schema5_manifest), start=1):
+            tag = str(row.get("battle_tag") or "")
+            path = Path(str(row.get("source_path") or "")).resolve(strict=True)
+            payload = path.read_bytes()
+            if (
+                not tag
+                or tag in seen
+                or hashlib.sha256(payload).hexdigest()
+                != str(row.get("source_sha256") or "")
+            ):
+                raise NativeBcCompileError(
+                    f"source token manifest identity failed at row {line_number}"
+                )
+            seen.add(tag)
+            value = json.loads(payload)
+            if not isinstance(value, Mapping) or value.get("battle_tag") != tag:
+                raise NativeBcCompileError(
+                    f"source token battle identity changed: {tag}"
+                )
+            yield value
+
+    recomputed_source = freeze_source_token_coverage(battles(), contract)
+    recomputed_quotas = build_adaptive_token_quotas(recomputed_source)
+    if (
+        body.get("source_coverage") != recomputed_source
+        or body.get("adaptive_quotas") != recomputed_quotas
+    ):
+        raise NativeBcCompileError(
+            "source token coverage receipt differs from frozen source bytes"
+        )
+    return {
+        "receipt_path": str(receipt_path),
+        "receipt_sha256": sha256_file(receipt_path),
+        "canonical_sha256": claimed,
+        "source_coverage": recomputed_source,
+        "adaptive_quotas": recomputed_quotas,
     }
 
 
@@ -775,7 +878,11 @@ def validate_compile_plan(
             "native_contract_file_sha256", "native_contract_sha256",
             "referenced_deployment_mask_sha256", "deployment_mask_manifest_sha256",
             "deployment_mask_content_sha256", "native_generation_receipt_path",
-            "native_generation_receipt_sha256",
+            "native_generation_receipt_sha256", "native_generation_results_path",
+            "native_generation_results_sha256",
+            "source_token_coverage_receipt_path",
+            "source_token_coverage_receipt_sha256",
+            "source_token_coverage_canonical_sha256",
         },
         "compile-plan inputs",
     )
@@ -829,6 +936,7 @@ def validate_compile_plan(
         {
             "compiler_sha256", "training_schema_sha256",
             "deployment_masks_sha256", "native_coverage_validator_sha256",
+            "token_coverage_validator_sha256",
         },
         "compile-plan components",
     )
@@ -850,8 +958,26 @@ def validate_compile_plan(
         "schema5_manifest_sha256", "native_contract_file_sha256",
         "native_contract_sha256", "deployment_mask_manifest_sha256",
         "deployment_mask_content_sha256", "native_generation_receipt_sha256",
+        "native_generation_results_sha256",
     ):
         _require_sha(inputs.get(name), f"inputs.{name}")
+    if inputs.get("source_token_coverage_receipt_path") is None:
+        if (
+            inputs.get("source_token_coverage_receipt_sha256") is not None
+            or inputs.get("source_token_coverage_canonical_sha256") is not None
+        ):
+            raise NativeBcCompileError(
+                "compile-plan has partial source token coverage identity"
+            )
+    else:
+        _require_sha(
+            inputs.get("source_token_coverage_receipt_sha256"),
+            "inputs.source_token_coverage_receipt_sha256",
+        )
+        _require_sha(
+            inputs.get("source_token_coverage_canonical_sha256"),
+            "inputs.source_token_coverage_canonical_sha256",
+        )
     referenced_masks = inputs.get("referenced_deployment_mask_sha256")
     if (
         not isinstance(referenced_masks, list)
@@ -1111,8 +1237,19 @@ def validate_compile_plan(
                 inputs["native_generation_receipt_sha256"],
                 "native generation receipt",
             ),
+            (
+                Path(str(inputs["native_generation_results_path"])),
+                inputs["native_generation_results_sha256"],
+                "native generation results",
+            ),
             (tick_root / "deployment-masks-v1" / "manifest.json", inputs["deployment_mask_manifest_sha256"], "mask manifest"),
         )
+        if inputs.get("source_token_coverage_receipt_path") is not None:
+            files += ((
+                Path(str(inputs["source_token_coverage_receipt_path"])),
+                inputs["source_token_coverage_receipt_sha256"],
+                "source token coverage receipt",
+            ),)
         for path, expected, label in files:
             if not path.is_file() or sha256_file(path) != str(expected):
                 raise NativeBcCompileError(f"compile-plan {label} changed")
@@ -1139,6 +1276,30 @@ def validate_compile_plan(
             "native_generation_receipt_sha256"
         ]:
             raise NativeBcCompileError("compile-plan native coverage receipt changed")
+        if (
+            native_coverage["results_sha256"]
+            != inputs["native_generation_results_sha256"]
+            or Path(native_coverage["results_path"]).resolve()
+            != Path(str(inputs["native_generation_results_path"])).resolve()
+        ):
+            raise NativeBcCompileError("compile-plan native results identity changed")
+        if inputs.get("source_token_coverage_receipt_path") is not None:
+            source_coverage = _authenticate_source_token_coverage_receipt(
+                Path(str(inputs["source_token_coverage_receipt_path"])),
+                schema5_manifest=Path(str(inputs["schema5_manifest_path"])),
+                native_contract=contract_path,
+                contract_sha256=str(inputs["native_contract_sha256"]),
+                contract_file_sha256=str(inputs["native_contract_file_sha256"]),
+            )
+            if (
+                source_coverage["receipt_sha256"]
+                != inputs["source_token_coverage_receipt_sha256"]
+                or source_coverage["canonical_sha256"]
+                != inputs["source_token_coverage_canonical_sha256"]
+            ):
+                raise NativeBcCompileError(
+                    "compile-plan source token coverage identity changed"
+                )
         _validate_plan_vocabulary(plan, contract)
         mask_store = DeploymentMaskStore(tick_root, create=False)
         mask_manifest = mask_store.verify_manifest()
@@ -1271,6 +1432,9 @@ def validate_compile_plan(
             ).resolve(),
             "native_coverage_validator_sha256": (
                 Path(__file__).parent / "one_click_v1.py"
+            ).resolve(),
+            "token_coverage_validator_sha256": (
+                Path(__file__).parent / "token_coverage_v1.py"
             ).resolve(),
         }
         for name, path in component_paths.items():
@@ -1976,6 +2140,7 @@ def create_compile_plan(
     output_root: Path,
     native_contract: Path,
     native_generation_receipt: Path,
+    source_token_coverage_receipt: Path | None = None,
     *,
     seed: int = 20260827,
     validation_fraction: float = 0.05,
@@ -1988,6 +2153,11 @@ def create_compile_plan(
     schema5_manifest = schema5_manifest.resolve(strict=True)
     native_contract = native_contract.resolve(strict=True)
     native_generation_receipt = native_generation_receipt.resolve(strict=True)
+    source_token_coverage_receipt = (
+        None
+        if source_token_coverage_receipt is None
+        else source_token_coverage_receipt.resolve(strict=True)
+    )
     output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     existing_plan_path = output_root / "compile-plan.json"
@@ -2010,6 +2180,30 @@ def create_compile_plan(
         contract_file_sha256=contract_file_sha256,
         expected_episodes=len(episode_entries),
     )
+    source_token_coverage = (
+        None
+        if source_token_coverage_receipt is None
+        else _authenticate_source_token_coverage_receipt(
+            source_token_coverage_receipt,
+            schema5_manifest=schema5_manifest,
+            native_contract=native_contract,
+            contract_sha256=contract_sha256,
+            contract_file_sha256=contract_file_sha256,
+        )
+    )
+    if source_token_coverage is not None:
+        declared_source_coverage = native_generation_coverage.get(
+            "source_token_coverage"
+        )
+        if not isinstance(declared_source_coverage, Mapping) or (
+            Path(str(declared_source_coverage.get("path") or "")).resolve()
+            != source_token_coverage_receipt
+            or declared_source_coverage.get("sha256")
+            != source_token_coverage["receipt_sha256"]
+        ):
+            raise NativeBcCompileError(
+                "native generation receipt is not bound to source token coverage"
+            )
     index_rows = _json_lines(schema5_manifest)
     indexed: dict[str, Mapping[str, Any]] = {}
     for row in index_rows:
@@ -2188,6 +2382,27 @@ def create_compile_plan(
         "native_generation_receipt_sha256": native_generation_coverage[
             "receipt_sha256"
         ],
+        "native_generation_results_path": native_generation_coverage[
+            "results_path"
+        ],
+        "native_generation_results_sha256": native_generation_coverage[
+            "results_sha256"
+        ],
+        "source_token_coverage_receipt_path": (
+            None
+            if source_token_coverage is None
+            else source_token_coverage["receipt_path"]
+        ),
+        "source_token_coverage_receipt_sha256": (
+            None
+            if source_token_coverage is None
+            else source_token_coverage["receipt_sha256"]
+        ),
+        "source_token_coverage_canonical_sha256": (
+            None
+            if source_token_coverage is None
+            else source_token_coverage["canonical_sha256"]
+        ),
     }
     compiler_contract = {
         "kind": COMPILER_KIND,
@@ -2215,6 +2430,9 @@ def create_compile_plan(
             ),
             "native_coverage_validator_sha256": sha256_file(
                 (Path(__file__).parent / "one_click_v1.py").resolve()
+            ),
+            "token_coverage_validator_sha256": sha256_file(
+                (Path(__file__).parent / "token_coverage_v1.py").resolve()
             ),
         },
     }
@@ -3169,6 +3387,472 @@ def _compile_output_shard_star(arguments: Sequence[Any]) -> dict[str, Any]:
     return _compile_output_shard(*arguments)
 
 
+def _final_compiled_token_coverage(
+    plan: Mapping[str, Any],
+    compiled_tags: set[str],
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], str, str]:
+    """Rejoin source, generator evidence and completed BC shards per token."""
+
+    source_receipt_path = plan["inputs"].get(
+        "source_token_coverage_receipt_path"
+    )
+    if source_receipt_path is None:
+        raise NativeBcCompileError(
+            "production token coverage requires an explicit source receipt"
+        )
+    source_auth = _authenticate_source_token_coverage_receipt(
+        Path(str(source_receipt_path)),
+        schema5_manifest=Path(str(plan["inputs"]["schema5_manifest_path"])),
+        native_contract=Path(str(plan["inputs"]["native_contract_path"])),
+        contract_sha256=str(plan["inputs"]["native_contract_sha256"]),
+        contract_file_sha256=str(
+            plan["inputs"]["native_contract_file_sha256"]
+        ),
+    )
+    source_coverage = source_auth["source_coverage"]
+    source_events_sha = str(
+        source_coverage["ability_event_registry"]["source_events_sha256"]
+    )
+    results_path = Path(
+        str(plan["inputs"]["native_generation_results_path"])
+    ).resolve(strict=True)
+    if sha256_file(results_path) != plan["inputs"][
+        "native_generation_results_sha256"
+    ]:
+        raise NativeBcCompileError("native results changed before token coverage")
+    by_tag: dict[str, Mapping[str, Any]] = {}
+    for row in _json_lines(results_path):
+        tag = str(row.get("battle_tag") or "")
+        if not tag or tag in by_tag:
+            raise NativeBcCompileError("native token evidence result tags are malformed")
+        by_tag[tag] = row
+    success_tags = {
+        tag for tag, row in by_tag.items()
+        if row.get("teacher_forced_success") is True
+    }
+    if success_tags != compiled_tags:
+        raise NativeBcCompileError(
+            "compiled tags differ from full-success native token evidence"
+        )
+
+    sequence_locations: dict[tuple[str, int], tuple[Path, int]] = {}
+    ordered_tags: list[str] = []
+    output_root = Path(str(plan["output_root"])).resolve()
+    for raw_shard in plan["shards"]:
+        shard_path = output_root / str(raw_shard["relative_path"])
+        for episode_index, episode in enumerate(raw_shard["episodes"]):
+            tag = str(episode["battle_tag"])
+            ordered_tags.append(tag)
+            for side in (0, 1):
+                key = (tag, side)
+                if key in sequence_locations:
+                    raise NativeBcCompileError(
+                        f"compiled token sequence is duplicated: {tag}/{side}"
+                    )
+                sequence_locations[key] = (
+                    shard_path,
+                    episode_index * 2 + side,
+                )
+    if set(ordered_tags) != compiled_tags or len(ordered_tags) != len(compiled_tags):
+        raise NativeBcCompileError(
+            "compiled token sequence locations differ from admitted tags"
+        )
+
+    source_paths: dict[str, Path] = {}
+    episode_inputs: dict[str, Mapping[str, Any]] = {}
+    for shard in plan["shards"]:
+        for episode in shard["episodes"]:
+            tag = str(episode["battle_tag"])
+            source_paths[tag] = Path(str(episode["source_path"])).resolve(strict=True)
+            episode_inputs[tag] = episode
+    loaded_contract = load_native_ingest_contract(
+        Path(str(plan["inputs"]["native_contract_path"]))
+    )
+    actor_records: list[dict[str, Any]] = []
+    readers: dict[tuple[str, str], ShardReader] = {}
+    mask_store = DeploymentMaskStore(
+        Path(str(plan["tick_store_root"])), create=False
+    )
+    compiled_array_names = (
+        "sequence_offsets", "play_now", "kind_label_mask", "action_kind",
+        "card_label_mask", "position_label_mask", "card_slot", "position",
+        "hand_tokens", "card_mask", "ability_label_mask", "ability_slot",
+        "ability_tokens", "ability_mask", "ability_position_label_mask",
+    )
+    current_compiled_path: Path | None = None
+    current_compiled_arrays: dict[str, np.ndarray] = {}
+
+    def close_compiled_arrays() -> None:
+        nonlocal current_compiled_arrays
+        for array_value in current_compiled_arrays.values():
+            mapping = getattr(array_value, "_mmap", None)
+            if mapping is not None:
+                mapping.close()
+        current_compiled_arrays = {}
+
+    def compiled_arrays(path: Path) -> Mapping[str, np.ndarray]:
+        nonlocal current_compiled_path, current_compiled_arrays
+        if current_compiled_path != path:
+            close_compiled_arrays()
+            current_compiled_arrays = {
+                name: np.load(path / f"{name}.npy", mmap_mode="r")
+                for name in compiled_array_names
+            }
+            current_compiled_path = path
+        return current_compiled_arrays
+
+    try:
+        for tag in ordered_tags:
+            result = by_tag[tag]
+            raw_actors = result.get("token_coverage_actor_evidence")
+            if not isinstance(raw_actors, list) or len(raw_actors) != 2:
+                raise NativeBcCompileError(
+                    f"full-success result lacks actor token evidence: {tag}"
+                )
+            source = json.loads(source_paths[tag].read_bytes())
+            native_plan = compile_battle(
+                source, native_ingest_contract=loaded_contract
+            )
+            episode_input = episode_inputs[tag]
+            reader_key = (
+                str(episode_input["tick_data_path"]),
+                str(episode_input["tick_index_path"]),
+            )
+            reader = readers.get(reader_key)
+            if reader is None:
+                reader = ShardReader(Path(reader_key[0]), Path(reader_key[1]))
+                readers[reader_key] = reader
+            episode = reader.episode(tag)
+            states = tuple(episode.iter_ticks())
+            states_by_tick = {state.tick: state for state in states}
+            if len(states_by_tick) != len(states):
+                raise NativeBcCompileError(
+                    f"token evidence Tick Store has duplicate Ticks: {tag}"
+                )
+            mask_metadata = mask_store.verify_episode_metadata(episode.metadata)
+            mask_entries = list(mask_metadata["entries"])
+            actors = {
+                int(row.get("actor_side", -1)): row
+                for row in raw_actors if isinstance(row, Mapping)
+            }
+            if set(actors) != {0, 1}:
+                raise NativeBcCompileError(f"actor token evidence sides changed: {tag}")
+            for side in (0, 1):
+                actor = actors[side]
+                shard_path, sequence_index = sequence_locations[(tag, side)]
+                arrays = compiled_arrays(shard_path)
+                offsets = arrays["sequence_offsets"]
+                sequence_start = int(offsets[sequence_index])
+                sequence_stop = int(offsets[sequence_index + 1])
+                if sequence_stop - sequence_start != len(states):
+                    raise NativeBcCompileError(
+                        f"compiled actor sequence length differs from Tick Store: {tag}/{side}"
+                    )
+                expected_deck = [
+                    card.source_token for card in native_plan.sides[side].deck
+                ]
+                if actor.get("deck_tokens") != expected_deck:
+                    raise NativeBcCompileError(
+                        f"actor token evidence deck differs from source: {tag}/{side}"
+                    )
+                expected_deploy = []
+                for action in native_plan.actions:
+                    if int(action.side) != side:
+                        continue
+                    card = native_plan.sides[side].deck[
+                        int(action.logical_card_index)
+                    ]
+                    matches = [
+                        entry for entry in mask_entries
+                        if int(entry["side"]) == side
+                        and int(entry["card_id"]) == int(card.card_id)
+                        and int(entry["form_flags"]) == int(card.form_flags)
+                    ]
+                    if len(matches) != 1:
+                        raise NativeBcCompileError(
+                            f"compiled mask identity is ambiguous: {tag}/{side}"
+                        )
+                    execution_tick = int(action.tick) + int(
+                        episode.metadata[ACTION_EXECUTION_OFFSET_METADATA]
+                    )
+                    reference = resolve_deployment_reference(
+                        matches[0], tick=execution_tick, require_dynamic_exact=True
+                    )
+                    if reference is None:
+                        raise NativeBcCompileError(
+                            f"compiled deploy lacks exact mask: {tag}/{side}"
+                        )
+                    payload = mask_store.load(str(reference["content_sha256"]))
+                    expected_deploy.append((
+                        int(action.source_event_index),
+                        int(action.source_marker_index),
+                        int(action.tick),
+                        str(card.source_token),
+                        int(payload["resolved_data_id"]),
+                        str(reference["content_sha256"]),
+                    ))
+                actual_deploy = sorted(
+                    (
+                        int(label.get("source_event_index", -1)),
+                        int(label.get("source_marker_index", -1)),
+                        int(label.get("source_tick", -1)),
+                        str(label.get("source_token") or ""),
+                        int(label.get("resolved_native_form_id", -1)),
+                        str(label.get("mask_content_sha256") or ""),
+                    )
+                    for label in actor.get("deploy_labels") or []
+                    if isinstance(label, Mapping)
+                )
+                expected_ability = sorted(
+                    (
+                        int(event.source_event_index),
+                        int(event.source_marker_index),
+                        int(event.tick),
+                    )
+                    for event in native_plan.ability_events if int(event.side) == side
+                )
+                actual_ability = sorted(
+                    (
+                        int(label.get("source_event_index", -1)),
+                        int(label.get("source_marker_index", -1)),
+                        int(label.get("source_tick", -1)),
+                    )
+                    for label in actor.get("ability_labels") or []
+                    if isinstance(label, Mapping)
+                )
+                if sorted(expected_deploy) != actual_deploy or expected_ability != actual_ability:
+                    raise NativeBcCompileError(
+                        f"actor token evidence events differ from source/native: {tag}/{side}"
+                    )
+                deploy_labels = {
+                    int(label["source_event_index"]): label
+                    for label in actor.get("deploy_labels") or []
+                }
+                ability_labels = {
+                    int(label["source_event_index"]): label
+                    for label in actor.get("ability_labels") or []
+                }
+                expected_deploy_rows: set[int] = set()
+                expected_ability_rows: set[int] = set()
+                state_start_tick = states[0].tick
+                for action in native_plan.actions:
+                    if int(action.side) != side:
+                        continue
+                    execution_tick = int(action.tick) + int(
+                        episode.metadata[ACTION_EXECUTION_OFFSET_METADATA]
+                    )
+                    local_row = execution_tick - state_start_tick
+                    row = sequence_start + local_row
+                    label = deploy_labels.get(int(action.source_event_index))
+                    state = states_by_tick.get(execution_tick)
+                    if (
+                        label is None
+                        or state is None
+                        or not 0 <= local_row < len(states)
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled deploy row is absent: {tag}/{side}/{execution_tick}"
+                        )
+                    hand = list(state.players[side].hand)
+                    try:
+                        expected_slot = hand.index(int(action.logical_card_index))
+                    except ValueError as error:
+                        raise NativeBcCompileError(
+                            f"compiled deploy exact hand differs: {tag}/{side}/{execution_tick}"
+                        ) from error
+                    expected_token = int(
+                        plan["source_card_to_token"][str(label["source_token"])]
+                    )
+                    expected_position = _cell(
+                        int(action.x) if side == 0 else 17_999 - int(action.x),
+                        int(action.y) if side == 0 else 31_999 - int(action.y),
+                    )
+                    if (
+                        int(arrays["play_now"][row]) != 1
+                        or int(arrays["kind_label_mask"][row]) != 1
+                        or int(arrays["action_kind"][row]) != 0
+                        or int(arrays["card_label_mask"][row]) != 1
+                        or int(arrays["position_label_mask"][row]) != 1
+                        or int(arrays["card_slot"][row]) != expected_slot
+                        or int(arrays["position"][row]) != expected_position
+                        or int(arrays["hand_tokens"][row, expected_slot])
+                        != expected_token
+                        or int(arrays["card_mask"][row, expected_slot]) != 1
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled deploy supervision differs from final shard: "
+                            f"{tag}/{side}/{execution_tick}"
+                        )
+                    expected_deploy_rows.add(row)
+                for event in native_plan.ability_events:
+                    if int(event.side) != side:
+                        continue
+                    execution_tick = int(event.tick) + int(
+                        episode.metadata[ACTION_EXECUTION_OFFSET_METADATA]
+                    )
+                    local_row = execution_tick - state_start_tick
+                    row = sequence_start + local_row
+                    label = ability_labels.get(int(event.source_event_index))
+                    if label is None or not 0 <= local_row < len(states):
+                        raise NativeBcCompileError(
+                            f"compiled ability row is absent: {tag}/{side}/{execution_tick}"
+                        )
+                    slot = int(arrays["ability_slot"][row])
+                    expected_token = int(
+                        plan["native_ability_id_to_token"][
+                            str(int(label["resolved_native_form_id"]))
+                        ]
+                    )
+                    if (
+                        int(arrays["play_now"][row]) != 1
+                        or int(arrays["kind_label_mask"][row]) != 1
+                        or int(arrays["action_kind"][row]) != 1
+                        or int(arrays["ability_label_mask"][row]) != 1
+                        or not 0 <= slot < arrays["ability_tokens"].shape[1]
+                        or int(arrays["ability_tokens"][row, slot])
+                        != expected_token
+                        or int(arrays["ability_mask"][row, slot]) != 1
+                        or int(arrays["ability_position_label_mask"][row]) != 0
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled ability supervision differs from final shard: "
+                            f"{tag}/{side}/{execution_tick}"
+                        )
+                    expected_ability_rows.add(row)
+                row_slice = slice(sequence_start, sequence_stop)
+                actual_deploy_rows = set(
+                    sequence_start
+                    + int(value)
+                    for value in np.flatnonzero(
+                        np.asarray(arrays["card_label_mask"][row_slice])
+                    )
+                )
+                actual_position_rows = set(
+                    sequence_start
+                    + int(value)
+                    for value in np.flatnonzero(
+                        np.asarray(arrays["position_label_mask"][row_slice])
+                    )
+                )
+                actual_ability_rows = set(
+                    sequence_start
+                    + int(value)
+                    for value in np.flatnonzero(
+                        np.asarray(arrays["ability_label_mask"][row_slice])
+                    )
+                )
+                actual_kind_rows = set(
+                    sequence_start
+                    + int(value)
+                    for value in np.flatnonzero(
+                        np.asarray(arrays["kind_label_mask"][row_slice])
+                    )
+                )
+                actual_play_rows = set(
+                    sequence_start
+                    + int(value)
+                    for value in np.flatnonzero(
+                        np.asarray(arrays["play_now"][row_slice])
+                    )
+                )
+                expected_all_rows = expected_deploy_rows | expected_ability_rows
+                if (
+                    actual_deploy_rows != expected_deploy_rows
+                    or actual_position_rows != expected_deploy_rows
+                    or actual_ability_rows != expected_ability_rows
+                    or actual_kind_rows != expected_all_rows
+                    or actual_play_rows != expected_all_rows
+                ):
+                    raise NativeBcCompileError(
+                        f"compiled label-row coverage differs from source events: {tag}/{side}"
+                    )
+                for label in actor.get("ability_labels") or []:
+                    if not isinstance(label, Mapping):
+                        raise NativeBcCompileError("ability token evidence is not an object")
+                    tick = int(label.get("execution_tick", -1))
+                    entity_id = int(label.get("selected_entity_id", -1))
+                    state = states_by_tick.get(tick)
+                    matches = [] if state is None else [
+                        entity for entity in state.entities
+                        if entity.key == entity_id
+                    ]
+                    if (
+                        len(matches) != 1
+                        or matches[0].side != side
+                        or matches[0].ability_slot <= 0
+                        or matches[0].ability_available != 1
+                        or int(matches[0].card_id)
+                        != int(label.get("resolved_native_form_id", -1))
+                    ):
+                        raise NativeBcCompileError(
+                            f"ability token evidence differs from Tick Store: {tag}/{side}/{tick}"
+                        )
+                actor_records.append(dict(actor))
+    finally:
+        close_compiled_arrays()
+        for reader in readers.values():
+            reader.close()
+
+    try:
+        authenticated = authenticate_generator_ability_evidence(
+            actor_records,
+            contract,
+            source_coverage,
+            expected_source_events_sha256=source_events_sha,
+        )
+        transcript_by_event = {
+            (
+                str(row["battle_tag"]),
+                int(row["actor_side"]),
+                int(row["source_event_index"]),
+            ): str(row["transcript_sha256"])
+            for row in authenticated["transcripts"]
+        }
+        compiled_records: list[dict[str, Any]] = []
+        for raw_actor in actor_records:
+            actor = json.loads(json.dumps(raw_actor))
+            for label in actor["deploy_labels"]:
+                label["compiled"] = True
+            for label in actor["ability_labels"]:
+                key = (
+                    str(actor["battle_tag"]),
+                    int(actor["actor_side"]),
+                    int(label["source_event_index"]),
+                )
+                digest = transcript_by_event.get(key)
+                if digest is None:
+                    raise NativeBcCompileError(
+                        f"compiled ability lacks authenticated transcript: {key}"
+                    )
+                label["compiled"] = True
+                label["resolution_transcript_sha256"] = digest
+            compiled_records.append(actor)
+        success = summarize_success_token_coverage(
+            compiled_records,
+            contract,
+            source=source_coverage,
+            authenticated_ability_transcripts=authenticated,
+            expected_source_events_sha256=source_events_sha,
+            expected_authenticated_transcripts_sha256=str(
+                authenticated["authenticated_transcripts_sha256"]
+            ),
+        )
+        receipt = build_token_coverage_receipt(
+            source_coverage,
+            success,
+            source_auth["adaptive_quotas"],
+        )
+        digest = coverage_receipt_sha256(receipt)
+    except NativeBcCompileError:
+        raise
+    except Exception as error:
+        raise NativeBcCompileError(
+            f"token coverage authentication failed: {error}"
+        ) from error
+    return receipt, digest, source_auth["receipt_sha256"]
+
+
 def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Verify every planned shard and atomically expose ``manifest.json`` last."""
     plan = _authenticate_plan_argument(plan, verify_live_inputs=True)
@@ -3193,6 +3877,11 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "native generation receipt",
         ),
         (
+            Path(str(plan["inputs"]["native_generation_results_path"])),
+            str(plan["inputs"]["native_generation_results_sha256"]),
+            "native generation results",
+        ),
+        (
             Path(str(plan["tick_store_root"]))
             / "deployment-masks-v1"
             / "manifest.json",
@@ -3200,6 +3889,12 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "deployment-mask manifest",
         ),
     )
+    if plan["inputs"].get("source_token_coverage_receipt_path") is not None:
+        immutable_inputs += ((
+            Path(str(plan["inputs"]["source_token_coverage_receipt_path"])),
+            str(plan["inputs"]["source_token_coverage_receipt_sha256"]),
+            "source token coverage receipt",
+        ),)
     for path, expected, label in immutable_inputs:
         if not path.is_file() or sha256_file(path) != expected:
             raise NativeBcCompileError(f"{label} changed before finalization")
@@ -3211,6 +3906,9 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         ).resolve(),
         "native_coverage_validator_sha256": (
             Path(__file__).parent / "one_click_v1.py"
+        ).resolve(),
+        "token_coverage_validator_sha256": (
+            Path(__file__).parent / "token_coverage_v1.py"
         ).resolve(),
     }
     for name, path in component_paths.items():
@@ -3294,12 +3992,61 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         ),
         expected_episodes=len(seen_tags),
     )
+    token_coverage_manifest: dict[str, Any]
+    if plan["inputs"].get("source_token_coverage_receipt_path") is None:
+        token_coverage_manifest = {
+            "enforced": False,
+            "reason": "legacy_direct_test_without_source_token_receipt",
+        }
+    else:
+        token_receipt, token_digest, source_receipt_sha = (
+            _final_compiled_token_coverage(plan, set(seen_tags), contract={
+                **load_native_ingest_contract(
+                    Path(str(plan["inputs"]["native_contract_path"]))
+                ).value
+            })
+        )
+        token_path = output / "token-coverage-receipt.json"
+        _atomic_json(token_path, token_receipt)
+        token_file_sha = sha256_file(token_path)
+        _atomic_bytes(
+            output / "token-coverage-receipt.sha256",
+            f"{token_file_sha}  token-coverage-receipt.json\n".encode("ascii"),
+        )
+        gate = (token_receipt.get("evaluation") or {}).get("gate") or {}
+        token_coverage_manifest = {
+            "enforced": True,
+            "receipt": "token-coverage-receipt.json",
+            "receipt_file_sha256": token_file_sha,
+            "receipt_canonical_sha256": token_digest,
+            "source_receipt_sha256": source_receipt_sha,
+            "gate": gate,
+        }
+        if gate.get("admitted") is not True:
+            deficits = token_receipt.get("evaluation") or {}
+            raise NativeBcCompileError(
+                "FAILED_COVERAGE: per-token deficits remain; evidence="
+                f"{token_path}; deficits="
+                + json.dumps(
+                    {
+                        "hard_floor": deficits.get("hard_floor_deficits"),
+                        "adaptive": deficits.get("adaptive_quota_deficits"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
     manifest: dict[str, Any] = {
         "kind": DATASET_KIND,
         "schema_version": SCHEMA_VERSION,
         # Stable across repeated finalization of the same authenticated plan.
         "created_utc": str(plan["created_utc"]),
-        "production_ready": True,
+        "production_ready": bool(
+            token_coverage_manifest.get("enforced") is True
+            and (token_coverage_manifest.get("gate") or {}).get("admitted")
+            is True
+        ),
         "native_replay_validated": True,
         "observation_mode": OBSERVATION_MODE,
         "timing_target": "native_tick_hazard_v1",
@@ -3316,11 +4063,13 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         "source_inputs": plan["inputs"],
         "capacity_preflight": plan["capacity_preflight"],
         "native_generation_coverage": native_generation_coverage,
+        "token_coverage": token_coverage_manifest,
         "dataset_content_sha256": _digest(
             {
                 "input": plan["input_content_sha256"],
                 "shards": file_hashes,
                 "assignments": hashlib.sha256(assignment_raw).hexdigest(),
+                "token_coverage": token_coverage_manifest,
             }
         ),
         "dimensions": {
@@ -3412,6 +4161,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         "actor_sequences": total_sequences,
         "rows": total_rows,
         "splits": manifest["split_statistics"],
+        "token_coverage": token_coverage_manifest,
     }
     _atomic_json(output / "compile-result.json", result)
     return result
@@ -3426,6 +4176,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--native-contract", type=Path, required=True)
     parser.add_argument("--native-generation-receipt", type=Path, required=True)
+    parser.add_argument(
+        "--source-token-coverage-receipt", type=Path, required=True
+    )
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--test-fraction", type=float, default=0.05)
@@ -3450,6 +4203,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.output_root,
         args.native_contract,
         args.native_generation_receipt,
+        args.source_token_coverage_receipt,
         seed=args.seed,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,
