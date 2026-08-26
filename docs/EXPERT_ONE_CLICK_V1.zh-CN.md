@@ -1,30 +1,32 @@
-# Expert Schema5-v2 一键闭环 v1
+# Expert Schema5 / contract-v3 一键闭环 v1
 
-双击仓库根目录的 `START_EXPERT_ONE_CLICK_V1.cmd`，入口会以前台常驻监督器的方式，从权威 Schema5-v2 数据采集一直推进到正式专家模型训练。它不是旧的 Schema3 流程，也不会读取历史 `native-eligibility-v1` 队列。
+双击仓库根目录的 `START_EXPERT_ONE_CLICK_V1.cmd`，入口会以前台常驻监督器的方式，从权威 Schema5、native ingest contract v3 数据采集一直推进到正式专家模型训练。这里的 `v3` 是 **ingest contract/产物代际**；战斗 JSON 文件格式仍固定为 `schema_version=5`。入口不会读取旧 Schema3 数据，也不会读取历史 `native-eligibility-v1` 队列。
 
 ## 固定流程
 
-1. 校验 crawler 配置、原生 ingest contract 和 Schema5-v2 独立输出目录。
+1. 校验 crawler 配置、原生 ingest contract v3 和独立输出目录 `authoritative-schema5-v3`。contract v2、`authoritative-schema5-v2` 或旧 one-click state 会立即 fail-closed。
 2. 未满 100,000 场时启动或接管 `crawler.authoritative_production`，持续监督并等待；监督器意外退出会被恢复。
 3. 正好达到 100,000 场后停止 crawler、checkpoint SQLite；此后才读取可用物理内存并把原生布局永久固化到 journal（可用内存至少 16 GiB 时为 2 AVD × 4 Worker，否则为 1 AVD × 4 Worker），随后冻结内容寻址 Schema5 manifest。
-4. 从该冻结 manifest 重新生成 eligibility audit。native 候选队列会逐行验证：只能是 Schema5、必须有权威 contract 标记、源文件必须位于 Schema5-v2 根目录且 SHA 相同。任何 Schema3 行立即 fail-closed。
+4. 从该冻结 manifest 重新生成 eligibility audit。native 候选队列会逐行验证：只能是 Schema5、必须有权威 contract-v3 标记、源文件必须位于 `authoritative-schema5-v3` 根目录且 SHA 相同。任何旧 contract 或 Schema3 行立即 fail-closed。
 5. 获取跨所有 `--data-root` 共用的原生硬件 OS 锁，启动固化布局的 direct Worker，准备或恢复原生 Tick 生成。已有工作队列、结果和 CRTS shard 会原地续跑。
 6. 候选、selected 和 processed 必须全部为 100,000；每个 JSON 都必须形成原生 attempt 终态。默认要求 teacher-forced 成功率至少 50%，完整成功/失败分布写入 coverage receipt。
 7. 生成结束后先逐实例关闭全部 Worker 和 AVD；异常路径也会 best-effort 关闭，然后才释放全局硬件锁。
 8. 对 Tick Store 做完整物理扫描：校验全部 CRTS/index SHA、帧计数，以及每场成功样本引用的内容寻址部署 Mask。
 9. 并行编译 native BC 数据集。编译器按确定性 shard 续跑，最终检查 split、Mask、标签、非有限值、原生拒绝和终局等 quality gates。
 10. 使用正式编译数据而不是合成数据，运行 2 个 train batch 的真实小 smoke。
-11. smoke 通过后调用 `expert_v1.training_v1.train --resume`，启动或恢复固定 Run `expert-v1-schema5-v2-100k`。
+11. smoke 通过后调用 `expert_v1.training_v1.train --resume`，启动或恢复固定 Run `expert-v1-schema5-v3-100k`。
 
 ## 断点与安全边界
 
 控制状态保存在：
 
 ```text
-D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v2\control\state.json
+D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3\control\state.json
 ```
 
 每个阶段在开始时写入输入文件 SHA-256，在完成时写入输出文件 SHA-256。重新双击时，已完成阶段只有在输入、输出逐字节未变化时才跳过；任何漂移都会停止并保留现场。单实例 OS 文件锁阻止两个入口同时写同一批数据，另一个固定的全局锁阻止不同数据根同时争用 AVD/ADB/direct ports。
+
+v3 使用新的 state schema 和阶段名（`collect/freeze/audit_schema5_v3`）。把 v2 的 `state.json` 复制到 v3 根目录，或显式把 `--data-root` 指向 `one-click-schema5-v2`，都会拒绝启动；不能通过改目录名续跑旧 manifest、shard 或 checkpoint。
 
 耗时阶段均具备恢复边界：crawler 使用原 SQLite 队列，native generator 使用自己的 SQLite work queue 和不可变 shard，编译器使用确定性 `compile-plan.json`/shard，训练使用完整 optimizer、normalizer 和 RNG checkpoint。
 
@@ -48,7 +50,9 @@ scripts\start_expert_one_click_v1.ps1 -Status
 scripts\start_expert_one_click_v1.ps1 -Smoke
 ```
 
-日志保存在 `...\one-click-schema5-v2\logs`。失败时不要删除状态或产物；修复外部原因后重新双击，流程会从当前阶段恢复。`--smoke` 不会启动 crawler 或 AVD，也不会用合成数据填补缺失产物。
+日志保存在 `...\one-click-schema5-v3\logs`。失败时不要删除状态或产物；修复外部原因后重新双击，流程会从当前阶段恢复。`--smoke` 不会启动 crawler 或 AVD，也不会用合成数据填补缺失产物。
+
+正式 v2→v3 迁移 apply 完成前，canonical contract 仍是 v2；此时入口会有意拒绝运行。只有 canonical contract、SQLite contract binding 和 crawler v3 输出目录三者一致后才能启动，禁止为了提前运行而关闭该检查。
 
 ## 并发配置
 

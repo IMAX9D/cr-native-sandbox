@@ -1,4 +1,4 @@
-"""Resumable, fail-closed Schema5-v2 expert-data-to-training orchestrator.
+"""Resumable, fail-closed Schema5/contract-v3 training orchestrator.
 
 The default command is intentionally a long-running foreground supervisor.  It
 keeps the authoritative crawler alive until the frozen 100k contract is met,
@@ -6,8 +6,8 @@ then advances through native replay, immutable dataset compilation, a real-data
 training smoke, and finally the resumable expert-v1 training run.
 
 This module never accepts the historical Schema3 eligibility queue.  Every
-native-generator candidate is regenerated from the frozen Schema5-v2 corpus and
-is checked row-by-row before an Android worker can be started.
+native-generator candidate is regenerated from the frozen Schema5 contract-v3
+corpus and is checked row-by-row before an Android worker can be started.
 """
 
 from __future__ import annotations
@@ -27,10 +27,15 @@ import time
 import tomllib
 from typing import Any, Iterable, Mapping, Sequence
 
+from expert_v1.native_ingest_contract import (
+    CONTRACT_KIND as NATIVE_CONTRACT_KIND,
+    CONTRACT_SCHEMA_VERSION as NATIVE_CONTRACT_SCHEMA_VERSION,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_ROOT = Path(
-    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v2"
+    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3"
 )
 DEFAULT_CRAWLER_ROOT = Path(r"D:\皇室战争数据集")
 DEFAULT_CRAWLER_PYTHON = Path(
@@ -51,13 +56,16 @@ DEFAULT_NATIVE_HARDWARE_LOCK = Path(
     r"D:\AI_data\cr-native-core\locks\native-hardware-v1.lock"
 )
 TWO_AVD_MIN_AVAILABLE_RAM_BYTES = 16 * 1024**3
+EXPECTED_AUTHORITATIVE_ROOT_NAME = "authoritative-schema5-v3"
+LEGACY_DATA_ROOT_NAMES = frozenset({"one-click-schema5-v2"})
 STATE_KIND = "cr_expert_one_click_state_v1"
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
+STATE_CONTRACT_GENERATION = "schema5-contract-v3"
 
 STAGES = (
-    "collect_schema5_v2",
-    "freeze_schema5_v2",
-    "audit_schema5_v2",
+    "collect_schema5_v3",
+    "freeze_schema5_v3",
+    "audit_schema5_v3",
     "generate_native_ticks",
     "stop_native_workers",
     "validate_tick_store_and_masks",
@@ -100,6 +108,16 @@ def native_contract_binding(path: Path) -> dict[str, Any]:
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise OneClickError("native contract root is not an object")
+    identity = (value.get("schema_version"), value.get("kind"))
+    expected_identity = (
+        NATIVE_CONTRACT_SCHEMA_VERSION,
+        NATIVE_CONTRACT_KIND,
+    )
+    if identity != expected_identity:
+        raise OneClickError(
+            "one-click requires native ingest contract v3; "
+            f"found identity={identity!r}, expected={expected_identity!r}"
+        )
     payload = {key: item for key, item in value.items() if key != "contract_sha256"}
     canonical_sha = hashlib.sha256(_canonical(payload)).hexdigest()
     if str(value.get("contract_sha256") or "") != canonical_sha:
@@ -114,6 +132,8 @@ def native_contract_binding(path: Path) -> dict[str, Any]:
         raise OneClickError("native contract file SHA-256 mismatch")
     return {
         "path": str(source),
+        "schema_version": NATIVE_CONTRACT_SCHEMA_VERSION,
+        "kind": NATIVE_CONTRACT_KIND,
         "canonical_sha256": canonical_sha,
         "file_sha256": file_sha,
     }
@@ -171,6 +191,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise OneClickError(f"JSON root is not an object: {path}")
     return value
+
+
+def _validate_state_generation(value: Mapping[str, Any], path: Path) -> None:
+    if not value:
+        return
+    if (
+        value.get("kind") != STATE_KIND
+        or int(value.get("schema_version", -1)) != STATE_SCHEMA_VERSION
+        or value.get("contract_generation") != STATE_CONTRACT_GENERATION
+    ):
+        raise OneClickError(
+            "one-click state belongs to another contract generation; "
+            f"v2/v3 state mixing is forbidden: {path}"
+        )
 
 
 def file_fingerprint(path: Path) -> dict[str, Any]:
@@ -294,16 +328,12 @@ class StageJournal:
         self.path = path
         self.value = _read_json(path)
         if self.value:
-            if (
-                self.value.get("kind") != STATE_KIND
-                or int(self.value.get("schema_version", -1))
-                != STATE_SCHEMA_VERSION
-            ):
-                raise OneClickError(f"one-click state contract changed: {path}")
+            _validate_state_generation(self.value, path)
         else:
             self.value = {
                 "schema_version": STATE_SCHEMA_VERSION,
                 "kind": STATE_KIND,
+                "contract_generation": STATE_CONTRACT_GENERATION,
                 "created_utc": utc_now(),
                 "updated_utc": utc_now(),
                 "active_stage": None,
@@ -445,7 +475,7 @@ class OneClickConfig:
 
     @property
     def frozen_manifest(self) -> Path:
-        return self.data_root / "manifests" / "schema5-v2-100k.jsonl"
+        return self.data_root / "manifests" / "schema5-v3-100k.jsonl"
 
     @property
     def frozen_metadata(self) -> Path:
@@ -501,7 +531,7 @@ class OneClickConfig:
 
     @property
     def training_run_id(self) -> str:
-        return "expert-v1-schema5-v2-100k"
+        return "expert-v1-schema5-v3-100k"
 
     def declared(self, *, include_native_layout: bool = True) -> dict[str, Any]:
         result = asdict(self)
@@ -637,7 +667,7 @@ def native_generation_command(config: OneClickConfig) -> tuple[str, ...]:
         "--ports",
         *(str(port) for port in config.ports[: config.workers]),
         "--selection-seed",
-        "authoritative-schema5-v2-100k-v1",
+        "authoritative-schema5-v3-100k-v1",
     )
 
 
@@ -676,7 +706,7 @@ def training_smoke_command(config: OneClickConfig) -> tuple[str, ...]:
         "--output-root",
         str(config.smoke_output_root),
         "--run-id",
-        f"real-schema5-v2-{dataset_sha[:16]}",
+        f"real-schema5-v3-{dataset_sha[:16]}",
         "--epochs",
         "1",
         "--batch-size",
@@ -758,9 +788,10 @@ def _authoritative_settings(config: OneClickConfig) -> dict[str, Any]:
         raise OneClickError(
             f"authoritative crawler config does not match one-click contract: {mismatches}"
         )
-    if "schema5-v2" not in config.authoritative_root.name.lower():
+    if config.authoritative_root.name.casefold() != EXPECTED_AUTHORITATIVE_ROOT_NAME:
         raise OneClickError(
-            "authoritative root is not the isolated Schema5-v2 corpus"
+            "authoritative root must be the isolated contract-v3 corpus named "
+            f"{EXPECTED_AUTHORITATIVE_ROOT_NAME!r}"
         )
     return settings
 
@@ -782,7 +813,7 @@ def _authoritative_count(config: OneClickConfig) -> int:
 
 
 def _authoritative_db_invariants(config: OneClickConfig) -> dict[str, Any]:
-    """Prove the whole progress DB is pinned to the v2 contract."""
+    """Prove the whole progress DB is pinned to the v3 contract."""
 
     binding = native_contract_binding(config.native_contract)
     connection = sqlite3.connect(config.authoritative_db.resolve(strict=True), timeout=30)
@@ -825,7 +856,7 @@ def _authoritative_db_invariants(config: OneClickConfig) -> dict[str, Any]:
         or accepted > config.target
     ):
         raise OneClickError(
-            "authoritative DB violates all-v2 invariant: "
+            "authoritative DB violates all-v3 invariant: "
             f"contracts={contract_counts}, invalid_status={invalid_status}, "
             f"invalid_accepted={invalid_accepted}, accepted={accepted}/{config.target}"
         )
@@ -1000,10 +1031,11 @@ def validate_schema5_candidate_queue(
             rows += 1
             ability_positive += int(int(value.get("ability_events_observed") or 0) > 0)
     if rows == 0:
-        raise OneClickError("Schema5-v2 native candidate queue is empty")
+        raise OneClickError("Schema5 contract-v3 native candidate queue is empty")
     if expected_rows is not None and rows != expected_rows:
         raise OneClickError(
-            f"Schema5-v2 candidate coverage is not complete: {rows}/{expected_rows}"
+            "Schema5 contract-v3 candidate coverage is not complete: "
+            f"{rows}/{expected_rows}"
         )
     if frozen is not None and seen != set(frozen):
         raise OneClickError("candidate queue is not an exact frozen-tag join")
@@ -1203,7 +1235,7 @@ class OneClickOrchestrator:
                     "remaining": config.target - accepted,
                     "crawler_active": _crawler_active(config),
                 }
-                self.journal.progress("collect_schema5_v2", progress)
+                self.journal.progress("collect_schema5_v3", progress)
                 print(
                     f"[collection] {accepted:,}/{config.target:,} "
                     f"remaining={config.target - accepted:,}",
@@ -1215,7 +1247,7 @@ class OneClickOrchestrator:
                     self.runner.run(
                         crawler_command(config, "start"),
                         cwd=config.crawler_root,
-                        log_name="collect-schema5-v2",
+                        log_name="collect-schema5-v3",
                     )
                     if not _crawler_active(config):
                         raise OneClickError(
@@ -1227,7 +1259,7 @@ class OneClickOrchestrator:
                 self.runner.run(
                     crawler_command(config, "stop"),
                     cwd=config.crawler_root,
-                    log_name="collect-schema5-v2",
+                    log_name="collect-schema5-v3",
                 )
             deadline = time.monotonic() + 60
             while _crawler_active(config) and time.monotonic() < deadline:
@@ -1244,10 +1276,10 @@ class OneClickOrchestrator:
             return fingerprint_files([config.authoritative_db, index]), {
                 "accepted": config.target,
                 "quick_check": quick_check,
-                "all_v2_invariant": invariants,
+                "all_v3_invariant": invariants,
             }
 
-        self._run_stage("collect_schema5_v2", inputs, action)
+        self._run_stage("collect_schema5_v3", inputs, action)
 
     def freeze(self) -> None:
         config = self.config
@@ -1276,7 +1308,7 @@ class OneClickOrchestrator:
                     str(config.native_contract),
                 ),
                 cwd=config.project_root,
-                log_name="freeze-schema5-v2",
+                log_name="freeze-schema5-v3",
             )
             metadata = _read_json(config.frozen_metadata)
             binding = native_contract_binding(config.native_contract)
@@ -1292,7 +1324,9 @@ class OneClickOrchestrator:
                 or Path(str(metadata.get("native_contract_path") or "")).resolve()
                 != config.native_contract.resolve()
             ):
-                raise OneClickError("frozen Schema5-v2 manifest failed admission")
+                raise OneClickError(
+                    "frozen Schema5 contract-v3 manifest failed admission"
+                )
             return fingerprint_files(
                 [config.frozen_manifest, config.frozen_metadata]
             ), {
@@ -1300,7 +1334,7 @@ class OneClickOrchestrator:
                 "manifest_sha256": metadata["manifest_sha256"],
             }
 
-        self._run_stage("freeze_schema5_v2", inputs, action)
+        self._run_stage("freeze_schema5_v3", inputs, action)
 
     def audit(self) -> None:
         config = self.config
@@ -1341,7 +1375,7 @@ class OneClickOrchestrator:
                     str(config.native_contract),
                 ),
                 cwd=config.project_root,
-                log_name="audit-schema5-v2",
+                log_name="audit-schema5-v3",
             )
             queue_summary = validate_schema5_candidate_queue(
                 config.candidate_queue,
@@ -1391,7 +1425,7 @@ class OneClickOrchestrator:
                 [audit_manifest, audit_summary, config.candidate_queue]
             ), queue_summary
 
-        self._run_stage("audit_schema5_v2", inputs, action)
+        self._run_stage("audit_schema5_v3", inputs, action)
 
     def generate_native(self) -> None:
         config = self.config
@@ -1898,6 +1932,7 @@ class OneClickOrchestrator:
 
 def status(config: OneClickConfig) -> dict[str, Any]:
     value = _read_json(config.state_path)
+    _validate_state_generation(value, config.state_path)
     try:
         accepted = _authoritative_count(config)
     except (OSError, sqlite3.Error):
@@ -1916,6 +1951,7 @@ def status(config: OneClickConfig) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "kind": "cr_expert_one_click_status_v1",
+        "contract_generation": STATE_CONTRACT_GENERATION,
         "state_path": str(config.state_path),
         "active_stage": value.get("active_stage") if value else None,
         "last_error": value.get("last_error") if value else None,
@@ -1942,7 +1978,19 @@ def _default_config(args: argparse.Namespace) -> OneClickConfig:
     data_root = args.data_root.resolve()
     crawler_root = args.crawler_root.resolve()
     authoritative_root = args.authoritative_root.resolve()
+    if authoritative_root.name.casefold() != EXPECTED_AUTHORITATIVE_ROOT_NAME:
+        raise OneClickError(
+            "--authoritative-root must end in "
+            f"{EXPECTED_AUTHORITATIVE_ROOT_NAME!r}; old v2 output is read-only"
+        )
+    if data_root.name.casefold() in LEGACY_DATA_ROOT_NAMES:
+        raise OneClickError(
+            "--data-root points at a legacy v2 state namespace; use the v3 root"
+        )
     persisted_state = _read_json(data_root / "control" / "state.json")
+    _validate_state_generation(
+        persisted_state, data_root / "control" / "state.json"
+    )
     persisted_layout = persisted_state.get("native_layout")
     if isinstance(persisted_layout, Mapping):
         avds = int(persisted_layout.get("avds") or 0)
@@ -2030,7 +2078,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(
             r"D:\AI_data\cr-native-core\expert-v1\training-dataset"
-            r"\authoritative-schema5-v2"
+            r"\authoritative-schema5-v3"
         ),
     )
     parser.add_argument("--native-contract", type=Path, default=DEFAULT_CONTRACT)

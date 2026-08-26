@@ -20,6 +20,7 @@ from expert_v1.one_click_v1 import (
     compile_command,
     file_fingerprint,
     formal_training_command,
+    native_contract_binding,
     native_generation_command,
     native_worker_command,
     training_smoke_command,
@@ -31,10 +32,18 @@ from expert_v1.one_click_v1 import (
 
 class ExpertOneClickV1Test(unittest.TestCase):
     @staticmethod
-    def _contract(path: Path) -> tuple[str, str]:
+    def _contract(
+        path: Path,
+        *,
+        schema_version: int = 3,
+        kind: str = "cr_native_authoritative_contract_v3",
+    ) -> tuple[str, str]:
         import hashlib
 
-        payload = {"schema_version": 2, "kind": "test-contract"}
+        payload = {
+            "schema_version": schema_version,
+            "kind": kind,
+        }
         canonical = hashlib.sha256(
             json.dumps(
                 payload, sort_keys=True, separators=(",", ":")
@@ -48,6 +57,46 @@ class ExpertOneClickV1Test(unittest.TestCase):
             f"{file_sha}  {path.name}\n", encoding="ascii"
         )
         return canonical, file_sha
+
+    def test_contract_v2_is_rejected_before_pipeline_use(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            contract = Path(temporary) / "contract-v2.json"
+            self._contract(
+                contract,
+                schema_version=2,
+                kind="cr_native_authoritative_contract_v2",
+            )
+            with self.assertRaisesRegex(OneClickError, "requires.*contract v3"):
+                native_contract_binding(contract)
+
+    def test_legacy_v2_state_is_rejected_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state.json"
+            state.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "kind": "cr_expert_one_click_state_v1",
+                    "stages": {"collect_schema5_v2": {"status": "completed"}},
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(OneClickError, "mixing is forbidden"):
+                StageJournal(state)
+
+    def test_parser_rejects_legacy_v2_output_namespaces(self) -> None:
+        args = build_parser().parse_args([
+            "--data-root",
+            str(Path(tempfile.gettempdir()) / "one-click-schema5-v2"),
+        ])
+        with self.assertRaisesRegex(OneClickError, "legacy v2 state"):
+            _default_config(args)
+
+        args = build_parser().parse_args([
+            "--authoritative-root",
+            str(Path(tempfile.gettempdir()) / "authoritative-schema5-v2"),
+        ])
+        with self.assertRaisesRegex(OneClickError, "old v2 output is read-only"):
+            _default_config(args)
 
     def test_single_instance_lock_rejects_second_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -68,7 +117,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
                 authoritative_db=root / "db.sqlite3",
-                authoritative_root=root / "authoritative-schema5-v2",
+                authoritative_root=root / "authoritative-schema5-v3",
                 native_contract=root / "contract.json",
                 template=root / "template.json",
                 workers=0,
@@ -120,7 +169,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
                 authoritative_db=root / "db.sqlite3",
-                authoritative_root=root / "authoritative-schema5-v2",
+                authoritative_root=root / "authoritative-schema5-v3",
                 native_contract=root / "contract.json",
                 template=root / "template.json",
             )
@@ -142,7 +191,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
                 authoritative_db=root / "db.sqlite3",
-                authoritative_root=root / "authoritative-schema5-v2",
+                authoritative_root=root / "authoritative-schema5-v3",
                 native_contract=root / "contract.json",
                 template=root / "template.json",
                 workers=0,
@@ -186,15 +235,15 @@ class ExpertOneClickV1Test(unittest.TestCase):
             output.write_text('{"output":1}\n', encoding="utf-8")
             journal = StageJournal(root / "state.json")
             inputs = [file_fingerprint(source), value_fingerprint("target", 3)]
-            self.assertTrue(journal.begin("freeze_schema5_v2", inputs))
+            self.assertTrue(journal.begin("freeze_schema5_v3", inputs))
             journal.complete(
-                "freeze_schema5_v2", [file_fingerprint(output)], {"rows": 3}
+                "freeze_schema5_v3", [file_fingerprint(output)], {"rows": 3}
             )
             reopened = StageJournal(root / "state.json")
-            self.assertFalse(reopened.begin("freeze_schema5_v2", inputs))
+            self.assertFalse(reopened.begin("freeze_schema5_v3", inputs))
             output.write_text('{"output":2}\n', encoding="utf-8")
             with self.assertRaisesRegex(OneClickError, "artifact SHA changed"):
-                reopened.begin("freeze_schema5_v2", inputs)
+                reopened.begin("freeze_schema5_v3", inputs)
 
     def test_interrupted_stage_refuses_changed_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -203,12 +252,12 @@ class ExpertOneClickV1Test(unittest.TestCase):
             source.write_text('{"source":1}\n', encoding="utf-8")
             journal = StageJournal(root / "state.json")
             self.assertTrue(
-                journal.begin("audit_schema5_v2", [file_fingerprint(source)])
+                journal.begin("audit_schema5_v3", [file_fingerprint(source)])
             )
             source.write_text('{"source":2}\n', encoding="utf-8")
             with self.assertRaisesRegex(OneClickError, "input SHA changed"):
                 StageJournal(root / "state.json").begin(
-                    "audit_schema5_v2", [file_fingerprint(source)]
+                    "audit_schema5_v3", [file_fingerprint(source)]
                 )
 
     def test_native_queue_rejects_any_schema3_row(self) -> None:
@@ -388,7 +437,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 training_python=root / "python.exe",
                 crawler_config=configured,
                 authoritative_db=root / "db.sqlite3",
-                authoritative_root=root / "authoritative-schema5-v2",
+                authoritative_root=root / "authoritative-schema5-v3",
                 native_contract=contract,
                 template=root / "template.json",
             )
@@ -409,7 +458,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
                 authoritative_db=root / "authoritative.sqlite3",
-                authoritative_root=root / "authoritative-schema5-v2",
+                authoritative_root=root / "authoritative-schema5-v3",
                 native_contract=root / "contract.json",
                 template=root / "template.json",
             )
