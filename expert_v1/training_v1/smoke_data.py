@@ -10,7 +10,13 @@ from typing import Any
 
 import numpy as np
 
-from .schema import DATASET_KIND, POSITION_COUNT, SCHEMA_VERSION, SHARD_KIND
+from .schema import (
+    DATASET_KIND,
+    POSITION_COUNT,
+    SCHEMA_VERSION,
+    SHARD_KIND,
+    sha256_file,
+)
 
 
 def _pack(mask: np.ndarray) -> np.ndarray:
@@ -23,6 +29,11 @@ def _shard(path: Path, *, seed: int, sequences: int, steps: int, dimensions: dic
     cards = dimensions["card_vocab_size"]
     abilities = dimensions["ability_vocab_size"]
     slots = dimensions["max_ability_slots"]
+    entity_counts = rng.integers(1, 5, size=rows, dtype=np.int64)
+    entity_offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(entity_counts, dtype=np.int64))
+    )
+    entities = int(entity_offsets[-1])
     arrays: dict[str, np.ndarray] = {
         "sequence_offsets": np.arange(0, rows + 1, steps, dtype=np.int64),
         "grid": rng.integers(0, 256, (rows, dimensions["grid_channels"], 32, 18), dtype=np.uint8),
@@ -31,6 +42,15 @@ def _shard(path: Path, *, seed: int, sequences: int, steps: int, dimensions: dic
         "hand_tokens": np.empty((rows, 4), dtype=np.int16),
         "next_card_token": np.empty(rows, dtype=np.int16),
         "revealed_enemy_tokens": np.zeros((rows, 8), dtype=np.int16),
+        "entity_offsets": entity_offsets,
+        "entity_tokens": rng.integers(1, cards, size=entities, dtype=np.int16),
+        "entity_positions": rng.integers(
+            0, POSITION_COUNT, size=entities, dtype=np.int16
+        ),
+        "entity_relations": rng.integers(0, 2, size=entities, dtype=np.uint8),
+        "entity_numeric": rng.random(
+            (entities, dimensions["entity_numeric_size"]), dtype=np.float32
+        ),
         "ability_tokens": np.zeros((rows, slots), dtype=np.int16),
         "delta_ticks": np.ones(rows, dtype=np.float32),
         "timing_exposure_ticks": np.ones(rows, dtype=np.float32),
@@ -106,6 +126,7 @@ def create_smoke_dataset(root: Path, *, replace: bool = False) -> Path:
         "card_vocab_size": 160,
         "ability_vocab_size": 32,
         "max_ability_slots": 2,
+        "entity_numeric_size": 3,
     }
     splits = {
         "train": ["shards/train-00000"],
@@ -144,6 +165,12 @@ def create_smoke_dataset(root: Path, *, replace: bool = False) -> Path:
                 f"public_scalar_{index}"
                 for index in range(dimensions["public_scalar_size"])
             ],
+            "entity_identity": "categorical_card_vocabulary_v1",
+            "entity_numeric": [
+                "public_entity_level_ratio",
+                "public_entity_hp_ratio",
+                "public_entity_log_max_hp",
+            ],
         },
         "quality_gates": {
             "split_collisions": 0,
@@ -167,7 +194,17 @@ def create_smoke_dataset(root: Path, *, replace: bool = False) -> Path:
         "ability_vocab": {"0": "PAD"},
     }
     root.mkdir(parents=True, exist_ok=True)
-    (root / "manifest.json").write_text(
+    manifest["shard_file_sha256"] = {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for split_paths in splits.values()
+        for relative in split_paths
+        for path in sorted((root / relative).glob("*.npy"))
+    }
+    manifest_path = root / "manifest.json"
+    manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    (root / "manifest.sha256").write_text(
+        f"{sha256_file(manifest_path)}  manifest.json\n", encoding="ascii"
     )
     return root

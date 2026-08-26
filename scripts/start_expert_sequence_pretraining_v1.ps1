@@ -102,11 +102,11 @@ $trainArgs = @(
     '-m', 'expert_v1.training_v1.train',
     '--dataset-root', $DatasetRoot,
     '--output-root', $OutputRoot,
-    '--expected-source-manifest', $AcceptedManifest,
-    '--run-id', "expert-sequence-v1-$stamp"
+    '--expected-source-manifest', $AcceptedManifest
 )
 if ($Smoke) {
     $trainArgs += @(
+        '--run-id', "expert-sequence-v1-smoke-$stamp",
         '--epochs', '1',
         '--batch-size', '2',
         '--sequence-length', '16',
@@ -118,6 +118,8 @@ if ($Smoke) {
         '--card-embedding-size', '32',
         '--device', 'cpu'
     )
+} else {
+    $trainArgs += '--resume'
 }
 & $python @trainArgs
 if ($LASTEXITCODE -ne 0) {

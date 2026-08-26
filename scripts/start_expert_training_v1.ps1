@@ -1,7 +1,8 @@
 param(
     [switch]$Smoke,
     [string]$DatasetRoot = 'D:\AI_data\cr-native-core\expert-v1\compiled\native-bc-v1',
-    [string]$OutputRoot = 'D:\AI_data\cr-native-core\expert-v1\runs'
+    [string]$OutputRoot = 'D:\AI_data\cr-native-core\expert-v1\runs',
+    [string]$ExpectedSourceManifest = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -39,12 +40,27 @@ if ($Smoke) {
     if (-not (Test-Path -LiteralPath $manifest)) {
         throw "Compiled expert dataset is not ready: $manifest"
     }
+    if ([String]::IsNullOrWhiteSpace($ExpectedSourceManifest)) {
+        $datasetManifest = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+        $ExpectedSourceManifest = [string]$datasetManifest.source_manifest.path
+    }
+    if (
+        [String]::IsNullOrWhiteSpace($ExpectedSourceManifest) -or
+        -not (Test-Path -LiteralPath $ExpectedSourceManifest)
+    ) {
+        throw "Compiled expert source manifest is missing: $ExpectedSourceManifest"
+    }
+    Write-Warning (
+        'Native teacher-forced rows currently lack source per-Tick state anchors; ' +
+        'training is explicitly accepting this audited limitation.'
+    )
     & $python -m expert_v1.training_v1.train `
         --dataset-root $DatasetRoot `
         --output-root $OutputRoot `
-        --run-id "expert-v1-$stamp"
+        --expected-source-manifest $ExpectedSourceManifest `
+        --allow-unanchored-native-states `
+        --resume
 }
 if ($LASTEXITCODE -ne 0) {
     throw "Expert training exited with code $LASTEXITCODE"
 }
-

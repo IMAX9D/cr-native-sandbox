@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -14,7 +15,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 
 from .dataset import NativeExpertSequenceDataset, collate_sequences
 from .losses import MetricAccumulator, behaviour_cloning_loss
@@ -25,25 +26,133 @@ from .schema import (
     read_manifest,
     sha256_file,
     validate_shard,
+    verify_dataset_integrity,
 )
 from .smoke_data import create_smoke_dataset
 
 
 CHECKPOINT_KIND = "cr_native_expert_bc_checkpoint_v1"
+CHECKPOINT_SCHEMA_VERSION = 2
+RUN_KIND = "cr_native_expert_bc_run_v1"
+RUN_SCHEMA_VERSION = 2
+CHECKPOINT_REQUIRED_FIELDS = {
+    "epoch",
+    "step",
+    "global_step",
+    "model_config",
+    "model_state",
+    "optimizer_state",
+    "scheduler_state",
+    "normalizer_state",
+    "rng",
+    "best_validation_loss",
+    "epochs_without_improvement",
+    "dataset_manifest_sha256",
+    "run_signature_sha256",
+}
+
+
+class TrainingInstanceLock(AbstractContextManager["TrainingInstanceLock"]):
+    """OS-backed single-instance lock released automatically after a crash."""
+
+    def __init__(self, path: Path, *, run_id: str) -> None:
+        self.path = path
+        self.run_id = run_id
+        self._handle: Any = None
+
+    def __enter__(self) -> "TrainingInstanceLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+b")
+        self._handle.seek(0, os.SEEK_END)
+        if self._handle.tell() == 0:
+            self._handle.write(b"\0")
+            self._handle.flush()
+        self._handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError) as error:
+            self._handle.close()
+            self._handle = None
+            raise RuntimeError(
+                f"another expert training process already owns {self.path}"
+            ) from error
+        metadata = {
+            "pid": os.getpid(),
+            "run_id": self.run_id,
+            "acquired_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        self._handle.seek(1)
+        self._handle.truncate()
+        self._handle.write(json.dumps(metadata, ensure_ascii=False).encode("utf-8"))
+        self._handle.flush()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if self._handle is None:
+            return
+        self._handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
+
+
+class DatasetPrecomputedNormalizer:
+    """Explicit identity normalizer for already-normalized compiled features.
+
+    Keeping this as a stateful runtime component makes checkpoint semantics
+    complete without silently changing the established feature contract.
+    """
+
+    KIND = "dataset_precomputed_identity_v1"
+
+    def __init__(self, public_scalar_size: int) -> None:
+        self.public_scalar_size = int(public_scalar_size)
+
+    def normalize_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if int(batch["public_scalars"].shape[-1]) != self.public_scalar_size:
+            raise RuntimeError("normalizer/public scalar dimension mismatch")
+        return batch
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"kind": self.KIND, "public_scalar_size": self.public_scalar_size}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if dict(state) != self.state_dict():
+            raise RuntimeError(f"checkpoint normalizer state is incompatible: {state}")
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def _atomic_torch(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    torch.save(dict(value), temporary)
-    temporary.replace(path)
+    with temporary.open("wb") as handle:
+        torch.save(dict(value), handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -51,6 +160,7 @@ def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
         handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _seed(seed: int) -> None:
@@ -59,6 +169,91 @@ def _seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _capture_rng(train_generator: torch.Generator) -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "train_loader_generator": train_generator.get_state(),
+    }
+
+
+def _restore_rng(state: Mapping[str, Any], train_generator: torch.Generator) -> None:
+    required = {
+        "python",
+        "numpy",
+        "torch",
+        "cuda",
+        "train_loader_generator",
+    }
+    missing = sorted(required - set(state))
+    if missing:
+        raise RuntimeError(f"checkpoint RNG state is incomplete: {missing}")
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    cuda_state = state["cuda"]
+    if cuda_state is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
+        torch.cuda.set_rng_state_all(cuda_state)
+    train_generator.set_state(state["train_loader_generator"].cpu())
+
+
+def _run_signature(
+    args: argparse.Namespace,
+    *,
+    dataset_manifest_sha256: str,
+    observation_mode: str,
+) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "observation_mode": observation_mode,
+        "trainer_contract": "expert_bc_resume_v2",
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "scheduler": "constant_lr_v1",
+        "normalizer": DatasetPrecomputedNormalizer.KIND,
+        # Preserve the user's CLI contract in the stable id. The resolved
+        # device is checked separately in run manifest compatibility so an
+        # unavailable GPU cannot silently create a fresh CPU run.
+        "device_request": args.device,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "sequence_length": args.sequence_length,
+        "burn_in": args.burn_in,
+        "workers": args.workers,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "gradient_clip": args.gradient_clip,
+        "hidden_size": args.hidden_size,
+        "card_embedding_size": args.card_embedding_size,
+        "lambda_max": args.lambda_max,
+        "lambda_initial": args.lambda_initial,
+        "early_stopping_patience": args.early_stopping_patience,
+        "minimum_delta": args.minimum_delta,
+        "seed": args.seed,
+        "max_train_batches": args.max_train_batches,
+        "max_eval_batches": args.max_eval_batches,
+        "allow_unanchored_native_states": bool(args.allow_unanchored_native_states),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest(), payload
+
+
+def _stable_run_id(
+    *,
+    observation_mode: str,
+    dataset_manifest_sha256: str,
+    run_signature_sha256: str,
+) -> str:
+    mode = "sequence" if observation_mode == OBSERVATION_SEQUENCE else "native"
+    return (
+        f"expert-{mode}-v1-{dataset_manifest_sha256[:12]}-"
+        f"{run_signature_sha256[:10]}"
+    )
 
 
 def _device(name: str) -> torch.device:
@@ -70,8 +265,16 @@ def _device(name: str) -> torch.device:
     return device
 
 
-def _move(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    return {key: value.to(device, non_blocking=device.type == "cuda") for key, value in batch.items()}
+def _move(
+    batch: dict[str, torch.Tensor],
+    device: torch.device,
+    normalizer: DatasetPrecomputedNormalizer,
+) -> dict[str, torch.Tensor]:
+    moved = {
+        key: value.to(device, non_blocking=device.type == "cuda")
+        for key, value in batch.items()
+    }
+    return normalizer.normalize_batch(moved)
 
 
 def _loader(
@@ -80,23 +283,33 @@ def _loader(
     args: argparse.Namespace,
     *,
     shuffle: bool,
+    generator: torch.Generator | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     dataset = NativeExpertSequenceDataset(
         root,
         split=split,
         sequence_length=args.sequence_length,
         burn_in=args.burn_in,
-        validate=True,
+        # run() has already hash-verified and semantically validated every
+        # shard once. Repeating the full scans for three DataLoaders only
+        # burns startup I/O and cannot improve the admission decision.
+        validate=False,
+    )
+    sampler = RandomSampler(dataset, generator=generator) if shuffle else None
+    worker_generator = torch.Generator().manual_seed(
+        args.seed + {"train": 101, "validation": 202, "test": 303}[split]
     )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle,
+        shuffle=False,
+        sampler=sampler,
         num_workers=args.workers,
         collate_fn=collate_sequences,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=args.workers > 0,
         drop_last=False,
+        generator=worker_generator,
     )
 
 
@@ -106,6 +319,7 @@ def _evaluate(
     device: torch.device,
     *,
     maximum_batches: int,
+    normalizer: DatasetPrecomputedNormalizer,
 ) -> dict[str, float]:
     model.eval()
     accumulator = MetricAccumulator()
@@ -113,272 +327,563 @@ def _evaluate(
         for index, batch in enumerate(loader):
             if maximum_batches and index >= maximum_batches:
                 break
-            batch = _move(batch, device)
+            batch = _move(batch, device, normalizer)
             output = model.forward_batch(batch)
             _loss, metrics = behaviour_cloning_loss(output, batch, model.config)
             accumulator.add(metrics)
     return accumulator.result()
 
 
-def run(args: argparse.Namespace) -> Path:
-    _seed(args.seed)
-    dataset_root = args.dataset_root.resolve()
+def _validate_training_admission(
+    args: argparse.Namespace,
+    dataset_root: Path,
+    manifest: Mapping[str, Any],
+    observation_mode: str,
+) -> None:
     if args.smoke:
-        create_smoke_dataset(dataset_root, replace=True)
-    manifest = read_manifest(dataset_root)
-    observation_mode = str(
-        manifest.get("observation_mode") or OBSERVATION_NATIVE
-    )
-    if not args.smoke:
-        if manifest.get("production_ready") is not True:
-            raise RuntimeError("dataset is not marked production_ready")
-        if observation_mode == OBSERVATION_NATIVE:
-            if manifest.get("native_replay_validated") is not True:
-                raise RuntimeError("dataset lacks native replay validation")
-        elif observation_mode == OBSERVATION_SEQUENCE:
-            if manifest.get("native_replay_validated") is not False:
-                raise RuntimeError(
-                    "sequence-only dataset must not claim native replay validation"
-                )
-        else:
-            raise RuntimeError(f"unsupported observation mode: {observation_mode}")
-        if (manifest.get("split_contract") or {}).get("player_holdout_test") is not True:
-            raise RuntimeError("production dataset lacks a player-holdout test split")
-        expected_source = args.expected_source_manifest.resolve()
-        if not expected_source.is_file():
-            raise RuntimeError(f"active accepted source manifest is missing: {expected_source}")
-        source_contract = manifest.get("source_manifest") or {}
-        compiled_source = Path(str(source_contract.get("path", ""))).resolve()
-        if compiled_source != expected_source:
+        return
+    if manifest.get("production_ready") is not True:
+        raise RuntimeError("dataset is not marked production_ready")
+    if observation_mode == OBSERVATION_NATIVE:
+        if manifest.get("native_replay_validated") is not True:
+            raise RuntimeError("dataset lacks native replay validation")
+    elif observation_mode == OBSERVATION_SEQUENCE:
+        if manifest.get("native_replay_validated") is not False:
+            raise RuntimeError("sequence-only dataset must not claim native replay validation")
+    else:
+        raise RuntimeError(f"unsupported observation mode: {observation_mode}")
+    if (manifest.get("split_contract") or {}).get("player_holdout_test") is not True:
+        raise RuntimeError("production dataset lacks a player-holdout test split")
+    expected_source = args.expected_source_manifest.resolve()
+    if not expected_source.is_file():
+        raise RuntimeError(f"active accepted source manifest is missing: {expected_source}")
+    source_contract = manifest.get("source_manifest") or {}
+    compiled_source = Path(str(source_contract.get("path", ""))).resolve()
+    if compiled_source != expected_source:
+        raise RuntimeError(f"compiled dataset uses stale/wrong source manifest: {compiled_source}")
+    if source_contract.get("sha256") != sha256_file(expected_source):
+        raise RuntimeError("active accepted source manifest changed after dataset compilation")
+    gates = manifest.get("quality_gates") or {}
+    required_zero = [
+        "split_collisions",
+        "forbidden_actor_features",
+        "nonfinite_features",
+        "expert_label_mask_violations",
+    ]
+    if observation_mode == OBSERVATION_NATIVE:
+        required_zero.extend(("native_action_rejections", "terminal_mismatches"))
+    else:
+        required_zero.extend(("fabricated_native_grid_rows", "player_holdout_leaks"))
+    failures = {name: gates.get(name) for name in required_zero if gates.get(name) != 0}
+    if failures:
+        raise RuntimeError(f"dataset quality gates are not clean: {failures}")
+    provenance = manifest.get("state_provenance") or {}
+    if observation_mode == OBSERVATION_SEQUENCE:
+        if provenance.get("mode") != "sequence_only":
+            raise RuntimeError("sequence-only state provenance is not explicit")
+        if int(provenance.get("sequence_only_rows", 0)) <= 0:
+            raise RuntimeError("sequence-only dataset has no training rows")
+        if int(provenance.get("native_grid_rows", -1)) != 0:
+            raise RuntimeError("sequence-only dataset contains/claims native grid rows")
+    else:
+        if "terminal_validation_unknown" not in gates:
+            raise RuntimeError("dataset does not report terminal_validation_unknown")
+        if not all(
+            key in provenance
+            for key in ("authoritative_rows", "native_generated_unanchored_rows")
+        ):
+            raise RuntimeError("dataset does not declare state provenance counts")
+        if (
+            int(provenance.get("authoritative_rows", 0))
+            + int(provenance.get("native_generated_unanchored_rows", 0))
+            <= 0
+        ):
+            raise RuntimeError("dataset contains no state-conditioned training rows")
+        unanchored_rows = int(provenance.get("native_generated_unanchored_rows", 0))
+        terminal_unknown = int(gates.get("terminal_validation_unknown", 0))
+        if (unanchored_rows or terminal_unknown) and not args.allow_unanchored_native_states:
             raise RuntimeError(
-                f"compiled dataset uses stale/wrong source manifest: {compiled_source}"
-            )
-        live_source_digest = sha256_file(expected_source)
-        if source_contract.get("sha256") != live_source_digest:
-            raise RuntimeError(
-                "active accepted source manifest changed after dataset compilation"
-            )
-        gates = manifest.get("quality_gates") or {}
-        required_zero = [
-            "split_collisions",
-            "forbidden_actor_features",
-            "nonfinite_features",
-            "expert_label_mask_violations",
-        ]
-        if observation_mode == OBSERVATION_NATIVE:
-            required_zero.extend(("native_action_rejections", "terminal_mismatches"))
-        else:
-            required_zero.extend(("fabricated_native_grid_rows", "player_holdout_leaks"))
-        failures = {
-            name: gates.get(name)
-            for name in required_zero
-            if gates.get(name) != 0
-        }
-        if failures:
-            raise RuntimeError(f"dataset quality gates are not clean: {failures}")
-        provenance = manifest.get("state_provenance") or {}
-        if observation_mode == OBSERVATION_SEQUENCE:
-            if provenance.get("mode") != "sequence_only":
-                raise RuntimeError("sequence-only state provenance is not explicit")
-            if int(provenance.get("sequence_only_rows", 0)) <= 0:
-                raise RuntimeError("sequence-only dataset has no training rows")
-            if int(provenance.get("native_grid_rows", -1)) != 0:
-                raise RuntimeError("sequence-only dataset contains/claims native grid rows")
-        else:
-            if "terminal_validation_unknown" not in gates:
-                raise RuntimeError("dataset does not report terminal_validation_unknown")
-            if not all(
-                key in provenance
-                for key in ("authoritative_rows", "native_generated_unanchored_rows")
-            ):
-                raise RuntimeError("dataset does not declare state provenance counts")
-            if (
-                int(provenance.get("authoritative_rows", 0))
-                + int(provenance.get("native_generated_unanchored_rows", 0))
-                <= 0
-            ):
-                raise RuntimeError("dataset contains no state-conditioned training rows")
-            unanchored_rows = int(provenance.get("native_generated_unanchored_rows", 0))
-            terminal_unknown = int(gates.get("terminal_validation_unknown", 0))
-            if (unanchored_rows or terminal_unknown) and not args.allow_unanchored_native_states:
-                raise RuntimeError(
-                    "dataset contains unanchored libg-generated states; pass the explicit "
-                    "--allow-unanchored-native-states acknowledgement to train an approximate "
-                    "state-conditioned model"
-                )
-    shard_summary: dict[str, dict[str, int]] = {}
-    for split, shards in manifest["splits"].items():
-        for relative in shards:
-            shard_summary[f"{split}:{relative}"] = validate_shard(
-                dataset_root / relative, manifest
+                "dataset contains unanchored libg-generated states; pass the explicit "
+                "--allow-unanchored-native-states acknowledgement to train an approximate "
+                "state-conditioned model"
             )
 
-    dimensions = manifest["dimensions"]
-    config = ExpertPolicyConfig(
-        grid_channels=int(dimensions["grid_channels"]),
-        public_scalar_size=int(dimensions["public_scalar_size"]),
-        card_vocab_size=int(dimensions["card_vocab_size"]),
-        ability_vocab_size=int(dimensions["ability_vocab_size"]),
-        max_ability_slots=int(dimensions["max_ability_slots"]),
-        card_embedding_size=args.card_embedding_size,
-        hidden_size=args.hidden_size,
-        lambda_max=args.lambda_max,
-        lambda_initial=args.lambda_initial,
+
+def _checkpoint_payload(
+    *,
+    epoch: int,
+    global_step: int,
+    model: RecurrentExpertPolicy,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    normalizer: DatasetPrecomputedNormalizer,
+    train_generator: torch.Generator,
+    dataset_manifest_sha256: str,
+    run_signature_sha256: str,
+    best_validation_loss: float,
+    epochs_without_improvement: int,
+    is_best: bool,
+    training_metrics: Mapping[str, float],
+    validation_metrics: Mapping[str, float],
+) -> dict[str, Any]:
+    return {
+        "kind": CHECKPOINT_KIND,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "epoch": int(epoch),
+        "step": int(global_step),
+        "global_step": int(global_step),
+        "updates": int(global_step),
+        "model_config": model.config.to_dict(),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        "normalizer_state": normalizer.state_dict(),
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "run_signature_sha256": run_signature_sha256,
+        "best_validation_loss": float(best_validation_loss),
+        "epochs_without_improvement": int(epochs_without_improvement),
+        "is_best": bool(is_best),
+        "training_metrics": dict(training_metrics),
+        "validation_metrics": dict(validation_metrics),
+        "rng": _capture_rng(train_generator),
+    }
+
+
+def _load_resume_checkpoint(run_root: Path, device: torch.device) -> tuple[Path, dict[str, Any]]:
+    candidates = [run_root / "checkpoints" / "latest.pt"]
+    best = run_root / "checkpoints" / "best.pt"
+    if best.is_file():
+        candidates.append(best)
+    loaded: list[tuple[Path, dict[str, Any]]] = []
+    for path in candidates:
+        if not path.is_file():
+            if path.name == "latest.pt":
+                raise RuntimeError(f"resume checkpoint is missing: {path}")
+            continue
+        value = torch.load(path, map_location=device, weights_only=False)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"invalid checkpoint payload: {path}")
+        if value.get("kind") != CHECKPOINT_KIND:
+            raise RuntimeError(f"unexpected checkpoint kind: {path}")
+        if int(value.get("schema_version", -1)) != CHECKPOINT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"checkpoint is not fully resumable schema v{CHECKPOINT_SCHEMA_VERSION}: {path}"
+            )
+        missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(value))
+        if missing:
+            raise RuntimeError(f"checkpoint is incomplete: {path}: {missing}")
+        loaded.append((path, value))
+    return max(
+        loaded,
+        key=lambda item: (
+            int(item[1].get("epoch", -1)),
+            int(item[1].get("global_step", -1)),
+            item[0].name == "latest.pt",
+        ),
+    )
+
+
+def _restore_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    model: RecurrentExpertPolicy,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    normalizer: DatasetPrecomputedNormalizer,
+    train_generator: torch.Generator,
+    dataset_manifest_sha256: str,
+    run_signature_sha256: str,
+) -> tuple[int, int, float, int]:
+    missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(checkpoint))
+    if missing:
+        raise RuntimeError(f"checkpoint is incomplete: {missing}")
+    if checkpoint.get("dataset_manifest_sha256") != dataset_manifest_sha256:
+        raise RuntimeError("checkpoint dataset manifest SHA-256 mismatch")
+    if checkpoint.get("run_signature_sha256") != run_signature_sha256:
+        raise RuntimeError("checkpoint training signature mismatch")
+    if checkpoint["model_config"] != model.config.to_dict():
+        raise RuntimeError("checkpoint model configuration mismatch")
+    model.load_state_dict(checkpoint["model_state"], strict=True)
+    optimizer.load_state_dict(checkpoint["optimizer_state"])
+    scheduler.load_state_dict(checkpoint["scheduler_state"])
+    normalizer.load_state_dict(checkpoint["normalizer_state"])
+    _restore_rng(checkpoint["rng"], train_generator)
+    epoch = int(checkpoint["epoch"])
+    global_step = int(checkpoint["global_step"])
+    if int(checkpoint["step"]) != global_step:
+        raise RuntimeError("checkpoint step/global_step counters disagree")
+    best_validation_loss = float(checkpoint["best_validation_loss"])
+    epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
+    if epoch < 0 or global_step < 0 or epochs_without_improvement < 0:
+        raise RuntimeError("checkpoint progress counters are invalid")
+    return epoch, global_step, best_validation_loss, epochs_without_improvement
+
+
+def run(args: argparse.Namespace) -> Path:
+    dataset_root = args.dataset_root.resolve()
+    if args.smoke and (not args.resume or not (dataset_root / "manifest.json").is_file()):
+        create_smoke_dataset(dataset_root, replace=True)
+    preliminary_manifest = read_manifest(dataset_root)
+    preliminary_digest = sha256_file(dataset_root / "manifest.json")
+    observation_mode = str(preliminary_manifest.get("observation_mode") or OBSERVATION_NATIVE)
+    device = _device(args.device)
+    run_signature_sha256, signature_payload = _run_signature(
+        args,
+        dataset_manifest_sha256=preliminary_digest,
         observation_mode=observation_mode,
     )
-    device = _device(args.device)
-    model = RecurrentExpertPolicy(config).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
-    )
-    train_loader = _loader(dataset_root, "train", args, shuffle=True)
-    validation_loader = _loader(dataset_root, "validation", args, shuffle=False)
-    test_loader = _loader(dataset_root, "test", args, shuffle=False)
-    if not len(train_loader.dataset) or not len(validation_loader.dataset) or not len(test_loader.dataset):
-        raise RuntimeError("train/validation/test must all contain at least one sequence window")
-
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = args.run_id or f"expert-v1-{stamp}"
-    run_root = args.output_root.resolve() / run_id
-    if run_root.exists():
-        raise FileExistsError(run_root)
-    (run_root / "checkpoints").mkdir(parents=True)
-    events = run_root / "events.jsonl"
-    run_manifest = {
-        "schema_version": 1,
-        "kind": "cr_native_expert_bc_run_v1",
-        "run_id": run_id,
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "dataset_root": str(dataset_root),
-        "dataset_manifest_sha256": sha256_file(dataset_root / "manifest.json"),
-        "source_manifest": manifest.get("source_manifest"),
-        "dataset_shards": shard_summary,
-        "model": config.to_dict(),
-        "training": {
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "sequence_length": args.sequence_length,
-            "burn_in": args.burn_in,
-            "learning_rate": args.learning_rate,
-            "weight_decay": args.weight_decay,
-            "gradient_clip": args.gradient_clip,
-            "early_stopping_patience": args.early_stopping_patience,
-            "minimum_delta": args.minimum_delta,
-            "seed": args.seed,
-        },
-        "semantics": {
-            "algorithm": "supervised_behaviour_cloning",
-            "reward": None,
-            "ppo": False,
-            "actor_information": "public_only_v1",
-            "action_heads": (
-                ["timing_hazard", "hand_slot", "position"]
-                if observation_mode == OBSERVATION_SEQUENCE
-                else ["timing_hazard", "action_kind", "hand_slot", "position", "ability", "ability_position"]
-            ),
-            "observation_mode": observation_mode,
-            "allow_unanchored_native_states": bool(args.allow_unanchored_native_states),
-            "state_provenance": manifest.get("state_provenance", {}),
-        },
-        "device": str(device),
-    }
-    _atomic_json(run_root / "manifest.json", run_manifest)
-    best_validation = float("inf")
-    epochs_without_improvement = 0
-    updates = 0
-    completed_epoch = 0
-    started = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
-        completed_epoch = epoch
-        model.train()
-        accumulator = MetricAccumulator()
-        epoch_started = time.perf_counter()
-        examples = 0
-        for batch_index, batch in enumerate(train_loader):
-            if args.max_train_batches and batch_index >= args.max_train_batches:
-                break
-            batch = _move(batch, device)
-            optimizer.zero_grad(set_to_none=True)
-            output = model.forward_batch(batch)
-            loss, metrics = behaviour_cloning_loss(output, batch, config)
-            if not bool(torch.isfinite(loss)):
-                raise FloatingPointError("expert BC loss became non-finite")
-            loss.backward()
-            gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
-            if not bool(torch.isfinite(gradient_norm)):
-                raise FloatingPointError("expert BC gradient became non-finite")
-            optimizer.step()
-            metrics["gradient_norm"] = float(gradient_norm.detach().item())
-            accumulator.add(metrics)
-            examples += int(batch["loss_mask"].sum().item())
-            updates += 1
-        training_metrics = accumulator.result()
-        validation_metrics = _evaluate(
-            model, validation_loader, device, maximum_batches=args.max_eval_batches
+    run_id = args.run_id or (
+        _stable_run_id(
+            observation_mode=observation_mode,
+            dataset_manifest_sha256=preliminary_digest,
+            run_signature_sha256=run_signature_sha256,
         )
-        epoch_event = {
-            "event": "epoch_complete",
-            "epoch": epoch,
-            "updates": updates,
-            "examples": examples,
-            "wall_seconds": time.perf_counter() - epoch_started,
-            "training": training_metrics,
-            "validation": validation_metrics,
-        }
-        _append_jsonl(events, epoch_event)
-        checkpoint = {
-            "kind": CHECKPOINT_KIND,
-            "schema_version": 1,
-            "epoch": epoch,
-            "updates": updates,
-            "model_config": config.to_dict(),
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "dataset_manifest_sha256": run_manifest["dataset_manifest_sha256"],
-            "training_metrics": training_metrics,
-            "validation_metrics": validation_metrics,
-            "rng": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        if args.resume
+        else f"expert-v1-{stamp}"
+    )
+    output_root = args.output_root.resolve()
+    run_root = output_root / run_id
+    with TrainingInstanceLock(output_root / ".expert-training-v1.lock", run_id=run_id):
+        manifest, integrity = verify_dataset_integrity(
+            dataset_root, workers=args.integrity_workers
+        )
+        actual_observation_mode = str(manifest.get("observation_mode") or OBSERVATION_NATIVE)
+        actual_signature, actual_signature_payload = _run_signature(
+            args,
+            dataset_manifest_sha256=integrity["manifest_sha256"],
+            observation_mode=actual_observation_mode,
+        )
+        if (
+            actual_observation_mode != observation_mode
+            or integrity["manifest_sha256"] != preliminary_digest
+            or actual_signature != run_signature_sha256
+        ):
+            raise RuntimeError("dataset changed while training startup validation was running")
+        signature_payload = actual_signature_payload
+        _validate_training_admission(args, dataset_root, manifest, observation_mode)
+
+        shard_summary: dict[str, dict[str, int]] = {}
+        for split, shards in manifest["splits"].items():
+            for relative in shards:
+                shard_summary[f"{split}:{relative}"] = validate_shard(
+                    dataset_root / relative, manifest
+                )
+        dimensions = manifest["dimensions"]
+        config = ExpertPolicyConfig(
+            grid_channels=int(dimensions["grid_channels"]),
+            public_scalar_size=int(dimensions["public_scalar_size"]),
+            card_vocab_size=int(dimensions["card_vocab_size"]),
+            ability_vocab_size=int(dimensions["ability_vocab_size"]),
+            max_ability_slots=int(dimensions["max_ability_slots"]),
+            entity_numeric_size=int(dimensions.get("entity_numeric_size", 3)),
+            card_embedding_size=args.card_embedding_size,
+            hidden_size=args.hidden_size,
+            lambda_max=args.lambda_max,
+            lambda_initial=args.lambda_initial,
+            observation_mode=observation_mode,
+        )
+        run_manifest = {
+            "schema_version": RUN_SCHEMA_VERSION,
+            "kind": RUN_KIND,
+            "run_id": run_id,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "dataset_root": str(dataset_root),
+            "dataset_manifest_sha256": integrity["manifest_sha256"],
+            "dataset_integrity": integrity,
+            "source_manifest": manifest.get("source_manifest"),
+            "dataset_shards": shard_summary,
+            "model": config.to_dict(),
+            "training": signature_payload,
+            "run_signature_sha256": run_signature_sha256,
+            "semantics": {
+                "algorithm": "supervised_behaviour_cloning",
+                "reward": None,
+                "ppo": False,
+                "actor_information": "public_only_v1",
+                "action_heads": (
+                    ["timing_hazard", "hand_slot", "position"]
+                    if observation_mode == OBSERVATION_SEQUENCE
+                    else [
+                        "timing_hazard",
+                        "action_kind",
+                        "hand_slot",
+                        "position",
+                        "ability",
+                        "ability_position",
+                    ]
+                ),
+                "observation_mode": observation_mode,
+                "allow_unanchored_native_states": bool(args.allow_unanchored_native_states),
+                "state_provenance": manifest.get("state_provenance", {}),
+                "scheduler": "constant_lr_v1",
+                "normalizer": DatasetPrecomputedNormalizer.KIND,
             },
+            "device": str(device),
         }
-        _atomic_torch(run_root / "checkpoints" / "latest.pt", checkpoint)
-        validation_loss = float(validation_metrics.get("loss", float("inf")))
-        if validation_loss < best_validation - args.minimum_delta:
-            best_validation = validation_loss
-            epochs_without_improvement = 0
-            _atomic_torch(run_root / "checkpoints" / "best.pt", checkpoint)
+
+        continuing = run_root.exists()
+        if continuing and not args.resume:
+            raise FileExistsError(run_root)
+        if continuing:
+            existing_path = run_root / "manifest.json"
+            if not existing_path.is_file():
+                raise RuntimeError(f"resume run manifest is missing: {existing_path}")
+            existing = json.loads(existing_path.read_text(encoding="utf-8-sig"))
+            for key in (
+                "schema_version",
+                "kind",
+                "run_id",
+                "dataset_root",
+                "dataset_manifest_sha256",
+                "model",
+                "training",
+                "run_signature_sha256",
+                "device",
+            ):
+                if existing.get(key) != run_manifest.get(key):
+                    raise RuntimeError(f"resume run manifest mismatch: {key}")
+            result_path = run_root / "result.json"
+            if result_path.is_file():
+                if not (run_root / "checkpoints" / "best.pt").is_file():
+                    raise RuntimeError("completed run is missing its best checkpoint")
+                _completed_path, completed_checkpoint = _load_resume_checkpoint(
+                    run_root, device
+                )
+                if (
+                    completed_checkpoint.get("dataset_manifest_sha256")
+                    != integrity["manifest_sha256"]
+                    or completed_checkpoint.get("run_signature_sha256")
+                    != run_signature_sha256
+                    or completed_checkpoint.get("model_config") != config.to_dict()
+                ):
+                    raise RuntimeError("completed run checkpoint does not match this run")
+                completed_result = json.loads(result_path.read_text(encoding="utf-8"))
+                if (
+                    completed_result.get("dataset_manifest_sha256")
+                    != integrity["manifest_sha256"]
+                    or completed_result.get("run_signature_sha256")
+                    != run_signature_sha256
+                ):
+                    raise RuntimeError("completed run result does not match this run")
+                print(result_path.read_text(encoding="utf-8").strip(), flush=True)
+                return run_root
         else:
-            epochs_without_improvement += 1
-        print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
-        if epochs_without_improvement >= args.early_stopping_patience:
-            _append_jsonl(events, {
-                "event": "early_stopping",
-                "epoch": epoch,
-                "best_validation_loss": best_validation,
-                "patience": args.early_stopping_patience,
-            })
-            break
-    best_path = run_root / "checkpoints" / "best.pt"
-    best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-    model.load_state_dict(best_checkpoint["model_state"])
-    test_metrics = _evaluate(model, test_loader, device, maximum_batches=args.max_eval_batches)
-    final = {
-        "event": "run_complete",
-        "epochs_requested": args.epochs,
-        "epochs_completed": completed_epoch,
-        "updates": updates,
-        "wall_seconds": time.perf_counter() - started,
-        "best_validation_loss": best_validation,
-        "test": test_metrics,
-        "checkpoint": str(best_path),
-    }
-    _append_jsonl(events, final)
-    _atomic_json(run_root / "result.json", final)
-    print(json.dumps(final, ensure_ascii=False), flush=True)
-    return run_root
+            (run_root / "checkpoints").mkdir(parents=True)
+            _atomic_json(run_root / "manifest.json", run_manifest)
+
+        _seed(args.seed)
+        model = RecurrentExpertPolicy(config).to(device)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _epoch: 1.0)
+        normalizer = DatasetPrecomputedNormalizer(config.public_scalar_size)
+        train_generator = torch.Generator().manual_seed(args.seed)
+        train_loader = _loader(
+            dataset_root,
+            "train",
+            args,
+            shuffle=True,
+            generator=train_generator,
+        )
+        validation_loader = _loader(dataset_root, "validation", args, shuffle=False)
+        test_loader = _loader(dataset_root, "test", args, shuffle=False)
+        if not all(
+            len(loader.dataset) for loader in (train_loader, validation_loader, test_loader)
+        ):
+            raise RuntimeError(
+                "train/validation/test must all contain at least one sequence window"
+            )
+
+        events = run_root / "events.jsonl"
+        best_validation = float("inf")
+        epochs_without_improvement = 0
+        updates = 0
+        completed_epoch = 0
+        latest_exists = (run_root / "checkpoints" / "latest.pt").is_file()
+        if continuing and latest_exists:
+            checkpoint_path, checkpoint = _load_resume_checkpoint(run_root, device)
+            (
+                completed_epoch,
+                updates,
+                best_validation,
+                epochs_without_improvement,
+            ) = _restore_checkpoint(
+                checkpoint,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                normalizer=normalizer,
+                train_generator=train_generator,
+                dataset_manifest_sha256=integrity["manifest_sha256"],
+                run_signature_sha256=run_signature_sha256,
+            )
+            latest_path = run_root / "checkpoints" / "latest.pt"
+            if checkpoint_path != latest_path:
+                _atomic_torch(latest_path, checkpoint)
+            _append_jsonl(
+                events,
+                {
+                    "event": "run_resumed",
+                    "epoch": completed_epoch,
+                    "global_step": updates,
+                    "checkpoint": str(checkpoint_path),
+                    "resumed_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        elif continuing:
+            checkpoint_files = list((run_root / "checkpoints").glob("*.pt"))
+            if checkpoint_files or (events.is_file() and events.stat().st_size):
+                raise RuntimeError(
+                    "run has partial progress but no complete latest checkpoint; "
+                    "preserving evidence"
+                )
+            _append_jsonl(
+                events,
+                {
+                    "event": "run_resumed_before_first_checkpoint",
+                    "epoch": 0,
+                    "global_step": 0,
+                    "resumed_utc": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+
+        started = time.perf_counter()
+        should_train = epochs_without_improvement < args.early_stopping_patience
+        if should_train:
+            for epoch in range(completed_epoch + 1, args.epochs + 1):
+                model.train()
+                accumulator = MetricAccumulator()
+                epoch_started = time.perf_counter()
+                examples = 0
+                for batch_index, batch in enumerate(train_loader):
+                    if args.max_train_batches and batch_index >= args.max_train_batches:
+                        break
+                    batch = _move(batch, device, normalizer)
+                    optimizer.zero_grad(set_to_none=True)
+                    output = model.forward_batch(batch)
+                    loss, metrics = behaviour_cloning_loss(output, batch, config)
+                    if not bool(torch.isfinite(loss)):
+                        raise FloatingPointError("expert BC loss became non-finite")
+                    loss.backward()
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.gradient_clip
+                    )
+                    if not bool(torch.isfinite(gradient_norm)):
+                        raise FloatingPointError("expert BC gradient became non-finite")
+                    optimizer.step()
+                    metrics["gradient_norm"] = float(gradient_norm.detach().item())
+                    accumulator.add(metrics)
+                    examples += int(batch["loss_mask"].sum().item())
+                    updates += 1
+                training_metrics = accumulator.result()
+                validation_metrics = _evaluate(
+                    model,
+                    validation_loader,
+                    device,
+                    maximum_batches=args.max_eval_batches,
+                    normalizer=normalizer,
+                )
+                validation_loss = float(validation_metrics.get("loss", float("inf")))
+                improved = validation_loss < best_validation - args.minimum_delta
+                if improved:
+                    best_validation = validation_loss
+                    epochs_without_improvement = 0
+                else:
+                    epochs_without_improvement += 1
+                scheduler.step()
+                completed_epoch = epoch
+                epoch_event = {
+                    "event": "epoch_complete",
+                    "epoch": epoch,
+                    "global_step": updates,
+                    "updates": updates,
+                    "examples": examples,
+                    "wall_seconds": time.perf_counter() - epoch_started,
+                    "training": training_metrics,
+                    "validation": validation_metrics,
+                }
+                checkpoint = _checkpoint_payload(
+                    epoch=epoch,
+                    global_step=updates,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    normalizer=normalizer,
+                    train_generator=train_generator,
+                    dataset_manifest_sha256=integrity["manifest_sha256"],
+                    run_signature_sha256=run_signature_sha256,
+                    best_validation_loss=best_validation,
+                    epochs_without_improvement=epochs_without_improvement,
+                    is_best=improved,
+                    training_metrics=training_metrics,
+                    validation_metrics=validation_metrics,
+                )
+                if improved:
+                    _atomic_torch(run_root / "checkpoints" / "best.pt", checkpoint)
+                _atomic_torch(run_root / "checkpoints" / "latest.pt", checkpoint)
+                _append_jsonl(events, epoch_event)
+                print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
+                if epochs_without_improvement >= args.early_stopping_patience:
+                    _append_jsonl(
+                        events,
+                        {
+                            "event": "early_stopping",
+                            "epoch": epoch,
+                            "best_validation_loss": best_validation,
+                            "patience": args.early_stopping_patience,
+                        },
+                    )
+                    break
+
+        best_path = run_root / "checkpoints" / "best.pt"
+        if not best_path.is_file():
+            raise RuntimeError("training has no complete best checkpoint")
+        best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+        if not isinstance(best_checkpoint, dict):
+            raise RuntimeError("best checkpoint payload is invalid")
+        missing_best = sorted(CHECKPOINT_REQUIRED_FIELDS - set(best_checkpoint))
+        if missing_best:
+            raise RuntimeError(f"best checkpoint is incomplete: {missing_best}")
+        if (
+            best_checkpoint.get("kind") != CHECKPOINT_KIND
+            or int(best_checkpoint.get("schema_version", -1))
+            != CHECKPOINT_SCHEMA_VERSION
+            or best_checkpoint.get("dataset_manifest_sha256")
+            != integrity["manifest_sha256"]
+            or best_checkpoint.get("run_signature_sha256") != run_signature_sha256
+            or best_checkpoint.get("model_config") != config.to_dict()
+        ):
+            raise RuntimeError("best checkpoint is incompatible with this run")
+        model.load_state_dict(best_checkpoint["model_state"], strict=True)
+        test_metrics = _evaluate(
+            model,
+            test_loader,
+            device,
+            maximum_batches=args.max_eval_batches,
+            normalizer=normalizer,
+        )
+        session_wall_seconds = time.perf_counter() - started
+        final = {
+            "event": "run_complete",
+            "epochs_requested": args.epochs,
+            "epochs_completed": completed_epoch,
+            "global_step": updates,
+            "step": updates,
+            "updates": updates,
+            "wall_seconds": session_wall_seconds,
+            "session_wall_seconds": session_wall_seconds,
+            "best_validation_loss": best_validation,
+            "test": test_metrics,
+            "checkpoint": str(best_path),
+            "dataset_manifest_sha256": integrity["manifest_sha256"],
+            "run_signature_sha256": run_signature_sha256,
+        }
+        _append_jsonl(events, final)
+        _atomic_json(run_root / "result.json", final)
+        print(json.dumps(final, ensure_ascii=False), flush=True)
+        return run_root
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -402,11 +907,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--run-id")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "resume the stable run from its latest complete checkpoint; when --run-id "
+            "is omitted a deterministic dataset/configuration run id is used"
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--burn-in", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--integrity-workers",
+        type=int,
+        default=0,
+        help="parallel dataset checksum workers (0 = automatic)",
+    )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gradient-clip", type=float, default=1.0)
@@ -433,6 +952,8 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.epochs <= 0 or args.batch_size <= 0 or args.early_stopping_patience <= 0:
         raise ValueError("epochs, batch size and early stopping patience must be positive")
+    if args.workers < 0 or args.integrity_workers < 0:
+        raise ValueError("workers and integrity workers must be non-negative")
     run(args)
     return 0
 
