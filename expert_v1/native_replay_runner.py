@@ -97,8 +97,12 @@ def _compact_decision_state(
         "elixir": int(own["elixir"]),
         "elixir_raw": int(own["elixir_raw"]),
         "hand_deck_indices": [int(value) for value in own["hand_deck_indices"]],
-        "next_deck_index": int(own["next_deck_index"]),
-        "refill_timer": int(own["refill_timer"]),
+        # Older deployed hosts omitted these two fields from the compact
+        # observation even though the full observation exposed them.  Keep
+        # the runner compatible while the upgraded host is rolled out; -1 is
+        # explicit "not observed", never a guessed cycle value.
+        "next_deck_index": int(own.get("next_deck_index", -1)),
+        "refill_timer": int(own.get("refill_timer", -1)),
     }
     entities = []
     for entity in state.get("entities", []):

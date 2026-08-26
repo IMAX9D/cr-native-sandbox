@@ -1863,12 +1863,14 @@ static jstring observe_state_json(
     }
     const int32_t elixir = player_elixir(player);
     if (compact_training) {
-      char compact_player[256];
+      char compact_player[320];
       std::snprintf(
           compact_player, sizeof(compact_player),
           "%s{\"side\":%d,\"elixir\":%d,\"elixir_raw\":%d,"
+          "\"refill_timer\":%d,\"next_deck_index\":%d,"
           "\"hand_deck_indices\":[%d,%d,%d,%d]}",
           side == 0 ? "" : ",", side, elixir, elixir_raw,
+          refill_timer, next_index,
           hand_deck_indices[0], hand_deck_indices[1],
           hand_deck_indices[2], hand_deck_indices[3]);
       result.append(compact_player);
