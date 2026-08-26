@@ -101,7 +101,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     copied += 1
                 frozen = {
                     **row,
-                    "source_path": str(destination.resolve()),
+                    # The staging directory is atomically renamed below. Persist
+                    # the final batch path, never the transient `.building` path.
+                    "source_path": str(
+                        (batch / destination.relative_to(building)).resolve()
+                    ),
                     "batch": batch.name,
                 }
                 frozen_live.append(frozen)
