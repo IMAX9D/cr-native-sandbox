@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 from expert_v1.native_dataset_generator import (
     COORDINATE_PROVENANCE,
+    _failure_class,
+    _failure_domain,
     NativeDatasetTask,
     RecordingCountingEnv,
     StagedTickSink,
@@ -15,8 +18,12 @@ from expert_v1.native_dataset_generator import (
     atomic_json,
     prepare_run,
     reconcile_result_files,
+    recover_unmanifested_final_shards,
+    requeue_failed_infrastructure,
     select_tasks,
+    should_retry_failure,
     summarize_results,
+    verify_published_tick_store,
 )
 from expert_v1.native_profile import native_teacher_forced_profile
 from expert_v1.tick_store_v1.schema import (
@@ -24,7 +31,7 @@ from expert_v1.tick_store_v1.schema import (
     PlayerPrivate,
     TickState,
 )
-from expert_v1.tick_store_v1.shard import WorkerShardSink
+from expert_v1.tick_store_v1.shard import WorkerShardSink, build_store_manifest
 from expert_v1.tick_store_v1.work_queue import TickStoreWorkQueue
 
 
@@ -76,6 +83,57 @@ def write_candidates(path: Path, rows: list[dict]) -> None:
 
 
 class NativeDatasetGeneratorTest(unittest.TestCase):
+    def test_failure_domains_keep_infrastructure_out_of_semantic_rejections(self) -> None:
+        timeout = _failure_class(
+            None, TimeoutError("RPC timeout"), "native_teacher_forced_replay"
+        )
+        disk = _failure_class(
+            None, OSError("disk full"), "immutable_tick_store_commit"
+        )
+        source_sha = _failure_class(
+            None, RuntimeError("changed"), "source_sha_verification"
+        )
+        self.assertEqual(_failure_domain(timeout), "infrastructure")
+        self.assertEqual(_failure_domain(disk), "infrastructure")
+        self.assertEqual(_failure_domain(source_sha), "infrastructure")
+        self.assertEqual(_failure_domain("native_action_rejected"), "semantic")
+        protocol = _failure_class(
+            SimpleNamespace(failure="native_action_count_mismatch_tick_20"),
+            None,
+            "first_native_difference",
+        )
+        hand = _failure_class(
+            SimpleNamespace(failure="hand_mismatch_event_7"),
+            None,
+            "first_native_difference",
+        )
+        unknown = _failure_class(
+            SimpleNamespace(failure="new_unrecognized_runner_failure"),
+            None,
+            "first_native_difference",
+        )
+        terminal = _failure_class(
+            SimpleNamespace(failure="native_terminal_before_execution_tick_80"),
+            None,
+            "first_native_difference",
+        )
+        self.assertEqual(_failure_domain(protocol), "infrastructure")
+        self.assertEqual(_failure_domain(hand), "source_integrity")
+        self.assertEqual(_failure_domain(unknown), "infrastructure")
+        self.assertEqual(_failure_domain(terminal), "semantic")
+        self.assertTrue(should_retry_failure({
+            "teacher_forced_success": False,
+            "failure_domain": "infrastructure",
+        }, 1))
+        self.assertFalse(should_retry_failure({
+            "teacher_forced_success": False,
+            "failure_domain": "infrastructure",
+        }, 3))
+        self.assertFalse(should_retry_failure({
+            "teacher_forced_success": False,
+            "failure_domain": "semantic",
+        }, 1))
+
     def test_limited_selection_is_deterministic_and_mixed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -197,6 +255,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             )
             self.assertFalse(execution.record["teacher_forced_success"])
             self.assertEqual(execution.record["failure_class"], "source_sha_mismatch")
+            self.assertEqual(execution.record["failure_domain"], "infrastructure")
             self.assertEqual(sink.writer.episode_count, 0)
             diagnostic_text = json.dumps(execution.diagnostic, ensure_ascii=False)
             self.assertNotIn("must-not-copy", diagnostic_text)
@@ -246,6 +305,44 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 json.loads(manifests[0].read_text())["episode_count"], 1
             )
 
+    def test_new_run_requeues_only_infrastructure_with_fresh_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue_path = root / "queue.sqlite3"
+            with TickStoreWorkQueue(queue_path) as queue:
+                queue.add_tasks([
+                    {
+                        "battle_tag": tag, "source_path": f"{tag}.json",
+                        "source_sha256": "a" * 64, "payload": {},
+                    }
+                    for tag in ("INFRA", "SEMANTIC")
+                ])
+                queue.connection.execute(
+                    "UPDATE tasks SET status='failed', attempts=3"
+                )
+            for tag, domain in (
+                ("INFRA", "infrastructure"), ("SEMANTIC", "semantic")
+            ):
+                atomic_json(root / "results" / f"{tag}.json", {
+                    "schema_version": 1,
+                    "kind": "expert_authoritative_native_tick_result_v1",
+                    "battle_tag": tag,
+                    "teacher_forced_success": False,
+                    "failure_domain": domain,
+                })
+            self.assertEqual(
+                requeue_failed_infrastructure(root, queue_path), 1
+            )
+            with TickStoreWorkQueue(queue_path) as queue:
+                rows = {
+                    row["battle_tag"]: (row["status"], row["attempts"])
+                    for row in queue.connection.execute(
+                        "SELECT battle_tag,status,attempts FROM tasks"
+                    )
+                }
+            self.assertEqual(rows["INFRA"], ("pending", 0))
+            self.assertEqual(rows["SEMANTIC"], ("failed", 3))
+
     def test_native_action_metrics_use_attempted_not_planned_denominator(self) -> None:
         class FakeEnv:
             def joint_act(self, actions):
@@ -264,9 +361,60 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         metrics = recorder.metrics()
         self.assertEqual(metrics["native_actions_attempted"], 2)
         self.assertEqual(metrics["native_actions_accepted"], 1)
+        self.assertEqual(metrics["native_actions_responded"], 2)
+        self.assertEqual(metrics["native_actions_rejected"], 1)
+        self.assertEqual(metrics["native_actions_no_response"], 0)
         self.assertEqual(metrics["true_attempted_acceptance_rate"], 0.5)
         self.assertEqual(metrics["native_deploy_actions_accepted"], 1)
         self.assertEqual(metrics["native_ability_actions_accepted"], 0)
+
+        class TimeoutEnv:
+            def joint_act(self, actions):
+                raise TimeoutError("transport stalled")
+
+        timed_out = RecordingCountingEnv(TimeoutEnv())
+        with self.assertRaises(TimeoutError):
+            timed_out.joint_act([{"type": "play", "side": 0}])
+        timeout_metrics = timed_out.metrics()
+        self.assertEqual(timeout_metrics["native_actions_attempted"], 1)
+        self.assertEqual(timeout_metrics["native_actions_responded"], 0)
+        self.assertEqual(timeout_metrics["native_actions_no_response"], 1)
+        self.assertEqual(timeout_metrics["native_action_exceptions"], 1)
+
+    def test_finalize_crash_window_rebuilds_missing_shard_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sink = WorkerShardSink(root, "worker", episodes_per_shard=1)
+            sink.append("RECOVER", tick_states(), {"stable": 1})
+            sink.finalize()
+            manifest = next(root.glob("worker-*.manifest.json"))
+            manifest.unlink()
+            self.assertEqual(
+                recover_unmanifested_final_shards(root, "worker"), 1
+            )
+            recovered = json.loads(manifest.read_text())
+            self.assertTrue(recovered["recovered_after_finalize_crash"])
+            self.assertEqual(recovered["episode_count"], 1)
+            self.assertEqual(
+                recover_unmanifested_final_shards(root, "worker"), 0
+            )
+            selection = root / "selection.jsonl"
+            selection.write_text("{}\n", encoding="utf-8")
+            build_store_manifest(
+                root, source_manifest=selection,
+                expected_episodes=1, expected_ticks=len(tick_states()),
+            )
+            self.assertEqual(
+                verify_published_tick_store(root)["episodes"], 1
+            )
+            data = next(root.glob("worker-*.crts"))
+            with data.open("r+b") as handle:
+                handle.seek(-1, 2)
+                value = handle.read(1)
+                handle.seek(-1, 2)
+                handle.write(bytes([value[0] ^ 0x01]))
+            with self.assertRaises(RuntimeError):
+                verify_published_tick_store(root)
 
     def test_summary_separates_semantic_rejection_from_infrastructure(self) -> None:
         task = NativeDatasetTask(
@@ -280,13 +428,19 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             "native_teacher_forced_profile": native_teacher_forced_profile(1),
             "coordinate_provenance": COORDINATE_PROVENANCE,
             "native_actions_attempted": 4,
+            "native_actions_responded": 4,
             "native_actions_accepted": 3,
+            "native_actions_rejected": 1,
+            "native_actions_no_response": 0,
+            "native_action_response_excess": 0,
+            "native_action_exceptions": 0,
             "native_deploy_actions_attempted": 3,
             "native_deploy_actions_accepted": 3,
             "native_ability_actions_attempted": 1,
             "native_ability_actions_accepted": 0,
             "teacher_forced_success": False,
             "failure_class": "ability_branch_required",
+            "failure_domain": "semantic",
             "terminal_diagnostic_status": "not_reached",
         }
         summary = summarize_results(
@@ -298,6 +452,26 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertTrue(summary["publication_ready"])
         self.assertEqual(summary["true_attempted_acceptance_rate"], 0.75)
         self.assertEqual(summary["branch_required_battles"], 1)
+        self.assertTrue(summary["native_action_accounting_closed"])
+
+        infrastructure = dict(base)
+        infrastructure.update({
+            "failure_class": "infrastructure_native_replay_exception",
+            "failure_domain": "infrastructure",
+            "native_actions_responded": 3,
+            "native_actions_rejected": 0,
+            "native_actions_no_response": 1,
+        })
+        blocked = summarize_results(
+            [task], [infrastructure], queue_counts={"failed": 1},
+            worker_reports=[{"worker_error": None}], wall_seconds=2.0,
+            missing_tags=[], unexpected_tags=[],
+        )
+        self.assertFalse(blocked["infrastructure_complete"])
+        self.assertFalse(blocked["publication_ready"])
+        self.assertEqual(
+            blocked["failure_domain_counts"], {"infrastructure": 1}
+        )
 
 
 if __name__ == "__main__":

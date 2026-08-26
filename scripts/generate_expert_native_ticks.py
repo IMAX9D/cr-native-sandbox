@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from expert_v1.native_dataset_generator import (  # noqa: E402
+    RunLock,
     prepare_run,
     run_generation,
 )
@@ -55,21 +56,23 @@ def _common(parser: argparse.ArgumentParser) -> None:
 
 
 def _prepare(args: argparse.Namespace) -> int:
-    tasks, selection, queue, contract = prepare_run(
-        candidate_queue=args.queue,
-        output_root=args.output_root,
-        template_path=args.template,
-        limit=args.limit,
-        selection_seed=args.selection_seed,
-        deployment_zero_quota=args.deployment_zero_quota,
-        ability_exact_quota=args.ability_exact_quota,
-        seed=args.seed,
-        maximum_seeds_to_test=args.maximum_seeds,
-        trace_batch_steps=args.trace_batch_steps,
-        episodes_per_shard=args.episodes_per_shard,
-    )
-    with TickStoreWorkQueue(queue) as work_queue:
-        counts = work_queue.counts()
+    output_root = args.output_root.resolve()
+    with RunLock(output_root / "run.lock"):
+        tasks, selection, queue, contract = prepare_run(
+            candidate_queue=args.queue,
+            output_root=output_root,
+            template_path=args.template,
+            limit=args.limit,
+            selection_seed=args.selection_seed,
+            deployment_zero_quota=args.deployment_zero_quota,
+            ability_exact_quota=args.ability_exact_quota,
+            seed=args.seed,
+            maximum_seeds_to_test=args.maximum_seeds,
+            trace_batch_steps=args.trace_batch_steps,
+            episodes_per_shard=args.episodes_per_shard,
+        )
+        with TickStoreWorkQueue(queue) as work_queue:
+            counts = work_queue.counts()
     print(json.dumps({
         "prepared": True,
         "selected_battles": len(tasks),
@@ -97,6 +100,7 @@ def _run(args: argparse.Namespace) -> int:
         trace_batch_steps=args.trace_batch_steps,
         episodes_per_shard=args.episodes_per_shard,
         lease_seconds=args.lease_seconds,
+        retry_infrastructure_failures=args.retry_infrastructure_failures,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["publication_ready"] else 2
@@ -140,6 +144,16 @@ def main() -> int:
         "--ports", type=int, nargs="+", default=DEFAULT_PORTS
     )
     run_parser.add_argument("--lease-seconds", type=float, default=900.0)
+    run_parser.add_argument(
+        "--no-retry-infrastructure-failures",
+        dest="retry_infrastructure_failures",
+        action="store_false",
+        help=(
+            "leave prior infrastructure failures terminal; by default a new "
+            "run reopens only infrastructure failures with a fresh retry budget"
+        ),
+    )
+    run_parser.set_defaults(retry_infrastructure_failures=True)
     run_parser.set_defaults(function=_run)
 
     status_parser = commands.add_parser("status")

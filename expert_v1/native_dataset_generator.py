@@ -20,7 +20,7 @@ from pathlib import Path
 import threading
 import time
 import traceback
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 try:
     import orjson
@@ -50,6 +50,7 @@ from .tick_store_v1.schema import TickState, require_consecutive
 from .tick_store_v1.shard import (
     FRAME_HEADER,
     FRAME_MAGIC,
+    SHARD_KIND,
     WorkerShardSink,
     _scan_frames,
     build_store_manifest,
@@ -631,12 +632,20 @@ class RecordingCountingEnv:
             self.action_history.append(audit)
 
     def metrics(self) -> dict[str, Any]:
+        no_response = max(
+            0, self.native_actions_attempted - self.native_actions_responded
+        )
+        response_excess = max(
+            0, self.native_actions_responded - self.native_actions_attempted
+        )
         return {
             "native_action_batches_attempted": self.native_action_batches_attempted,
             "native_actions_attempted": self.native_actions_attempted,
             "native_actions_responded": self.native_actions_responded,
             "native_actions_accepted": self.native_actions_accepted,
             "native_actions_rejected": self.native_actions_rejected,
+            "native_actions_no_response": no_response,
+            "native_action_response_excess": response_excess,
             "native_deploy_actions_attempted": self.native_deploy_actions_attempted,
             "native_deploy_actions_accepted": self.native_deploy_actions_accepted,
             "native_ability_actions_attempted": self.native_ability_actions_attempted,
@@ -741,26 +750,28 @@ class StoredFrameRegistry:
     ) -> dict[str, Any]:
         with self._lock:
             existing = self._entries.get(episode.battle_tag)
-        if existing is not None:
-            blob, _ = encode_episode(
-                episode.states,
-                {**episode.metadata, "battle_tag": episode.battle_tag},
-                anchor_interval=sink.anchor_interval,
-                compression_level=sink.compression_level,
-            )
-            actual = hashlib.sha256(blob).hexdigest()
-            if actual != str(existing["payload_sha256"]):
-                raise RuntimeError(
-                    "resume Tick payload diverged for " + episode.battle_tag
+            if existing is not None:
+                blob, _ = encode_episode(
+                    episode.states,
+                    {**episode.metadata, "battle_tag": episode.battle_tag},
+                    anchor_interval=sink.anchor_interval,
+                    compression_level=sink.compression_level,
                 )
-            return {**existing, "resume_reused_existing_frame": True}
-        entry = sink.append(
-            episode.battle_tag, episode.states, episode.metadata
-        )
-        entry["resume_reused_existing_frame"] = False
-        with self._lock:
+                actual = hashlib.sha256(blob).hexdigest()
+                if actual != str(existing["payload_sha256"]):
+                    raise RuntimeError(
+                        "resume Tick payload diverged for " + episode.battle_tag
+                    )
+                return {**existing, "resume_reused_existing_frame": True}
+            # The existence check, append, and registry mutation form one
+            # critical section.  SQLite normally prevents two executions of
+            # the same task; this also fences the rare lease-expiry race.
+            entry = sink.append(
+                episode.battle_tag, episode.states, episode.metadata
+            )
+            entry["resume_reused_existing_frame"] = False
             self._register(entry)
-        return entry
+            return entry
 
 
 def _verify_plan(task: NativeDatasetTask, source: Mapping[str, Any]) -> BattlePlan:
@@ -808,7 +819,15 @@ def _failure_class(
     if isinstance(error, NativeSeedSearchError):
         return "native_seed_search_exhausted"
     if error is not None:
-        return "exception"
+        if stage == "immutable_tick_store_commit":
+            return "infrastructure_tick_store_commit_failed"
+        if stage == "tick_store_postcondition":
+            return "infrastructure_tick_store_postcondition_failed"
+        if stage == "native_teacher_forced_replay":
+            return "infrastructure_native_replay_exception"
+        if stage == "compile_and_provenance_validation":
+            return "source_contract_or_compile_error"
+        return "infrastructure_exception"
     assert result is not None
     failure = str(result.failure or "unknown")
     if "ability_branch_required" in failure:
@@ -817,11 +836,52 @@ def _failure_class(
         return "ability_entity_missing"
     if "native_rejected" in failure:
         return "native_action_rejected"
+    if failure.startswith("native_terminal_before_"):
+        return "native_terminal_before_source_event"
+    if failure.startswith("hand_mismatch_event_"):
+        return "source_hand_sequence_mismatch"
+    if failure.startswith((
+        "source_ability_ticks_missing_count_",
+        "source_tick_",
+        "execution_tick_",
+    )):
+        return "source_plan_contract_mismatch"
+    if failure.startswith("native_seed_search_layout_revalidation_failed"):
+        return "infrastructure_seed_layout_revalidation_failed"
+    if failure.startswith((
+        "native_action_count_mismatch_",
+        "native_tick_mismatch_",
+        "observation_tick_",
+    )):
+        return "infrastructure_native_protocol_mismatch"
     if "tick_store_write" in failure:
         return "tick_store_staging_failed"
     if failure.startswith(NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK):
         return NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
-    return "teacher_forced_failure"
+    return "unclassified_native_failure"
+
+
+def _failure_domain(failure_class: str | None) -> str | None:
+    if failure_class is None:
+        return None
+    if failure_class in {
+        "native_seed_search_exhausted",
+        "ability_branch_required",
+        "ability_entity_missing",
+        "native_action_rejected",
+        "native_terminal_before_source_event",
+        NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK,
+    }:
+        return "semantic"
+    if failure_class == "source_sha_mismatch":
+        return "infrastructure"
+    if failure_class in {
+        "source_contract_or_compile_error",
+        "source_hand_sequence_mismatch",
+        "source_plan_contract_mismatch",
+    }:
+        return "source_integrity"
+    return "infrastructure"
 
 
 @dataclass(slots=True)
@@ -843,6 +903,7 @@ def execute_task(
     seed: int = DEFAULT_NATIVE_SEED,
     maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     trace_batch_steps: int = 64,
+    commit_guard: Callable[[], bool] | None = None,
 ) -> TaskExecution:
     """Execute one source and commit its Tick frame only after full success."""
     recorder = RecordingCountingEnv(env)
@@ -916,6 +977,10 @@ def execute_task(
                     "successful replay action counters differ from source actions"
                 )
             stage = "immutable_tick_store_commit"
+            if commit_guard is not None and not commit_guard():
+                raise RuntimeError(
+                    "native task lease ownership was lost before Tick commit"
+                )
             store_entry = registry.commit_or_reuse(sink, staged.episode)
     except Exception as caught:
         error = caught
@@ -946,6 +1011,7 @@ def execute_task(
                 None if result is None else result.logic_freeze_diagnostic
             ),
         }
+    failure_domain = _failure_domain(failure_class)
     coordinate_provenance = (
         None if plan is None else plan.coordinate_provenance
     )
@@ -968,6 +1034,7 @@ def execute_task(
         "source_json_copied": False,
         "teacher_forced_success": success,
         "failure_class": failure_class,
+        "failure_domain": failure_domain,
         "failure": failure,
         "first_difference": first_difference,
         "planned_deploy_actions": task.deployment_actions,
@@ -1034,6 +1101,7 @@ def execute_task(
         },
         "task": task.json(),
         "failure_class": failure_class,
+        "failure_domain": failure_domain,
         "failure": failure,
         "first_difference": first_difference,
         "native_action_metrics": metrics,
@@ -1098,8 +1166,92 @@ def _result_path(output_root: Path, battle_tag: str) -> Path:
     return output_root / "results" / f"{_safe_tag(battle_tag)}.json"
 
 
-def _diagnostic_path(output_root: Path, battle_tag: str) -> Path:
-    return output_root / "diagnostics" / f"{_safe_tag(battle_tag)}.json"
+def _diagnostic_path(
+    output_root: Path, battle_tag: str, attempt: int
+) -> Path:
+    return (
+        output_root / "diagnostics"
+        / f"{_safe_tag(battle_tag)}.attempt-{attempt:03d}.json"
+    )
+
+
+def should_retry_failure(
+    record: Mapping[str, Any], attempt: int, *, maximum_attempts: int = 3
+) -> bool:
+    return bool(
+        record.get("teacher_forced_success") is not True
+        and record.get("failure_domain") == "infrastructure"
+        and int(attempt) < int(maximum_attempts)
+    )
+
+
+def _lease_is_owned(
+    queue: TickStoreWorkQueue, worker_id: str, battle_tag: str
+) -> bool:
+    row = queue.connection.execute(
+        """
+        SELECT status, lease_owner, lease_until FROM tasks
+        WHERE battle_tag=?
+        """,
+        (battle_tag,),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row["status"] == "leased"
+        and row["lease_owner"] == worker_id
+        and float(row["lease_until"] or 0.0) > time.time()
+    )
+
+
+def recover_unmanifested_final_shards(
+    root: Path,
+    worker_id: str,
+    *,
+    anchor_interval: int = 256,
+    compression_level: int = 1,
+) -> int:
+    """Repair the crash window after .crts rename but before manifest write."""
+    recovered = 0
+    root.mkdir(parents=True, exist_ok=True)
+    for data_path in sorted(root.glob(f"{worker_id}-*.crts")):
+        stem = data_path.name.removesuffix(".crts")
+        manifest_path = root / f"{stem}.manifest.json"
+        if manifest_path.exists():
+            continue
+        index_path = root / f"{stem}.index.jsonl"
+        if not index_path.exists():
+            raise RuntimeError(
+                f"final shard has no recoverable index: {data_path}"
+            )
+        entries = _scan_frames(data_path, truncate_invalid_tail=False)
+        index_entries = [
+            json.loads(line)
+            for line in index_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+        if entries != index_entries:
+            raise RuntimeError(
+                f"final shard/index differ during recovery: {stem}"
+            )
+        manifest = {
+            "schema_version": 1,
+            "kind": SHARD_KIND,
+            "created_utc": utc_now(),
+            "name": stem,
+            "data_file": data_path.name,
+            "index_file": index_path.name,
+            "episode_count": len(entries),
+            "tick_count": sum(int(entry["ticks"]) for entry in entries),
+            "anchor_interval": anchor_interval,
+            "compression": f"zlib-level-{compression_level}",
+            "data_sha256": sha256_file(data_path),
+            "index_sha256": sha256_file(index_path),
+            "bytes": data_path.stat().st_size,
+            "recovered_after_finalize_crash": True,
+        }
+        atomic_json(manifest_path, manifest)
+        recovered += 1
+    return recovered
 
 
 def worker_loop(
@@ -1122,8 +1274,12 @@ def worker_loop(
     started = time.perf_counter()
     sink: WorkerShardSink | None = None
     manifests: list[dict[str, Any]] = []
+    recovered_final_shards = 0
     try:
         template = load_template(template_path)
+        recovered_final_shards = recover_unmanifested_final_shards(
+            output_root / "shards", worker_id
+        )
         sink = WorkerShardSink(
             output_root / "shards",
             worker_id,
@@ -1162,39 +1318,50 @@ def worker_loop(
                             seed=seed,
                             maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
+                            commit_guard=lambda: _lease_is_owned(
+                                queue, worker_id, task.battle_tag
+                            ),
                         )
-                    record = execution.record
-                    diagnostic_path = None
-                    if execution.diagnostic is not None:
-                        diagnostic_path = _diagnostic_path(
-                            output_root, task.battle_tag
+                        record = execution.record
+                        retry = should_retry_failure(
+                            record, raw_task.attempts, maximum_attempts=3
                         )
-                        atomic_json(diagnostic_path, execution.diagnostic)
-                    record["diagnostic_path"] = (
-                        None if diagnostic_path is None
-                        else str(diagnostic_path.resolve())
-                    )
-                    atomic_json(_result_path(output_root, task.battle_tag), record)
-                    if record["teacher_forced_success"]:
-                        entry = record["tick_store_entry"]
-                        queue.complete(
-                            worker_id,
-                            task.battle_tag,
-                            output_shard=str(entry["shard"]),
-                            frame_offset=int(entry["offset"]),
-                            frame_size=int(entry["frame_size"]),
-                            episode_sha256=str(entry["payload_sha256"]),
+                        record["retry_scheduled"] = retry
+                        record["final_attempt"] = not retry
+                        diagnostic_path = None
+                        if execution.diagnostic is not None:
+                            diagnostic_path = _diagnostic_path(
+                                output_root, task.battle_tag, raw_task.attempts
+                            )
+                            atomic_json(diagnostic_path, execution.diagnostic)
+                        record["diagnostic_path"] = (
+                            None if diagnostic_path is None
+                            else str(diagnostic_path.resolve())
                         )
-                        successes += 1
-                        stored_ticks += int(entry["ticks"])
-                    else:
-                        queue.fail(
-                            worker_id,
-                            task.battle_tag,
-                            str(record["failure"]),
-                            retry=False,
+                        atomic_json(
+                            _result_path(output_root, task.battle_tag), record
                         )
-                        failures += 1
+                        if record["teacher_forced_success"]:
+                            entry = record["tick_store_entry"]
+                            queue.complete(
+                                worker_id,
+                                task.battle_tag,
+                                output_shard=str(entry["shard"]),
+                                frame_offset=int(entry["offset"]),
+                                frame_size=int(entry["frame_size"]),
+                                episode_sha256=str(entry["payload_sha256"]),
+                            )
+                            successes += 1
+                            stored_ticks += int(entry["ticks"])
+                        else:
+                            queue.fail(
+                                worker_id,
+                                task.battle_tag,
+                                str(record["failure"]),
+                                retry=retry,
+                            )
+                            if not retry:
+                                failures += 1
                     completed += 1
     except Exception as error:
         worker_error = f"{type(error).__name__}: {error}"
@@ -1217,6 +1384,7 @@ def worker_loop(
         "stored_ticks": stored_ticks,
         "wall_seconds": time.perf_counter() - started,
         "worker_error": worker_error,
+        "recovered_final_shards": recovered_final_shards,
         "newly_finalized_shards": manifests,
     }
     atomic_json(output_root / "workers" / f"{worker_id}.json", report)
@@ -1259,6 +1427,17 @@ def summarize_results(
     failures = [row for row in results if not row.get("teacher_forced_success")]
     attempted = sum(int(row.get("native_actions_attempted") or 0) for row in results)
     accepted = sum(int(row.get("native_actions_accepted") or 0) for row in results)
+    responded = sum(int(row.get("native_actions_responded") or 0) for row in results)
+    rejected = sum(int(row.get("native_actions_rejected") or 0) for row in results)
+    no_response = sum(
+        int(row.get("native_actions_no_response") or 0) for row in results
+    )
+    response_excess = sum(
+        int(row.get("native_action_response_excess") or 0) for row in results
+    )
+    action_exceptions = sum(
+        int(row.get("native_action_exceptions") or 0) for row in results
+    )
     deploy_attempted = sum(
         int(row.get("native_deploy_actions_attempted") or 0) for row in results
     )
@@ -1277,6 +1456,9 @@ def summarize_results(
     )
     failure_classes = Counter(
         str(row.get("failure_class") or "unknown") for row in failures
+    )
+    failure_domains = Counter(
+        str(row.get("failure_domain") or "unknown") for row in failures
     )
     terminal = Counter(
         str(row.get("terminal_diagnostic_status") or "unknown")
@@ -1300,6 +1482,8 @@ def summarize_results(
         and not worker_errors
         and int(queue_counts.get("pending", 0)) == 0
         and int(queue_counts.get("leased", 0)) == 0
+        and int(failure_domains.get("infrastructure", 0)) == 0
+        and int(failure_domains.get("source_integrity", 0)) == 0
     )
     source_integrity = all(bool(row.get("source_sha_verified")) for row in results)
     profile_integrity = all(
@@ -1313,6 +1497,10 @@ def summarize_results(
         row.get("coordinate_provenance") == COORDINATE_PROVENANCE
         for row in results
         if row.get("source_sha_verified")
+    )
+    action_accounting_closed = bool(
+        attempted == accepted + rejected + no_response
+        and response_excess == 0
     )
     return {
         "schema_version": GENERATOR_SCHEMA_VERSION,
@@ -1328,7 +1516,13 @@ def summarize_results(
             task.deployment_actions + task.ability_events_observed for task in tasks
         ),
         "native_actions_attempted": attempted,
+        "native_actions_responded": responded,
         "native_actions_accepted": accepted,
+        "native_actions_rejected": rejected,
+        "native_actions_no_response": no_response,
+        "native_action_response_excess": response_excess,
+        "native_action_exceptions": action_exceptions,
+        "native_action_accounting_closed": action_accounting_closed,
         "true_attempted_acceptance_rate": _ratio(accepted, attempted),
         "native_deploy_actions_attempted": deploy_attempted,
         "native_deploy_actions_accepted": deploy_accepted,
@@ -1348,6 +1542,7 @@ def summarize_results(
             len(results) * 3600.0, wall_seconds
         ),
         "failure_class_counts": dict(sorted(failure_classes.items())),
+        "failure_domain_counts": dict(sorted(failure_domains.items())),
         "terminal_diagnostic_counts": dict(sorted(terminal.items())),
         "coordinate_provenance_counts": dict(sorted(coordinates.items())),
         "native_profile_counts": dict(sorted(profiles.items())),
@@ -1371,6 +1566,7 @@ def summarize_results(
             and source_integrity
             and profile_integrity
             and coordinate_integrity
+            and action_accounting_closed
         ),
         "source_json_copied": False,
         "semantic_rejections_are_expected_subset_evidence": True,
@@ -1443,6 +1639,11 @@ def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
                     )
                 reconciled += 1
             else:
+                if record.get("retry_scheduled") is True:
+                    # The prior process died before returning this retryable
+                    # attempt to pending.  The exclusive run lock lets the
+                    # caller release the lease and execute the next attempt.
+                    continue
                 with queue.connection:
                     queue.connection.execute(
                         """
@@ -1474,6 +1675,88 @@ def release_interrupted_leases(queue_path: Path) -> int:
                 (time.time(),),
             )
         return int(cursor.rowcount)
+
+
+def requeue_failed_infrastructure(
+    output_root: Path, queue_path: Path
+) -> int:
+    """Reopen only prior infrastructure failures on an explicit new run.
+
+    Semantic and source-contract failures remain terminal.  Attempts reset so
+    a repaired host, transport, or disk receives a fresh bounded retry budget.
+    """
+    requeued = 0
+    with TickStoreWorkQueue(queue_path) as queue:
+        for path in sorted((output_root / "results").glob("*.json")):
+            record = load_json(path)
+            if (
+                record.get("kind") != RESULT_KIND
+                or record.get("teacher_forced_success") is True
+                or record.get("failure_domain") != "infrastructure"
+            ):
+                continue
+            tag = str(record["battle_tag"])
+            with queue.connection:
+                cursor = queue.connection.execute(
+                    """
+                    UPDATE tasks SET status='pending', lease_owner=NULL,
+                        lease_until=NULL, attempts=0, output_shard=NULL,
+                        frame_offset=NULL, frame_size=NULL,
+                        episode_sha256=NULL, last_error=NULL, updated_at=?
+                    WHERE battle_tag=? AND status='failed'
+                    """,
+                    (time.time(), tag),
+                )
+            requeued += int(cursor.rowcount)
+    return requeued
+
+
+def verify_published_tick_store(root: Path) -> dict[str, int]:
+    """Read-only validation of every data/index hash behind the store manifest."""
+    manifest_path = root / "manifest.json"
+    manifest = load_json(manifest_path)
+    if manifest.get("kind") != "cr_native_tick_store_v1":
+        raise RuntimeError("published Tick Store manifest kind changed")
+    episodes = ticks = total_bytes = 0
+    shard_names: set[str] = set()
+    for shard in manifest.get("shards") or []:
+        if not isinstance(shard, Mapping):
+            raise RuntimeError("published Tick Store has malformed shard entry")
+        name = str(shard.get("name") or "")
+        if not name or name in shard_names:
+            raise RuntimeError("published Tick Store has duplicate/empty shard name")
+        shard_names.add(name)
+        data = root / str(shard["data_file"])
+        index = root / str(shard["index_file"])
+        if not data.is_file() or not index.is_file():
+            raise RuntimeError(f"published Tick Store shard is missing: {name}")
+        if sha256_file(data) != str(shard["data_sha256"]):
+            raise RuntimeError(f"published Tick Store data hash changed: {name}")
+        if sha256_file(index) != str(shard["index_sha256"]):
+            raise RuntimeError(f"published Tick Store index hash changed: {name}")
+        entries = _scan_frames(data, truncate_invalid_tail=False)
+        indexed = [
+            json.loads(line)
+            for line in index.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+        if entries != indexed:
+            raise RuntimeError(f"published Tick Store index content changed: {name}")
+        if len(entries) != int(shard["episode_count"]):
+            raise RuntimeError(f"published Tick Store episode count changed: {name}")
+        shard_ticks = sum(int(entry["ticks"]) for entry in entries)
+        if shard_ticks != int(shard["tick_count"]):
+            raise RuntimeError(f"published Tick Store Tick count changed: {name}")
+        episodes += len(entries)
+        ticks += shard_ticks
+        total_bytes += data.stat().st_size
+    if (
+        episodes != int(manifest.get("episode_count", -1))
+        or ticks != int(manifest.get("tick_count", -1))
+        or total_bytes != int(manifest.get("total_bytes", -1))
+    ):
+        raise RuntimeError("published Tick Store global counts changed")
+    return {"episodes": episodes, "ticks": ticks, "bytes": total_bytes}
 
 
 def completed_run_summary(
@@ -1512,8 +1795,14 @@ def completed_run_summary(
     for key, expected in expected_hashes.items():
         if str(content.get(key) or "") != expected:
             raise RuntimeError(f"published native dataset {key} changed")
+    physical = verify_published_tick_store(output_root / "shards")
     if int(summary.get("processed_battles", -1)) != len(tasks):
         raise RuntimeError("published summary task count changed")
+    if (
+        physical["episodes"] != int(summary.get("stored_episodes", -1))
+        or physical["ticks"] != int(summary.get("stored_ticks", -1))
+    ):
+        raise RuntimeError("published summary and physical Tick Store differ")
     return {
         **summary,
         "resume_noop": True,
@@ -1580,6 +1869,7 @@ def run_generation(
     trace_batch_steps: int = 64,
     episodes_per_shard: int = 256,
     lease_seconds: float = 900.0,
+    retry_infrastructure_failures: bool = True,
 ) -> dict[str, Any]:
     if workers <= 0 or workers > len(ports):
         raise ValueError("workers must be positive and no greater than port count")
@@ -1608,6 +1898,10 @@ def run_generation(
         )
         reconciled = reconcile_result_files(output_root, queue_path)
         released_leases = release_interrupted_leases(queue_path)
+        infrastructure_requeued = (
+            requeue_failed_infrastructure(output_root, queue_path)
+            if retry_infrastructure_failures else 0
+        )
         completed = completed_run_summary(output_root, tasks, queue_path)
         if completed is not None:
             return completed
@@ -1656,6 +1950,7 @@ def run_generation(
             "run_contract_sha256": sha256_file(output_root / "run-contract.json"),
             "resume_result_records_reconciled": reconciled,
             "resume_interrupted_leases_released": released_leases,
+            "resume_infrastructure_failures_requeued": infrastructure_requeued,
         })
         if summary["infrastructure_complete"]:
             store = build_store_manifest(

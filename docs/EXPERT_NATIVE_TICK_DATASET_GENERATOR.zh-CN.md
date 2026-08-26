@@ -136,13 +136,26 @@ manifest.sha256
 ## 6. Resume 与并发
 
 - SQLite 使用 WAL 和租约抢占；
+- `prepare` 与 `run` 共用同一个 OS 排他锁；
 - 每个原生 Worker 独占自己的 append-only shard；
 - 活跃任务定时续租；
+- 续租一直覆盖到原子 result 写入和 SQLite terminal commit；
+- 写 frame 前再次验证 lease owner/expiry；
 - 进程硬退出后，OS run lock 自动释放；
 - 下一次启动立即回收上次中断的租约，无需等待 15 分钟；
 - 已完成/已失败任务不会重复执行；
 - 运行契约或 selection 改变时拒绝在原目录续跑；
 - summary、selection、results 聚合和最终 manifest 都以临时文件原子替换。
+
+若进程在 `.partial -> .crts` 已完成、shard manifest 尚未发布的极小窗口退出，下一次启动会用 data/index 的逐 frame 校验重建缺失 manifest。已完整发布的 run 再次启动时，也会重新计算每个 `.crts` 和 index 的 SHA 并扫描 frame，而不是只相信顶层 manifest。
+
+失败严格区分为三个 domain：
+
+- `semantic`：明确白名单内的原生拒绝、技能实体缺失/分支、提前终局、structured logic freeze；永久止损；
+- `source_integrity`：编译契约、手牌序列或来源计划不一致；永久止损并禁止发布；
+- `infrastructure`：RPC/timeout、Host、协议计数/Tick、Tick Store 编码/磁盘、源 SHA 读取变化及任何未分类错误；单次运行最多尝试 3 次，仍失败则禁止发布。
+
+新一次 `run` 默认只把上次的 `infrastructure` failed task 重新置为 pending，并给它新的 3 次尝试预算；`semantic` 和 `source_integrity` 永不自动重排。可用 `--no-retry-infrastructure-failures` 关闭跨运行重排。任何未知 runner failure 默认属于 infrastructure，绝不会被静默当成可发布的语义拒绝。
 
 端口之间使用 SQLite work stealing，因此慢场不会永久拖住某一个固定分区。
 
@@ -157,10 +170,12 @@ native_actions_attempted
 native_actions_responded
 native_actions_accepted
 native_actions_rejected
+native_actions_no_response
+native_action_exceptions
 true_attempted_acceptance_rate = accepted / attempted
 ```
 
-部署和技能也分别提供真实尝试分母。`planned_actions` 仅表示数据覆盖，不参与原生接受率分母。
+部署和技能也分别提供真实尝试分母，并验证 `attempted = accepted + rejected + no_response`。`planned_actions` 仅表示数据覆盖，不参与原生接受率分母。
 
 ## 8. 使用方法
 
