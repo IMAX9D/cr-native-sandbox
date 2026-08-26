@@ -12,6 +12,7 @@ from expert_v1.native_ability_pilot import (
     sha256_file,
 )
 from expert_v1.native_replay_plan import compile_battle
+from expert_v1.native_pilot import execute_deployment_trace
 from expert_v1.tick_store_v1.shard import ShardReader, WorkerShardSink
 
 
@@ -76,9 +77,16 @@ def calibration() -> tuple[dict, dict]:
 
 
 class FakeTraceNativeEnv:
-    def __init__(self, *, branch: bool = False, reject_ability: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        branch: bool = False,
+        reject_ability: bool = False,
+        freeze_at_tick: int | None = None,
+    ) -> None:
         self.branch = branch
         self.reject_ability = reject_ability
+        self.freeze_at_tick = freeze_at_tick
         self.tick = 10
         self.champion_spawned = False
         self.players: list[dict] = []
@@ -145,7 +153,9 @@ class FakeTraceNativeEnv:
     def observe_train(self) -> dict:
         return self._state()
 
-    def trace_train(self, steps: int) -> dict:
+    def trace_train(
+        self, steps: int, *, allow_nonterminal_freeze: bool = False
+    ) -> dict:
         initial = {
             "frame_index": 0,
             "advanced_steps": 0,
@@ -153,7 +163,22 @@ class FakeTraceNativeEnv:
             "state": self._state(),
         }
         frames = []
+        frozen = False
         for index in range(1, steps + 1):
+            if self.freeze_at_tick is not None and self.tick >= self.freeze_at_tick:
+                if not allow_nonterminal_freeze:
+                    raise RuntimeError("synthetic nonterminal freeze was not allowed")
+                frozen = True
+                frames.append({
+                    "frame_index": index,
+                    "advanced_steps": index,
+                    "observation_complete": False,
+                    "state": {
+                        "tick": self.tick,
+                        "episode": self._state()["episode"],
+                    },
+                })
+                continue
             self.tick += 1
             frames.append({
                 "frame_index": index,
@@ -173,6 +198,7 @@ class FakeTraceNativeEnv:
             "final_frame_index": steps,
             "final_tick": self.tick,
             "terminal": False,
+            "nonterminal_freeze": frozen,
         }
 
     def joint_act(self, actions: list[dict]) -> dict:
@@ -387,6 +413,115 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             self.assertEqual(
                 last["response"]["actions"][0]["result"]["result_code"], 17
             )
+
+    def test_logic_freeze_before_ability_returns_structured_partial_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source_path = root / "source.json"
+            source_path.write_text(json.dumps(ability_battle()), encoding="utf-8")
+            sink = WorkerShardSink(root / "store", "worker")
+            record, diagnostic = execute_ability_task(
+                FakeTraceNativeEnv(freeze_at_tick=24),
+                make_task(source_path),
+                template(),
+                calibration(),
+                sink,
+                seed=424242,
+            )
+            manifests = sink.finalize()
+
+            self.assertFalse(record["teacher_forced_success"])
+            self.assertEqual(
+                record["failure_class"],
+                "native_logic_frozen_before_execution_tick",
+            )
+            self.assertEqual(record["source_deploy_actions"], 2)
+            self.assertEqual(record["accepted_deploy_actions"], 2)
+            self.assertEqual(record["source_ability_events"], 1)
+            self.assertEqual(record["accepted_ability_actions"], 0)
+            self.assertIsNotNone(record["chosen_seed"])
+            self.assertGreater(record["collected_tick_state_count"], 1)
+            freeze = record["logic_freeze_diagnostic"]
+            self.assertEqual(freeze["source_tick"], 25)
+            self.assertEqual(freeze["execution_tick"], 26)
+            self.assertEqual(freeze["last_native_tick"], 24)
+            self.assertEqual(freeze["accepted_actions_before_freeze"], 2)
+            self.assertFalse(freeze["training_usable"])
+            self.assertEqual(freeze["episode"]["crowns"], [0, 0])
+            self.assertEqual(freeze["episode"]["native_phase"]["battle"], 1)
+            self.assertIsNone(record["tick_store_entry"])
+            self.assertEqual(manifests, [])
+            assert diagnostic is not None
+            native_result = diagnostic["native_result"]
+            self.assertEqual(
+                native_result["terminal_diagnostic_status"],
+                "native_logic_frozen_before_execution_tick",
+            )
+            self.assertEqual(
+                native_result["collected_tick_state_count"],
+                record["collected_tick_state_count"],
+            )
+
+    def test_deployment_runner_returns_structured_freeze_and_prefix_states(self) -> None:
+        source = ability_battle("DEPLOYMENT-FREEZE-001")
+        source["ability_plays"] = []
+        source["elixir_stats"]["team"]["Ability"]["count"] = 0
+        source["card_plays"].append({
+            "time_raw": 25,
+            "side": "team",
+            "card": "archers",
+            "x": 8500,
+            "y": 17500,
+            "marker_index": 2,
+        })
+        plan = compile_battle(source, terminal_crowns=(1, 0))
+        replay = execute_deployment_trace(
+            FakeTraceNativeEnv(freeze_at_tick=24),
+            plan,
+            template(),
+            action_execution_tick_offset=1,
+        )
+
+        audit = replay.audit
+        self.assertFalse(audit["teacher_forced_success"])
+        self.assertFalse(audit["usable_tick_trajectory"])
+        self.assertEqual(
+            audit["failure_class"],
+            "native_logic_frozen_before_execution_tick",
+        )
+        self.assertEqual(audit["source_deployment_actions"], 3)
+        self.assertEqual(audit["accepted_deployment_actions"], 2)
+        self.assertIsNotNone(audit["chosen_seed"])
+        self.assertEqual(audit["stored_tick_count"], len(replay.states))
+        self.assertGreater(len(replay.states), 1)
+        freeze = audit["logic_freeze_diagnostic"]
+        self.assertEqual(freeze["source_tick"], 25)
+        self.assertEqual(freeze["execution_tick"], 26)
+        self.assertEqual(freeze["last_native_tick"], 24)
+        self.assertEqual(freeze["accepted_actions_before_freeze"], 2)
+        self.assertEqual(freeze["collected_tick_count"], len(replay.states))
+        self.assertFalse(freeze["training_usable"])
+
+    def test_deployment_final_fence_freeze_remains_success_diagnostic(self) -> None:
+        source = ability_battle("DEPLOYMENT-FENCE-FREEZE-001")
+        source["ability_plays"] = []
+        source["elixir_stats"]["team"]["Ability"]["count"] = 0
+        plan = compile_battle(source, terminal_crowns=(1, 0))
+        replay = execute_deployment_trace(
+            FakeTraceNativeEnv(freeze_at_tick=24),
+            plan,
+            template(),
+            action_execution_tick_offset=1,
+        )
+
+        self.assertTrue(replay.audit["teacher_forced_success"])
+        self.assertTrue(replay.audit["usable_tick_trajectory"])
+        self.assertIsNone(replay.audit["failure"])
+        self.assertIsNone(replay.audit["logic_freeze_diagnostic"])
+        self.assertEqual(
+            replay.audit["terminal_status"],
+            "logic_frozen_at_source_duration_fence",
+        )
 
 
 if __name__ == "__main__":

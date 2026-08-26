@@ -23,6 +23,11 @@ except ImportError:  # pragma: no cover - stdlib fallback is supported
 from native_core.env import NativeRoyaleEnv
 from native_core.card_catalog import catalog
 
+from .native_freeze import (
+    NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK,
+    logic_freeze_audit,
+    logic_freeze_failure,
+)
 from .native_profile import (
     ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
     action_tick_provenance,
@@ -268,19 +273,27 @@ def execute_deployment_trace(
     complete_frames = 1
     incomplete_frames = 0
     logic_frozen_at_fence = False
+    logic_freeze_before_execution: dict[str, Any] | None = None
 
     def advance_to(
-        target_tick: int, *, allow_nonterminal_freeze: bool = False
+        target_tick: int,
+        *,
+        source_tick: int | None = None,
+        allow_nonterminal_freeze: bool = False,
     ) -> bool:
         nonlocal current_tick, latest_state, trace_seconds, trace_rpc_count
         nonlocal trace_steps, normalize_seconds, complete_frames, incomplete_frames
         nonlocal terminal_seen, terminal_episode, failure, logic_frozen_at_fence
+        nonlocal logic_freeze_before_execution
         while current_tick < target_tick:
             requested = min(trace_batch_steps, target_tick - current_tick)
             trace_started = time.perf_counter()
             trace = env.trace_train(
                 requested,
-                allow_nonterminal_freeze=allow_nonterminal_freeze,
+                # Decode a frozen suffix in both contexts.  Only the final
+                # duration fence may accept it as diagnostics; between expert
+                # actions it becomes a structured fail-closed replay failure.
+                allow_nonterminal_freeze=True,
             )
             trace_seconds += time.perf_counter() - trace_started
             trace_rpc_count += 1
@@ -313,7 +326,16 @@ def execute_deployment_trace(
                         and trace.get("nonterminal_freeze") is True
                         and int(frame["state"].get("tick", -1)) == states[-1].tick
                     )
-                    if not terminal_incomplete and not fence_freeze:
+                    action_freeze = (
+                        not allow_nonterminal_freeze
+                        and trace.get("nonterminal_freeze") is True
+                        and int(frame["state"].get("tick", -1)) == states[-1].tick
+                    )
+                    if (
+                        not terminal_incomplete
+                        and not fence_freeze
+                        and not action_freeze
+                    ):
                         failure = "incomplete_nonterminal_compact_trace_frame"
                         break
                     if terminal_incomplete:
@@ -324,7 +346,37 @@ def execute_deployment_trace(
                             terminal_episode = raw_episode
                         terminal_seen = True
                     else:
-                        logic_frozen_at_fence = True
+                        if fence_freeze:
+                            logic_frozen_at_fence = True
+                        else:
+                            assert source_tick is not None
+                            logic_freeze_before_execution = logic_freeze_audit(
+                                frame["state"],
+                                fallback_state=latest_state,
+                                source_tick=source_tick,
+                                execution_tick=target_tick,
+                                execution_tick_offset=(
+                                    action_execution_tick_offset
+                                ),
+                                chosen_seed=seed_resolution.chosen_seed,
+                                source_actions=len(plan.actions),
+                                accepted_actions=accepted_actions,
+                                collected_tick_count=len(states),
+                                collected_tick_start=(
+                                    states[0].tick if states else None
+                                ),
+                                collected_tick_stop=(
+                                    states[-1].tick if states else None
+                                ),
+                                trace_requested_steps=requested,
+                                trace_stepped_calls=stepped,
+                            )
+                            failure = logic_freeze_failure(
+                                source_tick=source_tick,
+                                execution_tick=target_tick,
+                                last_native_tick=states[-1].tick,
+                            )
+                            break
                     continue
                 normalized = normalize_native_state(frame["state"])
                 if normalized.tick == states[-1].tick:
@@ -389,7 +441,7 @@ def execute_deployment_trace(
                     )
                 )
                 break
-            if not advance_to(execution_tick):
+            if not advance_to(execution_tick, source_tick=source_tick):
                 if failure is None and terminal_seen:
                     failure = (
                         f"native_terminal_before_source_tick_{source_tick}"
@@ -615,7 +667,9 @@ def execute_deployment_trace(
     crowns = episode.get("crowns") if isinstance(episode, Mapping) else None
     if terminal_seen and isinstance(crowns, list) and len(crowns) == 2:
         observed_crowns = (int(crowns[0]), int(crowns[1]))
-    if not teacher_forced_success:
+    if logic_freeze_before_execution is not None:
+        terminal_status = NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
+    elif not teacher_forced_success:
         terminal_status = "not_evaluated_teacher_forced_failure"
     elif logic_frozen_at_fence:
         terminal_status = "logic_frozen_at_source_duration_fence"
@@ -645,6 +699,12 @@ def execute_deployment_trace(
         "teacher_forced_success": teacher_forced_success,
         "usable_tick_trajectory": usable,
         "failure": failure,
+        "failure_class": (
+            NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
+            if logic_freeze_before_execution is not None
+            else None
+        ),
+        "logic_freeze_diagnostic": logic_freeze_before_execution,
         "source_deployment_actions": len(plan.actions),
         "accepted_deployment_actions": accepted_actions,
         "first_rejection": first_rejection,

@@ -503,9 +503,11 @@ class NativeRoyaleEnv:
         enrichments.  The initial frame is the pre-transition boundary and
         each complete frame is one authoritative 50 ms transition later.
 
-        ``allow_nonterminal_freeze`` is only for a post-action duration fence:
-        it accepts a final incomplete suffix whose logic Tick never advances.
-        Never enable it while advancing toward a future expert action.
+        ``allow_nonterminal_freeze`` is a decoder-level opt-in that exposes a
+        final incomplete suffix whose logic Tick never advances.  A caller at
+        a post-action duration fence may treat that as terminal diagnostics;
+        a caller advancing toward a future expert action must instead convert
+        it into a structured, fail-closed replay failure.
         """
         if not 1 <= steps <= MAX_TRACE_STEPS:
             raise ValueError("trace steps must be in 1..64")

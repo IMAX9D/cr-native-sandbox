@@ -27,6 +27,8 @@ class TickTraceAccumulator:
     batches: int = 0
     complete_frames: int = 0
     incomplete_terminal_frames: int = 0
+    incomplete_nonterminal_freeze_frames: int = 0
+    nonterminal_freeze_seen: bool = False
     terminal_episode: dict[str, Any] | None = None
 
     def start(self, state: Mapping[str, Any]) -> TickState:
@@ -38,7 +40,16 @@ class TickTraceAccumulator:
         self.complete_frames += 1
         return normalized
 
-    def extend(self, trace: Mapping[str, Any]) -> int:
+    def extend(
+        self,
+        trace: Mapping[str, Any],
+        *,
+        allow_nonterminal_freeze: bool = False,
+    ) -> int:
+        if self.nonterminal_freeze_seen:
+            raise TickStoreContractError(
+                "compact Tick trace cannot resume after nonterminal freeze"
+            )
         if (
             trace.get("schema_version") != 1
             or trace.get("trace_schema_version") != 1
@@ -71,7 +82,7 @@ class TickTraceAccumulator:
             )
 
         appended = 0
-        incomplete_terminal_suffix = False
+        incomplete_suffix_started = False
         for index, raw_frame in enumerate(frames, start=1):
             if (
                 not isinstance(raw_frame, Mapping)
@@ -82,23 +93,38 @@ class TickTraceAccumulator:
             ):
                 raise TickStoreContractError("compact Tick trace frame contract mismatch")
             if raw_frame.get("observation_complete") is not True:
-                if (
-                    trace.get("terminal") is not True
-                    or int(raw_frame["state"].get("tick", -1))
-                    != self.states[-1].tick
-                ):
+                terminal_suffix = (
+                    trace.get("terminal") is True
+                    and int(raw_frame["state"].get("tick", -1))
+                    == self.states[-1].tick
+                )
+                nonterminal_freeze_suffix = (
+                    allow_nonterminal_freeze
+                    and trace.get("nonterminal_freeze") is True
+                    and trace.get("terminal") is False
+                    and int(raw_frame["state"].get("tick", -1))
+                    == self.states[-1].tick
+                )
+                if not terminal_suffix and not nonterminal_freeze_suffix:
                     raise TickStoreContractError(
-                        "only a frozen terminal compact Tick suffix may be incomplete"
+                        "incomplete compact Tick suffix is neither terminal nor "
+                        "an explicitly allowed nonterminal freeze"
                     )
                 episode = raw_frame["state"].get("episode")
-                if isinstance(episode, Mapping) and episode.get("terminated", False):
+                if terminal_suffix and isinstance(
+                    episode, Mapping
+                ) and episode.get("terminated", False):
                     self.terminal_episode = dict(episode)
-                self.incomplete_terminal_frames += 1
-                incomplete_terminal_suffix = True
+                if terminal_suffix:
+                    self.incomplete_terminal_frames += 1
+                else:
+                    self.incomplete_nonterminal_freeze_frames += 1
+                    self.nonterminal_freeze_seen = True
+                incomplete_suffix_started = True
                 continue
-            if incomplete_terminal_suffix:
+            if incomplete_suffix_started:
                 raise TickStoreContractError(
-                    "compact Tick trace resumed after terminal suffix"
+                    "compact Tick trace resumed after frozen suffix"
                 )
             state = normalize_native_state(raw_frame["state"])
             expected_tick = self.states[-1].tick + 1
@@ -141,6 +167,10 @@ class TickTraceAccumulator:
             "trace_batches": self.batches,
             "complete_frames": self.complete_frames,
             "incomplete_terminal_frames": self.incomplete_terminal_frames,
+            "incomplete_nonterminal_freeze_frames": (
+                self.incomplete_nonterminal_freeze_frames
+            ),
+            "nonterminal_freeze_seen": self.nonterminal_freeze_seen,
             "tick_start": self.tick_start,
             "tick_stop": self.tick_stop,
         }

@@ -19,6 +19,11 @@ from typing import Any, Mapping, Sequence
 from native_core.env import NativeRoyaleEnv
 
 from .native_capabilities import ability_cards, resolve_live_ability
+from .native_freeze import (
+    NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK,
+    logic_freeze_audit,
+    logic_freeze_failure,
+)
 from .native_profile import (
     ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
     action_tick_provenance,
@@ -35,7 +40,7 @@ from .native_seed_search import (
     layouts_accept_plan,
     resolve_native_seed,
 )
-from .tick_store_v1 import TickTraceAccumulator
+from .tick_store_v1 import TickState, TickTraceAccumulator
 
 
 @dataclass(frozen=True)
@@ -82,13 +87,25 @@ class NativeReplayResult:
     tick_trace_batches: int
     tick_trace_complete_frames: int
     tick_trace_incomplete_terminal_frames: int
+    tick_trace_incomplete_nonterminal_freeze_frames: int
+    collected_tick_states: tuple[TickState, ...]
+    logic_freeze_diagnostic: dict[str, Any] | None
     tick_store_entry: dict[str, Any] | None
 
     def json(self) -> dict[str, Any]:
+        fields = dict(self.__dict__)
+        collected_states = fields.pop("collected_tick_states")
         return {
             "schema_version": 1,
             "kind": "expert_native_replay_result_v1",
-            **self.__dict__,
+            **fields,
+            "collected_tick_state_count": len(collected_states),
+            "collected_tick_start": (
+                None if not collected_states else collected_states[0].tick
+            ),
+            "collected_tick_stop": (
+                None if not collected_states else collected_states[-1].tick
+            ),
             "native_teacher_forced_profile": native_teacher_forced_profile(
                 self.action_execution_tick_offset
             ),
@@ -190,6 +207,7 @@ def _advance_native(
     accumulator: TickTraceAccumulator | None,
     *,
     trace_batch_steps: int,
+    allow_nonterminal_freeze: bool = False,
 ) -> dict[str, Any]:
     """Advance normally or capture every Tick through compact batch RPCs."""
     if steps <= 0:
@@ -199,32 +217,52 @@ def _advance_native(
     remaining = steps
     stepped_total = 0
     final_state: Mapping[str, Any] | None = None
+    last_complete_state: Mapping[str, Any] | None = None
     terminal = False
+    nonterminal_freeze = False
     while remaining > 0 and not terminal:
         requested = min(remaining, trace_batch_steps)
-        trace = env.trace_train(requested)
-        accumulator.extend(trace)
+        trace = (
+            env.trace_train(requested, allow_nonterminal_freeze=True)
+            if allow_nonterminal_freeze
+            else env.trace_train(requested)
+        )
+        accumulator.extend(
+            trace, allow_nonterminal_freeze=allow_nonterminal_freeze
+        )
         stepped = int(trace["stepped"])
         if stepped <= 0 and not trace.get("terminal", False):
             raise RuntimeError("compact native Tick trace made no progress")
         stepped_total += stepped
         remaining -= stepped
         terminal = bool(trace.get("terminal", False))
+        nonterminal_freeze = bool(trace.get("nonterminal_freeze", False))
         final_frame = (
             trace["frames"][-1]
             if trace["frames"]
             else trace["initial_frame"]
         )
         final_state = final_frame["state"]
+        for frame in reversed([trace["initial_frame"], *trace["frames"]]):
+            if frame.get("observation_complete") is True:
+                last_complete_state = frame["state"]
+                break
+        if nonterminal_freeze:
+            break
     if final_state is None:
         raise RuntimeError("compact native Tick trace returned no state")
     return {
         "requested_steps": steps,
         "stepped": stepped_total,
         "battle_active": not terminal,
+        "nonterminal_freeze": nonterminal_freeze,
         "fixed_dt": 0.05,
         "tick_after": int(final_state["tick"]),
         "episode": dict(final_state["episode"]),
+        "state": dict(final_state),
+        "last_complete_state": (
+            None if last_complete_state is None else dict(last_complete_state)
+        ),
     }
 
 
@@ -270,6 +308,7 @@ def execute_plan(
     terminal_match: bool | None = None
     observed_crowns: tuple[int, int] | None = None
     tick_store_entry: dict[str, Any] | None = None
+    logic_freeze_diagnostic: dict[str, Any] | None = None
     tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
     del calibration
     allowed_abilities = [ability_cards(side.deck) for side in plan.sides]
@@ -361,15 +400,75 @@ def execute_plan(
                 break
             gap = execution_tick - final_tick
             if gap:
+                tick_before_advance = final_tick
                 step_started = time.perf_counter()
                 native_step = _advance_native(
                     env, gap, tick_accumulator,
                     trace_batch_steps=trace_batch_steps,
+                    allow_nonterminal_freeze=(tick_accumulator is not None),
                 )
                 step_seconds += time.perf_counter() - step_started
-                native_ticks += gap
                 episode = native_step.get("episode", {})
                 final_tick = int(native_step.get("tick_after", execution_tick))
+                native_ticks += max(0, final_tick - tick_before_advance)
+                nonterminal_freeze = bool(
+                    native_step.get("nonterminal_freeze", False)
+                ) or (
+                    final_tick < execution_tick
+                    and not episode.get("terminated")
+                    and not episode.get("truncated")
+                )
+                if nonterminal_freeze:
+                    frozen_state = native_step.get("state")
+                    if not isinstance(frozen_state, Mapping):
+                        frozen_state = {
+                            "tick": final_tick,
+                            "episode": episode,
+                        }
+                    collected_states = (
+                        ()
+                        if tick_accumulator is None
+                        else tuple(tick_accumulator.states)
+                    )
+                    logic_freeze_diagnostic = logic_freeze_audit(
+                        frozen_state,
+                        fallback_state=(
+                            native_step.get("last_complete_state")
+                            if isinstance(
+                                native_step.get("last_complete_state"), Mapping
+                            )
+                            else None
+                        ),
+                        source_tick=source_tick,
+                        execution_tick=execution_tick,
+                        execution_tick_offset=action_execution_tick_offset,
+                        chosen_seed=seed_resolution.chosen_seed,
+                        source_actions=(
+                            len(plan.actions) + len(plan.ability_events)
+                        ),
+                        accepted_actions=accepted_actions,
+                        collected_tick_count=len(collected_states),
+                        collected_tick_start=(
+                            None
+                            if not collected_states
+                            else collected_states[0].tick
+                        ),
+                        collected_tick_stop=(
+                            None
+                            if not collected_states
+                            else collected_states[-1].tick
+                        ),
+                        trace_requested_steps=gap,
+                        trace_stepped_calls=int(
+                            native_step.get("stepped", 0)
+                        ),
+                    )
+                    failure = logic_freeze_failure(
+                        source_tick=source_tick,
+                        execution_tick=execution_tick,
+                        last_native_tick=final_tick,
+                    )
+                    break
                 if final_tick != execution_tick:
                     failure = (
                         f"native_tick_mismatch_{final_tick}_expected_{execution_tick}"
@@ -633,7 +732,11 @@ def execute_plan(
         except Exception as error:
             failure = f"tick_store_write_{type(error).__name__}:{error}"
             teacher_forced_success = False
-    if plan.terminal_crowns is None:
+    if logic_freeze_diagnostic is not None:
+        terminal_diagnostic_status = (
+            NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
+        )
+    elif plan.terminal_crowns is None:
         terminal_diagnostic_status = "not_requested"
     elif terminal_validated and terminal_match:
         terminal_diagnostic_status = "match"
@@ -696,6 +799,15 @@ def execute_plan(
             0 if tick_accumulator is None
             else tick_accumulator.incomplete_terminal_frames
         ),
+        tick_trace_incomplete_nonterminal_freeze_frames=(
+            0
+            if tick_accumulator is None
+            else tick_accumulator.incomplete_nonterminal_freeze_frames
+        ),
+        collected_tick_states=(
+            () if tick_accumulator is None else tuple(tick_accumulator.states)
+        ),
+        logic_freeze_diagnostic=logic_freeze_diagnostic,
         tick_store_entry=tick_store_entry,
     )
 

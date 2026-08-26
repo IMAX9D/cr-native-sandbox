@@ -71,6 +71,11 @@ seed 相等是由执行路径结构确定的，机器报告明确标为 structur
 因此 v10 并没有在 T+1 边界执行并拒绝该动作；它根本到不了 T+1 边界。把它和
 10 个真实 code4 一起写成“11 个 offset 1 动作失败”会误读结果。
 
+可靠性修复后对同一真实 Tag 定点复测，runner 已返回结构化
+`native_logic_frozen_before_execution_tick_3682_source_tick_3681_last_tick_3681`，
+并保留 chosen seed 28、78/48 source/accepted actions 与 10..3681 的 3,672 个
+完整 Tick；历史 v10 文件保持不可变。见 `NATIVE_LOGIC_FREEZE_RELIABILITY.zh-CN.md`。
+
 本报告同时保留两套口径：
 
 | 口径 | v9 | v10 |

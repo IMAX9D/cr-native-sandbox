@@ -110,6 +110,11 @@ action_tick_provenance = source marker is immutable RoyaleAPI time_raw T;
 - 已经以显式 `--action-execution-tick-offset 1` 启动的进程继续按启动时加载的参数
   运行，不需要中断或重启。
 
+动作间若 libg 在目标 execution Tick 前停止推进，runner 返回结构化
+`native_logic_frozen_before_execution_tick` 并保留已采集前缀，但该前缀永远
+`training_usable=false`、不写成功 shard。详见
+`NATIVE_LOGIC_FREEZE_RELIABILITY.zh-CN.md`。
+
 ## 为什么正式选择 T+1
 
 正确坐标后的固定 100 场 v9/v10 审计中，排除一场到不了 T+1 边界的原生逻辑冻结

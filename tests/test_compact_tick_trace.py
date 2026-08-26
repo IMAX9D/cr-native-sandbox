@@ -4,6 +4,7 @@ from copy import deepcopy
 import unittest
 
 from expert_v1.tick_store_v1 import TickTraceAccumulator
+from expert_v1.tick_store_v1.schema import TickStoreContractError
 from expert_v1.native_replay_runner import _advance_native
 from native_core.client import MAX_TRACE_RESPONSE_BYTES
 from native_core.env import NativeHostError, NativeRoyaleEnv
@@ -200,6 +201,46 @@ class CompactTickTraceTest(unittest.TestCase):
             env.trace_train(3)
         decoded = env.trace_train(3, allow_nonterminal_freeze=True)
         self.assertIs(decoded["nonterminal_freeze"], True)
+        accumulator = TickTraceAccumulator()
+        self.assertEqual(
+            accumulator.extend(decoded, allow_nonterminal_freeze=True), 1
+        )
+        self.assertEqual([state.tick for state in accumulator.states], [100, 101])
+        self.assertEqual(accumulator.incomplete_nonterminal_freeze_frames, 2)
+        with self.assertRaisesRegex(
+            TickStoreContractError, "cannot resume after nonterminal freeze"
+        ):
+            accumulator.extend(trace(101, 1))
+
+    def test_runner_returns_nonterminal_freeze_without_losing_prefix(self) -> None:
+        value = trace(100, 3)
+        value["frames"][1:] = [
+            {
+                "frame_index": index,
+                "advanced_steps": index,
+                "observation_complete": False,
+                "state": {
+                    "tick": 101,
+                    "episode": compact_state(101)["episode"],
+                },
+            }
+            for index in (2, 3)
+        ]
+        value["final_tick"] = 101
+        env = FakeEnv(value)
+        accumulator = TickTraceAccumulator()
+        accumulator.start(compact_state(100))
+        result = _advance_native(
+            env,
+            3,
+            accumulator,
+            trace_batch_steps=64,
+            allow_nonterminal_freeze=True,
+        )
+        self.assertTrue(result["nonterminal_freeze"])
+        self.assertEqual(result["tick_after"], 101)
+        self.assertEqual([state.tick for state in accumulator.states], [100, 101])
+        self.assertEqual(accumulator.incomplete_nonterminal_freeze_frames, 2)
 
     def test_step_bound_is_enforced_before_rpc(self) -> None:
         env = FakeEnv(trace(100, 1))
@@ -213,7 +254,10 @@ class CompactTickTraceTest(unittest.TestCase):
                 self.tick = 100
                 self.calls: list[int] = []
 
-            def trace_train(self, steps: int) -> dict:
+            def trace_train(
+                self, steps: int, *, allow_nonterminal_freeze: bool = False
+            ) -> dict:
+                del allow_nonterminal_freeze
                 self.calls.append(steps)
                 value = trace(self.tick, steps)
                 self.tick += steps

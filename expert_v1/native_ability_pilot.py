@@ -28,6 +28,7 @@ from .native_profile import (
     action_tick_provenance,
     native_teacher_forced_profile,
 )
+from .native_freeze import NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
 from .native_replay_plan import (
     BattlePlan,
     ReplayPlanError,
@@ -300,12 +301,55 @@ class RecordingNativeEnv:
         self.latest_state = deepcopy(state)
         return state
 
-    def trace_train(self, steps: int) -> dict[str, Any]:
-        response = self.env.trace_train(steps)
+    def trace_train(
+        self, steps: int, *, allow_nonterminal_freeze: bool = False
+    ) -> dict[str, Any]:
+        response = self.env.trace_train(
+            steps, allow_nonterminal_freeze=allow_nonterminal_freeze
+        )
         frames = response.get("frames") or []
         final = frames[-1] if frames else response.get("initial_frame")
         if isinstance(final, Mapping) and isinstance(final.get("state"), Mapping):
-            self.latest_state = deepcopy(dict(final["state"]))
+            raw_state = dict(final["state"])
+            if (
+                final.get("observation_complete") is False
+                and self.latest_state is not None
+            ):
+                last_complete = next(
+                    (
+                        frame
+                        for frame in reversed(
+                            [response.get("initial_frame"), *frames]
+                        )
+                        if isinstance(frame, Mapping)
+                        and frame.get("observation_complete") is True
+                        and isinstance(frame.get("state"), Mapping)
+                    ),
+                    None,
+                )
+                merged = deepcopy(
+                    dict(last_complete["state"])
+                    if isinstance(last_complete, Mapping)
+                    else self.latest_state
+                )
+                previous_episode = merged.get("episode")
+                raw_episode = raw_state.get("episode")
+                merged.update(deepcopy(raw_state))
+                if isinstance(previous_episode, Mapping) or isinstance(
+                    raw_episode, Mapping
+                ):
+                    episode = dict(
+                        previous_episode
+                        if isinstance(previous_episode, Mapping)
+                        else {}
+                    )
+                    episode.update(
+                        raw_episode if isinstance(raw_episode, Mapping) else {}
+                    )
+                    merged["episode"] = episode
+                self.latest_state = merged
+            else:
+                self.latest_state = deepcopy(raw_state)
         self.trace_history.append({
             "requested_steps": int(steps),
             "stepped": int(response.get("stepped", -1)),
@@ -314,6 +358,9 @@ class RecordingNativeEnv:
             ),
             "final_tick": int(response.get("final_tick", -1)),
             "terminal": bool(response.get("terminal", False)),
+            "nonterminal_freeze": bool(
+                response.get("nonterminal_freeze", False)
+            ),
         })
         return response
 
@@ -358,6 +405,8 @@ def _failure_class(result: NativeReplayResult | None, error: Exception | None) -
         return "native_action_rejected"
     if "tick_store_write" in failure:
         return "tick_store_write_failed"
+    if failure.startswith(NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK):
+        return NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
     return "teacher_forced_failure"
 
 
@@ -538,6 +587,17 @@ def execute_ability_task(
         "tick_trace_batches": 0 if result is None else result.tick_trace_batches,
         "tick_trace_complete_frames": (
             0 if result is None else result.tick_trace_complete_frames
+        ),
+        "tick_trace_incomplete_nonterminal_freeze_frames": (
+            0
+            if result is None
+            else result.tick_trace_incomplete_nonterminal_freeze_frames
+        ),
+        "collected_tick_state_count": (
+            0 if result is None else len(result.collected_tick_states)
+        ),
+        "logic_freeze_diagnostic": (
+            None if result is None else result.logic_freeze_diagnostic
         ),
         "tick_store_integrity": store_integrity,
         "tick_store_entry": entry,

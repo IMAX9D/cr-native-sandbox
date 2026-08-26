@@ -23,6 +23,9 @@ from expert_v1.native_profile import (
     action_tick_provenance,
     native_teacher_forced_profile,
 )
+from expert_v1.native_freeze import (
+    NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK,
+)
 from expert_v1.native_ability_pilot import (
     AbilityPilotTask,
     execute_ability_task,
@@ -296,6 +299,10 @@ def run(args: argparse.Namespace) -> int:
         and not missing_tags
         and not unexpected_tags
     )
+    logic_freeze_failures = int(
+        failures[NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK]
+    )
+    phase_comparable_battles = len(results) - logic_freeze_failures
     summary = {
         "schema_version": 1,
         "kind": "expert_native_ability_pilot_summary_v1",
@@ -319,6 +326,12 @@ def run(args: argparse.Namespace) -> int:
         "processed_battles": len(results),
         "teacher_forced_successes": len(success),
         "teacher_forced_failures": len(results) - len(success),
+        "logic_freeze_before_execution_battles": logic_freeze_failures,
+        "phase_comparable_battles": phase_comparable_battles,
+        "phase_comparable_success_rate": (
+            len(success) / phase_comparable_battles
+            if phase_comparable_battles else 0.0
+        ),
         "missing_result_tags": missing_tags,
         "unexpected_result_tags": unexpected_tags,
         "source_deploy_actions": sum(task.deploy_action_count for task in tasks),

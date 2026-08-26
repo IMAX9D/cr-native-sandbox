@@ -24,6 +24,9 @@ from expert_v1.native_profile import (
     action_tick_provenance,
     native_teacher_forced_profile,
 )
+from expert_v1.native_freeze import (
+    NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK,
+)
 from expert_v1.native_pilot import (
     PilotTask,
     execute_deployment_trace,
@@ -468,6 +471,13 @@ def main() -> int:
     with TickStoreWorkQueue(queue_path) as queue:
         queue_counts = queue.counts()
     successful = [value for value in results if value.get("usable_tick_trajectory")]
+    logic_freeze_failures = [
+        value
+        for value in results
+        if value.get("failure_class")
+        == NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
+    ]
+    phase_comparable_episodes = len(results) - len(logic_freeze_failures)
     total_ticks = sum(int(value.get("stored_tick_count") or 0) for value in successful)
     total_source_actions = sum(
         int(value.get("source_deployment_actions") or 0) for value in results
@@ -520,6 +530,11 @@ def main() -> int:
     ]
     rejection_codes: Counter[str] = Counter()
     rejection_classes: Counter[str] = Counter()
+    failure_classes: Counter[str] = Counter(
+        str(value.get("failure_class") or "other")
+        for value in results
+        if not value.get("usable_tick_trajectory")
+    )
     for value in results:
         rejection = value.get("first_rejection")
         if not isinstance(rejection, dict):
@@ -569,6 +584,14 @@ def main() -> int:
             "successful_episodes": len(successful),
             "failed_episodes": len(results) - len(successful),
             "success_rate": len(successful) / len(results) if results else 0.0,
+            "logic_freeze_before_execution_episodes": len(
+                logic_freeze_failures
+            ),
+            "phase_comparable_episodes": phase_comparable_episodes,
+            "phase_comparable_success_rate": (
+                len(successful) / phase_comparable_episodes
+                if phase_comparable_episodes else 0.0
+            ),
             "source_deployment_actions": total_source_actions,
             "accepted_deployment_actions": total_accepted_actions,
             # Fail-closed replay does not attempt actions after the first
@@ -589,6 +612,7 @@ def main() -> int:
             "native_rejection_class_counts": dict(
                 sorted(rejection_classes.items())
             ),
+            "failure_class_counts": dict(sorted(failure_classes.items())),
         },
         "tick_trace": {
             "stored_ticks": total_ticks,
