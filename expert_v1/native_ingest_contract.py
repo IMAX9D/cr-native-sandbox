@@ -25,8 +25,11 @@ from .native_replay_plan import ROYALEAPI_CARD_ALIASES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_SCHEMA_VERSION = 2
-CONTRACT_KIND = "cr_native_authoritative_contract_v2"
+CONTRACT_SCHEMA_VERSION = 3
+CONTRACT_KIND = "cr_native_authoritative_contract_v3"
+LEGACY_CONTRACT_IDENTITIES = {
+    (2, "cr_native_authoritative_contract_v2"),
+}
 RUNTIME_VERSION = "150535029"
 GAME_VERSION = "15.535.29"
 SOURCE_NUMERIC_GAME_MODE_IDS = (72_000_006, 72_000_450, 72_000_464)
@@ -57,6 +60,47 @@ KING_TOWER_MAX_HP_BY_LEVEL = {
     14: 6_408,
     15: 7_032,
     16: 7_728,
+}
+KING_TOWER_LEVEL = 16
+KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP = (
+    "ranked_template_cap16_and_tower_troop_level16_v1"
+)
+KING_TOWER_LEVEL_PROVENANCE_FULL_HP = (
+    "ranked_template_cap16_and_full_king_hp_v1"
+)
+KING_TOWER_LEVEL_PROVENANCES = (
+    KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP,
+    KING_TOWER_LEVEL_PROVENANCE_FULL_HP,
+)
+# This is a side-local proof, not a heuristic.  In the frozen Ranked template
+# both King and Tower Troop levels are capped at 16, while the live game rule
+# forbids a Tower Troop from exceeding its player's King Tower.  Therefore a
+# source Tower Troop level of 16 proves King level >= 16, and the template cap
+# proves King level <= 16.  The older full-HP probe remains an independent
+# fallback for sides whose Tower Troop is below 16.
+KING_TOWER_LEVEL_EVIDENCE: dict[str, Any] = {
+    "schema_version": 1,
+    "scope": "side_local_ranked_template",
+    "ranked_template_level_cap": KING_TOWER_LEVEL,
+    "resolved_king_tower_level": KING_TOWER_LEVEL,
+    "precedence": ["tower_troop_level", "final_king_hp"],
+    "accepted_provenances": list(KING_TOWER_LEVEL_PROVENANCES),
+    "tower_troop_level": {
+        "required_value": KING_TOWER_LEVEL,
+        "inference": (
+            "tower_troop_level<=king_tower_level and ranked_template_cap=16"
+        ),
+        "provenance": KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP,
+        "official_sources": [
+            "https://support.supercell.com/clash-royale/en/articles/king-tower-level.html",
+            "https://support.supercell.com/clash-royale/en/articles/tower-troops-4.html",
+        ],
+    },
+    "final_king_hp": {
+        "required_value": KING_TOWER_MAX_HP_BY_LEVEL[KING_TOWER_LEVEL],
+        "provenance": KING_TOWER_LEVEL_PROVENANCE_FULL_HP,
+    },
+    "forbidden_inference_fields": ["card_levels", "deck_cards.level"],
 }
 DEFAULT_BINDING_PATH = (
     PROJECT_ROOT / "bindings" / "runtime-150535029-x86_64.json"
@@ -90,6 +134,7 @@ INGEST_SCHEMA: dict[str, Any] = {
         ),
         "provenance": NATIVE_EXECUTION_GAME_MODE_PROVENANCE,
     },
+    "king_tower_level": KING_TOWER_LEVEL_EVIDENCE,
 }
 
 
@@ -287,6 +332,7 @@ def build_native_ingest_contract(
             str(level): hp
             for level, hp in sorted(KING_TOWER_MAX_HP_BY_LEVEL.items())
         },
+        "king_tower_level_evidence": KING_TOWER_LEVEL_EVIDENCE,
         "runtime": {
             "runtime_version": RUNTIME_VERSION,
             "game_version": GAME_VERSION,
@@ -378,6 +424,48 @@ class NativeIngestContract:
     source_numeric_game_mode_ids: frozenset[int]
     native_execution_mode_by_source: Mapping[int, int]
     king_tower_max_hp_by_level: Mapping[int, int]
+
+    def validate_king_tower_level_evidence(
+        self,
+        *,
+        king_tower_level: Any,
+        provenance: Any,
+        tower_troop_level: Any,
+        final_king_hp: Any,
+    ) -> tuple[ValidationIssue, ...]:
+        """Validate one side's exact Ranked-template King-level proof.
+
+        Tower Troop level 16 has precedence over the full-HP fallback so a
+        producer cannot silently change which source field supplied truth.
+        Card/deck levels are intentionally absent from this API.
+        """
+        if king_tower_level != KING_TOWER_LEVEL:
+            return (ValidationIssue(
+                "king_tower_level", "king_tower_level_missing", king_tower_level,
+            ),)
+        evidence_version = int(self.value.get("schema_version") or 0)
+        if evidence_version >= CONTRACT_SCHEMA_VERSION and (
+            tower_troop_level == KING_TOWER_LEVEL
+        ):
+            expected = KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP
+        elif final_king_hp == self.king_tower_max_hp_by_level[KING_TOWER_LEVEL]:
+            expected = KING_TOWER_LEVEL_PROVENANCE_FULL_HP
+        else:
+            return (ValidationIssue(
+                "king_tower_level",
+                "king_tower_level_exact_evidence_missing",
+                {
+                    "tower_troop_level": tower_troop_level,
+                    "final_king_hp": final_king_hp,
+                },
+            ),)
+        if provenance != expected:
+            return (ValidationIssue(
+                "king_tower_level_provenance",
+                "king_tower_level_provenance_invalid",
+                {"expected": expected, "actual": provenance},
+            ),)
+        return ()
 
     def validate_card_token(self, token: str) -> tuple[ValidationIssue, ...]:
         normalized = str(token).strip().lower()
@@ -482,10 +570,12 @@ def load_native_ingest_contract(
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise NativeIngestContractError("contract root must be an object")
-    if value.get("schema_version") != CONTRACT_SCHEMA_VERSION:
-        raise NativeIngestContractError("unsupported contract schema_version")
-    if value.get("kind") != CONTRACT_KIND:
-        raise NativeIngestContractError("unexpected contract kind")
+    identity = (value.get("schema_version"), value.get("kind"))
+    if identity not in {
+        (CONTRACT_SCHEMA_VERSION, CONTRACT_KIND),
+        *LEGACY_CONTRACT_IDENTITIES,
+    }:
+        raise NativeIngestContractError("unsupported contract schema/kind")
     if value.get("game_version") != GAME_VERSION:
         raise NativeIngestContractError("contract game version mismatch")
     claimed = str(value.get("contract_sha256") or "")
@@ -500,6 +590,7 @@ def load_native_ingest_contract(
     source_modes = value.get("source_numeric_game_mode_ids")
     execution_modes = value.get("native_execution_mode_by_source")
     king_tower_hp = value.get("king_tower_max_hp_by_level")
+    king_tower_evidence = value.get("king_tower_level_evidence")
     if not all(
         isinstance(item, list) and item
         for item in (allowed, towers, abilities, source_modes)
@@ -537,6 +628,17 @@ def load_native_ingest_contract(
         for level, hp in king_tower_hp.items()
     ):
         raise NativeIngestContractError("King Tower max-HP table is invalid")
+    if (
+        identity == (CONTRACT_SCHEMA_VERSION, CONTRACT_KIND)
+        and king_tower_evidence != KING_TOWER_LEVEL_EVIDENCE
+    ):
+        raise NativeIngestContractError(
+            "King Tower level evidence contract is missing or changed"
+        )
+    if identity in LEGACY_CONTRACT_IDENTITIES and king_tower_evidence is not None:
+        raise NativeIngestContractError(
+            "legacy contract unexpectedly declares King Tower evidence v3"
+        )
     try:
         normalized_king_tower_hp = {
             int(level): int(hp) for level, hp in king_tower_hp.items()

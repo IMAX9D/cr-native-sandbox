@@ -46,6 +46,16 @@ class NativeIngestContractTest(unittest.TestCase):
                 "13": 5832, "14": 6408, "15": 7032, "16": 7728,
             },
         )
+        evidence = value["king_tower_level_evidence"]
+        self.assertEqual(evidence["ranked_template_level_cap"], 16)
+        self.assertEqual(
+            evidence["precedence"],
+            ["tower_troop_level", "final_king_hp"],
+        )
+        self.assertEqual(
+            evidence["forbidden_inference_fields"],
+            ["card_levels", "deck_cards.level"],
+        )
         self.assertEqual(value["counts"]["supported_base_cards"], 122)
         self.assertEqual(value["counts"]["allowed_card_tokens"], 180)
         self.assertEqual(value["counts"]["tower_troops"], 4)
@@ -127,6 +137,35 @@ class NativeIngestContractTest(unittest.TestCase):
                 },
             )
             self.assertEqual(contract.king_tower_max_hp_by_level[16], 7728)
+            self.assertEqual(
+                contract.validate_king_tower_level_evidence(
+                    king_tower_level=16,
+                    provenance=(
+                        "ranked_template_cap16_and_tower_troop_level16_v1"
+                    ),
+                    tower_troop_level=16,
+                    final_king_hp=1,
+                ),
+                (),
+            )
+            self.assertEqual(
+                contract.validate_king_tower_level_evidence(
+                    king_tower_level=16,
+                    provenance="ranked_template_cap16_and_full_king_hp_v1",
+                    tower_troop_level=15,
+                    final_king_hp=7728,
+                ),
+                (),
+            )
+            self.assertEqual(
+                contract.validate_king_tower_level_evidence(
+                    king_tower_level=16,
+                    provenance="ranked_template_cap16_and_full_king_hp_v1",
+                    tower_troop_level=15,
+                    final_king_hp=7000,
+                )[0].code,
+                "king_tower_level_exact_evidence_missing",
+            )
             self.assertEqual(
                 contract.validate_ability_source(
                     ["goblinstein"], observed_ability_events=1

@@ -40,8 +40,8 @@ D:\AI_data\runtime\venv\Scripts\python.exe scripts\export_native_ingest_contract
 
 | 字段 | 语义 |
 | --- | --- |
-| `schema_version` | 当前固定为 `2` |
-| `kind` | `cr_native_authoritative_contract_v2` |
+| `schema_version` | 当前生成器固定为 `3`；迁移窗口可只读验证旧 `2` |
+| `kind` | `cr_native_authoritative_contract_v3` |
 | `game_version` | `15.535.29` |
 | `allowed_card_tokens` | 精确、全小写的 RoyaleAPI 牌/形态 token |
 | `allowed_tower_troops` | 原生已有 support ID 的塔兵 slug |
@@ -49,6 +49,7 @@ D:\AI_data\runtime\venv\Scripts\python.exe scripts\export_native_ingest_contract
 | `source_numeric_game_mode_ids` | 可接收的来源模式真值：`72000006`、`72000450`、`72000464` |
 | `native_execution_mode_by_source` | 来源模式到原生执行模式的显式映射；三个来源模式当前均映射到 `72000006` |
 | `king_tower_max_hp_by_level` | 已由 libg 探针冻结的 King Tower 等级→最大 HP；当前完整覆盖 1–16 级 |
+| `king_tower_level_evidence` | Ranked cap=16 下逐方 King16 的两条精确证据、优先级和禁止推断字段 |
 | `contract_sha256` | 移除本字段后，对整个顶层对象做 canonical JSON SHA-256 |
 
 canonical JSON 参数为：UTF-8、`sort_keys=true`、无多余空格、
@@ -93,6 +94,14 @@ ID。下载器无需重新推导这些表。
 6. `native_execution_game_mode_id` 必须与契约映射精确一致，且 provenance 必须为
    `frozen_native_ingest_contract_mode_map_v1`；缺失、猜测或直接把 Ranked 来源 ID
    写进 libg 都拒绝。
+7. King16 必须逐方独立证明：该方 `tower_troop_level==16` 时使用
+   `ranked_template_cap16_and_tower_troop_level16_v1`；否则只允许该方终局 King
+   HP 精确为 `7728`，并使用
+   `ranked_template_cap16_and_full_king_hp_v1`。Tower Troop 不能高于 King Tower
+   是官方规则（[King Tower Level](https://support.supercell.com/clash-royale/en/articles/king-tower-level.html)、
+   [Tower Troops](https://support.supercell.com/clash-royale/en/articles/tower-troops-4.html)）；
+   再结合 Ranked 模板 cap=16，Tower Troop 16 严格推出 King=16。卡牌/牌组等级
+   永远不参与该推断。
 
 主工程也提供纯读取 API：
 
@@ -128,9 +137,8 @@ issues = validate_ingest_metadata(
 - `authoritative_native_contract` 的 game version、canonical SHA 与文件 SHA；
 - 每方 8 个 `deck_cards` 的 slot/slug/base/form/level；
 - 塔兵 slug 与**独立的塔兵等级**；
-- 每方 `king_tower_level=16`、
-  `king_tower_level_provenance=ranked_template_cap16_and_full_king_hp_v1`，且
-  来源最终 King HP 必须为完整 `7728`；
+- 每方 `king_tower_level=16`，且 provenance 必须与该方实际证据精确对应：优先
+  Tower Troop 16，否则使用终局 King 满血 `7728`；两方可使用不同证据；
 - `final_tower_hp` 的 King、`princess0`、`princess1`、total；
 - 完整 raw `data_i` 坐标契约与精确技能事件数组。
 

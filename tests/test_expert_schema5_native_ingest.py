@@ -42,6 +42,62 @@ def authoritative_fixture(directory: Path) -> tuple[dict, object]:
 
 
 class ExpertSchema5NativeIngestTests(unittest.TestCase):
+    def test_damaged_king_is_exact_when_tower_troop_is_level_16(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, contract = authoritative_fixture(Path(directory))
+            player = source["rounds"][0]["opponent"][0]
+            player["tower_troop_level"] = 16
+            player["king_tower_level_provenance"] = (
+                "ranked_template_cap16_and_tower_troop_level16_v1"
+            )
+            source["final_tower_hp"]["opponent"]["king"] = 5_000
+            source["final_tower_hp"]["opponent"]["total"] = (
+                5_000
+                + source["final_tower_hp"]["opponent"]["princess0"]
+                + source["final_tower_hp"]["opponent"]["princess1"]
+            )
+            plan = compile_battle(source, native_ingest_contract=contract)
+            self.assertEqual(plan.sides[1].king_tower_level, 16)
+            self.assertEqual(
+                plan.sides[1].king_tower_level_provenance,
+                "ranked_template_cap16_and_tower_troop_level16_v1",
+            )
+            self.assertEqual(plan.sides[1].final_tower_hp.king, 5_000)  # type: ignore[union-attr]
+            source_path = Path(directory) / "damaged-king.json"
+            source_path.write_text(json.dumps(source), encoding="utf-8")
+            audited = audit_one(
+                {"source_path": str(source_path), "battle_tag": source["battle_tag"]},
+                native_ingest_contract=contract,
+            )
+            self.assertTrue(audited["king_tower_levels_complete"])
+            self.assertTrue(audited["final_tower_hp_complete"])
+            self.assertTrue(audited["authoritative_native_full_candidate"])
+
+            wrong_provenance = deepcopy(source)
+            wrong_provenance["rounds"][0]["opponent"][0][
+                "king_tower_level_provenance"
+            ] = "ranked_template_cap16_and_full_king_hp_v1"
+            with self.assertRaisesRegex(
+                ReplayPlanError, "king_tower_level_provenance_invalid"
+            ):
+                compile_battle(
+                    wrong_provenance, native_ingest_contract=contract
+                )
+
+    def test_damaged_king_without_level_16_tower_troop_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, contract = authoritative_fixture(Path(directory))
+            source["final_tower_hp"]["opponent"]["king"] = 5_000
+            source["final_tower_hp"]["opponent"]["total"] = (
+                5_000
+                + source["final_tower_hp"]["opponent"]["princess0"]
+                + source["final_tower_hp"]["opponent"]["princess1"]
+            )
+            with self.assertRaisesRegex(
+                ReplayPlanError, "king_tower_level_exact_evidence_missing"
+            ):
+                compile_battle(source, native_ingest_contract=contract)
+
     def test_plan_and_materialization_preserve_authoritative_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source, contract = authoritative_fixture(Path(directory))

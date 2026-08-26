@@ -642,11 +642,7 @@ def _side_deck(
             if source_schema == 5
             else "legacy_not_observed"
         )
-        if source_schema == 5 and (
-            king_tower_level != 16
-            or king_tower_level_provenance
-            != "ranked_template_cap16_and_full_king_hp_v1"
-        ):
+        if source_schema == 5 and king_tower_level != 16:
             raise ReplayPlanError(
                 f"schema-v5 {source_side} King Tower level evidence is invalid"
             )
@@ -790,16 +786,18 @@ def compile_battle(
         )
         if source_schema == 5:
             assert schema_five is not None
-            expected_king_hp = schema_five[
+            evidence_issues = schema_five[
                 "contract"
-            ].king_tower_max_hp_by_level.get(king_tower_level)
-            if expected_king_hp is None:
+            ].validate_king_tower_level_evidence(
+                king_tower_level=king_tower_level,
+                provenance=king_tower_level_source,
+                tower_troop_level=tower_level,
+                final_king_hp=(None if terminal_hp is None else terminal_hp.king),
+            )
+            if evidence_issues:
                 raise ReplayPlanError(
-                    f"schema-v5 {source_side} King Tower level has no frozen HP probe"
-                )
-            if terminal_hp is None or terminal_hp.king != expected_king_hp:
-                raise ReplayPlanError(
-                    f"schema-v5 {source_side} full King Tower HP anchor is inconsistent"
+                    f"schema-v5 {source_side} King Tower level evidence is "
+                    f"inconsistent: {evidence_issues[0].code}"
                 )
         final_tower_hp.append(terminal_hp)
         logical_indices.append({item.base_token: index for index, item in enumerate(deck)})

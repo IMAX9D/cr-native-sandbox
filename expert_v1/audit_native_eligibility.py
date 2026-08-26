@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .native_capabilities import ability_log_tier
-from .native_ingest_contract import load_native_ingest_contract
+from .native_ingest_contract import (
+    KING_TOWER_LEVEL,
+    KING_TOWER_LEVEL_PROVENANCE_FULL_HP,
+    KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP,
+    KING_TOWER_MAX_HP_BY_LEVEL,
+    load_native_ingest_contract,
+)
 from .native_replay_plan import ReplayPlanError, compile_battle, split_card_token
 
 
@@ -139,12 +145,15 @@ def _raw_coordinate_audit(value: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
+def _metadata_audit(
+    value: Mapping[str, Any], *, native_ingest_contract: Any | None = None,
+) -> dict[str, Any]:
     schema = int(value.get("schema_version") or 1)
     rounds = value.get("rounds")
     deck_complete = levels_complete = forms_complete = towers_complete = True
     tower_levels_complete = schema == 5
     king_tower_levels_complete = schema == 5
+    king_level_evidence: list[tuple[str, Any, Any, Any]] = []
     tower_tokens: list[str | None] = []
     if schema < 2 or not isinstance(rounds, list) or len(rounds) != 1:
         deck_complete = levels_complete = forms_complete = towers_complete = False
@@ -185,11 +194,12 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
                     and not isinstance(tower_level, bool)
                     and tower_level >= 1
                 )
-                king_tower_levels_complete &= (
-                    player.get("king_tower_level") == 16
-                    and player.get("king_tower_level_provenance")
-                    == "ranked_template_cap16_and_full_king_hp_v1"
-                )
+                king_level_evidence.append((
+                    side,
+                    tower_level,
+                    player.get("king_tower_level"),
+                    player.get("king_tower_level_provenance"),
+                ))
     terminal = value.get("final_tower_hp")
     final_tower_hp_complete = False
     if schema == 5 and isinstance(terminal, Mapping):
@@ -208,8 +218,29 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
             )
             final_tower_hp_complete &= bool(
                 valid
-                and int(hp["king"]) == 7_728
                 and int(hp["total"]) == sum(int(hp[key]) for key in keys[:3])
+            )
+    if schema == 5:
+        evidence_version = int(
+            (native_ingest_contract.value.get("schema_version") or 0)
+            if native_ingest_contract is not None
+            else 2
+        )
+        king_tower_levels_complete &= len(king_level_evidence) == 2
+        for side, tower_level, king_level, provenance in king_level_evidence:
+            side_hp = terminal.get(side) if isinstance(terminal, Mapping) else None
+            final_king_hp = side_hp.get("king") if isinstance(side_hp, Mapping) else None
+            expected_provenance = (
+                KING_TOWER_LEVEL_PROVENANCE_TOWER_TROOP
+                if evidence_version >= 3 and tower_level == KING_TOWER_LEVEL
+                else KING_TOWER_LEVEL_PROVENANCE_FULL_HP
+                if final_king_hp == KING_TOWER_MAX_HP_BY_LEVEL[KING_TOWER_LEVEL]
+                else None
+            )
+            king_tower_levels_complete &= bool(
+                king_level == KING_TOWER_LEVEL
+                and expected_provenance is not None
+                and provenance == expected_provenance
             )
     contract_stamp = value.get("authoritative_native_contract")
     schema5_contract_stamp_complete = bool(
@@ -308,7 +339,9 @@ def audit_one(
         if isinstance(duration, (int, float)) else None
     )
     coordinates = _raw_coordinate_audit(value)
-    metadata = _metadata_audit(value)
+    metadata = _metadata_audit(
+        value, native_ingest_contract=native_ingest_contract
+    )
     ability_count = _ability_count(value)
     ability_tier = ability_log_tier(value)
     base: dict[str, Any] = {
