@@ -83,6 +83,7 @@ class FakeTraceNativeEnv:
         self.champion_spawned = False
         self.players: list[dict] = []
         self.submitted: list[list[dict]] = []
+        self.submitted_ticks: list[int] = []
         self._reset_players()
 
     def _reset_players(self) -> None:
@@ -176,6 +177,7 @@ class FakeTraceNativeEnv:
 
     def joint_act(self, actions: list[dict]) -> dict:
         self.submitted.append([dict(action) for action in actions])
+        self.submitted_ticks.append(self.tick)
         response = []
         for action in actions:
             if action["type"] == "ability" and self.reject_ability:
@@ -266,6 +268,7 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             self.assertIsNone(diagnostic)
             self.assertEqual(record["accepted_ability_actions"], 1)
             self.assertEqual(record["ability_resolution_counts"], {"unique": 1})
+            self.assertEqual(record["action_execution_tick_offset"], 0)
             self.assertTrue(record["tick_store_integrity"])
             self.assertEqual(len(manifests), 1)
             manifest = manifests[0]
@@ -277,6 +280,52 @@ class ExpertNativeAbilityPilotTests(unittest.TestCase):
             self.assertEqual(
                 [state.tick for state in states],
                 list(range(states[0].tick, states[-1].tick + 1)),
+            )
+
+    def test_offset_one_is_audited_in_result_and_tick_store(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            source = ability_battle()
+            source["card_plays"][0].update({
+                "x_raw": 1_250, "y_raw": 2_500, "data_i": 1,
+            })
+            source["card_plays"][1].update({
+                "x_raw": 1_000, "y_raw": 2_000, "data_i": 0,
+            })
+            source_path = root / "source.json"
+            source_path.write_text(json.dumps(source), encoding="utf-8")
+            task = make_task(source_path)
+            sink = WorkerShardSink(root / "store", "worker", episodes_per_shard=10)
+            env = FakeTraceNativeEnv()
+            record, diagnostic = execute_ability_task(
+                env, task, template(), calibration(), sink,
+                seed=424242, trace_batch_steps=16,
+                action_execution_tick_offset=1,
+            )
+            manifests = sink.finalize()
+
+            self.assertTrue(record["teacher_forced_success"], record["failure"])
+            self.assertIsNone(diagnostic)
+            self.assertEqual(env.submitted_ticks, [21, 26])
+            self.assertEqual(record["action_execution_tick_offset"], 1)
+            self.assertIn("source_tick+1", record["action_tick_provenance"])
+            self.assertEqual(
+                record["coordinate_provenance"],
+                "royaleapi_raw_data_i_to_native_v1",
+            )
+            self.assertEqual(record["coordinate_audit"]["data_i_zero_events"], 1)
+            self.assertEqual(record["ability_resolutions"][0]["source_tick"], 25)
+            self.assertEqual(record["ability_resolutions"][0]["execution_tick"], 26)
+            with ShardReader(
+                root / "store" / manifests[0]["data_file"],
+                root / "store" / manifests[0]["index_file"],
+            ) as reader:
+                metadata = reader.episode(task.battle_tag).metadata
+            self.assertEqual(metadata["action_execution_tick_offset"], 1)
+            self.assertIn("source_tick+1", metadata["action_tick_provenance"])
+            self.assertEqual(
+                metadata["coordinate_provenance"],
+                "royaleapi_raw_data_i_to_native_v1",
             )
 
     def test_branch_required_preserves_candidates_and_native_state(self) -> None:

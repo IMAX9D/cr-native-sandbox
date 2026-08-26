@@ -10,7 +10,7 @@ tick mismatch ends that replay and preserves an audit record.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 import time
@@ -19,6 +19,7 @@ from typing import Any, Mapping, Sequence
 from native_core.env import NativeRoyaleEnv
 
 from .native_capabilities import ability_cards, resolve_live_ability
+from .native_pilot import action_execution_tick
 from .native_replay_plan import (
     DEFAULT_NATIVE_SEED,
     BattlePlan,
@@ -49,6 +50,10 @@ class NativeReplayResult:
     ability_replay_complete: bool
     ability_resolution_counts: dict[str, int]
     ability_resolutions: tuple[dict[str, Any], ...]
+    action_execution_tick_offset: int
+    action_tick_provenance: str
+    coordinate_provenance: str
+    coordinate_audit: dict[str, Any]
     preferred_seed: int
     chosen_seed: int
     seeds_tested: int
@@ -229,10 +234,20 @@ def execute_plan(
     tick_sink: Any | None = None,
     tick_store_metadata: Mapping[str, Any] | None = None,
     trace_batch_steps: int = 64,
+    action_execution_tick_offset: int = 0,
 ) -> NativeReplayResult:
     """Replay one battle with gap-batched native stepping."""
     if tick_sink is not None and not 1 <= trace_batch_steps <= 64:
         raise ValueError("trace_batch_steps must be in 1..64")
+    # Validate the experimental execution boundary even when the source plan
+    # happens to be empty.  Source labels are immutable RoyaleAPI ``time_raw``
+    # values; only the native command boundary may move by the audited offset.
+    action_execution_tick(0, action_execution_tick_offset)
+    action_tick_provenance = (
+        "source label is RoyaleAPI time_raw; native execution Tick is "
+        f"source_tick+{action_execution_tick_offset}; source label unchanged"
+    )
+    coordinate_audit = asdict(plan.coordinate_audit)
     started = time.perf_counter()
     reset_seconds = step_seconds = observe_seconds = action_seconds = 0.0
     native_ticks = accepted_actions = 0
@@ -292,15 +307,50 @@ def execute_plan(
     if failure is None and missing_ability_events:
         failure = f"source_ability_ticks_missing_count_{missing_ability_events}"
 
+    # Compile-time validation owns source semantics: a side may issue only one
+    # deployment/ability command at a source Tick.  Re-check both source and
+    # mapped execution keys here so the optional shift can never manufacture
+    # a same-side native-Tick collision.
+    replay_groups: list[tuple[int, int, list[dict[str, Any]]]] = []
+    source_occupancy: set[tuple[int, int]] = set()
+    execution_occupancy: set[tuple[int, int]] = set()
+    for source_tick, events in grouped_replay_events(plan, mappings):
+        execution_tick = action_execution_tick(
+            source_tick, action_execution_tick_offset
+        )
+        for event in events:
+            side = int(event["side"])
+            source_key = (int(source_tick), side)
+            execution_key = (execution_tick, side)
+            if source_key in source_occupancy:
+                raise ValueError(
+                    "source plan contains a same-side deploy/ability conflict "
+                    f"at Tick {source_tick}"
+                )
+            if execution_key in execution_occupancy:
+                raise ValueError(
+                    "action execution offset created a same-side conflict at "
+                    f"Tick {execution_tick}"
+                )
+            source_occupancy.add(source_key)
+            execution_occupancy.add(execution_key)
+        replay_groups.append((int(source_tick), execution_tick, events))
+
     previous_source_tick = final_tick
+    previous_execution_tick = final_tick
     if failure is None:
-        for source_tick, events in grouped_replay_events(plan, mappings):
-            if source_tick < final_tick:
+        for source_tick, execution_tick, events in replay_groups:
+            if execution_tick < final_tick:
                 failure = (
                     f"source_tick_{source_tick}_precedes_native_tick_{final_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"execution_tick_{execution_tick}_source_tick_{source_tick}_"
+                        f"precedes_native_tick_{final_tick}"
+                    )
                 )
                 break
-            gap = source_tick - final_tick
+            gap = execution_tick - final_tick
             if gap:
                 step_started = time.perf_counter()
                 native_step = _advance_native(
@@ -310,19 +360,40 @@ def execute_plan(
                 step_seconds += time.perf_counter() - step_started
                 native_ticks += gap
                 episode = native_step.get("episode", {})
-                final_tick = int(native_step.get("tick_after", source_tick))
-                if final_tick != source_tick:
-                    failure = f"native_tick_mismatch_{final_tick}_expected_{source_tick}"
+                final_tick = int(native_step.get("tick_after", execution_tick))
+                if final_tick != execution_tick:
+                    failure = (
+                        f"native_tick_mismatch_{final_tick}_expected_{execution_tick}"
+                        if action_execution_tick_offset == 0
+                        else (
+                            f"native_tick_mismatch_{final_tick}_expected_execution_"
+                            f"tick_{execution_tick}_source_tick_{source_tick}"
+                        )
+                    )
                     break
                 if episode.get("terminated") or episode.get("truncated"):
-                    failure = f"native_terminal_before_source_tick_{source_tick}"
+                    failure = (
+                        f"native_terminal_before_source_tick_{source_tick}"
+                        if action_execution_tick_offset == 0
+                        else (
+                            f"native_terminal_before_execution_tick_{execution_tick}_"
+                            f"source_tick_{source_tick}"
+                        )
+                    )
                     break
 
             observe_started = time.perf_counter()
             state = env.observe_train()
             observe_seconds += time.perf_counter() - observe_started
-            if int(state["tick"]) != source_tick:
-                failure = f"observation_tick_{state['tick']}_expected_{source_tick}"
+            if int(state["tick"]) != execution_tick:
+                failure = (
+                    f"observation_tick_{state['tick']}_expected_{execution_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"observation_tick_{state['tick']}_expected_execution_tick_"
+                        f"{execution_tick}_source_tick_{source_tick}"
+                    )
+                )
                 break
             by_side = {int(player["side"]): player for player in state["players"]}
             for event in events:
@@ -352,11 +423,15 @@ def execute_plan(
                 side = int(event["side"])
                 marker = int(event["source_marker_index"])
                 resolution = resolve_live_ability(
-                    state, side=side, tick=source_tick,
+                    state, side=side, tick=execution_tick,
                     allowed_cards=allowed_abilities[side],
                 )
                 resolution_row = {
                     **resolution.json(),
+                    "source_tick": int(source_tick),
+                    "execution_tick": int(execution_tick),
+                    "execution_tick_offset": int(action_execution_tick_offset),
+                    "action_tick_provenance": action_tick_provenance,
                     "source_event_index": int(event["source_event_index"]),
                     "source_marker_index": marker,
                     "source_ability_id": event.get("source_ability_id"),
@@ -408,6 +483,9 @@ def execute_plan(
                     "type": "ability",
                     "entity_id": int(selected_entity),
                     "ability_resolution": resolution.status,
+                    "source_tick": int(source_tick),
+                    "execution_tick": int(execution_tick),
+                    "execution_tick_offset": int(action_execution_tick_offset),
                 })
             if failure is not None:
                 break
@@ -424,8 +502,17 @@ def execute_plan(
                         expert_action=action_by_side.get(actor_side),
                     )
                     record.update({
+                        "execution_tick": int(execution_tick),
+                        "execution_tick_offset": int(action_execution_tick_offset),
+                        "action_tick_provenance": action_tick_provenance,
+                        "source_wait_ticks_before": source_tick - previous_source_tick,
+                        "execution_wait_ticks_before": (
+                            execution_tick - previous_execution_tick
+                        ),
                         "state_provenance": plan.state_provenance,
                         "action_provenance": plan.action_provenance,
+                        "coordinate_provenance": plan.coordinate_provenance,
+                        "coordinate_audit": coordinate_audit,
                         "hand_provenance": (
                             "inferred_exact"
                             if first_exact_ticks[actor_side] is not None
@@ -441,7 +528,14 @@ def execute_plan(
             action_seconds += time.perf_counter() - action_started
             results = action_result.get("actions", [])
             if len(results) != len(native_actions):
-                failure = f"native_action_count_mismatch_tick_{source_tick}"
+                failure = (
+                    f"native_action_count_mismatch_tick_{source_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"native_action_count_mismatch_execution_tick_"
+                        f"{execution_tick}_source_tick_{source_tick}"
+                    )
+                )
                 break
             rejected = [
                 item for item in results
@@ -461,9 +555,17 @@ def execute_plan(
                     int(item.get("result", {}).get("result_code", -1))
                     for item in rejected
                 ]
-                failure = f"native_rejected_tick_{source_tick}_codes_{codes}"
+                failure = (
+                    f"native_rejected_tick_{source_tick}_codes_{codes}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"native_rejected_tick_{execution_tick}_source_tick_"
+                        f"{source_tick}_codes_{codes}"
+                    )
+                )
                 break
             previous_source_tick = source_tick
+            previous_execution_tick = execution_tick
 
     if failure is None and plan.terminal_crowns is not None:
         # Duration is stored at one-second resolution.  A 20-Tick fence lets
@@ -504,6 +606,10 @@ def execute_plan(
             "seed": seed_resolution.chosen_seed,
             "state_provenance": plan.state_provenance,
             "action_provenance": plan.action_provenance,
+            "action_execution_tick_offset": action_execution_tick_offset,
+            "action_tick_provenance": action_tick_provenance,
+            "coordinate_provenance": plan.coordinate_provenance,
+            "coordinate_audit": coordinate_audit,
             "ability_provenance": plan.ability_provenance,
             "terminal_provenance": plan.terminal_provenance,
             "source_actions": len(plan.actions) + len(plan.ability_events),
@@ -543,6 +649,10 @@ def execute_plan(
         ),
         ability_resolution_counts=dict(ability_resolution_counts),
         ability_resolutions=tuple(ability_resolutions),
+        action_execution_tick_offset=action_execution_tick_offset,
+        action_tick_provenance=action_tick_provenance,
+        coordinate_provenance=plan.coordinate_provenance,
+        coordinate_audit=coordinate_audit,
         preferred_seed=seed_resolution.preferred_seed,
         chosen_seed=seed_resolution.chosen_seed,
         seeds_tested=seed_resolution.seeds_tested,

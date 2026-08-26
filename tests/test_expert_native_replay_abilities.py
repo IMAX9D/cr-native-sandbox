@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from expert_v1.native_replay_plan import compile_battle
+from expert_v1.native_replay_plan import ReplayPlanError, compile_battle
 from expert_v1.native_replay_runner import execute_plan
 
 
@@ -67,6 +67,7 @@ class FakeNativeEnv:
             for side in range(2)
         ]
         self.submitted: list[list[dict]] = []
+        self.submitted_ticks: list[int] = []
 
     def _state(self) -> dict:
         entities = [{
@@ -106,6 +107,7 @@ class FakeNativeEnv:
 
     def joint_act(self, actions: list[dict]) -> dict:
         self.submitted.append(actions)
+        self.submitted_ticks.append(self.tick)
         for action in actions:
             if action["type"] != "play":
                 continue
@@ -153,9 +155,71 @@ class ExpertNativeReplayAbilityTests(unittest.TestCase):
         self.assertEqual(result.accepted_ability_actions, 1)
         self.assertTrue(result.ability_replay_complete)
         self.assertEqual(result.ability_resolution_counts, {"unique": 1})
+        self.assertEqual(result.action_execution_tick_offset, 0)
+        self.assertEqual(result.ability_resolutions[0]["source_tick"], 25)
+        self.assertEqual(result.ability_resolutions[0]["execution_tick"], 25)
         self.assertEqual(env.submitted[-1], [
             {"type": "ability", "side": 0, "entity_id": 50}
         ])
+
+    def test_offset_one_keeps_source_ticks_and_uses_data_i_coordinates(self) -> None:
+        source = ability_battle()
+        source["card_plays"][0].update({
+            "x_raw": 1_250, "y_raw": 2_500, "data_i": 1,
+        })
+        source["card_plays"][1].update({
+            "x_raw": 1_000, "y_raw": 2_000, "data_i": 0,
+        })
+        plan = compile_battle(source)
+        env = FakeNativeEnv()
+        result = execute_plan(
+            env, plan, template(), calibration(),
+            action_execution_tick_offset=1,
+        )
+
+        self.assertTrue(result.accepted, result.failure)
+        self.assertEqual(env.submitted_ticks, [21, 26])
+        self.assertEqual(
+            env.submitted[0],
+            [
+                {
+                    "type": "play", "side": 0, "deck_index": 0,
+                    "x": 1_250, "y": 2_500,
+                },
+                {
+                    "type": "play", "side": 1, "deck_index": 0,
+                    "x": 17_000, "y": 30_000,
+                },
+            ],
+        )
+        self.assertEqual(result.action_execution_tick_offset, 1)
+        self.assertIn("source_tick+1", result.action_tick_provenance)
+        self.assertEqual(result.coordinate_provenance, "royaleapi_raw_data_i_to_native_v1")
+        self.assertEqual(result.coordinate_audit["data_i_zero_events"], 1)
+        self.assertEqual(result.coordinate_audit["data_i_one_events"], 1)
+        resolution = result.ability_resolutions[0]
+        self.assertEqual(resolution["source_tick"], 25)
+        self.assertEqual(resolution["execution_tick"], 26)
+        self.assertEqual(resolution["tick"], 26)
+        first_decision = result.decision_records[0]
+        self.assertEqual(first_decision["source_tick"], 20)
+        self.assertEqual(first_decision["execution_tick"], 21)
+        self.assertEqual(first_decision["tick"], 21)
+
+    def test_deploy_ability_conflict_is_checked_on_source_tick(self) -> None:
+        source = ability_battle()
+        source["ability_plays"][0]["time_raw"] = 20
+        with self.assertRaisesRegex(
+            ReplayPlanError, "multiple deploy/ability actions.*native tick 20"
+        ):
+            compile_battle(source)
+
+    def test_offset_rejects_values_outside_audited_boundaries(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly 0 or 1"):
+            execute_plan(
+                FakeNativeEnv(), compile_battle(ability_battle()),
+                template(), calibration(), action_execution_tick_offset=2,
+            )
 
     def test_branch_required_stops_without_guessing(self) -> None:
         plan = compile_battle(ability_battle())

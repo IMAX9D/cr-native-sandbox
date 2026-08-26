@@ -89,6 +89,7 @@ def _worker(
     seed: int,
     maximum_seeds_to_test: int,
     trace_batch_steps: int,
+    action_execution_tick_offset: int,
 ) -> dict[str, Any]:
     worker_id = f"ability-worker-{worker_index:02d}"
     result_path = output_root / f"{worker_id}.results.jsonl"
@@ -122,6 +123,9 @@ def _worker(
                             seed=seed,
                             maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
+                            action_execution_tick_offset=(
+                                action_execution_tick_offset
+                            ),
                         )
                         record.update({
                             "worker_id": worker_id,
@@ -155,6 +159,7 @@ def _worker(
         "successes": successes,
         "failures": completed - successes,
         "stored_ticks": stored_ticks,
+        "action_execution_tick_offset": action_execution_tick_offset,
         "wall_seconds": time.perf_counter() - started,
         "worker_error": worker_error,
         "shards": manifests,
@@ -210,6 +215,7 @@ def run(args: argparse.Namespace) -> int:
                 seed=args.seed,
                 maximum_seeds_to_test=args.maximum_seeds,
                 trace_batch_steps=args.trace_batch_steps,
+                action_execution_tick_offset=args.action_execution_tick_offset,
             )
             for index, port in enumerate(args.ports)
         ]
@@ -231,6 +237,8 @@ def run(args: argparse.Namespace) -> int:
     failures: Counter[str] = Counter()
     resolutions: Counter[str] = Counter()
     terminal: Counter[str] = Counter()
+    coordinates: Counter[str] = Counter()
+    coordinate_totals: Counter[str] = Counter()
     for row in results:
         if not row["teacher_forced_success"]:
             failures[str(row.get("failure_class") or "unknown")] += 1
@@ -239,6 +247,16 @@ def run(args: argparse.Namespace) -> int:
             for key, value in row.get("ability_resolution_counts", {}).items()
         })
         terminal[str(row.get("terminal_diagnostic_status") or "unknown")] += 1
+        coordinates[str(row.get("coordinate_provenance") or "unknown")] += 1
+        coordinate_audit = row.get("coordinate_audit")
+        if isinstance(coordinate_audit, dict):
+            for key in (
+                "raw_data_i_events",
+                "data_i_zero_events",
+                "data_i_one_events",
+                "legacy_xy_fallback_events",
+            ):
+                coordinate_totals[key] += int(coordinate_audit.get(key, 0))
     processed_tags = {str(row["battle_tag"]) for row in results}
     expected_tags = {task.battle_tag for task in tasks}
     missing_tags = sorted(expected_tags - processed_tags)
@@ -246,11 +264,19 @@ def run(args: argparse.Namespace) -> int:
     per_tick_verified = bool(success) and all(
         row.get("tick_store_integrity") is True for row in success
     )
+    action_boundary_verified = bool(results) and all(
+        int(row.get("action_execution_tick_offset", -1))
+        == int(args.action_execution_tick_offset)
+        and f"source_tick+{args.action_execution_tick_offset}"
+        in str(row.get("action_tick_provenance") or "")
+        for row in results
+    )
     zero_worker_errors = all(row["worker_error"] is None for row in worker_reports)
     acceptance_pass = bool(
         len(results) == len(tasks)
         and len(success) == len(tasks)
         and per_tick_verified
+        and action_boundary_verified
         and zero_worker_errors
         and not missing_tags
         and not unexpected_tags
@@ -267,6 +293,11 @@ def run(args: argparse.Namespace) -> int:
         "seed_role": "legacy_preferred_only; chosen seed is searched per battle",
         "maximum_seeds_to_test": args.maximum_seeds,
         "trace_batch_steps": args.trace_batch_steps,
+        "action_execution_tick_offset": args.action_execution_tick_offset,
+        "action_tick_provenance": (
+            "source label is RoyaleAPI time_raw; native execution Tick is "
+            f"source_tick+{args.action_execution_tick_offset}; source label unchanged"
+        ),
         "selected_battles": len(tasks),
         "processed_battles": len(results),
         "teacher_forced_successes": len(success),
@@ -282,6 +313,8 @@ def run(args: argparse.Namespace) -> int:
             int(row["accepted_ability_actions"]) for row in results
         ),
         "ability_resolution_counts": dict(resolutions),
+        "coordinate_provenance_counts": dict(coordinates),
+        "coordinate_audit_totals": dict(coordinate_totals),
         "failure_class_counts": dict(failures),
         "terminal_diagnostic_counts": dict(terminal),
         "stored_episodes": int(store_manifest["episode_count"]),
@@ -294,6 +327,7 @@ def run(args: argparse.Namespace) -> int:
         "wall_seconds": wall_seconds,
         "stored_ticks_per_second": total_store_ticks / wall_seconds,
         "per_tick_store_verified": per_tick_verified,
+        "action_boundary_audit_verified": action_boundary_verified,
         "zero_worker_errors": zero_worker_errors,
         "acceptance_pass": acceptance_pass,
         "branch_policy": "multiple live candidates fail closed; no guessed entity",
@@ -330,6 +364,16 @@ def main() -> int:
     run_parser.add_argument("--seed", type=int, default=DEFAULT_NATIVE_SEED)
     run_parser.add_argument("--maximum-seeds", type=int, default=4096)
     run_parser.add_argument("--trace-batch-steps", type=int, default=64)
+    run_parser.add_argument(
+        "--action-execution-tick-offset",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help=(
+            "diagnostic only: execute deploy and ability commands at "
+            "time_raw+offset while preserving every source Tick; default 0"
+        ),
+    )
     run_parser.set_defaults(function=run)
     args = parser.parse_args()
     if getattr(args, "trace_batch_steps", 1) not in range(1, 65):

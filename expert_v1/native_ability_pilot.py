@@ -366,6 +366,7 @@ def execute_ability_task(
     seed: int,
     maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     trace_batch_steps: int = 64,
+    action_execution_tick_offset: int = 0,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Execute one task and return a compact result plus full failure evidence."""
     recorder = RecordingNativeEnv(env)
@@ -415,8 +416,12 @@ def execute_ability_task(
                 "every_native_tick_present": True,
                 "selection_digest": task.selection_digest,
                 "seed": int(seed),
+                "action_execution_tick_offset": int(
+                    action_execution_tick_offset
+                ),
             },
             trace_batch_steps=trace_batch_steps,
+            action_execution_tick_offset=action_execution_tick_offset,
         )
         layout_reports = ({
             "mode": "source_order_bounded_native_seed_search",
@@ -425,6 +430,8 @@ def execute_ability_task(
             "seeds_tested": result.seeds_tested,
             "cache_hit": result.seed_search_cache_hit,
             "source_seed_recovered": result.source_seed_recovered,
+            "action_execution_tick_offset": result.action_execution_tick_offset,
+            "action_tick_provenance": result.action_tick_provenance,
         },)
     except Exception as caught:
         error = caught
@@ -456,6 +463,21 @@ def execute_ability_task(
             error = RuntimeError("successful replay violated per-Tick store integrity")
             error_traceback = None
 
+    action_tick_provenance = (
+        "source label is RoyaleAPI time_raw; native execution Tick is "
+        f"source_tick+{action_execution_tick_offset}; source label unchanged"
+        if result is None else result.action_tick_provenance
+    )
+    if result is not None:
+        coordinate_provenance = result.coordinate_provenance
+        coordinate_audit = result.coordinate_audit
+    elif plan is not None:
+        coordinate_provenance = plan.coordinate_provenance
+        coordinate_audit = plan.json()["coordinate_audit"]
+    else:
+        coordinate_provenance = None
+        coordinate_audit = None
+
     record = {
         "schema_version": 1,
         "kind": RESULT_KIND,
@@ -479,6 +501,10 @@ def execute_ability_task(
         "source_seed_recovered": (
             False if result is None else result.source_seed_recovered
         ),
+        "action_execution_tick_offset": int(action_execution_tick_offset),
+        "action_tick_provenance": action_tick_provenance,
+        "coordinate_provenance": coordinate_provenance,
+        "coordinate_audit": coordinate_audit,
         "source_deploy_actions": task.deploy_action_count,
         "accepted_deploy_actions": (
             0 if result is None else result.accepted_deploy_actions
@@ -513,6 +539,10 @@ def execute_ability_task(
         "battle_tag": task.battle_tag,
         "failure_class": record["failure_class"],
         "failure": record["failure"],
+        "action_execution_tick_offset": int(action_execution_tick_offset),
+        "action_tick_provenance": record["action_tick_provenance"],
+        "coordinate_provenance": record["coordinate_provenance"],
+        "coordinate_audit": record["coordinate_audit"],
         "task": task.json(),
         "source": source,
         "plan": None if plan is None else plan.json(),
