@@ -26,6 +26,7 @@ from expert_v1.native_dataset_generator import (
     select_tasks,
     should_retry_failure,
     summarize_results,
+    verify_published_audit_prefix_store,
     verify_published_tick_store,
 )
 from expert_v1.native_profile import native_teacher_forced_profile
@@ -34,7 +35,11 @@ from expert_v1.tick_store_v1.schema import (
     PlayerPrivate,
     TickState,
 )
-from expert_v1.tick_store_v1.shard import WorkerShardSink, build_store_manifest
+from expert_v1.tick_store_v1.shard import (
+    AUDIT_PREFIX_STORE_KIND,
+    WorkerShardSink,
+    build_store_manifest,
+)
 from expert_v1.tick_store_v1.work_queue import TickStoreWorkQueue
 
 
@@ -88,6 +93,7 @@ def write_candidates(path: Path, rows: list[dict]) -> None:
 def replay_result_stub(
     *, success: bool, chosen_seed: int = 7, failure: str | None = None,
     action_sequence: tuple[dict, ...] = (),
+    collected_states: tuple[TickState, ...] = (),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         teacher_forced_success=success,
@@ -96,6 +102,9 @@ def replay_result_stub(
         accepted_deploy_actions=len(action_sequence) if success else 0,
         accepted_ability_actions=0,
         action_acceptance_sequence=action_sequence,
+        ability_resolutions=(),
+        logic_freeze_diagnostic=None,
+        collected_tick_states=collected_states,
         final_tick=80,
         terminal_validated=False,
         terminal_match=None,
@@ -115,13 +124,15 @@ def replay_result_stub(
         layout_resolution_mode="source_order_bounded_native_seed_search",
         native_ticks_advanced=70,
         tick_trace_batches=0,
-        tick_trace_complete_frames=0,
+        tick_trace_complete_frames=len(collected_states),
+        tick_trace_incomplete_terminal_frames=0,
+        tick_trace_incomplete_nonterminal_freeze_frames=0,
         deployment_mask_probe_rpc_count=0,
     )
 
 
 class NativeDatasetGeneratorTest(unittest.TestCase):
-    def test_failed_preflight_skips_full_trace_and_all_mask_probes(self) -> None:
+    def test_failed_preflight_runs_fixed_seed_prefix_without_mask_probes(self) -> None:
         rejected = replay_result_stub(
             success=False,
             failure="native_rejected_tick_21_codes_[4]",
@@ -136,15 +147,19 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             return_value=rejected,
         ) as mocked:
             outcome = execute_two_phase_plan(
-                object(), SimpleNamespace(), {}, StagedTickSink(),
+                object(), SimpleNamespace(battle_tag="PREFIX"), {}, StagedTickSink(),
                 seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
                 tick_store_metadata={},
             )
 
-        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(mocked.call_count, 2)
         self.assertIsNone(outcome.full_trace)
-        self.assertFalse(mocked.call_args.kwargs["capture_deployment_masks"])
-        self.assertIsNone(mocked.call_args.kwargs["tick_sink"])
+        second = mocked.call_args_list[1]
+        self.assertEqual(second.kwargs["fixed_seed"], 7)
+        self.assertTrue(second.kwargs["collect_tick_states_on_failure"])
+        self.assertFalse(second.kwargs["capture_deployment_masks"])
+        self.assertIsNone(second.kwargs["tick_sink"])
+        self.assertFalse(outcome.failure_prefix_staged)
         self.assertEqual(list(outcome.preflight_recorder.trace_history), [])
         self.assertEqual(
             outcome.preflight_recorder.native_deployment_mask_probes_attempted,
@@ -182,6 +197,50 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertTrue(second.kwargs["capture_deployment_masks"])
         self.assertIsNotNone(second.kwargs["tick_sink"])
         self.assertEqual(outcome.semantic_diff, {})
+
+    def test_semantic_failure_prefix_is_consecutive_censored_and_audit_only(self) -> None:
+        action = ({
+            "source_tick": 20, "execution_tick": 21,
+            "source_event_index": 0, "type": "play", "side": 0,
+            "accepted": False, "result_code": 4,
+        },)
+        preflight = replay_result_stub(
+            success=False,
+            chosen_seed=7,
+            failure="native_rejected_tick_21_source_tick_20_codes_[4]",
+            action_sequence=action,
+        )
+        prefix = replay_result_stub(
+            success=False,
+            chosen_seed=7,
+            failure=preflight.failure,
+            action_sequence=action,
+            collected_states=tuple(tick_states(12)),
+        )
+        prefix.seeds_tested = 0
+        prefix.seed_search_native_resets = 1
+        prefix.layout_resolution_mode = "fixed_preflight_seed_replay"
+        staged = StagedTickSink()
+        with patch(
+            "expert_v1.native_dataset_generator.execute_plan",
+            side_effect=[preflight, prefix],
+        ):
+            outcome = execute_two_phase_plan(
+                object(), SimpleNamespace(battle_tag="PREFIX"), {}, StagedTickSink(),
+                prefix_staged=staged,
+                seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
+                tick_store_metadata={"source_sha256": "a" * 64},
+            )
+        self.assertTrue(outcome.failure_prefix_staged)
+        self.assertIsNotNone(staged.episode)
+        extent = staged.episode.metadata["native_replay_extent_v1"]
+        self.assertEqual(extent["training_admission"], "audit_only")
+        self.assertEqual(extent["action_label_tick_stop_exclusive"], 21)
+        self.assertEqual(extent["timing_censor_tick_exclusive"], 21)
+        self.assertFalse(extent["failure_tick_has_labels"])
+        self.assertEqual(extent["terminal_target"], "unknown_censored")
+        self.assertNotIn("native_deployment_masks_v1", staged.episode.metadata)
+        self.assertEqual(staged.episode.states[-1].tick, 21)
 
     def test_two_phase_action_or_terminal_difference_is_a_closed_diff(self) -> None:
         preflight = replay_result_stub(success=True, chosen_seed=7)
@@ -341,7 +400,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             self.assertEqual(first[0], second[0])
             self.assertEqual(first[3]["run_contract_version"], 2)
             self.assertEqual(
-                first[3]["native_execution_pipeline"]["contract_version"], 1
+                first[3]["native_execution_pipeline"]["contract_version"], 2
             )
             with TickStoreWorkQueue(first[2]) as queue:
                 self.assertEqual(queue.counts(), {"pending": 2})
@@ -442,6 +501,39 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             self.assertEqual(
                 json.loads(manifests[0].read_text())["episode_count"], 1
             )
+
+    def test_prefix_frame_checkpoint_reconciles_failed_queue_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            queue_path = root / "queue.sqlite3"
+            with TickStoreWorkQueue(queue_path) as queue:
+                queue.add_tasks([{
+                    "battle_tag": "PREFIX-CRASH",
+                    "source_path": "source.json",
+                    "source_sha256": "a" * 64,
+                    "payload": {},
+                }])
+                queue.claim(
+                    "worker", limit=1, lease_seconds=300,
+                    maximum_attempts=10,
+                )
+            prefix_root = root / "audit-prefix-shards"
+            sink = WorkerShardSink(prefix_root, "prefix", episodes_per_shard=1)
+            entry = sink.append("PREFIX-CRASH", tick_states(), {"audit": True})
+            sink.finalize()
+            atomic_json(root / "results" / "PREFIX_CRASH.json", {
+                "schema_version": 1,
+                "kind": "expert_authoritative_native_tick_result_v1",
+                "battle_tag": "PREFIX-CRASH",
+                "teacher_forced_success": False,
+                "failure": "native_rejected_tick_13_codes_[4]",
+                "retry_scheduled": False,
+                "audit_prefix_tick_store_entry": entry,
+            })
+            self.assertEqual(reconcile_result_files(root, queue_path), 1)
+            with TickStoreWorkQueue(queue_path) as queue:
+                self.assertEqual(queue.counts(), {"failed": 1})
+            self.assertEqual(reconcile_result_files(root, queue_path), 0)
 
     def test_new_run_requeues_only_infrastructure_with_fresh_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -580,9 +672,9 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             "failure_class": "ability_branch_required",
             "failure_domain": "semantic",
             "terminal_diagnostic_status": "not_reached",
-            "native_preflight_contract_version": 1,
+            "native_preflight_contract_version": 2,
             "native_execution_pipeline_mode": (
-                "native_preflight_then_fixed_seed_full_trace_v1"
+                "native_preflight_then_fixed_seed_full_or_failure_prefix_v2"
             ),
             "preflight_teacher_forced_success": False,
             "full_trace_executed": False,
@@ -600,7 +692,8 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             }], wall_seconds=2.0, missing_tags=[], unexpected_tags=[],
         )
         self.assertTrue(summary["infrastructure_complete"])
-        self.assertTrue(summary["publication_ready"])
+        self.assertFalse(summary["publication_ready"])
+        self.assertEqual(summary["unframed_episodes"], 1)
         self.assertEqual(summary["true_attempted_acceptance_rate"], 0.75)
         self.assertEqual(summary["branch_required_battles"], 1)
         self.assertTrue(summary["native_action_accounting_closed"])
@@ -628,6 +721,68 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertEqual(
             blocked["failure_domain_counts"], {"infrastructure": 1}
         )
+
+    def test_audit_prefix_store_is_physically_isolated_and_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selection = root / "selection.jsonl"
+            selection.write_text("{}\n", encoding="utf-8")
+            extent = {
+                "schema_version": 1,
+                "kind": "cr_native_replay_extent_v1",
+                "extent": "valid_prefix",
+                "training_admission": "audit_only",
+                "source_episode_complete": False,
+                "every_native_tick_present_within_extent": True,
+                "fixed_seed_replay": True,
+                "chosen_seed": 7,
+                "preflight_semantics_sha256": "a" * 64,
+                "prefix_replay_semantics_sha256": "a" * 64,
+                "semantic_match": True,
+                "failure_class": "native_action_rejected",
+                "failure_domain": "semantic",
+                "failure": "native_rejected_tick_13_codes_[4]",
+                "failure_source_tick": 12,
+                "failure_execution_tick": 13,
+                "first_invalid_source_event_index": 0,
+                "safe_accepted_event_count": 0,
+                "safe_accepted_action_transcript_sha256": "b" * 64,
+                "observation_tick_start": 10,
+                "observation_tick_stop_exclusive": 14,
+                "action_label_tick_stop_exclusive": 13,
+                "timing_censor_tick_exclusive": 13,
+                "failure_tick_has_labels": False,
+                "terminal_target": "unknown_censored",
+                "terminal_validated": False,
+                "deployment_masks": "not_collected_audit_prefix",
+                "trace_batches": 1,
+                "trace_complete_frames": 4,
+                "trace_incomplete_terminal_frames": 0,
+                "trace_incomplete_nonterminal_freeze_frames": 0,
+            }
+            sink = WorkerShardSink(root, "prefix", episodes_per_shard=1)
+            sink.append(
+                "PREFIX",
+                tick_states(),
+                {"native_replay_extent_v1": extent},
+            )
+            sink.finalize()
+            build_store_manifest(
+                root,
+                source_manifest=selection,
+                expected_episodes=1,
+                expected_ticks=4,
+                store_kind=AUDIT_PREFIX_STORE_KIND,
+                store_metadata={
+                    "training_admission": "audit_only",
+                    "native_deployment_masks": {"required": False},
+                },
+            )
+            physical = verify_published_audit_prefix_store(root)
+            self.assertEqual(physical["battle_tags"], ["PREFIX"])
+            self.assertEqual(physical["deployment_mask_sidecars_referenced"], 0)
+            with self.assertRaisesRegex(RuntimeError, "manifest kind"):
+                verify_published_tick_store(root)
 
 
 if __name__ == "__main__":

@@ -407,6 +407,10 @@ class ExpertOneClickV1Test(unittest.TestCase):
                     "successes": 1,
                     "failures": 1,
                     "failure_class_counts": {"semantic": 1},
+                    "success_tags": ["A"],
+                    "audit_prefix_tags": [],
+                    "unframed_tags": ["B"],
+                    "audit_tick_episodes": 1,
                     "ability_positive": {
                         "candidates": 1,
                         "attempted": 1,
@@ -486,6 +490,63 @@ class ExpertOneClickV1Test(unittest.TestCase):
         )
         self.assertTrue(waived["gate"]["admitted"])
         self.assertTrue(waived["gate"]["waiver_applied"])
+
+    def test_native_result_audit_prefix_union_and_tamper_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue.jsonl"
+            queue.write_text(
+                "".join(
+                    json.dumps({"battle_tag": tag, "ability_events_observed": 0})
+                    + "\n"
+                    for tag in ("FULL", "PREFIX")
+                ),
+                encoding="utf-8",
+            )
+            results = root / "results.jsonl"
+            prefix = {
+                "kind": "expert_authoritative_native_tick_result_v1",
+                "battle_tag": "PREFIX",
+                "final_attempt": True,
+                "teacher_forced_success": False,
+                "failure_class": "native_action_rejected",
+                "failure_domain": "semantic",
+                "failure_prefix_semantic_match": True,
+                "audit_prefix_tick_store_entry": {"ticks": 12},
+                "audit_prefix_extent": {
+                    "kind": "cr_native_replay_extent_v1",
+                    "extent": "valid_prefix",
+                    "training_admission": "audit_only",
+                    "terminal_target": "unknown_censored",
+                    "failure_tick_has_labels": False,
+                },
+            }
+            rows = [
+                {
+                    "kind": "expert_authoritative_native_tick_result_v1",
+                    "battle_tag": "FULL",
+                    "final_attempt": True,
+                    "teacher_forced_success": True,
+                },
+                prefix,
+            ]
+            results.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            audit = validate_native_result_records(
+                results, queue, expected_rows=2
+            )
+            self.assertEqual(audit["success_tags"], ["FULL"])
+            self.assertEqual(audit["audit_prefix_tags"], ["PREFIX"])
+            self.assertEqual(audit["unframed_tags"], [])
+            prefix["audit_prefix_extent"]["training_admission"] = "full_bc"
+            results.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(OneClickError, "audit-prefix"):
+                validate_native_result_records(results, queue, expected_rows=2)
 
     def test_ability_positive_waiver_requires_a_reason(self) -> None:
         result = {

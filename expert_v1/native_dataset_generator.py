@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import threading
 import time
 import traceback
@@ -55,9 +56,11 @@ from .tick_store_v1.deployment_masks import (
 )
 from .tick_store_v1.schema import TickState, require_consecutive
 from .tick_store_v1.shard import (
+    AUDIT_PREFIX_STORE_KIND,
     FRAME_HEADER,
     FRAME_MAGIC,
     SHARD_KIND,
+    STORE_KIND,
     WorkerShardSink,
     _scan_frames,
     build_store_manifest,
@@ -73,8 +76,13 @@ RESULT_KIND = "expert_authoritative_native_tick_result_v1"
 DIAGNOSTIC_KIND = "expert_authoritative_native_tick_failure_v1"
 COORDINATE_PROVENANCE = "royaleapi_raw_data_i_to_native_v1"
 RUN_CONTRACT_VERSION = 2
-NATIVE_PREFLIGHT_CONTRACT_VERSION = 1
-NATIVE_PREFLIGHT_MODE = "native_preflight_then_fixed_seed_full_trace_v1"
+NATIVE_PREFLIGHT_CONTRACT_VERSION = 2
+NATIVE_PREFLIGHT_MODE = (
+    "native_preflight_then_fixed_seed_full_or_failure_prefix_v2"
+)
+AUDIT_PREFIX_DIRECTORY = "audit-prefix-shards"
+REPLAY_EXTENT_METADATA_KEY = "native_replay_extent_v1"
+REPLAY_EXTENT_KIND = "cr_native_replay_extent_v1"
 EXACT_ABILITY_TIERS = {
     "source_reports_zero",
     "observed_ticks_identity_runtime_resolved",
@@ -1015,7 +1023,10 @@ def _failure_class(
     if isinstance(error, PreflightFullTraceDivergence):
         return "infrastructure_preflight_full_trace_semantic_divergence"
     if error is not None:
-        if stage == "immutable_tick_store_commit":
+        if stage in {
+            "immutable_tick_store_commit",
+            "immutable_prefix_tick_store_commit",
+        }:
             return "infrastructure_tick_store_commit_failed"
         if stage == "tick_store_postcondition":
             return "infrastructure_tick_store_postcondition_failed"
@@ -1184,10 +1195,151 @@ class TwoPhaseNativeReplay:
     preflight_seconds: float
     full_trace_seconds: float
     semantic_diff: dict[str, Any] | None
+    failure_prefix: NativeReplayResult | None = None
+    failure_prefix_recorder: RecordingCountingEnv | None = None
+    failure_prefix_seconds: float = 0.0
+    failure_prefix_staged: bool = False
 
     @property
     def result(self) -> NativeReplayResult:
         return self.preflight if self.full_trace is None else self.full_trace
+
+
+_FAILURE_TICK_PATTERNS = (
+    re.compile(r"native_rejected_tick_(\d+)(?:_source_tick_(\d+))?"),
+    re.compile(r"native_terminal_before_execution_tick_(\d+)_source_tick_(\d+)"),
+    re.compile(r"native_terminal_before_source_tick_(\d+)"),
+    re.compile(r"native_logic_frozen_before_execution_tick_(\d+)_source_tick_(\d+)"),
+)
+
+
+def _failure_boundary(
+    result: NativeReplayResult,
+) -> tuple[int, int | None, int | None] | None:
+    """Return execution/source/event boundary for a traceable semantic failure."""
+    rejected = [
+        row for row in result.action_acceptance_sequence
+        if row.get("accepted") is not True
+    ]
+    if rejected:
+        row = rejected[0]
+        return (
+            int(row["execution_tick"]),
+            int(row["source_tick"]),
+            int(row["source_event_index"]),
+        )
+    if result.ability_resolutions:
+        row = result.ability_resolutions[-1]
+        if row.get("execution") not in {"unique_executed", "explicit_branch_executed"}:
+            return (
+                int(row["execution_tick"]),
+                int(row["source_tick"]),
+                int(row["source_event_index"]),
+            )
+    diagnostic = result.logic_freeze_diagnostic
+    if isinstance(diagnostic, Mapping):
+        return (
+            int(diagnostic["execution_tick"]),
+            int(diagnostic["source_tick"]),
+            None,
+        )
+    failure = str(result.failure or "")
+    for pattern in _FAILURE_TICK_PATTERNS:
+        match = pattern.search(failure)
+        if match:
+            execution_tick = int(match.group(1))
+            source_tick = (
+                int(match.group(2)) if match.lastindex and match.lastindex >= 2
+                and match.group(2) is not None else execution_tick
+            )
+            return execution_tick, source_tick, None
+    return None
+
+
+def _traceable_semantic_prefix(result: NativeReplayResult) -> bool:
+    failure_class = _failure_class(result, None, "preflight_first_native_difference")
+    return (
+        _failure_domain(failure_class) == "semantic"
+        and failure_class != "native_seed_search_exhausted"
+        and _failure_boundary(result) is not None
+    )
+
+
+def _prefix_extent_metadata(
+    preflight: NativeReplayResult,
+    prefix: NativeReplayResult,
+    *,
+    base: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    states = prefix.collected_tick_states
+    boundary = _failure_boundary(prefix)
+    if not states or boundary is None:
+        return None
+    require_consecutive(states)
+    if int(prefix.tick_trace_complete_frames) != len(states):
+        return None
+    failure_execution_tick, failure_source_tick, failure_event_index = boundary
+    last_tick = states[-1].tick
+    if failure_execution_tick < states[0].tick or last_tick > failure_execution_tick:
+        return None
+    failure_class = _failure_class(
+        prefix, None, "preflight_first_native_difference"
+    )
+    accepted_before_boundary = [
+        dict(row)
+        for row in prefix.action_acceptance_sequence
+        if row.get("accepted") is True
+        and int(row["execution_tick"]) < failure_execution_tick
+    ]
+    label_stop = min(failure_execution_tick, last_tick + 1)
+    extent = {
+        "schema_version": 1,
+        "kind": REPLAY_EXTENT_KIND,
+        "extent": "valid_prefix",
+        "training_admission": "audit_only",
+        "source_episode_complete": False,
+        "every_native_tick_present_within_extent": True,
+        "fixed_seed_replay": True,
+        "chosen_seed": int(prefix.chosen_seed),
+        "preflight_semantics_sha256": _semantic_digest(preflight),
+        "prefix_replay_semantics_sha256": _semantic_digest(prefix),
+        "semantic_match": True,
+        "failure_class": failure_class,
+        "failure_domain": "semantic",
+        "failure": prefix.failure,
+        "failure_source_tick": failure_source_tick,
+        "failure_execution_tick": failure_execution_tick,
+        "first_invalid_source_event_index": failure_event_index,
+        "safe_accepted_event_count": len(accepted_before_boundary),
+        "safe_accepted_action_transcript_sha256": hashlib.sha256(
+            json.dumps(
+                accepted_before_boundary,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "observation_tick_start": int(states[0].tick),
+        "observation_tick_stop_exclusive": int(last_tick + 1),
+        "action_label_tick_stop_exclusive": int(label_stop),
+        "timing_censor_tick_exclusive": int(label_stop),
+        "failure_tick_has_labels": False,
+        "terminal_target": "unknown_censored",
+        "terminal_validated": False,
+        "deployment_masks": "not_collected_audit_prefix",
+        "trace_batches": int(prefix.tick_trace_batches),
+        "trace_complete_frames": int(prefix.tick_trace_complete_frames),
+        "trace_incomplete_terminal_frames": int(
+            prefix.tick_trace_incomplete_terminal_frames
+        ),
+        "trace_incomplete_nonterminal_freeze_frames": int(
+            prefix.tick_trace_incomplete_nonterminal_freeze_frames
+        ),
+    }
+    return {
+        **dict(base),
+        REPLAY_EXTENT_METADATA_KEY: extent,
+        "every_native_tick_present": True,
+    }
 
 
 def execute_two_phase_plan(
@@ -1195,6 +1347,7 @@ def execute_two_phase_plan(
     plan: BattlePlan,
     template: Mapping[str, Any],
     staged: StagedTickSink,
+    prefix_staged: StagedTickSink | None = None,
     *,
     seed: int,
     maximum_seeds_to_test: int,
@@ -1244,6 +1397,57 @@ def execute_two_phase_plan(
             "native preflight unexpectedly produced Tick trace or mask probes"
         )
     if not preflight.teacher_forced_success:
+        prefix_result: NativeReplayResult | None = None
+        prefix_recorder: RecordingCountingEnv | None = None
+        prefix_seconds = 0.0
+        prefix_semantic_diff: dict[str, Any] | None = None
+        prefix_was_staged = False
+        if _traceable_semantic_prefix(preflight):
+            prefix_recorder = RecordingCountingEnv(env)
+            phase_state["failure_prefix_recorder"] = prefix_recorder
+            phase_state["failure_prefix_executed"] = True
+            phase_started = time.perf_counter()
+            try:
+                prefix_result = execute_plan(
+                    prefix_recorder,
+                    plan,
+                    template,
+                    None,
+                    seed=seed,
+                    fixed_seed=preflight.chosen_seed,
+                    maximum_seeds_to_test=maximum_seeds_to_test,
+                    capture_decisions=False,
+                    ability_branch_choices=None,
+                    tick_sink=None,
+                    trace_batch_steps=trace_batch_steps,
+                    capture_deployment_masks=False,
+                    collect_tick_states_on_failure=True,
+                    action_execution_tick_offset=(
+                        ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+                    ),
+                )
+            finally:
+                prefix_seconds = time.perf_counter() - phase_started
+                phase_state["failure_prefix_seconds"] = prefix_seconds
+            prefix_semantic_diff = diff_native_replay_semantics(
+                preflight, prefix_result
+            )
+            extent_metadata = (
+                None
+                if prefix_semantic_diff or prefix_result.teacher_forced_success
+                else _prefix_extent_metadata(
+                    preflight,
+                    prefix_result,
+                    base=tick_store_metadata,
+                )
+            )
+            if extent_metadata is not None and prefix_staged is not None:
+                prefix_staged.append(
+                    plan.battle_tag,
+                    prefix_result.collected_tick_states,
+                    extent_metadata,
+                )
+                prefix_was_staged = True
         return TwoPhaseNativeReplay(
             preflight=preflight,
             full_trace=None,
@@ -1251,7 +1455,11 @@ def execute_two_phase_plan(
             full_trace_recorder=None,
             preflight_seconds=preflight_seconds,
             full_trace_seconds=0.0,
-            semantic_diff=None,
+            semantic_diff=prefix_semantic_diff,
+            failure_prefix=prefix_result,
+            failure_prefix_recorder=prefix_recorder,
+            failure_prefix_seconds=prefix_seconds,
+            failure_prefix_staged=prefix_was_staged,
         )
 
     full_trace_recorder = RecordingCountingEnv(env)
@@ -1328,10 +1536,13 @@ _COUNTING_METRIC_KEYS = (
 def _combined_phase_metrics(
     preflight: RecordingCountingEnv,
     full_trace: RecordingCountingEnv | None,
+    failure_prefix: RecordingCountingEnv | None = None,
 ) -> dict[str, Any]:
     rows = [preflight.metrics()]
     if full_trace is not None:
         rows.append(full_trace.metrics())
+    if failure_prefix is not None:
+        rows.append(failure_prefix.metrics())
     combined = {
         key: sum(int(row[key]) for row in rows)
         for key in _COUNTING_METRIC_KEYS
@@ -1360,6 +1571,8 @@ def execute_task(
     template: Mapping[str, Any],
     sink: WorkerShardSink,
     registry: StoredFrameRegistry,
+    prefix_sink: WorkerShardSink | None = None,
+    prefix_registry: StoredFrameRegistry | None = None,
     *,
     worker_id: str,
     port: int,
@@ -1373,18 +1586,22 @@ def execute_task(
     """Execute one source and commit its Tick frame only after full success."""
     preflight_recorder = RecordingCountingEnv(env)
     full_trace_recorder: RecordingCountingEnv | None = None
+    failure_prefix_recorder: RecordingCountingEnv | None = None
     plan: BattlePlan | None = None
     preflight_result: NativeReplayResult | None = None
     result: NativeReplayResult | None = None
     two_phase: TwoPhaseNativeReplay | None = None
     staged = StagedTickSink()
+    prefix_staged = StagedTickSink()
     error: Exception | None = None
     error_traceback: str | None = None
     stage = "source_sha_verification"
     source_sha_verified = False
     store_entry: dict[str, Any] | None = None
+    audit_prefix_store_entry: dict[str, Any] | None = None
     preflight_seconds = 0.0
     full_trace_seconds = 0.0
+    failure_prefix_seconds = 0.0
     semantic_diff: dict[str, Any] | None = None
     phase_state: dict[str, Any] = {}
     started = time.perf_counter()
@@ -1409,6 +1626,7 @@ def execute_task(
             plan,
             template,
             staged,
+            prefix_staged=prefix_staged,
             seed=seed,
             maximum_seeds_to_test=maximum_seeds_to_test,
             trace_batch_steps=trace_batch_steps,
@@ -1434,11 +1652,33 @@ def execute_task(
         result = two_phase.result
         preflight_recorder = two_phase.preflight_recorder
         full_trace_recorder = two_phase.full_trace_recorder
+        failure_prefix_recorder = two_phase.failure_prefix_recorder
         preflight_seconds = two_phase.preflight_seconds
         full_trace_seconds = two_phase.full_trace_seconds
+        failure_prefix_seconds = two_phase.failure_prefix_seconds
         semantic_diff = two_phase.semantic_diff
         if not preflight_result.teacher_forced_success:
             stage = "preflight_first_native_difference"
+            if semantic_diff:
+                stage = "preflight_failure_prefix_semantic_diff"
+                raise PreflightFullTraceDivergence(semantic_diff)
+            if two_phase.failure_prefix_staged:
+                if prefix_staged.episode is None:
+                    raise RuntimeError("failure prefix was reported staged but is absent")
+                if prefix_sink is None or prefix_registry is None:
+                    # Unit callers may intentionally omit persistence.  The
+                    # production worker always supplies the isolated store.
+                    pass
+                else:
+                    stage = "immutable_prefix_tick_store_commit"
+                    if commit_guard is not None and not commit_guard():
+                        raise RuntimeError(
+                            "native task lease ownership was lost before prefix commit"
+                        )
+                    audit_prefix_store_entry = prefix_registry.commit_or_reuse(
+                        prefix_sink, prefix_staged.episode
+                    )
+                    stage = "preflight_first_native_difference"
         elif semantic_diff:
             stage = "preflight_full_trace_semantic_diff"
             raise PreflightFullTraceDivergence(semantic_diff)
@@ -1498,11 +1738,15 @@ def execute_task(
             "preflight_recorder", preflight_recorder
         )
         full_trace_recorder = phase_state.get("full_trace_recorder")
+        failure_prefix_recorder = phase_state.get("failure_prefix_recorder")
         preflight_seconds = float(
             phase_state.get("preflight_seconds", preflight_seconds)
         )
         full_trace_seconds = float(
             phase_state.get("full_trace_seconds", full_trace_seconds)
+        )
+        failure_prefix_seconds = float(
+            phase_state.get("failure_prefix_seconds", failure_prefix_seconds)
         )
 
     success = bool(
@@ -1512,9 +1756,11 @@ def execute_task(
         and store_entry is not None
     )
     metrics = _combined_phase_metrics(
-        preflight_recorder, full_trace_recorder
+        preflight_recorder, full_trace_recorder, failure_prefix_recorder
     )
-    active_recorder = full_trace_recorder or preflight_recorder
+    active_recorder = (
+        full_trace_recorder or failure_prefix_recorder or preflight_recorder
+    )
     if success:
         failure_class = failure = None
         first_difference = None
@@ -1584,6 +1830,18 @@ def execute_task(
         "preflight_seconds": preflight_seconds,
         "full_trace_executed": full_trace_executed,
         "full_trace_seconds": full_trace_seconds,
+        "failure_prefix_executed": failure_prefix_recorder is not None,
+        "failure_prefix_seconds": failure_prefix_seconds,
+        "failure_prefix_semantic_match": (
+            None
+            if two_phase is None or two_phase.failure_prefix is None
+            else not bool(two_phase.semantic_diff)
+        ),
+        "failure_prefix_tick_count": (
+            0
+            if prefix_staged.episode is None
+            else len(prefix_staged.episode.states)
+        ),
         "avoided_trace_ticks": avoided_trace_ticks,
         "preflight_native_ticks_advanced": (
             0
@@ -1607,6 +1865,11 @@ def execute_task(
         ),
         "preflight_native_action_metrics": preflight_metrics,
         "full_trace_native_action_metrics": full_trace_metrics,
+        "failure_prefix_native_action_metrics": (
+            None
+            if failure_prefix_recorder is None
+            else failure_prefix_recorder.metrics()
+        ),
         "preflight_action_acceptance_sequence": (
             []
             if preflight_result is None
@@ -1761,6 +2024,14 @@ def execute_task(
             None if result is None else result.observed_final_tower_hp
         ),
         "tick_store_entry": store_entry,
+        "audit_prefix_tick_store_entry": audit_prefix_store_entry,
+        "audit_prefix_extent": (
+            None
+            if prefix_staged.episode is None
+            else prefix_staged.episode.metadata.get(
+                REPLAY_EXTENT_METADATA_KEY
+            )
+        ),
         "wall_seconds": time.perf_counter() - started,
     }
     if success:
@@ -1796,6 +2067,11 @@ def execute_task(
             if two_phase is None or two_phase.full_trace is None
             else two_phase.full_trace.json()
         ),
+        "failure_prefix_native_result": (
+            None
+            if two_phase is None or two_phase.failure_prefix is None
+            else two_phase.failure_prefix.json()
+        ),
         "preflight_full_trace_semantic_diff": semantic_diff,
         "native_boundary_snapshot": active_recorder.snapshot(),
         "preflight_native_boundary_snapshot": preflight_recorder.snapshot(),
@@ -1803,6 +2079,11 @@ def execute_task(
             None
             if full_trace_recorder is None
             else full_trace_recorder.snapshot()
+        ),
+        "failure_prefix_native_boundary_snapshot": (
+            None
+            if failure_prefix_recorder is None
+            else failure_prefix_recorder.snapshot()
         ),
         "exception_traceback": error_traceback,
     }
@@ -1953,6 +2234,7 @@ def worker_loop(
     output_root: Path,
     template_path: Path,
     registry: StoredFrameRegistry,
+    prefix_registry: StoredFrameRegistry,
     seed: int,
     maximum_seeds_to_test: int,
     trace_batch_steps: int,
@@ -1965,8 +2247,12 @@ def worker_loop(
     worker_error: str | None = None
     started = time.perf_counter()
     sink: WorkerShardSink | None = None
+    prefix_sink: WorkerShardSink | None = None
     manifests: list[dict[str, Any]] = []
     recovered_final_shards = 0
+    recovered_prefix_shards = 0
+    prefix_manifests: list[dict[str, Any]] = []
+    prefix_episodes = prefix_ticks = 0
     try:
         template = load_template(template_path)
         native_ingest_contract = (
@@ -1980,6 +2266,16 @@ def worker_loop(
         sink = WorkerShardSink(
             output_root / "shards",
             worker_id,
+            episodes_per_shard=episodes_per_shard,
+            anchor_interval=256,
+            compression_level=1,
+        )
+        recovered_prefix_shards = recover_unmanifested_final_shards(
+            output_root / AUDIT_PREFIX_DIRECTORY, worker_id + "-prefix"
+        )
+        prefix_sink = WorkerShardSink(
+            output_root / AUDIT_PREFIX_DIRECTORY,
+            worker_id + "-prefix",
             episodes_per_shard=episodes_per_shard,
             anchor_interval=256,
             compression_level=1,
@@ -2009,6 +2305,8 @@ def worker_loop(
                             template,
                             sink,
                             registry,
+                            prefix_sink,
+                            prefix_registry,
                             worker_id=worker_id,
                             port=port,
                             attempt=raw_task.attempts,
@@ -2052,6 +2350,12 @@ def worker_loop(
                             successes += 1
                             stored_ticks += int(entry["ticks"])
                         else:
+                            prefix_entry = record.get(
+                                "audit_prefix_tick_store_entry"
+                            )
+                            if isinstance(prefix_entry, Mapping):
+                                prefix_episodes += 1
+                                prefix_ticks += int(prefix_entry["ticks"])
                             queue.fail(
                                 worker_id,
                                 task.battle_tag,
@@ -2070,6 +2374,14 @@ def worker_loop(
             except Exception as error:
                 if worker_error is None:
                     worker_error = f"shard_finalize_{type(error).__name__}: {error}"
+        if prefix_sink is not None:
+            try:
+                prefix_manifests = prefix_sink.finalize()
+            except Exception as error:
+                if worker_error is None:
+                    worker_error = (
+                        f"prefix_shard_finalize_{type(error).__name__}: {error}"
+                    )
     report = {
         "schema_version": GENERATOR_SCHEMA_VERSION,
         "kind": "expert_authoritative_native_tick_worker_report_v1",
@@ -2080,10 +2392,14 @@ def worker_loop(
         "successes": successes,
         "failures": failures,
         "stored_ticks": stored_ticks,
+        "audit_prefix_episodes": prefix_episodes,
+        "audit_prefix_ticks": prefix_ticks,
         "wall_seconds": time.perf_counter() - started,
         "worker_error": worker_error,
         "recovered_final_shards": recovered_final_shards,
+        "recovered_prefix_shards": recovered_prefix_shards,
         "newly_finalized_shards": manifests,
+        "newly_finalized_prefix_shards": prefix_manifests,
     }
     atomic_json(output_root / "workers" / f"{worker_id}.json", report)
     return report
@@ -2123,6 +2439,11 @@ def summarize_results(
 ) -> dict[str, Any]:
     successes = [row for row in results if row.get("teacher_forced_success")]
     failures = [row for row in results if not row.get("teacher_forced_success")]
+    prefixes = [
+        row for row in failures
+        if isinstance(row.get("audit_prefix_tick_store_entry"), Mapping)
+    ]
+    unframed = [row for row in failures if row not in prefixes]
     attempted = sum(int(row.get("native_actions_attempted") or 0) for row in results)
     accepted = sum(int(row.get("native_actions_accepted") or 0) for row in results)
     responded = sum(int(row.get("native_actions_responded") or 0) for row in results)
@@ -2169,6 +2490,30 @@ def summarize_results(
     stored_ticks = sum(
         int(row.get("tick_store_entry", {}).get("ticks", 0))
         for row in successes
+    )
+    audit_prefix_ticks = sum(
+        int(row["audit_prefix_tick_store_entry"].get("ticks", 0))
+        for row in prefixes
+    )
+    prefix_integrity = all(
+        isinstance(row.get("audit_prefix_extent"), Mapping)
+        and row["audit_prefix_extent"].get("kind") == REPLAY_EXTENT_KIND
+        and row["audit_prefix_extent"].get("extent") == "valid_prefix"
+        and row["audit_prefix_extent"].get("training_admission") == "audit_only"
+        and row["audit_prefix_extent"].get("terminal_target")
+        == "unknown_censored"
+        and row["audit_prefix_extent"].get("failure_tick_has_labels") is False
+        and row.get("failure_domain") == "semantic"
+        and row.get("failure_prefix_semantic_match") is True
+        and int(row.get("failure_prefix_tick_count") or 0) > 0
+        and int(row.get("deployment_mask_probe_rpc_count") or 0) == 0
+        and int(row.get("native_deployment_mask_probes_attempted") or 0) == 0
+        for row in prefixes
+    )
+    audit_tick_coverage_complete = bool(
+        len(successes) + len(prefixes) == len(tasks)
+        and not unframed
+        and prefix_integrity
     )
     mask_probe_rpcs = sum(
         int(row.get("native_deployment_mask_probes_attempted") or 0)
@@ -2323,6 +2668,15 @@ def summarize_results(
         ),
         "stored_episodes": len(successes),
         "stored_ticks": stored_ticks,
+        "audit_prefix_episodes": len(prefixes),
+        "audit_prefix_ticks": audit_prefix_ticks,
+        "audit_tick_episodes": len(successes) + len(prefixes),
+        "unframed_episodes": len(unframed),
+        "audit_tick_coverage_rate": _ratio(
+            len(successes) + len(prefixes), len(tasks)
+        ),
+        "audit_prefix_integrity": prefix_integrity,
+        "audit_tick_coverage_complete": audit_tick_coverage_complete,
         "native_deployment_mask_probe_rpcs": mask_probe_rpcs,
         "native_deployment_mask_probe_responses": mask_probe_responses,
         "native_deployment_mask_probe_exceptions": mask_probe_exceptions,
@@ -2367,20 +2721,32 @@ def summarize_results(
             and successful_mask_integrity
             and two_phase_integrity
             and semantic_divergences == 0
+            and audit_tick_coverage_complete
         ),
         "source_json_copied": False,
         "semantic_rejections_are_expected_subset_evidence": True,
     }
 
 
-def _physical_frame_valid(output_root: Path, record: Mapping[str, Any]) -> bool:
-    entry = record.get("tick_store_entry")
+def _physical_frame_valid(
+    output_root: Path,
+    record: Mapping[str, Any],
+    *,
+    prefix: bool = False,
+) -> bool:
+    entry = record.get(
+        "audit_prefix_tick_store_entry" if prefix else "tick_store_entry"
+    )
     if not isinstance(entry, Mapping):
         return False
     stem = str(entry.get("shard") or "")
     paths = [
-        output_root / "shards" / f"{stem}.crts",
-        output_root / "shards" / f"{stem}.crts.partial",
+        output_root
+        / (AUDIT_PREFIX_DIRECTORY if prefix else "shards")
+        / f"{stem}.crts",
+        output_root
+        / (AUDIT_PREFIX_DIRECTORY if prefix else "shards")
+        / f"{stem}.crts.partial",
     ]
     path = next((item for item in paths if item.exists()), None)
     if path is None:
@@ -2443,6 +2809,12 @@ def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
                     # The prior process died before returning this retryable
                     # attempt to pending.  The exclusive run lock lets the
                     # caller release the lease and execute the next attempt.
+                    continue
+                if isinstance(
+                    record.get("audit_prefix_tick_store_entry"), Mapping
+                ) and not _physical_frame_valid(
+                    output_root, record, prefix=True
+                ):
                     continue
                 with queue.connection:
                     queue.connection.execute(
@@ -2511,11 +2883,15 @@ def requeue_failed_infrastructure(
     return requeued
 
 
-def verify_published_tick_store(root: Path) -> dict[str, int]:
+def verify_published_tick_store(
+    root: Path,
+    *,
+    expected_kind: str = STORE_KIND,
+) -> dict[str, Any]:
     """Read-only validation of every data/index hash behind the store manifest."""
     manifest_path = root / "manifest.json"
     manifest = load_json(manifest_path)
-    if manifest.get("kind") != "cr_native_tick_store_v1":
+    if manifest.get("kind") != expected_kind:
         raise RuntimeError("published Tick Store manifest kind changed")
     mask_contract = (manifest.get("metadata") or {}).get(
         "native_deployment_masks"
@@ -2523,24 +2899,30 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
     mask_store: DeploymentMaskStore | None = None
     referenced_masks: set[str] = set()
     if mask_contract is not None:
-        if (
-            not isinstance(mask_contract, Mapping)
-            or mask_contract.get("required") is not True
-        ):
+        if not isinstance(mask_contract, Mapping):
             raise RuntimeError("published Tick Store mask contract is malformed")
-        expected_path = f"{MASK_STORE_DIRECTORY}/manifest.json"
-        if str(mask_contract.get("manifest") or "") != expected_path:
-            raise RuntimeError("published Tick Store mask manifest path changed")
-        mask_manifest_path = root / expected_path
-        if not mask_manifest_path.is_file():
-            raise RuntimeError("published Tick Store mask manifest is missing")
-        if sha256_file(mask_manifest_path) != str(
-            mask_contract.get("manifest_sha256") or ""
-        ):
-            raise RuntimeError("published Tick Store mask manifest hash changed")
-        mask_store = DeploymentMaskStore(root, create=False)
-        mask_store.verify_manifest()
+        if expected_kind == AUDIT_PREFIX_STORE_KIND:
+            if mask_contract != {"required": False}:
+                raise RuntimeError(
+                    "audit-prefix Tick Store must explicitly forbid masks"
+                )
+        else:
+            if mask_contract.get("required") is not True:
+                raise RuntimeError("published Tick Store mask contract is malformed")
+            expected_path = f"{MASK_STORE_DIRECTORY}/manifest.json"
+            if str(mask_contract.get("manifest") or "") != expected_path:
+                raise RuntimeError("published Tick Store mask manifest path changed")
+            mask_manifest_path = root / expected_path
+            if not mask_manifest_path.is_file():
+                raise RuntimeError("published Tick Store mask manifest is missing")
+            if sha256_file(mask_manifest_path) != str(
+                mask_contract.get("manifest_sha256") or ""
+            ):
+                raise RuntimeError("published Tick Store mask manifest hash changed")
+            mask_store = DeploymentMaskStore(root, create=False)
+            mask_store.verify_manifest()
     episodes = ticks = total_bytes = 0
+    battle_tags: set[str] = set()
     shard_names: set[str] = set()
     for shard in manifest.get("shards") or []:
         if not isinstance(shard, Mapping):
@@ -2571,6 +2953,11 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
         if shard_ticks != int(shard["tick_count"]):
             raise RuntimeError(f"published Tick Store Tick count changed: {name}")
         episodes += len(entries)
+        for entry in entries:
+            tag = str(entry.get("battle_tag") or "")
+            if not tag or tag in battle_tags:
+                raise RuntimeError("published Tick Store battle tags are not unique")
+            battle_tags.add(tag)
         ticks += shard_ticks
         total_bytes += data.stat().st_size
         if mask_store is not None:
@@ -2595,6 +2982,42 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
                         for item in metadata["entries"]
                         for variant in item["dynamic_label_variants"]
                     )
+        elif expected_kind == AUDIT_PREFIX_STORE_KIND:
+            with data.open("rb") as handle:
+                for entry in entries:
+                    handle.seek(int(entry["offset"]))
+                    raw_header = handle.read(FRAME_HEADER.size)
+                    _, payload_size, _, _, _, _ = FRAME_HEADER.unpack(raw_header)
+                    reader = EpisodeReader(handle.read(payload_size))
+                    extent = reader.metadata.get(REPLAY_EXTENT_METADATA_KEY)
+                    states = tuple(reader.iter_ticks())
+                    if (
+                        not isinstance(extent, Mapping)
+                        or extent.get("kind") != REPLAY_EXTENT_KIND
+                        or extent.get("extent") != "valid_prefix"
+                        or extent.get("training_admission") != "audit_only"
+                        or extent.get("source_episode_complete") is not False
+                        or extent.get("semantic_match") is not True
+                        or extent.get("failure_domain") != "semantic"
+                        or extent.get("failure_tick_has_labels") is not False
+                        or extent.get("terminal_target") != "unknown_censored"
+                        or extent.get("terminal_validated") is not False
+                        or extent.get("deployment_masks")
+                        != "not_collected_audit_prefix"
+                        or int(extent.get("trace_complete_frames", -1))
+                        != len(states)
+                        or not states
+                        or len(states) != int(entry["ticks"])
+                        or int(extent.get("observation_tick_start", -1))
+                        != states[0].tick
+                        or int(extent.get("observation_tick_stop_exclusive", -1))
+                        != states[-1].tick + 1
+                        or int(extent.get("action_label_tick_stop_exclusive", -1))
+                        > states[-1].tick + 1
+                    ):
+                        raise RuntimeError(
+                            f"published audit prefix metadata changed: {entry.get('battle_tag')}"
+                        )
     if (
         episodes != int(manifest.get("episode_count", -1))
         or ticks != int(manifest.get("tick_count", -1))
@@ -2606,7 +3029,14 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
         "ticks": ticks,
         "bytes": total_bytes,
         "deployment_mask_sidecars_referenced": len(referenced_masks),
+        "battle_tags": sorted(battle_tags),
     }
+
+
+def verify_published_audit_prefix_store(root: Path) -> dict[str, Any]:
+    return verify_published_tick_store(
+        root, expected_kind=AUDIT_PREFIX_STORE_KIND
+    )
 
 
 def completed_run_summary(
@@ -2619,8 +3049,12 @@ def completed_run_summary(
     summary_path = output_root / "summary.json"
     results_path = output_root / "results.jsonl"
     store_manifest_path = output_root / "shards" / "manifest.json"
+    prefix_manifest_path = (
+        output_root / AUDIT_PREFIX_DIRECTORY / "manifest.json"
+    )
     if not all(path.exists() for path in (
         manifest_path, summary_path, results_path, store_manifest_path,
+        prefix_manifest_path,
     )):
         return None
     with TickStoreWorkQueue(queue_path) as queue:
@@ -2641,6 +3075,9 @@ def completed_run_summary(
         "results_sha256": sha256_file(results_path),
         "summary_sha256": sha256_file(summary_path),
         "tick_store_manifest_sha256": sha256_file(store_manifest_path),
+        "audit_prefix_tick_store_manifest_sha256": sha256_file(
+            prefix_manifest_path
+        ),
     }
     mask_manifest_path = (
         output_root / "shards" / MASK_STORE_DIRECTORY / "manifest.json"
@@ -2657,11 +3094,21 @@ def completed_run_summary(
         if str(content.get(key) or "") != expected:
             raise RuntimeError(f"published native dataset {key} changed")
     physical = verify_published_tick_store(output_root / "shards")
+    prefix_physical = verify_published_audit_prefix_store(
+        output_root / AUDIT_PREFIX_DIRECTORY
+    )
     if int(summary.get("processed_battles", -1)) != len(tasks):
         raise RuntimeError("published summary task count changed")
     if (
         physical["episodes"] != int(summary.get("stored_episodes", -1))
         or physical["ticks"] != int(summary.get("stored_ticks", -1))
+        or prefix_physical["episodes"]
+        != int(summary.get("audit_prefix_episodes", -1))
+        or prefix_physical["ticks"]
+        != int(summary.get("audit_prefix_ticks", -1))
+        or set(physical["battle_tags"]) & set(prefix_physical["battle_tags"])
+        or len(physical["battle_tags"]) + len(prefix_physical["battle_tags"])
+        != len(tasks)
     ):
         raise RuntimeError("published summary and physical Tick Store differ")
     return {
@@ -2769,6 +3216,9 @@ def run_generation(
         if completed is not None:
             return completed
         registry = StoredFrameRegistry(output_root / "shards")
+        prefix_registry = StoredFrameRegistry(
+            output_root / AUDIT_PREFIX_DIRECTORY
+        )
         started = time.perf_counter()
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2781,6 +3231,7 @@ def run_generation(
                     output_root=output_root,
                     template_path=template_path.resolve(strict=True),
                     registry=registry,
+                    prefix_registry=prefix_registry,
                     seed=seed,
                     maximum_seeds_to_test=maximum_seeds_to_test,
                     trace_batch_steps=trace_batch_steps,
@@ -2870,6 +3321,32 @@ def run_generation(
             summary["deployment_mask_sidecar_bytes"] = int(
                 mask_manifest["bytes"]
             )
+            prefix_store = build_store_manifest(
+                output_root / AUDIT_PREFIX_DIRECTORY,
+                source_manifest=selection_path,
+                expected_episodes=int(summary["audit_prefix_episodes"]),
+                expected_ticks=int(summary["audit_prefix_ticks"]),
+                store_kind=AUDIT_PREFIX_STORE_KIND,
+                store_metadata={
+                    "generator_kind": GENERATOR_KIND,
+                    "episode_extent": "valid_prefix",
+                    "training_admission": "audit_only",
+                    "terminal_target": "unknown_censored",
+                    "native_deployment_masks": {"required": False},
+                },
+            )
+            prefix_manifest_path = (
+                output_root / AUDIT_PREFIX_DIRECTORY / "manifest.json"
+            )
+            summary["audit_prefix_stored_bytes"] = int(
+                prefix_store["total_bytes"]
+            )
+            summary["audit_prefix_tick_store_manifest"] = str(
+                prefix_manifest_path.resolve()
+            )
+            summary["audit_prefix_tick_store_manifest_sha256"] = (
+                sha256_file(prefix_manifest_path)
+            )
         atomic_json(output_root / "summary.json", summary)
         if summary["publication_ready"]:
             manifest = {
@@ -2906,6 +3383,8 @@ def run_generation(
                         "selected_battles", "processed_battles",
                         "teacher_forced_successes", "teacher_forced_failures",
                         "stored_episodes", "stored_ticks",
+                        "audit_prefix_episodes", "audit_prefix_ticks",
+                        "audit_tick_episodes", "unframed_episodes",
                         "native_actions_attempted", "native_actions_accepted",
                         "native_deployment_mask_probe_rpcs",
                         "native_deployment_mask_dynamic_label_probe_rpcs",
@@ -2927,6 +3406,12 @@ def run_generation(
                     "deployment_mask_store_manifest_sha256": sha256_file(
                         output_root / "shards" / MASK_STORE_DIRECTORY
                         / "manifest.json"
+                    ),
+                    "audit_prefix_tick_store_manifest": (
+                        f"{AUDIT_PREFIX_DIRECTORY}/manifest.json"
+                    ),
+                    "audit_prefix_tick_store_manifest_sha256": sha256_file(
+                        output_root / AUDIT_PREFIX_DIRECTORY / "manifest.json"
                     ),
                 },
             }

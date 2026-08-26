@@ -21,6 +21,7 @@ FRAME_MAGIC = b"EPS1"
 FRAME_HEADER = struct.Struct("<4sQIQII")
 SHARD_KIND = "cr_native_tick_shard_v1"
 STORE_KIND = "cr_native_tick_store_v1"
+AUDIT_PREFIX_STORE_KIND = "cr_native_tick_prefix_audit_store_v1"
 
 
 class ShardCorruptionError(ValueError):
@@ -400,6 +401,7 @@ def build_store_manifest(
     expected_episodes: int,
     expected_ticks: int | None = None,
     store_metadata: Mapping[str, Any] | None = None,
+    store_kind: str = STORE_KIND,
 ) -> dict[str, Any]:
     """Hash every immutable shard and atomically publish the global store."""
     root = root.resolve(strict=True)
@@ -430,9 +432,11 @@ def build_store_manifest(
     content_digest = hashlib.sha256(
         json.dumps(digest_input, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    if store_kind not in {STORE_KIND, AUDIT_PREFIX_STORE_KIND}:
+        raise ValueError(f"unsupported Tick Store kind: {store_kind}")
     manifest = {
         "schema_version": 1,
-        "kind": STORE_KIND,
+        "kind": store_kind,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_manifest": {
             "path": str(source_manifest),

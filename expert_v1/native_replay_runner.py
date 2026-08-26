@@ -374,12 +374,16 @@ def execute_plan(
     tick_store_metadata: Mapping[str, Any] | None = None,
     trace_batch_steps: int = 64,
     capture_deployment_masks: bool = False,
+    collect_tick_states_on_failure: bool = False,
     action_execution_tick_offset: int = (
         ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
     ),
 ) -> NativeReplayResult:
     """Replay one battle with gap-batched native stepping."""
-    if tick_sink is not None and not 1 <= trace_batch_steps <= 64:
+    if (
+        (tick_sink is not None or collect_tick_states_on_failure)
+        and not 1 <= trace_batch_steps <= 64
+    ):
         raise ValueError("trace_batch_steps must be in 1..64")
     # Validate the experimental execution boundary even when the source plan
     # happens to be empty.  Source labels are immutable RoyaleAPI ``time_raw``
@@ -414,7 +418,11 @@ def execute_plan(
     deployment_mask_label_rejections = 0
     deployment_mask_first_label_rejection: dict[str, Any] | None = None
     logic_freeze_diagnostic: dict[str, Any] | None = None
-    tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
+    tick_accumulator = (
+        TickTraceAccumulator()
+        if tick_sink is not None or collect_tick_states_on_failure
+        else None
+    )
     del calibration
     allowed_abilities = [ability_cards(side.deck) for side in plan.sides]
     missing_ability_events = sum(

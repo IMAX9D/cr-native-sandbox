@@ -21,6 +21,7 @@ from expert_v1.compile_native_bc_dataset import (
     _assign_components,
     _release_capacity_reservation,
     _stratified_capacity_sample,
+    _validate_tick_store,
     compile_planned_shards,
     create_compile_plan,
     finalize_dataset,
@@ -50,6 +51,7 @@ from expert_v1.tick_store_v1.schema import (
     TowerState,
 )
 from expert_v1.tick_store_v1.shard import (
+    AUDIT_PREFIX_STORE_KIND,
     AppendOnlyShardWriter,
     build_store_manifest,
 )
@@ -352,6 +354,16 @@ class NativeBcCompilerTests(unittest.TestCase):
             expected_episodes=3,
             expected_ticks=3 * 181,
         )
+        prefix_root = root / "audit-prefix-shards"
+        prefix_root.mkdir()
+        prefix_manifest = build_store_manifest(
+            prefix_root,
+            source_manifest=index,
+            expected_episodes=0,
+            expected_ticks=0,
+            store_kind=AUDIT_PREFIX_STORE_KIND,
+            store_metadata={"training_admission": "audit_only"},
+        )
         candidate_queue = root / "candidate-queue.jsonl"
         candidate_queue.write_text(
             "".join(
@@ -410,6 +422,13 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "teacher_forced_successes": 3,
                     "teacher_forced_failures": 0,
                     "stored_episodes": 3,
+                    "audit_prefix_episodes": 0,
+                    "audit_tick_episodes": 3,
+                    "unframed_episodes": 0,
+                    "audit_tick_coverage_rate": 1.0,
+                    "audit_prefix_store": file_fingerprint(
+                        prefix_root / "manifest.json"
+                    ),
                     "success_rate": 1.0,
                     "minimum_success_rate": 0.50,
                     "ability_coverage": ability_coverage,
@@ -578,6 +597,17 @@ class NativeBcCompilerTests(unittest.TestCase):
             ):
                 finalize_dataset(plan)
 
+    def test_audit_prefix_store_is_explicitly_rejected_by_bc_compiler(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _tick_root, _source, _contract, receipt = self._inputs(root)
+            coverage = json.loads(receipt.read_text())
+            prefix_root = Path(coverage["audit_prefix_store"]["path"]).parent
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "audit-prefix.*audit_only"
+            ):
+                _validate_tick_store(prefix_root, workers=1)
+
     def test_capacity_preflight_is_bound_and_low_disk_fails_before_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -646,6 +676,28 @@ class NativeBcCompilerTests(unittest.TestCase):
             value = json.loads(receipt.read_text())
             candidate_queue = Path(value["candidate_queue"]["path"])
             results_path = Path(value["results"]["path"])
+            prefix_root = Path(value["audit_prefix_store"]["path"]).parent
+            with AppendOnlyShardWriter(prefix_root, "prefix-worker") as writer:
+                prefix_entry = writer.append(
+                    "ABILITYFAIL",
+                    _states(
+                        json.loads(
+                            Path(json.loads(source.read_text().splitlines()[0])["source_path"])
+                            .read_text()
+                        ),
+                        load_native_ingest_contract(contract),
+                    )[:1],
+                    {"training_admission": "audit_only"},
+                )
+                writer.finalize()
+            build_store_manifest(
+                prefix_root,
+                source_manifest=source,
+                expected_episodes=1,
+                expected_ticks=1,
+                store_kind=AUDIT_PREFIX_STORE_KIND,
+                store_metadata={"training_admission": "audit_only"},
+            )
             candidate_rows = [
                 {
                     "battle_tag": f"SCHEMA5FIXTURE{number}",
@@ -668,6 +720,16 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "final_attempt": True,
                     "teacher_forced_success": False,
                     "failure_class": "semantic",
+                    "failure_domain": "semantic",
+                    "failure_prefix_semantic_match": True,
+                    "audit_prefix_tick_store_entry": prefix_entry,
+                    "audit_prefix_extent": {
+                        "kind": "cr_native_replay_extent_v1",
+                        "extent": "valid_prefix",
+                        "training_admission": "audit_only",
+                        "terminal_target": "unknown_censored",
+                        "failure_tick_has_labels": False,
+                    },
                 }
             ]
             candidate_queue.write_text(
@@ -696,6 +758,13 @@ class NativeBcCompilerTests(unittest.TestCase):
                 teacher_forced_successes=3,
                 teacher_forced_failures=1,
                 stored_episodes=3,
+                audit_prefix_episodes=1,
+                audit_tick_episodes=4,
+                unframed_episodes=0,
+                audit_tick_coverage_rate=1.0,
+                audit_prefix_store=file_fingerprint(
+                    prefix_root / "manifest.json"
+                ),
                 success_rate=0.75,
                 ability_coverage=ability,
                 candidate_queue=file_fingerprint(candidate_queue),

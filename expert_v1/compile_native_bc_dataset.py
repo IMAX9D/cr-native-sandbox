@@ -46,6 +46,7 @@ from .tick_store_v1.deployment_masks import (
     verify_deployment_labels,
 )
 from .tick_store_v1.shard import SHARD_KIND as TICK_SHARD_KIND
+from .tick_store_v1.shard import AUDIT_PREFIX_STORE_KIND
 from .tick_store_v1.shard import STORE_KIND as TICK_STORE_KIND
 from .tick_store_v1.shard import ShardReader, sha256_file
 from .tick_store_v1.schema import ActorTick, TickState, actor_projection
@@ -283,6 +284,11 @@ def _validate_tick_store(root: Path, *, workers: int) -> tuple[dict[str, Any], l
     if not manifest_path.is_file():
         raise NativeBcCompileError(f"Tick Store manifest is missing: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    if manifest.get("kind") == AUDIT_PREFIX_STORE_KIND:
+        raise NativeBcCompileError(
+            "audit-prefix Tick Store is training_admission=audit_only and "
+            "cannot be compiled as BC data"
+        )
     if (
         manifest.get("kind") != TICK_STORE_KIND
         or int(manifest.get("schema_version", -1)) != 1
@@ -611,12 +617,33 @@ def _authenticate_native_generation_receipt(
         receipt.get("teacher_forced_failures"), "coverage failures"
     )
     stored = _require_integer(receipt.get("stored_episodes"), "coverage stored")
+    prefix_stored = _require_integer(
+        receipt.get("audit_prefix_episodes"), "coverage audit prefixes"
+    )
+    audit_episodes = _require_integer(
+        receipt.get("audit_tick_episodes"), "coverage audited episodes"
+    )
+    unframed = _require_integer(
+        receipt.get("unframed_episodes"), "coverage unframed episodes"
+    )
+    prefix_manifest_path = _verify_coverage_fingerprint(
+        receipt.get("audit_prefix_store"), "audit-prefix store"
+    )
+    prefix_manifest = json.loads(
+        prefix_manifest_path.read_text(encoding="utf-8-sig")
+    )
     if (
         selected != target
         or processed != target
         or successes + failures != target
         or stored != successes
         or stored != expected_episodes
+        or prefix_stored != failures
+        or audit_episodes != target
+        or unframed != 0
+        or float(receipt.get("audit_tick_coverage_rate", -1)) != 1.0
+        or prefix_manifest.get("kind") != AUDIT_PREFIX_STORE_KIND
+        or int(prefix_manifest.get("episode_count", -1)) != prefix_stored
         or float(receipt.get("success_rate", -1)) != successes / target
         or successes / target < float(receipt.get("minimum_success_rate", 2))
     ):
@@ -669,6 +696,14 @@ def _authenticate_native_generation_receipt(
         "admitted"
     ) is not True:
         raise NativeBcCompileError("native ability coverage receipt is not admitted")
+    if (
+        len(audit.get("success_tags") or []) != successes
+        or len(audit.get("audit_prefix_tags") or []) != prefix_stored
+        or audit.get("unframed_tags") != []
+        or set(audit.get("success_tags") or [])
+        & set(audit.get("audit_prefix_tags") or [])
+    ):
+        raise NativeBcCompileError("native audit-prefix coverage is not exact")
     return {
         "receipt_path": str(receipt_path),
         "receipt_sha256": sha256_file(receipt_path),

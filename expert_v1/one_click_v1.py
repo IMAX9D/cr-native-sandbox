@@ -516,6 +516,10 @@ class OneClickConfig:
         return self.native_root / "shards"
 
     @property
+    def audit_prefix_store_root(self) -> Path:
+        return self.native_root / "audit-prefix-shards"
+
+    @property
     def tick_validation_receipt(self) -> Path:
         return self.data_root / "receipts" / "tick-store-validation.json"
 
@@ -1082,6 +1086,9 @@ def validate_native_result_records(
         raise OneClickError("candidate queue tag set is malformed")
     seen: set[str] = set()
     successes = 0
+    success_tags: set[str] = set()
+    prefix_tags: set[str] = set()
+    unframed_tags: set[str] = set()
     failure_classes: dict[str, int] = {}
     cohorts: dict[str, dict[str, Any]] = {
         "ability_positive": {
@@ -1125,9 +1132,34 @@ def validate_native_result_records(
             cohort = cohorts[cohort_name]
             cohort["attempted"] += 1
             if row["teacher_forced_success"]:
+                if row.get("audit_prefix_tick_store_entry") is not None:
+                    raise OneClickError("successful native result references prefix frame")
                 successes += 1
+                success_tags.add(tag)
                 cohort["successes"] += 1
             else:
+                prefix_entry = row.get("audit_prefix_tick_store_entry")
+                extent = row.get("audit_prefix_extent")
+                if isinstance(prefix_entry, Mapping):
+                    if (
+                        not isinstance(extent, Mapping)
+                        or extent.get("kind") != "cr_native_replay_extent_v1"
+                        or extent.get("extent") != "valid_prefix"
+                        or extent.get("training_admission") != "audit_only"
+                        or extent.get("terminal_target") != "unknown_censored"
+                        or extent.get("failure_tick_has_labels") is not False
+                        or row.get("failure_domain") != "semantic"
+                        or row.get("failure_prefix_semantic_match") is not True
+                        or int(prefix_entry.get("ticks", 0)) <= 0
+                        or int(
+                            row.get("native_deployment_mask_probes_attempted")
+                            or 0
+                        ) != 0
+                    ):
+                        raise OneClickError("audit-prefix result contract changed")
+                    prefix_tags.add(tag)
+                else:
+                    unframed_tags.add(tag)
                 cohort["failures"] += 1
                 failure_class = str(row.get("failure_class") or "unknown")
                 failure_classes[failure_class] = (
@@ -1155,6 +1187,10 @@ def validate_native_result_records(
         "successes": successes,
         "failures": len(seen) - successes,
         "failure_class_counts": dict(sorted(failure_classes.items())),
+        "success_tags": sorted(success_tags),
+        "audit_prefix_tags": sorted(prefix_tags),
+        "unframed_tags": sorted(unframed_tags),
+        "audit_tick_episodes": len(success_tags) + len(prefix_tags),
         **cohorts,
     }
 
@@ -1616,6 +1652,9 @@ class OneClickOrchestrator:
             summary_path = config.native_root / "summary.json"
             manifest_path = config.native_root / "manifest.json"
             store_manifest = config.tick_store_root / "manifest.json"
+            prefix_store_manifest = (
+                config.audit_prefix_store_root / "manifest.json"
+            )
             mask_manifest = (
                 config.tick_store_root / "deployment-masks-v1" / "manifest.json"
             )
@@ -1632,6 +1671,8 @@ class OneClickOrchestrator:
             successes = int(summary.get("teacher_forced_successes", -1))
             failures = int(summary.get("teacher_forced_failures", -1))
             stored = int(summary.get("stored_episodes", -1))
+            prefix_stored = int(summary.get("audit_prefix_episodes", -1))
+            unframed = int(summary.get("unframed_episodes", -1))
             success_rate = successes / config.target
             ability_coverage = evaluate_ability_positive_coverage(
                 queue_summary,
@@ -1661,6 +1702,17 @@ class OneClickOrchestrator:
                 "teacher_forced_successes": successes,
                 "teacher_forced_failures": failures,
                 "stored_episodes": stored,
+                "audit_prefix_episodes": prefix_stored,
+                "audit_tick_episodes": int(
+                    summary.get("audit_tick_episodes", -1)
+                ),
+                "unframed_episodes": unframed,
+                "audit_tick_coverage_rate": summary.get(
+                    "audit_tick_coverage_rate"
+                ),
+                "audit_prefix_store": file_fingerprint(
+                    prefix_store_manifest
+                ),
                 "success_rate": success_rate,
                 "minimum_success_rate": config.minimum_native_success_rate,
                 "ability_coverage": ability_coverage,
@@ -1687,6 +1739,15 @@ class OneClickOrchestrator:
                 or processed != config.target
                 or successes + failures != config.target
                 or stored != successes
+                or prefix_stored != failures
+                or unframed != 0
+                or int(summary.get("audit_tick_episodes", -1)) != config.target
+                or summary.get("audit_tick_coverage_complete") is not True
+                or set(result_audit["success_tags"])
+                & set(result_audit["audit_prefix_tags"])
+                or len(result_audit["success_tags"])
+                + len(result_audit["audit_prefix_tags"])
+                != config.target
                 or summary.get("missing_result_tags") != []
                 or summary.get("unexpected_result_tags") != []
                 or success_rate < config.minimum_native_success_rate
@@ -1712,6 +1773,7 @@ class OneClickOrchestrator:
                     manifest_path,
                     store_manifest,
                     mask_manifest,
+                    prefix_store_manifest,
                     results_path,
                     config.native_generation_receipt,
                 ]
@@ -1726,6 +1788,9 @@ class OneClickOrchestrator:
                 ],
                 "ability_coverage": ability_coverage,
                 "stored_episodes": stored,
+                "audit_prefix_episodes": prefix_stored,
+                "audit_tick_episodes": int(summary["audit_tick_episodes"]),
+                "unframed_episodes": unframed,
                 "stored_ticks": int(summary["stored_ticks"]),
             }
 
@@ -1736,6 +1801,9 @@ class OneClickOrchestrator:
         native_manifest = config.native_root / "manifest.json"
         summary_path = config.native_root / "summary.json"
         store_manifest = config.tick_store_root / "manifest.json"
+        prefix_store_manifest = (
+            config.audit_prefix_store_root / "manifest.json"
+        )
         mask_manifest = (
             config.tick_store_root / "deployment-masks-v1" / "manifest.json"
         )
@@ -1744,6 +1812,7 @@ class OneClickOrchestrator:
                 native_manifest,
                 summary_path,
                 store_manifest,
+                prefix_store_manifest,
                 mask_manifest,
                 config.native_root / "results.jsonl",
                 config.native_generation_receipt,
@@ -1761,10 +1830,14 @@ class OneClickOrchestrator:
             # immutable CRTS/index SHA and every episode's content-addressed
             # deployment-mask metadata before compilation can begin.
             from expert_v1.native_dataset_generator import (
+                verify_published_audit_prefix_store,
                 verify_published_tick_store,
             )
 
             physical = verify_published_tick_store(config.tick_store_root)
+            prefix_physical = verify_published_audit_prefix_store(
+                config.audit_prefix_store_root
+            )
             summary = _read_json(summary_path)
             coverage = _read_json(config.native_generation_receipt)
             if (
@@ -1780,6 +1853,15 @@ class OneClickOrchestrator:
                     "admitted"
                 )
                 is not True
+                or prefix_physical["episodes"]
+                != int(summary.get("audit_prefix_episodes", -1))
+                or prefix_physical["ticks"]
+                != int(summary.get("audit_prefix_ticks", -1))
+                or set(physical["battle_tags"])
+                & set(prefix_physical["battle_tags"])
+                or len(physical["battle_tags"])
+                + len(prefix_physical["battle_tags"])
+                != config.target
             ):
                 raise OneClickError(
                     "Tick Store/Mask physical validation disagrees with summary"
@@ -1790,6 +1872,7 @@ class OneClickOrchestrator:
                 "created_utc": utc_now(),
                 "inputs": inputs,
                 "physical": physical,
+                "audit_prefix_physical": prefix_physical,
             }
             _atomic_json(config.tick_validation_receipt, receipt)
             return [file_fingerprint(config.tick_validation_receipt)], physical
@@ -1880,6 +1963,7 @@ class OneClickOrchestrator:
             config.native_root / "manifest.json",
             config.native_root / "results.jsonl",
             config.tick_store_root / "manifest.json",
+            config.audit_prefix_store_root / "manifest.json",
             config.tick_store_root / "deployment-masks-v1" / "manifest.json",
             config.native_generation_receipt,
         ]
