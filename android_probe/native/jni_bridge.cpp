@@ -673,6 +673,61 @@ Java_royale_nativehost_JniHost_nativeAct(
   memory.read(entry_address + 0x41, &entry_b41);
   memory.read(entry_address + 0x44, &entry_i44);
   memory.read(entry_address + 0x48, &entry_i48);
+  // Preserve the exact native command guards and resource inputs seen by the
+  // executor.  Placement validity alone is insufficient to diagnose a
+  // rejected command: D8D520 returns 4 when D503D0's battle-level command
+  // gate is closed, and 13 when the current integer elixir is below the
+  // packed selection cost.  These are read-only diagnostics; execution still
+  // goes through the authoritative native command below.
+  auto command_hard_gate = reinterpret_cast<BattleLogicPredicate>(
+      base + kBattleCommandHardGateRva);
+  auto command_gate = reinterpret_cast<BattleLogicPredicate>(
+      base + kBattleCommandGateRva);
+  auto player_elixir = reinterpret_cast<PlayerElixir>(
+      base + kPlayerElixirRva);
+  auto next_deck_index = reinterpret_cast<NextDeckIndex>(
+      base + kNextDeckIndexRva);
+  const bool hard_gate_before = command_hard_gate(
+      reinterpret_cast<void*>(battle_logic));
+  const bool command_gate_before = command_gate(
+      reinterpret_cast<void*>(battle_logic));
+  int32_t battle_phase = -1, logic_state = -1;
+  int32_t logic_end_counter = -1, logic_player_count = -1;
+  int32_t logic_substate = -1, mode_target = -1, mode_counter = -1;
+  uint8_t mode_flag_116 = 0, mode_flag_191 = 0, battle_flag_1e9 = 0;
+  uint64_t logic_substate_ptr = 0, mode_config = 0;
+  memory.read(battle + 0x24, &battle_phase);
+  memory.read(battle + 0x1E9, &battle_flag_1e9);
+  memory.read(battle_logic + 0x18, &logic_state);
+  memory.read(battle_logic + 0x60, &logic_player_count);
+  memory.read(battle_logic + 0x198, &logic_end_counter);
+  if (memory.read(battle_logic + 0x1B0, &logic_substate_ptr) &&
+      logic_substate_ptr != 0) {
+    memory.read(logic_substate_ptr + 0x08, &logic_substate);
+    if (memory.read(logic_substate_ptr + 0x18, &mode_config) &&
+        mode_config != 0) {
+      memory.read(mode_config + 0x110, &mode_target);
+      memory.read(mode_config + 0x116, &mode_flag_116);
+      memory.read(mode_config + 0x191, &mode_flag_191);
+      memory.read(mode_config + 0x194, &mode_counter);
+    }
+  }
+  const uintptr_t player_address = reinterpret_cast<uintptr_t>(player);
+  int32_t elixir_raw_before = -1, refill_timer_before = -1;
+  int32_t hand_size_before = -1, cycle_size_before = -1;
+  int32_t deck_count_before = -1;
+  memory.read(player_address + 0x2F8, &elixir_raw_before);
+  memory.read(player_address + 0x218, &refill_timer_before);
+  memory.read(player_address + 0x22C, &hand_size_before);
+  memory.read(player_address + 0x23C, &cycle_size_before);
+  memory.read(player_address + 0x240, &deck_count_before);
+  const int32_t elixir_before = player_elixir(player);
+  const int32_t card_cost =
+      static_cast<int32_t>(static_cast<uint32_t>(packed_selection) >> 28);
+  const int32_t resource_deficit_raw =
+      std::max(0, card_cost * 10000 - elixir_raw_before);
+  const int32_t next_deck_index_before = next_deck_index(
+      reinterpret_cast<void*>(player_address + 0x210));
   auto resolve_selection = reinterpret_cast<ResolveCanonicalSelection>(
       base + kResolveCanonicalSelectionRva);
   auto validate_deployment = reinterpret_cast<ValidateDeployment>(
@@ -719,15 +774,35 @@ Java_royale_nativehost_JniHost_nativeAct(
       : placement_code == 5
       ? "blocked_tile_or_card_constraint"
       : "selection_unavailable";
-  char payload[1024];
+  const char* result_reason = result_code == 0
+      ? "accepted"
+      : result_code == 3
+      ? "battle_command_hard_gate"
+      : result_code == 4
+      ? "battle_command_gate"
+      : result_code == 13
+      ? "insufficient_elixir"
+      : "native_command_rejected";
+  char payload[2048];
   std::snprintf(
       payload, sizeof(payload),
       "{\"accepted\":%s,\"result_code\":%d,\"tick\":%d,"
+      "\"result_reason\":\"%s\","
       "\"side\":%d,\"deck_index\":%d,\"hand_index\":%d,"
       "\"x\":%d,\"y\":%d,"
       "\"dry_run\":%s,\"placement_valid\":%s,"
       "\"placement_code\":%d,\"placement_reason\":\"%s\","
       "\"packed_selection\":%d,\"execution_flags\":%d,"
+      "\"guard_before\":{\"hard_gate\":%s,\"command_gate\":%s,"
+      "\"battle_phase\":%d,\"battle_flag_1e9\":%d,"
+      "\"logic_state\":%d,\"logic_substate\":%d,"
+      "\"logic_end_counter_198\":%d,\"logic_player_count_60\":%d,"
+      "\"mode_target_110\":%d,\"mode_flag_116\":%d,"
+      "\"mode_flag_191\":%d,\"mode_counter_194\":%d},"
+      "\"resource_before\":{\"elixir\":%d,\"elixir_raw\":%d,"
+      "\"card_cost\":%d,\"deficit_raw\":%d,"
+      "\"refill_timer\":%d,\"next_deck_index\":%d,"
+      "\"hand_size\":%d,\"cycle_size\":%d,\"deck_count\":%d},"
       "\"entry_fields\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
       "\"entry_vtable_rva\":\"0x%llx\","
       "\"entry_json_loader_rva\":\"0x%llx\","
@@ -736,10 +811,19 @@ Java_royale_nativehost_JniHost_nativeAct(
       "\"resolved_data_id\":%d,"
       "\"original_spell\":\"0x%llx\","
       "\"command_rva\":\"0x%llx\",\"execute_rva\":\"0x%llx\"}",
-      result_code == 0 ? "true" : "false", result_code, tick, side,
+      result_code == 0 ? "true" : "false", result_code, tick,
+      result_reason, side,
       deck_index, hand_index, x, y, dry_run ? "true" : "false",
       placement_code == 0 ? "true" : "false", placement_code,
       placement_reason, packed_selection, kCommandExecutionFlags,
+      hard_gate_before ? "true" : "false",
+      command_gate_before ? "true" : "false",
+      battle_phase, static_cast<int>(battle_flag_1e9), logic_state,
+      logic_substate, logic_end_counter, logic_player_count, mode_target,
+      static_cast<int>(mode_flag_116), static_cast<int>(mode_flag_191),
+      mode_counter, elixir_before, elixir_raw_before, card_cost,
+      resource_deficit_raw, refill_timer_before, next_deck_index_before,
+      hand_size_before, cycle_size_before, deck_count_before,
       entry_i18, entry_i1c, entry_i20, entry_i24,
       entry_i28, entry_i2c, entry_i30, entry_i34,
       static_cast<int>(entry_b40), static_cast<int>(entry_b41),
