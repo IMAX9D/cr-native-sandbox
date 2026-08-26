@@ -74,7 +74,13 @@ def main() -> int:
         "battle_tag": plan.battle_tag,
         "tier": plan.replay_tier,
         "accepted": result.accepted,
+        "teacher_forced_success": result.teacher_forced_success,
         "failure": result.failure,
+        "ability_log_tier": result.ability_log_tier,
+        "source_ability_events": result.source_ability_events,
+        "accepted_ability_actions": result.accepted_ability_actions,
+        "ability_resolution_counts": result.ability_resolution_counts,
+        "terminal_diagnostic_status": result.terminal_diagnostic_status,
         "native_ticks_advanced": result.native_ticks_advanced,
         "wall_seconds": result.wall_seconds,
     }, ensure_ascii=False, indent=2))

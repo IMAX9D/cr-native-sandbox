@@ -51,6 +51,7 @@ def audit_one(
             "action_provenance": plan.action_provenance,
             "hand_provenance": plan.hand_provenance,
             "ability_provenance": plan.ability_provenance,
+            "ability_log_tier": plan.ability_log_tier,
             "terminal_provenance": plan.terminal_provenance,
             "terminal_crowns": plan.terminal_crowns,
             "duration_ticks": plan.duration_ticks,
@@ -58,6 +59,7 @@ def audit_one(
             "missing_abilities": sum(
                 side.missing_ability_event_count for side in plan.sides
             ),
+            "observed_abilities": len(plan.ability_events),
             "compatible_initial_states": [
                 side.cycle.compatible_initial_state_count for side in plan.sides
             ],
@@ -127,6 +129,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 counters["actions"] += int(accepted["actions"])
                 counters["native_ticks"] += int(accepted["duration_ticks"])
                 counters["missing_abilities"] += int(accepted["missing_abilities"])
+                counters["observed_abilities"] += int(accepted["observed_abilities"])
+                counters[
+                    f"ability_tier_{accepted['ability_log_tier']}"
+                ] += 1
                 for reason in accepted["limitations"]:
                     limitations[str(reason)] += 1
                 if accepted["native_replay_ready"]:

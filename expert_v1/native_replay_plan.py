@@ -20,11 +20,11 @@ import numpy as np
 from native_core.card_catalog import catalog
 from native_core.decks import resolve_card
 
+from .native_capabilities import ability_cards, ability_log_tier, tower_troop
 from .upgrade_base_cycles import INITIAL_MASKS, INITIAL_QUEUES
 
 
 SIDE_NAMES = ("team", "opponent")
-TOWER_PRINCESS_ID = 159_000_000
 DEFAULT_NATIVE_SEED = 424_242
 
 # The frozen DataTables retain several pre-release/internal names.  Keep this
@@ -94,7 +94,19 @@ class ExpertAction:
     x: int
     y: int
     source_event_index: int
+    source_marker_index: int
     side_action_index: int
+
+
+@dataclass(frozen=True)
+class ExpertAbilityEvent:
+    """One observed native ability-button marker from a schema-v3 replay."""
+
+    tick: int
+    side: int
+    source_event_index: int
+    source_marker_index: int
+    source_ability_id: str | None
 
 
 @dataclass(frozen=True)
@@ -104,6 +116,7 @@ class SidePlan:
     deck: tuple[CardSpec, ...]
     cycle: CycleCandidate
     action_count: int
+    observed_ability_event_count: int
     missing_ability_event_count: int
     tower_troop: str | None
 
@@ -117,6 +130,8 @@ class BattlePlan:
     duration_ticks: int
     sides: tuple[SidePlan, SidePlan]
     actions: tuple[ExpertAction, ...]
+    ability_events: tuple[ExpertAbilityEvent, ...]
+    ability_log_tier: str
     replay_tier: str
     native_replay_ready: bool
     original_state_exact: bool
@@ -239,23 +254,57 @@ def _ability_count(value: Mapping[str, Any], source_side: str) -> int:
 
 
 def _ability_provenance(value: Mapping[str, Any], counts: Sequence[int]) -> str:
-    events = value.get("ability_plays")
-    if not any(counts):
-        return "source_reports_zero"
-    if not isinstance(events, list):
-        return "missing_observed_count_only"
-    observed = [
-        sum(1 for event in events if isinstance(event, Mapping) and event.get("side") == side)
-        for side in SIDE_NAMES
-    ]
-    if observed != list(counts):
-        return "observed_tick_count_mismatch"
-    if all(
-        event.get("ability_id") not in (None, "")
-        for event in events if isinstance(event, Mapping)
-    ):
-        return "observed_ticks_with_source_identity_unmapped"
-    return "observed_ticks_identity_unresolved"
+    tier = ability_log_tier(value)
+    if tier == "observed_ticks_identity_runtime_resolved":
+        return "observed_ticks_identity_runtime_resolved"
+    return tier
+
+
+def _compile_ability_events(
+    value: Mapping[str, Any], *, duration_ticks: int,
+) -> tuple[ExpertAbilityEvent, ...]:
+    raw_events = value.get("ability_plays")
+    if not isinstance(raw_events, list):
+        return ()
+    result: list[ExpertAbilityEvent] = []
+    marker_indices: set[int] = set()
+    previous_key: tuple[int, int] | None = None
+    for source_event_index, raw in enumerate(raw_events):
+        if not isinstance(raw, Mapping):
+            raise ReplayPlanError(
+                f"ability event {source_event_index} is not an object"
+            )
+        source_side = str(raw.get("side"))
+        if source_side not in SIDE_NAMES:
+            raise ReplayPlanError(
+                f"ability event {source_event_index} has invalid side"
+            )
+        tick = int(raw.get("time_raw", -1))
+        if tick < 0 or tick > duration_ticks + 20:
+            raise ReplayPlanError(
+                f"ability event {source_event_index} tick is outside battle duration"
+            )
+        marker_index = int(raw.get("marker_index", source_event_index))
+        if marker_index < 0 or marker_index in marker_indices:
+            raise ReplayPlanError(
+                f"ability event {source_event_index} has invalid/duplicate marker index"
+            )
+        marker_indices.add(marker_index)
+        key = (tick, marker_index)
+        if previous_key is not None and key < previous_key:
+            raise ReplayPlanError("ability events are not sorted by tick/marker index")
+        previous_key = key
+        raw_identity = raw.get("ability_id")
+        result.append(ExpertAbilityEvent(
+            tick=tick,
+            side=SIDE_NAMES.index(source_side),
+            source_event_index=source_event_index,
+            source_marker_index=marker_index,
+            source_ability_id=(
+                None if raw_identity in (None, "") else str(raw_identity)
+            ),
+        ))
+    return tuple(result)
 
 
 def _schema_two_player(
@@ -372,6 +421,7 @@ def compile_battle(
         actions.append(ExpertAction(
             tick=tick, side=side, logical_card_index=logical,
             base_token=base_token, x=x, y=y, source_event_index=event_index,
+            source_marker_index=int(event.get("marker_index", event_index)),
             side_action_index=side_action_counts[side],
         ))
         side_action_counts[side] += 1
@@ -383,15 +433,39 @@ def compile_battle(
 
     cycles = [compatible_cycle(indices) for indices in per_side_indices]
     ability_counts = [_ability_count(value, source_side) for source_side in SIDE_NAMES]
+    compiled_abilities = _compile_ability_events(
+        value, duration_ticks=duration_ticks
+    )
+    observed_ability_counts = [
+        sum(1 for event in compiled_abilities if event.side == side)
+        for side in range(2)
+    ]
+    ability_tier = ability_log_tier(value)
     side_plans = tuple(
         SidePlan(
             side=side, source_side=SIDE_NAMES[side], deck=side_decks[side],
             cycle=cycles[side], action_count=len(per_side_indices[side]),
-            missing_ability_event_count=ability_counts[side],
+            observed_ability_event_count=observed_ability_counts[side],
+            missing_ability_event_count=max(
+                0, ability_counts[side] - observed_ability_counts[side]
+            ),
             tower_troop=tower_troops[side],
         )
         for side in range(2)
     )
+
+    # A player can submit at most one command in a native Tick.  Preserve
+    # simultaneous opposing actions, but reject a same-side deploy/ability or
+    # duplicate ability instead of inventing an order inside that Tick.
+    occupied_ticks = {(action.tick, action.side) for action in actions}
+    for event in compiled_abilities:
+        key = (event.tick, event.side)
+        if key in occupied_ticks:
+            raise ReplayPlanError(
+                f"multiple deploy/ability actions for side {event.side} "
+                f"at native tick {event.tick}"
+            )
+        occupied_ticks.add(key)
 
     limitations = [
         "source_native_rng_seed_missing",
@@ -405,10 +479,28 @@ def compile_battle(
         limitations.extend((
             "card_forms_missing", "card_levels_missing", "tower_troops_missing",
         ))
-    if any(ability_counts):
-        limitations.append("ability_button_events_missing")
-    if any(tower not in (None, "tower-princess") for tower in tower_troops):
-        limitations.append("non_princess_tower_runtime_mapping_missing")
+    if ability_tier == "count_only_missing_ticks":
+        limitations.extend((
+            "ability_button_events_missing",
+            "ability_button_event_ticks_missing",
+        ))
+    elif ability_tier == "observed_tick_count_mismatch":
+        limitations.append("ability_button_event_count_mismatch")
+    for side, expected in enumerate(ability_counts):
+        if expected and not ability_cards(side_decks[side]):
+            limitations.append(f"ability_card_runtime_mapping_missing_side_{side}")
+    unmapped_towers: list[str] = []
+    for tower in tower_troops:
+        if tower is None:
+            continue
+        try:
+            tower_troop(tower)
+        except ValueError:
+            unmapped_towers.append(tower)
+    if unmapped_towers:
+        limitations.append(
+            "tower_troop_runtime_mapping_missing:" + ",".join(sorted(set(unmapped_towers)))
+        )
     unsupported_forms = sorted({
         spec.source_token
         for deck in side_decks for spec in deck
@@ -423,10 +515,15 @@ def compile_battle(
     limitations = list(dict.fromkeys(limitations))
 
     metadata_exact = source_schema >= 2
+    ability_events_complete = ability_tier in {
+        "source_reports_zero", "observed_ticks_identity_runtime_resolved",
+    }
     replay_ready = (
         metadata_exact
-        and not any(ability_counts)
-        and all(tower == "tower-princess" for tower in tower_troops)
+        and ability_events_complete
+        and all(not count or ability_cards(side_decks[side])
+                for side, count in enumerate(ability_counts))
+        and not unmapped_towers
         and not unsupported_forms
     )
     tier = (
@@ -444,6 +541,8 @@ def compile_battle(
         duration_ticks=duration_ticks,
         sides=side_plans,  # type: ignore[arg-type]
         actions=tuple(actions),
+        ability_events=compiled_abilities,
+        ability_log_tier=ability_tier,
         replay_tier=tier,
         native_replay_ready=replay_ready,
         # No current RoyaleAPI artifact has the seed/build/state anchors needed
@@ -532,9 +631,9 @@ def materialize_replay(
         if any(item is None for item in native_deck):
             raise AssertionError("materialized native deck has an empty slot")
         battle[f"deck{side}"]["sp"] = native_deck
-        # Only Tower Princess is currently mapped/certified by this runtime.
+        support = tower_troop(side_plan.tower_troop or "tower-princess")
         battle[f"deck{side}"]["sc"] = [{
-            "d": TOWER_PRINCESS_ID,
+            "d": support.support_card_id,
             "l": int(max((spec.level or fallback_level) for spec in side_plan.deck) - 1),
             "t": 0,
             "c": 0,
@@ -563,3 +662,44 @@ def grouped_actions(
         })
     if current_tick is not None:
         yield current_tick, sorted(batch, key=lambda item: item["side"])
+
+
+def grouped_replay_events(
+    plan: BattlePlan, mappings: Sequence[Sequence[int]],
+) -> Iterable[tuple[int, list[dict[str, Any]]]]:
+    """Yield deployments and unresolved ability markers on one Tick timeline."""
+    events: list[dict[str, Any]] = []
+    for action in plan.actions:
+        events.append({
+            "type": "play",
+            "tick": action.tick,
+            "side": action.side,
+            "deck_index": int(mappings[action.side][action.logical_card_index]),
+            "x": action.x,
+            "y": action.y,
+            "source_event_index": action.source_event_index,
+            "source_marker_index": action.source_marker_index,
+        })
+    for event in plan.ability_events:
+        events.append({
+            "type": "ability_marker",
+            "tick": event.tick,
+            "side": event.side,
+            "source_event_index": event.source_event_index,
+            "source_marker_index": event.source_marker_index,
+            "source_ability_id": event.source_ability_id,
+        })
+    events.sort(key=lambda item: (
+        int(item["tick"]), int(item["source_marker_index"]), int(item["side"])
+    ))
+    current_tick: int | None = None
+    batch: list[dict[str, Any]] = []
+    for event in events:
+        tick = int(event["tick"])
+        if current_tick is not None and tick != current_tick:
+            yield current_tick, sorted(batch, key=lambda item: int(item["side"]))
+            batch = []
+        current_tick = tick
+        batch.append(event)
+    if current_tick is not None:
+        yield current_tick, sorted(batch, key=lambda item: int(item["side"]))

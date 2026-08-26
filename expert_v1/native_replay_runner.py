@@ -9,6 +9,7 @@ tick mismatch ends that replay and preserves an audit record.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -17,10 +18,11 @@ from typing import Any, Mapping, Sequence
 
 from native_core.env import NativeRoyaleEnv
 
+from .native_capabilities import ability_cards, resolve_live_ability
 from .native_replay_plan import (
     DEFAULT_NATIVE_SEED,
     BattlePlan,
-    grouped_actions,
+    grouped_replay_events,
     materialize_replay,
     native_layout_order,
 )
@@ -30,9 +32,19 @@ from .native_replay_plan import (
 class NativeReplayResult:
     battle_tag: str
     accepted: bool
+    teacher_forced_success: bool
     failure: str | None
     source_actions: int
     accepted_actions: int
+    source_deploy_actions: int
+    accepted_deploy_actions: int
+    source_ability_events: int
+    accepted_ability_actions: int
+    missing_ability_event_count: int
+    ability_log_tier: str
+    ability_replay_complete: bool
+    ability_resolution_counts: dict[str, int]
+    ability_resolutions: tuple[dict[str, Any], ...]
     final_tick: int
     native_ticks_advanced: int
     reset_seconds: float
@@ -42,6 +54,7 @@ class NativeReplayResult:
     wall_seconds: float
     terminal_validated: bool
     terminal_match: bool | None
+    terminal_diagnostic_status: str
     source_crowns: tuple[int, int] | None
     observed_crowns: tuple[int, int] | None
     decision_records: tuple[dict[str, Any], ...]
@@ -151,11 +164,15 @@ def execute_plan(
     *,
     seed: int = DEFAULT_NATIVE_SEED,
     capture_decisions: bool = True,
+    ability_branch_choices: Mapping[int, int] | None = None,
 ) -> NativeReplayResult:
     """Replay one battle with gap-batched native stepping."""
     started = time.perf_counter()
     reset_seconds = step_seconds = observe_seconds = action_seconds = 0.0
     native_ticks = accepted_actions = 0
+    accepted_deploy_actions = accepted_ability_actions = 0
+    ability_resolution_counts: Counter[str] = Counter()
+    ability_resolutions: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     failure: str | None = None
     final_tick = 0
@@ -164,6 +181,10 @@ def execute_plan(
     observed_crowns: tuple[int, int] | None = None
     replay, mappings = materialize_replay(
         plan, template, calibration, seed=seed
+    )
+    allowed_abilities = [ability_cards(side.deck) for side in plan.sides]
+    missing_ability_events = sum(
+        side.missing_ability_event_count for side in plan.sides
     )
     first_exact_ticks: list[int | None] = []
     for side, side_plan in enumerate(plan.sides):
@@ -190,10 +211,12 @@ def execute_plan(
         if native_layout_order(player) != desired_native_order:
             failure = f"native_shuffle_layout_changed_side_{side}"
             break
+    if failure is None and missing_ability_events:
+        failure = f"source_ability_ticks_missing_count_{missing_ability_events}"
 
     previous_source_tick = final_tick
     if failure is None:
-        for source_tick, actions in grouped_actions(plan, mappings):
+        for source_tick, events in grouped_replay_events(plan, mappings):
             if source_tick < final_tick:
                 failure = (
                     f"source_tick_{source_tick}_precedes_native_tick_{final_tick}"
@@ -221,18 +244,96 @@ def execute_plan(
                 failure = f"observation_tick_{state['tick']}_expected_{source_tick}"
                 break
             by_side = {int(player["side"]): player for player in state["players"]}
-            for action in actions:
-                if int(action["deck_index"]) not in {
-                    int(value) for value in by_side[int(action["side"])]["hand_deck_indices"]
+            for event in events:
+                if event["type"] != "play":
+                    continue
+                if int(event["deck_index"]) not in {
+                    int(value)
+                    for value in by_side[int(event["side"])]["hand_deck_indices"]
                 }:
                     failure = (
-                        f"hand_mismatch_event_{action['source_event_index']}"
+                        f"hand_mismatch_event_{event['source_event_index']}"
                     )
                     break
             if failure is not None:
                 break
+            native_actions: list[dict[str, Any]] = []
+            resolved_events: list[dict[str, Any]] = []
+            for event in events:
+                if event["type"] == "play":
+                    native_action = {
+                        key: int(event[key])
+                        for key in ("side", "deck_index", "x", "y")
+                    } | {"type": "play"}
+                    native_actions.append(native_action)
+                    resolved_events.append(event)
+                    continue
+                side = int(event["side"])
+                marker = int(event["source_marker_index"])
+                resolution = resolve_live_ability(
+                    state, side=side, tick=source_tick,
+                    allowed_cards=allowed_abilities[side],
+                )
+                resolution_row = {
+                    **resolution.json(),
+                    "source_event_index": int(event["source_event_index"]),
+                    "source_marker_index": marker,
+                    "source_ability_id": event.get("source_ability_id"),
+                    "selected_entity_id": None,
+                    "execution": "not_executed",
+                }
+                ability_resolution_counts[resolution.status] += 1
+                selected_entity: int | None = None
+                if resolution.status == "unique":
+                    selected_entity = resolution.candidate_entity_ids[0]
+                    resolution_row["execution"] = "unique_executed"
+                elif resolution.status == "branch_required":
+                    explicit = (
+                        None if ability_branch_choices is None
+                        else ability_branch_choices.get(marker)
+                    )
+                    if explicit is None:
+                        resolution_row["execution"] = "branch_required_unselected"
+                        ability_resolutions.append(resolution_row)
+                        failure = (
+                            f"ability_branch_required_marker_{marker}_candidates_"
+                            f"{list(resolution.candidate_entity_ids)}"
+                        )
+                        break
+                    selected_entity = int(explicit)
+                    if selected_entity not in resolution.candidate_entity_ids:
+                        resolution_row["selected_entity_id"] = selected_entity
+                        resolution_row["execution"] = "invalid_explicit_branch"
+                        ability_resolutions.append(resolution_row)
+                        failure = (
+                            f"ability_branch_choice_invalid_marker_{marker}_entity_"
+                            f"{selected_entity}"
+                        )
+                        break
+                    resolution_row["execution"] = "explicit_branch_executed"
+                    ability_resolution_counts["explicit_branch_selected"] += 1
+                else:
+                    resolution_row["execution"] = resolution.status
+                    ability_resolutions.append(resolution_row)
+                    failure = f"ability_{resolution.status}_marker_{marker}"
+                    break
+                resolution_row["selected_entity_id"] = selected_entity
+                ability_resolutions.append(resolution_row)
+                native_actions.append({
+                    "type": "ability", "side": side,
+                    "entity_id": int(selected_entity),
+                })
+                resolved_events.append(event | {
+                    "type": "ability",
+                    "entity_id": int(selected_entity),
+                    "ability_resolution": resolution.status,
+                })
+            if failure is not None:
+                break
             if capture_decisions:
-                action_by_side = {int(action["side"]): action for action in actions}
+                action_by_side = {
+                    int(event["side"]): event for event in resolved_events
+                }
                 for actor_side in (0, 1):
                     record = _compact_decision_state(
                         state,
@@ -254,22 +355,26 @@ def execute_plan(
                         "terminal_provenance": plan.terminal_provenance,
                     })
                     records.append(record)
-            native_actions = [
-                {key: int(action[key]) for key in ("side", "deck_index", "x", "y")}
-                | {"type": "play"}
-                for action in actions
-            ]
             action_started = time.perf_counter()
             action_result = env.joint_act(native_actions)
             action_seconds += time.perf_counter() - action_started
             results = action_result.get("actions", [])
-            if len(results) != len(actions):
+            if len(results) != len(native_actions):
                 failure = f"native_action_count_mismatch_tick_{source_tick}"
                 break
             rejected = [
                 item for item in results
                 if not bool(item.get("result", {}).get("accepted", False))
             ]
+            for source_event, item in zip(
+                resolved_events, results, strict=True
+            ):
+                if bool(item.get("result", {}).get("accepted", False)):
+                    accepted_actions += 1
+                    if source_event["type"] == "ability":
+                        accepted_ability_actions += 1
+                    else:
+                        accepted_deploy_actions += 1
             if rejected:
                 codes = [
                     int(item.get("result", {}).get("result_code", -1))
@@ -277,7 +382,6 @@ def execute_plan(
                 ]
                 failure = f"native_rejected_tick_{source_tick}_codes_{codes}"
                 break
-            accepted_actions += len(results)
             previous_source_tick = source_tick
 
     if failure is None and plan.terminal_crowns is not None:
@@ -299,21 +403,42 @@ def execute_plan(
             observed_crowns = (int(crowns[0]), int(crowns[1]))
             terminal_validated = True
             terminal_match = observed_crowns == plan.terminal_crowns
-            if not terminal_match:
-                failure = (
-                    f"terminal_crowns_{observed_crowns}_expected_"
-                    f"{plan.terminal_crowns}"
-                )
         else:
             terminal_match = False
-            failure = "native_terminal_missing_at_source_end"
+
+    teacher_forced_success = (
+        failure is None
+        and accepted_actions == len(plan.actions) + len(plan.ability_events)
+        and missing_ability_events == 0
+    )
+    if plan.terminal_crowns is None:
+        terminal_diagnostic_status = "not_requested"
+    elif terminal_validated and terminal_match:
+        terminal_diagnostic_status = "match"
+    elif terminal_validated:
+        terminal_diagnostic_status = "crowns_mismatch"
+    else:
+        terminal_diagnostic_status = "native_terminal_missing"
 
     return NativeReplayResult(
         battle_tag=plan.battle_tag,
-        accepted=failure is None and accepted_actions == len(plan.actions),
+        accepted=teacher_forced_success,
+        teacher_forced_success=teacher_forced_success,
         failure=failure,
-        source_actions=len(plan.actions),
+        source_actions=len(plan.actions) + len(plan.ability_events),
         accepted_actions=accepted_actions,
+        source_deploy_actions=len(plan.actions),
+        accepted_deploy_actions=accepted_deploy_actions,
+        source_ability_events=len(plan.ability_events),
+        accepted_ability_actions=accepted_ability_actions,
+        missing_ability_event_count=missing_ability_events,
+        ability_log_tier=plan.ability_log_tier,
+        ability_replay_complete=(
+            missing_ability_events == 0
+            and accepted_ability_actions == len(plan.ability_events)
+        ),
+        ability_resolution_counts=dict(ability_resolution_counts),
+        ability_resolutions=tuple(ability_resolutions),
         final_tick=final_tick,
         native_ticks_advanced=native_ticks,
         reset_seconds=reset_seconds,
@@ -323,6 +448,7 @@ def execute_plan(
         wall_seconds=time.perf_counter() - started,
         terminal_validated=terminal_validated,
         terminal_match=terminal_match,
+        terminal_diagnostic_status=terminal_diagnostic_status,
         source_crowns=plan.terminal_crowns,
         observed_crowns=observed_crowns,
         decision_records=tuple(records),
