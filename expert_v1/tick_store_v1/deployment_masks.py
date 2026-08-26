@@ -63,6 +63,17 @@ CONTENT_PATH_RULE = (
 )
 MIRROR_CARD_ID = 28_000_006
 
+# Compilation constructs short-lived store objects per episode/actor.  A
+# per-instance cache therefore still caused one authenticated JSON read for
+# every Tick x four cards.  These caches are process-wide and keyed by the
+# resolved store root so independent corpora cannot alias each other.
+_PROCESS_CACHE_LOCK = threading.RLock()
+_PROCESS_PAYLOAD_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_PROCESS_DERIVED_CACHE: dict[
+    tuple[str, str, int, tuple[tuple[int, int, int, int, int], ...]],
+    tuple[str, ...],
+] = {}
+
 
 class DeploymentMaskContractError(ValueError):
     """A native mask, reference, or offline label is not authoritative."""
@@ -718,6 +729,9 @@ class DeploymentMaskStore:
         self._lock = threading.Lock()
         self._payload_cache: dict[str, dict[str, Any]] = {}
 
+    def _process_key(self, digest: str) -> tuple[str, str]:
+        return str(self.root), digest
+
     def path_for(self, content_sha256: str) -> Path:
         digest = _validate_sha256(content_sha256, "content_sha256")
         return self.root / digest[:2] / f"{digest}.json"
@@ -755,6 +769,8 @@ class DeploymentMaskStore:
                     os.fsync(output.fileno())
                 os.replace(temporary, path)
             self._payload_cache[digest] = normalized
+            with _PROCESS_CACHE_LOCK:
+                _PROCESS_PAYLOAD_CACHE[self._process_key(digest)] = normalized
         return {
             "content_sha256": digest,
             "content_path": _sidecar_relative_path(digest),
@@ -779,10 +795,13 @@ class DeploymentMaskStore:
     ) -> dict[str, Any]:
         digest = _validate_sha256(content_sha256, "content_sha256")
         if allow_cached:
-            with self._lock:
-                cached = self._payload_cache.get(digest)
-                if cached is not None:
-                    return dict(cached)
+            with _PROCESS_CACHE_LOCK:
+                cached = _PROCESS_PAYLOAD_CACHE.get(self._process_key(digest))
+            if cached is None:
+                with self._lock:
+                    cached = self._payload_cache.get(digest)
+            if cached is not None:
+                return dict(cached)
         path = self.path_for(digest)
         try:
             raw = path.read_bytes()
@@ -809,13 +828,61 @@ class DeploymentMaskStore:
             )
         with self._lock:
             self._payload_cache[digest] = normalized
+        with _PROCESS_CACHE_LOCK:
+            _PROCESS_PAYLOAD_CACHE[self._process_key(digest)] = normalized
         return normalized
+
+    def derive(
+        self,
+        content_sha256: str,
+        state: TickState | Mapping[str, Any],
+        *,
+        side: int,
+        card_id: int,
+    ) -> tuple[str, ...]:
+        """Return a bit-identical derived mask with tower-state memoization.
+
+        Deployment projection depends only on the authenticated sidecar, actor
+        side, and living tower footprints.  HP magnitude and all troop/effect
+        state are irrelevant, so a normal battle has only a handful of cache
+        states even though it contains thousands of native Ticks.
+        """
+        digest = _validate_sha256(content_sha256, "content_sha256")
+        towers = _tower_rows(state)
+        signature = tuple(
+            sorted(
+                (
+                    int(tower["side"]),
+                    int(tower["role"]),
+                    int(tower["x"]),
+                    int(tower["y"]),
+                    int(int(tower["hp"]) > 0),
+                )
+                for tower in towers
+            )
+        )
+        key = (str(self.root), digest, int(side), signature)
+        with _PROCESS_CACHE_LOCK:
+            cached = _PROCESS_DERIVED_CACHE.get(key)
+        if cached is not None:
+            return cached
+        payload = self.load(digest, allow_cached=True)
+        result = derive_deployment_rows(
+            payload, state, side=side, card_id=card_id
+        )
+        with _PROCESS_CACHE_LOCK:
+            previous = _PROCESS_DERIVED_CACHE.setdefault(key, result)
+        if previous != result:
+            raise DeploymentMaskContractError(
+                "derived deployment-mask cache diverged"
+            )
+        return previous
 
     def verify_episode_metadata(
         self,
         metadata: Mapping[str, Any],
         *,
-        allow_cached: bool = False,
+        allow_cached: bool = True,
     ) -> dict[str, Any]:
         value = metadata.get(EPISODE_METADATA_KEY)
         if not isinstance(value, Mapping):
@@ -1123,9 +1190,10 @@ def verify_deployment_labels(
             reference, tick=tick, require_dynamic_exact=True
         )
         assert selected_reference is not None
-        payload = store.load(str(selected_reference["content_sha256"]))
-        rows = derive_deployment_rows(
-            payload, state, side=side, card_id=int(reference["card_id"])
+        digest = str(selected_reference["content_sha256"])
+        payload = store.load(digest, allow_cached=True)
+        rows = store.derive(
+            digest, state, side=side, card_id=int(reference["card_id"])
         )
         player = state.players[side]
         reasons = []

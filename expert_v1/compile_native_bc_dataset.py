@@ -16,6 +16,7 @@ resume without rewriting completed shards.
 from __future__ import annotations
 
 import argparse
+from array import array
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -27,6 +28,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import threading
+import time
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
@@ -37,7 +40,6 @@ from .native_ingest_contract import load_native_ingest_contract
 from .native_replay_plan import BattlePlan, compile_battle
 from .tick_store_v1.deployment_masks import (
     DeploymentMaskStore,
-    derive_deployment_rows,
     resolve_deployment_reference,
     verify_deployment_labels,
 )
@@ -49,8 +51,10 @@ from .training_v1.schema import (
     ARENA_COLUMNS,
     ARENA_ROWS,
     DATASET_KIND,
+    GRID_STORAGE,
     POSITION_COUNT,
     POSITION_MASK_BYTES,
+    POSITION_MASK_STORAGE,
     SCHEMA_VERSION,
     SHARD_KIND,
     validate_manifest,
@@ -58,13 +62,18 @@ from .training_v1.schema import (
 )
 
 
-COMPILER_KIND = "cr_native_tick_store_bc_compiler_v1"
-PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v1"
+COMPILER_KIND = "cr_native_tick_store_bc_compiler_v2"
+PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v2"
 ASSIGNMENT_KIND = "cr_native_tick_store_bc_split_assignment_v1"
 OBSERVATION_MODE = "native_state_v1"
 ACTION_EXECUTION_OFFSET_METADATA = "action_execution_tick_offset"
 ENTITY_NUMERIC_FIELDS = ("level_ratio", "hp_ratio", "log_max_hp")
 MAX_ABILITY_SLOTS = 16
+CAPACITY_PREFLIGHT_KIND = "cr_native_bc_capacity_preflight_v1"
+CAPACITY_PREFLIGHT_FILENAME = "capacity-preflight.json"
+CAPACITY_SAMPLE_BATTLES = 100
+CAPACITY_SAFETY_FACTOR = 1.35
+CAPACITY_MINIMUM_RESERVE_BYTES = 10 * 1024**3
 GRID_CHANNELS = (
     "own_tower_occupancy",
     "own_tower_hp_ratio",
@@ -557,14 +566,14 @@ def validate_compile_plan(
             "inputs", "compiler", "tick_store_root", "output_root", "episodes",
             "estimated_rows", "split_audit", "card_vocabulary",
             "native_card_id_to_token", "source_card_to_token", "ability_vocabulary",
-            "native_ability_id_to_token", "shards",
+            "native_ability_id_to_token", "capacity_preflight", "shards",
         },
         "compile-plan",
     )
     if (
         plan.get("kind") != PLAN_KIND
         or _require_integer(plan.get("schema_version"), "plan.schema_version", minimum=1)
-        != 1
+        != 2
     ):
         raise NativeBcCompileError("compile-plan kind/schema changed")
     if not isinstance(plan.get("created_utc"), str) or not plan["created_utc"]:
@@ -590,7 +599,8 @@ def validate_compile_plan(
         {
             "kind", "schema_version", "seed", "validation_fraction",
             "test_fraction", "maximum_rows_per_shard", "actor_information",
-            "action_alignment", "entity_identity", "mask_policy", "components",
+            "action_alignment", "entity_identity", "mask_policy", "storage_schema",
+            "components",
         },
         "compile-plan compiler",
     )
@@ -599,12 +609,17 @@ def validate_compile_plan(
         or _require_integer(
             compiler.get("schema_version"), "compiler.schema_version", minimum=1
         )
-        != 1
+        != 2
         or compiler.get("actor_information") != "public_only_v1"
         or compiler.get("action_alignment") != "source_tick_plus_episode_metadata_offset"
         or compiler.get("entity_identity") != "discrete_native_card_token_v1"
         or compiler.get("mask_policy")
         != "content_addressed_native_sidecar_fail_closed_v1"
+        or compiler.get("storage_schema") != {
+            "grid": GRID_STORAGE,
+            "selected_position_mask": POSITION_MASK_STORAGE,
+            "ability_position_mask": POSITION_MASK_STORAGE,
+        }
     ):
         raise NativeBcCompileError("compile-plan compiler semantics changed")
     seed = _require_integer(compiler.get("seed"), "compiler.seed")
@@ -668,6 +683,59 @@ def validate_compile_plan(
         raise NativeBcCompileError("compile-plan Tick Store manifest path disagrees with root")
     if plan_path is not None and output_root != plan_path.resolve().parent:
         raise NativeBcCompileError("compile-plan output root disagrees with its location")
+    capacity_reference = plan.get("capacity_preflight")
+    if not isinstance(capacity_reference, Mapping):
+        raise NativeBcCompileError("compile-plan capacity preflight reference is missing")
+    _require_keys(
+        capacity_reference,
+        {
+            "path", "file_sha256", "content_sha256", "sample_actor_rows",
+            "sample_bytes_per_actor_row", "projected_output_bytes",
+            "required_free_bytes",
+        },
+        "compile-plan capacity preflight",
+    )
+    capacity_path = Path(str(capacity_reference.get("path") or "")).resolve()
+    if (
+        capacity_path != output_root / CAPACITY_PREFLIGHT_FILENAME
+        or str(capacity_path) != str(capacity_reference["path"])
+        or not capacity_path.is_file()
+        or sha256_file(capacity_path)
+        != _require_sha(
+            capacity_reference.get("file_sha256"),
+            "capacity_preflight.file_sha256",
+        )
+    ):
+        raise NativeBcCompileError("compile-plan capacity preflight file changed")
+    capacity_value = _read_capacity_preflight(capacity_path)
+    if (
+        capacity_value["content_sha256"]
+        != _require_sha(
+            capacity_reference.get("content_sha256"),
+            "capacity_preflight.content_sha256",
+        )
+        or int(capacity_value["sample_actor_rows"])
+        != _require_integer(
+            capacity_reference.get("sample_actor_rows"),
+            "capacity_preflight.sample_actor_rows",
+            minimum=1,
+        )
+        or float(capacity_value["sample_bytes_per_actor_row"])
+        != float(capacity_reference.get("sample_bytes_per_actor_row", -1))
+        or int(capacity_value["projected_output_bytes"])
+        != _require_integer(
+            capacity_reference.get("projected_output_bytes"),
+            "capacity_preflight.projected_output_bytes",
+            minimum=1,
+        )
+        or int(capacity_value["required_free_bytes"])
+        != _require_integer(
+            capacity_reference.get("required_free_bytes"),
+            "capacity_preflight.required_free_bytes",
+            minimum=1,
+        )
+    ):
+        raise NativeBcCompileError("compile-plan capacity preflight summary changed")
 
     raw_shards = plan.get("shards")
     if not isinstance(raw_shards, list) or not raw_shards:
@@ -803,6 +871,12 @@ def validate_compile_plan(
     expected_rows = sum(int(value["tick_count"]) * 2 for value in all_episodes)
     if _require_integer(plan.get("estimated_rows"), "plan.estimated_rows") != expected_rows:
         raise NativeBcCompileError("compile-plan estimated row count changed")
+    if (
+        int(capacity_value["estimated_total_actor_rows"]) != expected_rows
+        or int(capacity_value["maximum_rows_per_shard"]) != maximum_rows
+        or int(capacity_value["planned_shards"]) != len(raw_shards)
+    ):
+        raise NativeBcCompileError("capacity preflight does not cover this exact plan")
 
     contract_path = Path(str(inputs["native_contract_path"])).resolve()
     if verify_live_inputs:
@@ -1017,6 +1091,206 @@ def _authenticate_plan_argument(
     return authenticated
 
 
+def _read_capacity_preflight(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except Exception as error:
+        raise NativeBcCompileError("capacity preflight is missing/invalid") from error
+    if not isinstance(value, Mapping) or _canonical_bytes(value) != raw:
+        raise NativeBcCompileError("capacity preflight is not canonical JSON")
+    expected = {
+        "kind", "schema_version", "content_sha256", "sample_battles",
+        "sample_battle_tags_sha256", "sample_actor_rows", "sample_output_bytes",
+        "sample_bytes_per_actor_row", "sample_compile_seconds",
+        "sample_actor_rows_per_second", "sample_peak_rss_bytes",
+        "sample_peak_rss_delta_bytes", "maximum_rows_per_shard",
+        "planned_shards", "estimated_total_actor_rows", "projected_output_bytes",
+        "safety_factor", "projected_output_with_safety_bytes",
+        "filesystem_total_bytes", "filesystem_free_bytes",
+        "minimum_reserve_bytes", "required_free_bytes",
+        "estimated_peak_worker_rss_bytes", "system_available_memory_bytes",
+        "recommended_max_parallel_compile_workers", "disk_gate_passed",
+        "memory_gate_passed", "passed",
+    }
+    _require_keys(value, expected, "capacity preflight")
+    if (
+        value.get("kind") != CAPACITY_PREFLIGHT_KIND
+        or _require_integer(value.get("schema_version"), "capacity.schema_version", minimum=1)
+        != 1
+    ):
+        raise NativeBcCompileError("capacity preflight kind/schema changed")
+    content_sha = _require_sha(value.get("content_sha256"), "capacity.content_sha256")
+    body = {key: item for key, item in value.items() if key != "content_sha256"}
+    if content_sha != _digest(body):
+        raise NativeBcCompileError("capacity preflight canonical content SHA changed")
+    if value.get("passed") is not True:
+        raise NativeBcCompileError("capacity preflight did not pass")
+    return dict(value)
+
+
+def _capacity_reference(path: Path) -> dict[str, Any]:
+    value = _read_capacity_preflight(path)
+    return {
+        "path": str(path.resolve()),
+        "file_sha256": sha256_file(path),
+        "content_sha256": value["content_sha256"],
+        "sample_actor_rows": int(value["sample_actor_rows"]),
+        "sample_bytes_per_actor_row": float(value["sample_bytes_per_actor_row"]),
+        "projected_output_bytes": int(value["projected_output_bytes"]),
+        "required_free_bytes": int(value["required_free_bytes"]),
+    }
+
+
+def _build_capacity_preflight(
+    *,
+    output_root: Path,
+    tick_store_root: Path,
+    episodes: Sequence[EpisodeInput],
+    raw_plan: Mapping[str, Any],
+    estimated_total_rows: int,
+    maximum_rows_per_shard: int,
+    planned_shards: int,
+) -> dict[str, Any]:
+    """Compile a deterministic <=100-battle sample before full shard writes."""
+    if not episodes or estimated_total_rows <= 0:
+        raise NativeBcCompileError("capacity sample requires non-empty native episodes")
+    selected = sorted(episodes, key=lambda value: value.battle_tag)[
+        : min(CAPACITY_SAMPLE_BATTLES, len(episodes))
+    ]
+    sample_root = output_root / f".capacity-sample-{os.getpid()}"
+    if sample_root.exists():
+        shutil.rmtree(sample_root)
+    sample_root.mkdir(parents=True)
+    raw_spec = {
+        "relative_path": "sample",
+        "split": "capacity",
+        "index": 0,
+        "episodes": [asdict(value) for value in selected],
+        "estimated_rows": sum(value.tick_count * 2 for value in selected),
+        "content_sha256": _digest(
+            {"capacity_sample": [asdict(value) for value in selected]}
+        ),
+    }
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception as error:
+        raise NativeBcCompileError(
+            "psutil is required for the capacity memory preflight"
+        ) from error
+    process = psutil.Process(os.getpid())
+    baseline_rss = int(process.memory_info().rss)
+    peak_rss = [baseline_rss]
+    finished = threading.Event()
+
+    def watch_rss() -> None:
+        while not finished.wait(0.01):
+            try:
+                peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
+            except Exception:
+                return
+
+    watcher = threading.Thread(target=watch_rss, daemon=True)
+    watcher.start()
+    started = time.perf_counter()
+    try:
+        metadata = _compile_output_shard(
+            str(sample_root), str(tick_store_root), raw_spec, raw_plan
+        )
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
+        sample_path = sample_root / "sample"
+        output_bytes = sum(
+            path.stat().st_size for path in sample_path.rglob("*") if path.is_file()
+        )
+        sample_rows = int(metadata["rows"])
+        if sample_rows <= 0 or output_bytes <= 0:
+            raise NativeBcCompileError("capacity sample produced no actor rows/bytes")
+        bytes_per_row = output_bytes / sample_rows
+        projected = math.ceil(bytes_per_row * estimated_total_rows)
+        # NPY headers and shard metadata are already represented by the sample;
+        # add a small explicit per-shard allowance before the global margin.
+        projected += int(planned_shards) * 64 * 1024
+        projected_safe = math.ceil(projected * CAPACITY_SAFETY_FACTOR)
+        usage = shutil.disk_usage(output_root)
+        reserve = max(
+            CAPACITY_MINIMUM_RESERVE_BYTES,
+            math.ceil(int(usage.total) * 0.05),
+        )
+        required_free = projected_safe + reserve
+        available_memory = int(psutil.virtual_memory().available)
+        delta_rss = max(0, peak_rss[0] - baseline_rss)
+        estimated_peak_worker = baseline_rss + math.ceil(
+            delta_rss
+            * (maximum_rows_per_shard / max(1, sample_rows))
+            * 1.25
+        )
+        recommended_workers = max(
+            1,
+            int((available_memory * 0.75) // max(estimated_peak_worker, 1)),
+        )
+        disk_passed = int(usage.free) >= required_free
+        memory_passed = estimated_peak_worker <= int(available_memory * 0.80)
+        body: dict[str, Any] = {
+            "kind": CAPACITY_PREFLIGHT_KIND,
+            "schema_version": 1,
+            "sample_battles": len(selected),
+            "sample_battle_tags_sha256": _digest(
+                {"battle_tags": [value.battle_tag for value in selected]}
+            ),
+            "sample_actor_rows": sample_rows,
+            "sample_output_bytes": output_bytes,
+            "sample_bytes_per_actor_row": bytes_per_row,
+            "sample_compile_seconds": elapsed,
+            "sample_actor_rows_per_second": sample_rows / elapsed,
+            "sample_peak_rss_bytes": peak_rss[0],
+            "sample_peak_rss_delta_bytes": delta_rss,
+            "maximum_rows_per_shard": int(maximum_rows_per_shard),
+            "planned_shards": int(planned_shards),
+            "estimated_total_actor_rows": int(estimated_total_rows),
+            "projected_output_bytes": int(projected),
+            "safety_factor": CAPACITY_SAFETY_FACTOR,
+            "projected_output_with_safety_bytes": int(projected_safe),
+            "filesystem_total_bytes": int(usage.total),
+            "filesystem_free_bytes": int(usage.free),
+            "minimum_reserve_bytes": int(reserve),
+            "required_free_bytes": int(required_free),
+            "estimated_peak_worker_rss_bytes": int(estimated_peak_worker),
+            "system_available_memory_bytes": int(available_memory),
+            "recommended_max_parallel_compile_workers": int(recommended_workers),
+            "disk_gate_passed": disk_passed,
+            "memory_gate_passed": memory_passed,
+            "passed": bool(disk_passed and memory_passed),
+        }
+        value = {**body, "content_sha256": _digest(body)}
+    finally:
+        finished.set()
+        watcher.join(timeout=1.0)
+        try:
+            shutil.rmtree(sample_root)
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise NativeBcCompileError(
+                f"capacity sample cleanup failed: {sample_root}"
+            ) from error
+        if sample_root.exists():
+            raise NativeBcCompileError(
+                f"capacity sample cleanup left output pollution: {sample_root}"
+            )
+    path = output_root / CAPACITY_PREFLIGHT_FILENAME
+    _atomic_json(path, value)
+    if value["passed"] is not True:
+        raise NativeBcCompileError(
+            "capacity preflight failed: "
+            f"projected={value['projected_output_with_safety_bytes']} "
+            f"free={value['filesystem_free_bytes']} reserve={value['minimum_reserve_bytes']} "
+            f"peak_worker={value['estimated_peak_worker_rss_bytes']} "
+            f"available_memory={value['system_available_memory_bytes']}"
+        )
+    return _capacity_reference(path)
+
+
 def create_compile_plan(
     tick_store_root: Path,
     schema5_manifest: Path,
@@ -1026,7 +1300,7 @@ def create_compile_plan(
     seed: int = 20260827,
     validation_fraction: float = 0.05,
     test_fraction: float = 0.05,
-    maximum_rows_per_shard: int = 32_768,
+    maximum_rows_per_shard: int = 524_288,
     io_workers: int = 16,
 ) -> dict[str, Any]:
     """Verify all immutable inputs and atomically publish a deterministic plan."""
@@ -1034,6 +1308,13 @@ def create_compile_plan(
     schema5_manifest = schema5_manifest.resolve(strict=True)
     native_contract = native_contract.resolve(strict=True)
     output_root = output_root.resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    existing_plan_path = output_root / "compile-plan.json"
+    existing_authenticated = (
+        load_compile_plan(existing_plan_path)
+        if existing_plan_path.is_file()
+        else None
+    )
     if maximum_rows_per_shard <= 0:
         raise ValueError("maximum_rows_per_shard must be positive")
     contract, contract_file_sha256 = _load_contract(native_contract)
@@ -1176,6 +1457,29 @@ def create_compile_plan(
         raise NativeBcCompileError("compile plan produced an empty split")
     card_vocabulary, id_to_card_token, source_to_card_token = _card_vocab(contract)
     ability_vocabulary, id_to_ability_token = _ability_vocab(contract)
+    worker_contract = {
+        "native_contract_path": str(native_contract),
+        "native_card_id_to_token": {
+            str(key): value for key, value in id_to_card_token.items()
+        },
+        "source_card_to_token": source_to_card_token,
+        "native_ability_id_to_token": {
+            str(key): value for key, value in id_to_ability_token.items()
+        },
+    }
+    capacity_reference = (
+        dict(existing_authenticated["capacity_preflight"])
+        if existing_authenticated is not None
+        else _build_capacity_preflight(
+            output_root=output_root,
+            tick_store_root=tick_store_root,
+            episodes=episodes,
+            raw_plan=worker_contract,
+            estimated_total_rows=sum(value.tick_count * 2 for value in episodes),
+            maximum_rows_per_shard=maximum_rows_per_shard,
+            planned_shards=len(shard_specs),
+        )
+    )
     input_contract = {
         "tick_store_manifest_path": str(tick_store_root / "manifest.json"),
         "tick_store_manifest_sha256": sha256_file(tick_store_root / "manifest.json"),
@@ -1193,12 +1497,17 @@ def create_compile_plan(
     }
     compiler_contract = {
         "kind": COMPILER_KIND,
-        "schema_version": 1,
+        "schema_version": 2,
         "seed": int(seed),
         "validation_fraction": float(validation_fraction),
         "test_fraction": float(test_fraction),
         "maximum_rows_per_shard": int(maximum_rows_per_shard),
         "actor_information": "public_only_v1",
+        "storage_schema": {
+            "grid": GRID_STORAGE,
+            "selected_position_mask": POSITION_MASK_STORAGE,
+            "ability_position_mask": POSITION_MASK_STORAGE,
+        },
         "action_alignment": "source_tick_plus_episode_metadata_offset",
         "entity_identity": "discrete_native_card_token_v1",
         "mask_policy": "content_addressed_native_sidecar_fail_closed_v1",
@@ -1217,7 +1526,7 @@ def create_compile_plan(
     )
     plan = {
         "kind": PLAN_KIND,
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input_content_sha256": input_content_sha256,
         "inputs": input_contract,
@@ -1232,6 +1541,7 @@ def create_compile_plan(
         "source_card_to_token": source_to_card_token,
         "ability_vocabulary": ability_vocabulary,
         "native_ability_id_to_token": {str(key): value for key, value in id_to_ability_token.items()},
+        "capacity_preflight": capacity_reference,
         "shards": [
             {
                 **asdict(value),
@@ -1241,10 +1551,9 @@ def create_compile_plan(
         ],
     }
     plan["plan_content_sha256"] = _digest(plan)
-    output_root.mkdir(parents=True, exist_ok=True)
-    existing = output_root / "compile-plan.json"
-    if existing.exists():
-        old = load_compile_plan(existing)
+    existing = existing_plan_path
+    if existing_authenticated is not None:
+        old = existing_authenticated
         normalized_plan = json.loads(_canonical_bytes(plan))
         expected_without_time = {
             key: value
@@ -1343,6 +1652,56 @@ def _grid(actor: ActorTick) -> np.ndarray:
     return np.rint(np.clip(result, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
+def _sparse_grid_row(actor: ActorTick) -> tuple[np.ndarray, np.ndarray]:
+    """Build the exact quantized grid row without allocating 4,608 zeros."""
+    accumulated: dict[int, np.float32] = {}
+
+    def flat(channel: int, row: int, column: int) -> int:
+        return (channel * ARENA_ROWS + row) * ARENA_COLUMNS + column
+
+    def assign(channel: int, row: int, column: int, value: float) -> None:
+        accumulated[flat(channel, row, column)] = np.float32(value)
+
+    def add(channel: int, row: int, column: int, value: float) -> None:
+        key = flat(channel, row, column)
+        accumulated[key] = np.float32(
+            accumulated.get(key, np.float32(0.0)) + np.float32(value)
+        )
+
+    for tower in actor.towers:
+        index = _cell(tower.x, tower.y)
+        row, column = divmod(index, ARENA_COLUMNS)
+        offset = 0 if tower.side == 0 else 2
+        assign(offset, row, column, 1.0)
+        assign(
+            offset + 1,
+            row,
+            column,
+            max(0.0, min(1.0, tower.hp / tower.max_hp))
+            if tower.max_hp > 0
+            else 0.0,
+        )
+    for entity in actor.entities:
+        index = _cell(entity.x, entity.y)
+        row, column = divmod(index, ARENA_COLUMNS)
+        offset = 4 if entity.relation == 0 else 6
+        add(offset, row, column, 1.0 / 16.0)
+        if entity.max_hp > 0:
+            add(
+                offset + 1,
+                row,
+                column,
+                max(0.0, min(1.0, entity.hp / entity.max_hp)) / 16.0,
+            )
+    indices = np.asarray(sorted(accumulated), dtype=np.uint16)
+    raw_values = np.asarray(
+        [accumulated[int(index)] for index in indices], dtype=np.float32
+    )
+    values = np.rint(np.clip(raw_values, 0.0, 1.0) * 255.0).astype(np.uint8)
+    nonzero = values != 0
+    return indices[nonzero], values[nonzero]
+
+
 def _event_maps(plan: BattlePlan, offset: int) -> dict[tuple[int, int], tuple[str, Any]]:
     result: dict[tuple[int, int], tuple[str, Any]] = {}
     for action in plan.actions:
@@ -1382,6 +1741,13 @@ def _compile_actor(
         (int(value["side"]), int(value["deck_index"])): value
         for value in mask_metadata["entries"]
     }
+    sidecars: dict[str, dict[str, Any]] = {}
+    for entry in mask_metadata["entries"]:
+        for reference in (entry, *entry.get("dynamic_label_variants", [])):
+            digest = str(reference["content_sha256"])
+            if digest not in sidecars:
+                sidecars[digest] = mask_store.load(digest, allow_cached=True)
+    dense_mask_cache: dict[tuple[str, tuple[str, ...]], np.ndarray] = {}
     side_plan = plan.sides[actor_side]
     enemy_plan = plan.sides[1 - actor_side]
     deck_tokens = np.asarray(
@@ -1393,7 +1759,6 @@ def _compile_actor(
     allowed_ability_form = {value.native_form_id for value in ability_cards(side_plan.deck)}
     count = len(states)
     arrays: dict[str, np.ndarray] = {
-        "grid": np.zeros((count, len(GRID_CHANNELS), ARENA_ROWS, ARENA_COLUMNS), dtype=np.uint8),
         "public_scalars": np.zeros((count, len(PUBLIC_SCALARS)), dtype=np.float32),
         "own_deck_tokens": np.repeat(deck_tokens[None, :], count, axis=0),
         "hand_tokens": np.zeros((count, 4), dtype=np.int16),
@@ -1405,8 +1770,6 @@ def _compile_actor(
         "card_mask": np.zeros((count, 4), dtype=np.uint8),
         "action_kind_mask": np.zeros((count, 2), dtype=np.uint8),
         "ability_mask": np.zeros((count, max_ability_slots), dtype=np.uint8),
-        "selected_position_mask_packed": np.zeros((count, POSITION_MASK_BYTES), dtype=np.uint8),
-        "ability_position_mask_packed": np.zeros((count, POSITION_MASK_BYTES), dtype=np.uint8),
         "play_now": np.zeros(count, dtype=np.uint8),
         "action_kind": np.full(count, -100, dtype=np.int16),
         "card_slot": np.full(count, -100, dtype=np.int16),
@@ -1422,6 +1785,12 @@ def _compile_actor(
         "sample_weight": np.ones(count, dtype=np.float32),
     }
     revealed_enemy: list[int] = []
+    grid_offsets = np.zeros(count + 1, dtype=np.int64)
+    grid_index_buffer = array("H")
+    grid_value_buffer = bytearray()
+    grid_entry_count = 0
+    selected_position_masks: list[np.ndarray] = []
+    ability_position_masks: list[np.ndarray] = []
     entity_offsets = np.zeros(count + 1, dtype=np.int64)
     entity_tokens: list[int] = []
     entity_positions: list[int] = []
@@ -1444,7 +1813,11 @@ def _compile_actor(
                 revealed_enemy.append(token)
             enemy_cursor += 1
         arrays["revealed_enemy_tokens"][row, : min(8, len(revealed_enemy))] = revealed_enemy[:8]
-        arrays["grid"][row] = _grid(actor)
+        occupied, occupied_values = _sparse_grid_row(actor)
+        grid_index_buffer.frombytes(occupied.tobytes())
+        grid_value_buffer.extend(occupied_values.tobytes())
+        grid_entry_count += len(occupied)
+        grid_offsets[row + 1] = grid_entry_count
         arrays["public_scalars"][row] = _public_scalars(actor, state)
         hand_indices = actor.own_player.hand
         if len(set(hand_indices)) != 4 or any(value < 0 or value >= 8 for value in hand_indices):
@@ -1494,11 +1867,19 @@ def _compile_actor(
                     # card-supervised Tick.  Mask the slot instead of silently
                     # substituting its first-hand base probe.
                     continue
-                sidecar = mask_store.load(str(selected_reference["content_sha256"]))
-                rows = derive_deployment_rows(
-                    sidecar, state, side=actor_side, card_id=int(reference["card_id"])
+                content_sha256 = str(selected_reference["content_sha256"])
+                sidecar = sidecars[content_sha256]
+                rows = mask_store.derive(
+                    content_sha256,
+                    state,
+                    side=actor_side,
+                    card_id=int(reference["card_id"]),
                 )
-                position_mask = _mask_array(rows, actor_side=actor_side)
+                dense_key = (content_sha256, rows)
+                position_mask = dense_mask_cache.get(dense_key)
+                if position_mask is None:
+                    position_mask = _mask_array(rows, actor_side=actor_side)
+                    dense_mask_cache[dense_key] = position_mask
                 affordable = actor.own_player.elixir_raw >= int(sidecar["card_cost_raw"])
                 legal = bool(affordable and position_mask.any())
                 arrays["card_mask"][row, hand_slot] = legal
@@ -1579,8 +1960,8 @@ def _compile_actor(
             arrays["position"][row] = position
             arrays["card_label_mask"][row] = 1
             arrays["position_label_mask"][row] = 1
-            arrays["selected_position_mask_packed"][row] = np.packbits(
-                position_mask, bitorder="little"
+            selected_position_masks.append(
+                np.packbits(position_mask, bitorder="little")
             )
         else:
             arrays["action_kind"][row] = 1
@@ -1599,6 +1980,19 @@ def _compile_actor(
             f"expert action Tick is absent from Tick Store: {plan.battle_tag}/{missing_events[:3]}"
         )
     arrays["entity_offsets"] = entity_offsets
+    arrays["grid_offsets"] = grid_offsets
+    arrays["grid_indices"] = np.asarray(
+        grid_index_buffer, dtype=np.uint16
+    )
+    arrays["grid_values"] = np.frombuffer(
+        grid_value_buffer, dtype=np.uint8
+    ).copy()
+    arrays["selected_position_mask_packed"] = np.asarray(
+        selected_position_masks, dtype=np.uint8
+    ).reshape(-1, POSITION_MASK_BYTES)
+    arrays["ability_position_mask_packed"] = np.asarray(
+        ability_position_masks, dtype=np.uint8
+    ).reshape(-1, POSITION_MASK_BYTES)
     arrays["entity_tokens"] = np.asarray(entity_tokens, dtype=np.int16)
     arrays["entity_positions"] = np.asarray(entity_positions, dtype=np.int16)
     arrays["entity_relations"] = np.asarray(entity_relations, dtype=np.uint8)
@@ -1656,6 +2050,9 @@ def _compile_output_shard(
     id_to_ability_token = {
         int(key): int(value) for key, value in raw_plan["native_ability_id_to_token"].items()
     }
+    replay_contract = load_native_ingest_contract(
+        Path(str(raw_plan["native_contract_path"])).resolve(strict=True)
+    )
     compiled: list[dict[str, np.ndarray]] = []
     sequence_identity: list[dict[str, Any]] = []
     maximum_entities = 0
@@ -1668,7 +2065,9 @@ def _compile_output_shard(
             if sha256_file(source_path) != episode.source_sha256:
                 raise NativeBcCompileError(f"source changed during compilation: {episode.battle_tag}")
             source = json.loads(source_path.read_text(encoding="utf-8-sig"))
-            plan = compile_battle(source)
+            plan = compile_battle(
+                source, native_ingest_contract=replay_contract
+            )
             if plan.source_schema_version != 5 or not plan.native_replay_ready:
                 raise NativeBcCompileError(f"schema-v5 plan is not native ready: {episode.battle_tag}")
             key = (episode.tick_data_path, episode.tick_index_path)
@@ -1746,11 +2145,31 @@ def _compile_output_shard(
         hashes["entity_offsets.npy"] = _save_npy(
             temporary / "entity_offsets.npy", global_entity_offsets
         )
+        grid_counts = np.concatenate(
+            [np.diff(sequence["grid_offsets"]) for sequence in compiled]
+        )
+        global_grid_offsets = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(grid_counts, dtype=np.int64))
+        )
+        hashes["grid_offsets.npy"] = _save_npy(
+            temporary / "grid_offsets.npy", global_grid_offsets
+        )
         for name in compiled[0]:
-            if name == "entity_offsets":
+            if name in {"entity_offsets", "grid_offsets"}:
                 continue
             value = np.concatenate([sequence[name] for sequence in compiled], axis=0)
             hashes[f"{name}.npy"] = _save_npy(temporary / f"{name}.npy", value)
+        for label_name, rows_name in (
+            ("position_label_mask", "selected_position_mask_rows"),
+            ("ability_position_label_mask", "ability_position_mask_rows"),
+        ):
+            labels = np.concatenate(
+                [sequence[label_name] for sequence in compiled], axis=0
+            )
+            sparse_rows = np.flatnonzero(labels).astype(np.int64, copy=False)
+            hashes[f"{rows_name}.npy"] = _save_npy(
+                temporary / f"{rows_name}.npy", sparse_rows
+            )
         metadata = {
             "kind": SHARD_KIND,
             "schema_version": SCHEMA_VERSION,
@@ -1796,6 +2215,30 @@ def compile_planned_shards(
     # entire 100K input corpus; each worker still verifies every source and
     # Tick payload it consumes.
     plan = _authenticate_plan_argument(plan, verify_live_inputs=False)
+    capacity = _read_capacity_preflight(
+        Path(str(plan["capacity_preflight"]["path"]))
+    )
+    output_root = Path(str(plan["output_root"]))
+    already_written = sum(
+        path.stat().st_size
+        for path in (output_root / "shards").rglob("*.npy")
+        if path.is_file()
+    ) if (output_root / "shards").is_dir() else 0
+    free_bytes = int(shutil.disk_usage(output_root).free)
+    remaining_gate = max(
+        0, int(capacity["required_free_bytes"]) - int(already_written)
+    )
+    if free_bytes < remaining_gate:
+        raise NativeBcCompileError(
+            "capacity gate no longer passes before shard compilation: "
+            f"free={free_bytes}, required_remaining={remaining_gate}"
+        )
+    recommended_workers = int(capacity["recommended_max_parallel_compile_workers"])
+    if process_workers > recommended_workers:
+        raise NativeBcCompileError(
+            "requested compile workers exceed measured memory gate: "
+            f"requested={process_workers}, recommended_max={recommended_workers}"
+        )
     if worker_count <= 0 or worker_index < 0 or worker_index >= worker_count:
         raise ValueError("invalid worker partition")
     specs = [
@@ -1804,6 +2247,7 @@ def compile_planned_shards(
         if index % worker_count == worker_index
     ]
     worker_contract = {
+        "native_contract_path": plan["inputs"]["native_contract_path"],
         "native_card_id_to_token": plan["native_card_id_to_token"],
         "source_card_to_token": plan["source_card_to_token"],
         "native_ability_id_to_token": plan["native_ability_id_to_token"],
@@ -1940,11 +2384,17 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         "observation_mode": OBSERVATION_MODE,
         "timing_target": "native_tick_hazard_v1",
         "actor_information": "public_only_v1",
+        "storage_schema": {
+            "grid": GRID_STORAGE,
+            "selected_position_mask": POSITION_MASK_STORAGE,
+            "ability_position_mask": POSITION_MASK_STORAGE,
+        },
         "source_manifest": {
             "path": str(source),
             "sha256": plan["inputs"]["schema5_manifest_sha256"],
         },
         "source_inputs": plan["inputs"],
+        "capacity_preflight": plan["capacity_preflight"],
         "dataset_content_sha256": _digest(
             {
                 "input": plan["input_content_sha256"],
@@ -2056,7 +2506,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--test-fraction", type=float, default=0.05)
-    parser.add_argument("--maximum-rows-per-shard", type=int, default=32_768)
+    parser.add_argument("--maximum-rows-per-shard", type=int, default=524_288)
     parser.add_argument("--io-workers", type=int, default=min(32, max(1, (os.cpu_count() or 1) * 2)))
     parser.add_argument("--process-workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--worker-index", type=int, default=0)
@@ -2090,6 +2540,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "episodes": plan["episodes"],
             "estimated_rows": plan["estimated_rows"],
             "shards": len(plan["shards"]),
+            "capacity_preflight": plan["capacity_preflight"],
         }
     completed = compile_planned_shards(
         plan,

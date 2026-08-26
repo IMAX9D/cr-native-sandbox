@@ -1,4 +1,4 @@
-# Native Tick Store → BC Dataset 编译器 v1
+# Native Tick Store → BC Dataset 编译器 v2
 
 入口：`python -m expert_v1.compile_native_bc_dataset`。
 
@@ -26,8 +26,14 @@
 
 敌方手牌、敌方圣水、native RNG、未公开卡组和未来终局时长均不会写入训练
 数组。实体卡牌身份写入 ragged `entity_tokens`，通过全卡牌 categorical
-vocabulary embedding；`grid.npy` 只保存公共连续量，禁止把 `card_id` 当连续
-像素。
+vocabulary embedding；逻辑上的公共 grid 仍是完全相同的 `[8,32,18] uint8`，
+物理存储改为 actor-row CSR：`grid_offsets/grid_indices/grid_values`。Dataset 只在
+读取 recurrent window 时逐字节还原 dense grid，禁止把 `card_id` 当连续像素。
+
+部署落点 Mask 也不再为每个 20 Hz WAIT Tick 写两份 72-byte packed row。
+`selected_position_mask` 与 `ability_position_mask` 只保存对应 `label_mask=true` 的
+监督行及其 row index，未监督行在窗口读取时严格还原为全零。此变更只改变物理
+存储，不改变模型 tensor、logits、loss 或标签语义。
 
 ## 标签
 
@@ -52,9 +58,15 @@ probe 冒充精确 Mask。
 
 ## 断点与并发
 
-`compile-plan.json` 固化输入和编译器组件 SHA。输出按约 32K actor rows 切成
+`compile-plan.json` 固化输入、编译器组件 SHA 和 `capacity-preflight.json` SHA。
+在正式写 shard 前会确定性编译最多 100 场样本，实测 bytes/actor-row、编译速度
+和峰值 RSS，按全量 actor rows 外推并加 35% 安全余量与至少 10 GiB/5% 文件系统
+保留空间；磁盘或单 Worker 内存门不通过即 fail-closed，不会开始全量写入。
+
+输出默认按约 512K actor rows 切成
 确定性 shard；每个 shard 写入独立临时目录、计算全部 `.npy` SHA 后原子改名。
-重启时已完成且 SHA 正确的 shard 直接复用。
+重启时已完成且 SHA 正确的 shard 直接复用。训练 Dataset 每个进程最多保持 8 个
+shard mmap 打开，随机 shuffle 不会逐步耗尽文件句柄或地址空间。
 
 单机自动并行：
 
@@ -70,4 +82,3 @@ python -m expert_v1.compile_native_bc_dataset `
 `--worker-count N --worker-index 0..N-1`；全部结束后执行 `--finalize-only`。
 `manifest.json` 是最终可见性边界，只在所有 shard 通过训练 schema 后原子发布，
 并同时生成 `manifest.sha256` 与完整 `shard_file_sha256` 覆盖。
-

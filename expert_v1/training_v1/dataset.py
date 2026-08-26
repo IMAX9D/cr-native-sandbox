@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections import OrderedDict
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -15,7 +16,8 @@ from .schema import (
     OBSERVATION_SEQUENCE,
     load_shard_arrays,
     read_manifest,
-    unpack_position_masks,
+    unpack_sparse_grid,
+    unpack_sparse_position_masks,
     validate_shard,
 )
 
@@ -70,6 +72,7 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         sequence_length: int = 128,
         burn_in: int = 32,
         validate: bool = True,
+        maximum_open_shards: int = 8,
     ) -> None:
         if sequence_length <= 0 or burn_in < 0:
             raise ValueError("sequence_length must be positive and burn_in non-negative")
@@ -80,15 +83,24 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         self.split = split
         self.sequence_length = int(sequence_length)
         self.burn_in = int(burn_in)
+        if maximum_open_shards <= 0:
+            raise ValueError("maximum_open_shards must be positive")
+        self.maximum_open_shards = int(maximum_open_shards)
         self.shards = [(self.root / relative).resolve() for relative in self.manifest["splits"][split]]
-        self._arrays: dict[int, dict[str, np.ndarray]] = {}
+        # A production corpus contains thousands of moderately sized shards.
+        # Keep mmap descriptors bounded per DataLoader process instead of
+        # retaining every shard touched by a shuffled epoch.
+        self._arrays: OrderedDict[int, dict[str, np.ndarray]] = OrderedDict()
         self._offsets: list[np.ndarray] = []
         self._sequence_window_prefix: list[np.ndarray] = []
         self._shard_window_prefix = [0]
         for shard in self.shards:
             if validate:
                 validate_shard(shard, self.manifest)
-            offsets = np.load(shard / "sequence_offsets.npy", mmap_mode="r")
+            # Sequence offsets are tiny (two entries per actor episode); copy
+            # them once so enumerating every shard does not pin one mmap/file
+            # descriptor per shard for the lifetime of the DataLoader.
+            offsets = np.load(shard / "sequence_offsets.npy", allow_pickle=False)
             lengths = np.diff(offsets)
             windows = np.asarray(
                 [math.ceil(int(length) / self.sequence_length) for length in lengths],
@@ -107,7 +119,30 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
         if arrays is None:
             arrays = load_shard_arrays(self.shards[shard_index], self.manifest)
             self._arrays[shard_index] = arrays
+            while len(self._arrays) > self.maximum_open_shards:
+                _index, retired = self._arrays.popitem(last=False)
+                self._close_arrays(retired)
+        else:
+            self._arrays.move_to_end(shard_index)
         return arrays
+
+    @staticmethod
+    def _close_arrays(arrays: Mapping[str, np.ndarray]) -> None:
+        for value in arrays.values():
+            mapping = getattr(value, "_mmap", None)
+            if mapping is not None:
+                mapping.close()
+
+    def close(self) -> None:
+        while self._arrays:
+            _index, arrays = self._arrays.popitem(last=False)
+            self._close_arrays(arrays)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _locate(self, index: int) -> tuple[int, int, int]:
         if index < 0:
@@ -168,13 +203,30 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
                 item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
         else:
             item["grid"] = torch.from_numpy(
-                np.asarray(arrays["grid"][sl]).copy()
+                unpack_sparse_grid(
+                    arrays["grid_offsets"],
+                    arrays["grid_indices"],
+                    arrays["grid_values"],
+                    start=read_start,
+                    stop=target_stop,
+                    channels=int(self.manifest["dimensions"]["grid_channels"]),
+                )
             ).float().div_(255.0)
             item["position_mask"] = torch.from_numpy(
-                unpack_position_masks(np.asarray(arrays["selected_position_mask_packed"][sl]))
+                unpack_sparse_position_masks(
+                    arrays["selected_position_mask_rows"],
+                    arrays["selected_position_mask_packed"],
+                    start=read_start,
+                    stop=target_stop,
+                )
             )
             item["ability_position_mask"] = torch.from_numpy(
-                unpack_position_masks(np.asarray(arrays["ability_position_mask_packed"][sl]))
+                unpack_sparse_position_masks(
+                    arrays["ability_position_mask_rows"],
+                    arrays["ability_position_mask_packed"],
+                    start=read_start,
+                    stop=target_stop,
+                )
             )
             for name in TOKEN_FIELDS + LABEL_FIELDS:
                 item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).long()

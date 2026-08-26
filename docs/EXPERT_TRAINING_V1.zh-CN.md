@@ -89,7 +89,8 @@ WAIT Tick 不产生 Card、Position 或 Ability 梯度。被原生规则判定�
 
 根目录包含 `manifest.json`，每个 shard 是普通 `.npy` 目录，支持 mmap 和多进程 DataLoader。主要数组：
 
-- `grid [N,C,32,18] uint8`
+- `grid_offsets [N+1] int64`、`grid_indices [nnz] uint16`、
+  `grid_values [nnz] uint8`（Dataset 窗口内无损还原为 `grid [N,C,32,18]`）
 - `public_scalars [N,P]`
 - `own_deck_tokens [N,8]`
 - `hand_tokens [N,4]`
@@ -99,11 +100,14 @@ WAIT Tick 不产生 Card、Position 或 Ability 梯度。被原生规则判定�
 - `card_mask [N,4]`
 - `action_kind_mask [N,2]`
 - `ability_mask [N,A]`
-- `selected_position_mask_packed [N,72]`
+- `selected_position_mask_rows [P]` + `selected_position_mask_packed [P,72]`
+- `ability_position_mask_rows [Q]` + `ability_position_mask_packed [Q,72]`
 - 六个条件标签及各自 `*_label_mask`
 - `sequence_offsets`、`delta_ticks`、`timing_exposure_ticks`、`sample_weight`
 
-落点 Mask 以 576 bit（72 bytes）保存；WAIT Tick 不存四份重复的落点 Mask，只保存专家所选卡对应的 Mask，Position Loss 只在实际部署时读取它。
+落点 Mask 以 576 bit（72 bytes）保存；WAIT Tick 不写零填充 Mask，只保存实际
+position 监督行，Dataset 按 row index 在窗口内恢复未监督行全零语义。Position
+Loss 的 tensor/API 不变。
 
 采集到技能 Tick 但技能身份仍未解析时，可以训练 `timing` 和 `action_kind=ability`，但必须令 `ability_label_mask=false`。只有 libg 在该 Tick 唯一解析出真实可用技能后，才允许训练 Ability Head；不能根据卡组静态猜技能身份。
 

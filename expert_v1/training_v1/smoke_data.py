@@ -12,9 +12,12 @@ import numpy as np
 
 from .schema import (
     DATASET_KIND,
+    GRID_STORAGE,
     POSITION_COUNT,
+    POSITION_MASK_STORAGE,
     SCHEMA_VERSION,
     SHARD_KIND,
+    pack_sparse_grid,
     sha256_file,
 )
 
@@ -34,9 +37,19 @@ def _shard(path: Path, *, seed: int, sequences: int, steps: int, dimensions: dic
         (np.zeros(1, dtype=np.int64), np.cumsum(entity_counts, dtype=np.int64))
     )
     entities = int(entity_offsets[-1])
+    dense_grid = np.zeros(
+        (rows, dimensions["grid_channels"], 32, 18), dtype=np.uint8
+    )
+    for row in range(rows):
+        flat = dense_grid[row].reshape(-1)
+        cells = rng.choice(flat.size, size=min(96, flat.size), replace=False)
+        flat[cells] = rng.integers(1, 256, size=len(cells), dtype=np.uint8)
+    grid_offsets, grid_indices, grid_values = pack_sparse_grid(dense_grid)
     arrays: dict[str, np.ndarray] = {
         "sequence_offsets": np.arange(0, rows + 1, steps, dtype=np.int64),
-        "grid": rng.integers(0, 256, (rows, dimensions["grid_channels"], 32, 18), dtype=np.uint8),
+        "grid_offsets": grid_offsets,
+        "grid_indices": grid_indices,
+        "grid_values": grid_values,
         "public_scalars": rng.normal(size=(rows, dimensions["public_scalar_size"])).astype(np.float32),
         "own_deck_tokens": np.empty((rows, 8), dtype=np.int16),
         "hand_tokens": np.empty((rows, 4), dtype=np.int16),
@@ -103,8 +116,18 @@ def _shard(path: Path, *, seed: int, sequences: int, steps: int, dimensions: dic
             arrays["position_label_mask"][row] = 1
             arrays["card_slot"][row] = slot
             arrays["position"][row] = int(legal[0])
-    arrays["selected_position_mask_packed"] = _pack(selected_positions)
-    arrays["ability_position_mask_packed"] = _pack(ability_positions)
+    selected_rows = np.flatnonzero(arrays["position_label_mask"]).astype(np.int64)
+    ability_rows = np.flatnonzero(arrays["ability_position_label_mask"]).astype(
+        np.int64
+    )
+    arrays["selected_position_mask_rows"] = selected_rows
+    arrays["selected_position_mask_packed"] = _pack(
+        selected_positions[selected_rows]
+    )
+    arrays["ability_position_mask_rows"] = ability_rows
+    arrays["ability_position_mask_packed"] = _pack(
+        ability_positions[ability_rows]
+    )
     path.mkdir(parents=True)
     for name, value in arrays.items():
         np.save(path / f"{name}.npy", value, allow_pickle=False)
@@ -148,6 +171,11 @@ def create_smoke_dataset(root: Path, *, replace: bool = False) -> Path:
         "production_ready": False,
         "native_replay_validated": False,
         "actor_information": "public_only_v1",
+        "storage_schema": {
+            "grid": GRID_STORAGE,
+            "selected_position_mask": POSITION_MASK_STORAGE,
+            "ability_position_mask": POSITION_MASK_STORAGE,
+        },
         "dimensions": dimensions,
         "splits": splits,
         "split_contract": {

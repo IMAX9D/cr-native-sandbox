@@ -3,6 +3,9 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+
+import expert_v1.tick_store_v1.deployment_masks as deployment_masks_module
 
 from expert_v1.native_dataset_generator import (
     StagedTickSink,
@@ -498,6 +501,56 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             physical = verify_published_tick_store(root)
             self.assertEqual(physical["episodes"], 1)
             self.assertEqual(physical["deployment_mask_sidecars_referenced"], 8)
+
+    def test_process_cache_authenticates_digest_once_and_derive_is_bit_exact(self) -> None:
+        capture = NativeDeploymentMaskCapture(deck_slots())
+        env = ProbeEnv()
+        capture.capture_available(env, state(10, [0, 1, 2, 3]))
+        capture.capture_available(env, state(20, [4, 5, 6, 7]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            publisher = DeploymentMaskStore(root)
+            published = publisher.publish_many(capture.payloads)
+            digest = next(iter(published))
+            process_key = (str(publisher.root), digest)
+            with deployment_masks_module._PROCESS_CACHE_LOCK:
+                deployment_masks_module._PROCESS_PAYLOAD_CACHE.pop(process_key, None)
+                stale = [
+                    key
+                    for key in deployment_masks_module._PROCESS_DERIVED_CACHE
+                    if key[:2] == process_key
+                ]
+                for key in stale:
+                    deployment_masks_module._PROCESS_DERIVED_CACHE.pop(key, None)
+
+            original_read_bytes = Path.read_bytes
+            reads = 0
+
+            def counted(path: Path) -> bytes:
+                nonlocal reads
+                if path == publisher.path_for(digest):
+                    reads += 1
+                return original_read_bytes(path)
+
+            first = DeploymentMaskStore(root, create=False)
+            second = DeploymentMaskStore(root, create=False)
+            with patch.object(Path, "read_bytes", counted):
+                payload = first.load(digest, allow_cached=True)
+                self.assertEqual(second.load(digest, allow_cached=True), payload)
+                cached_rows = first.derive(
+                    digest, tick_state(), side=0, card_id=28_000_000
+                )
+                self.assertIs(
+                    cached_rows,
+                    second.derive(
+                        digest, tick_state(), side=0, card_id=28_000_000
+                    ),
+                )
+            self.assertEqual(reads, 1)
+            direct_rows = derive_deployment_rows(
+                payload, tick_state(), side=0, card_id=28_000_000
+            )
+            self.assertEqual(cached_rows, direct_rows)
 
 
 if __name__ == "__main__":

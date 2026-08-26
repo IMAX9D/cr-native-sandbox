@@ -17,9 +17,9 @@ from typing import Any, Mapping
 import numpy as np
 
 
-SCHEMA_VERSION = 1
-DATASET_KIND = "cr_native_expert_bc_dataset_v1"
-SHARD_KIND = "cr_native_expert_bc_shard_v1"
+SCHEMA_VERSION = 2
+DATASET_KIND = "cr_native_expert_bc_dataset_v2"
+SHARD_KIND = "cr_native_expert_bc_shard_v2"
 OBSERVATION_NATIVE = "native_state_v1"
 OBSERVATION_SEQUENCE = "sequence_only_v1"
 ARENA_ROWS = 32
@@ -28,12 +28,20 @@ POSITION_COUNT = ARENA_ROWS * ARENA_COLUMNS
 POSITION_MASK_BYTES = POSITION_COUNT // 8
 DECK_SIZE = 8
 HAND_SIZE = 4
+GRID_STORAGE = "actor_row_csr_flat_u16_u8_v1"
+POSITION_MASK_STORAGE = "supervised_rows_packbits_little_v1"
 
 # A shard is a directory of plain .npy arrays.  This keeps large arrays
 # memory-mappable and avoids loading a compressed archive into every worker.
 NATIVE_REQUIRED_ARRAYS = {
     "sequence_offsets",
-    "grid",
+    # Lossless actor-row CSR over the flattened [channels, 32, 18] uint8
+    # tensor.  The dense grid is reconstructed only for the requested mmap
+    # window; storing 4,608 mostly-zero bytes for every 20 Hz actor row made
+    # the production corpus several terabytes.
+    "grid_offsets",
+    "grid_indices",
+    "grid_values",
     "public_scalars",
     "own_deck_tokens",
     "hand_tokens",
@@ -52,7 +60,9 @@ NATIVE_REQUIRED_ARRAYS = {
     "card_mask",
     "action_kind_mask",
     "ability_mask",
+    "selected_position_mask_rows",
     "selected_position_mask_packed",
+    "ability_position_mask_rows",
     "ability_position_mask_packed",
     "play_now",
     "action_kind",
@@ -317,6 +327,35 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
             f"privileged actor features are forbidden: {forbidden_features}"
         )
     if observation_mode == OBSERVATION_NATIVE:
+        storage = value.get("storage_schema") or {}
+        if storage.get("grid") != GRID_STORAGE:
+            raise DatasetContractError(
+                f"native grid storage must be {GRID_STORAGE}"
+            )
+        if storage.get("selected_position_mask") != POSITION_MASK_STORAGE:
+            raise DatasetContractError(
+                "selected-position mask storage contract changed"
+            )
+        if storage.get("ability_position_mask") != POSITION_MASK_STORAGE:
+            raise DatasetContractError(
+                "ability-position mask storage contract changed"
+            )
+        if value.get("production_ready") is True:
+            capacity = value.get("capacity_preflight") or {}
+            expected_capacity_path = (root / "capacity-preflight.json").resolve()
+            try:
+                capacity_path = Path(str(capacity["path"])).resolve()
+                capacity_sha = str(capacity["file_sha256"])
+            except Exception as error:
+                raise DatasetContractError(
+                    "production native dataset lacks capacity preflight binding"
+                ) from error
+            if capacity_path != expected_capacity_path or not capacity_path.is_file():
+                raise DatasetContractError(
+                    "capacity preflight path is outside/missing from dataset root"
+                )
+            if not _SHA256_RE.fullmatch(capacity_sha) or sha256_file(capacity_path) != capacity_sha:
+                raise DatasetContractError("capacity preflight checksum changed")
         if feature_schema.get("entity_identity") != "categorical_card_vocabulary_v1":
             raise DatasetContractError(
                 "native entity identity must use categorical card-vocabulary tokens"
@@ -383,14 +422,7 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     dimensions = manifest["dimensions"]
     if str(manifest.get("observation_mode") or OBSERVATION_NATIVE) == OBSERVATION_SEQUENCE:
         return _validate_sequence_shard(shard, manifest, arrays, offsets, rows)
-    grid_shape = (
-        rows,
-        int(dimensions["grid_channels"]),
-        ARENA_ROWS,
-        ARENA_COLUMNS,
-    )
     shapes = {
-        "grid": grid_shape,
         "public_scalars": (rows, int(dimensions["public_scalar_size"])),
         "own_deck_tokens": (rows, DECK_SIZE),
         "hand_tokens": (rows, HAND_SIZE),
@@ -400,9 +432,22 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         "card_mask": (rows, HAND_SIZE),
         "action_kind_mask": (rows, 2),
         "ability_mask": (rows, int(dimensions["max_ability_slots"])),
-        "selected_position_mask_packed": (rows, POSITION_MASK_BYTES),
-        "ability_position_mask_packed": (rows, POSITION_MASK_BYTES),
     }
+    grid_offsets = arrays["grid_offsets"]
+    if (
+        grid_offsets.dtype != np.int64
+        or
+        grid_offsets.ndim != 1
+        or tuple(grid_offsets.shape) != (rows + 1,)
+        or int(grid_offsets[0]) != 0
+        or np.any(np.diff(grid_offsets) < 0)
+    ):
+        raise DatasetContractError("grid_offsets must be monotonic rows+1 CSR offsets")
+    grid_entries = int(grid_offsets[-1])
+    shapes.update({
+        "grid_indices": (grid_entries,),
+        "grid_values": (grid_entries,),
+    })
     entity_offsets = arrays["entity_offsets"]
     if (
         entity_offsets.ndim != 1
@@ -421,8 +466,24 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         "entity_relations": (entities,),
         "entity_numeric": (entities, entity_numeric_size),
     })
+    position_rows_count = int(arrays["position_label_mask"].astype(bool).sum())
+    ability_position_rows_count = int(
+        arrays["ability_position_label_mask"].astype(bool).sum()
+    )
+    shapes.update({
+        "selected_position_mask_rows": (position_rows_count,),
+        "selected_position_mask_packed": (
+            position_rows_count,
+            POSITION_MASK_BYTES,
+        ),
+        "ability_position_mask_rows": (ability_position_rows_count,),
+        "ability_position_mask_packed": (
+            ability_position_rows_count,
+            POSITION_MASK_BYTES,
+        ),
+    })
     one_dimensional = REQUIRED_ARRAYS - set(shapes) - {
-        "sequence_offsets", "entity_offsets"
+        "sequence_offsets", "entity_offsets", "grid_offsets"
     }
     shapes.update({name: (rows,) for name in one_dimensional})
     for name, expected in shapes.items():
@@ -430,10 +491,25 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
             raise DatasetContractError(
                 f"{shard}/{name}.npy shape {arrays[name].shape} != {expected}"
             )
-    if len(offsets) and rows != arrays["grid"].shape[0]:
-        raise DatasetContractError("offset terminal does not match row count")
-    if arrays["grid"].dtype != np.uint8:
-        raise DatasetContractError("grid must be uint8")
+    if arrays["grid_indices"].dtype != np.uint16:
+        raise DatasetContractError("grid_indices must be uint16")
+    if arrays["grid_values"].dtype != np.uint8:
+        raise DatasetContractError("grid_values must be uint8")
+    grid_indices = arrays["grid_indices"]
+    grid_size = int(dimensions["grid_channels"]) * ARENA_ROWS * ARENA_COLUMNS
+    if grid_indices.max(initial=0) >= grid_size:
+        raise DatasetContractError("grid CSR index outside flattened grid")
+    if np.any(arrays["grid_values"] == 0):
+        raise DatasetContractError("grid CSR may not store explicit zero values")
+    if grid_entries > 1:
+        differences = np.diff(grid_indices.astype(np.int32, copy=False))
+        boundaries = np.asarray(grid_offsets[1:-1], dtype=np.int64) - 1
+        boundaries = boundaries[(boundaries >= 0) & (boundaries < len(differences))]
+        differences[boundaries] = 1
+        if np.any(differences <= 0):
+            raise DatasetContractError(
+                "grid CSR indices must be strictly increasing within each row"
+            )
     for name in ("own_deck_tokens", "hand_tokens", "next_card_token", "revealed_enemy_tokens"):
         values = arrays[name]
         if values.min(initial=0) < 0 or values.max(initial=0) >= int(dimensions["card_vocab_size"]):
@@ -519,8 +595,14 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     if np.any((positions[position_rows] < 0) | (positions[position_rows] >= POSITION_COUNT)):
         raise DatasetContractError("position label outside arena")
     if np.any(position_rows):
+        stored_rows = arrays["selected_position_mask_rows"].astype(np.int64)
+        expected_rows = np.flatnonzero(position_rows)
+        if not np.array_equal(stored_rows, expected_rows):
+            raise DatasetContractError(
+                "selected-position sparse row index disagrees with label mask"
+            )
         unpacked = np.unpackbits(
-            arrays["selected_position_mask_packed"][position_rows],
+            arrays["selected_position_mask_packed"],
             axis=-1,
             count=POSITION_COUNT,
             bitorder="little",
@@ -529,6 +611,10 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
             raise DatasetContractError("expert position is masked illegal")
     if np.any(position_rows & ~card_rows):
         raise DatasetContractError("position label requires a card label")
+    if arrays["selected_position_mask_rows"].dtype != np.int64:
+        raise DatasetContractError("selected-position sparse rows must be int64")
+    if arrays["selected_position_mask_packed"].dtype != np.uint8:
+        raise DatasetContractError("selected-position packed masks must be uint8")
     ability_rows = arrays["ability_label_mask"].astype(bool)
     ability_slots = arrays["ability_slot"].astype(np.int64)
     max_slots = int(dimensions["max_ability_slots"])
@@ -548,8 +634,14 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     ):
         raise DatasetContractError("ability position label outside arena")
     if np.any(ability_position_rows):
+        stored_rows = arrays["ability_position_mask_rows"].astype(np.int64)
+        expected_rows = np.flatnonzero(ability_position_rows)
+        if not np.array_equal(stored_rows, expected_rows):
+            raise DatasetContractError(
+                "ability-position sparse row index disagrees with label mask"
+            )
         unpacked = np.unpackbits(
-            arrays["ability_position_mask_packed"][ability_position_rows],
+            arrays["ability_position_mask_packed"],
             axis=-1,
             count=POSITION_COUNT,
             bitorder="little",
@@ -560,6 +652,10 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
             ]
         ):
             raise DatasetContractError("expert ability position is masked illegal")
+    if arrays["ability_position_mask_rows"].dtype != np.int64:
+        raise DatasetContractError("ability-position sparse rows must be int64")
+    if arrays["ability_position_mask_packed"].dtype != np.uint8:
+        raise DatasetContractError("ability-position packed masks must be uint8")
     any_supervision = (
         valid
         | kind_rows
@@ -580,6 +676,75 @@ def unpack_position_masks(packed: np.ndarray) -> np.ndarray:
         count=POSITION_COUNT,
         bitorder="little",
     ).astype(np.bool_)
+
+
+def pack_sparse_grid(grid: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Encode dense ``[rows, channels, 32, 18]`` uint8 losslessly as CSR."""
+    value = np.asarray(grid)
+    if value.ndim != 4 or tuple(value.shape[-2:]) != (ARENA_ROWS, ARENA_COLUMNS):
+        raise ValueError("grid must have shape [rows, channels, 32, 18]")
+    if value.dtype != np.uint8:
+        raise ValueError("grid must be uint8")
+    flattened = value.reshape(value.shape[0], -1)
+    row_indices, flat_indices = np.nonzero(flattened)
+    counts = np.bincount(row_indices, minlength=value.shape[0])
+    offsets = np.concatenate(
+        (np.zeros(1, dtype=np.int64), np.cumsum(counts, dtype=np.int64))
+    )
+    return (
+        offsets,
+        flat_indices.astype(np.uint16, copy=False),
+        flattened[row_indices, flat_indices].astype(np.uint8, copy=False),
+    )
+
+
+def unpack_sparse_grid(
+    offsets: np.ndarray,
+    indices: np.ndarray,
+    values: np.ndarray,
+    *,
+    start: int,
+    stop: int,
+    channels: int,
+) -> np.ndarray:
+    """Decode an actor-row CSR slice into byte-identical dense uint8 grids."""
+    if not 0 <= start <= stop < len(offsets):
+        raise ValueError("invalid sparse-grid row slice")
+    count = stop - start
+    result = np.zeros(
+        (count, channels, ARENA_ROWS, ARENA_COLUMNS), dtype=np.uint8
+    )
+    if count == 0:
+        return result
+    first = int(offsets[start])
+    last = int(offsets[stop])
+    local_offsets = np.asarray(offsets[start : stop + 1], dtype=np.int64) - first
+    selected_indices = np.asarray(indices[first:last], dtype=np.int64)
+    selected_values = np.asarray(values[first:last], dtype=np.uint8)
+    if int(local_offsets[-1]) != len(selected_indices) or len(selected_indices) != len(selected_values):
+        raise DatasetContractError("sparse-grid slice offsets disagree with payload")
+    if len(selected_indices):
+        row_ids = np.repeat(np.arange(count, dtype=np.int64), np.diff(local_offsets))
+        result.reshape(count, -1)[row_ids, selected_indices] = selected_values
+    return result
+
+
+def unpack_sparse_position_masks(
+    rows: np.ndarray,
+    packed: np.ndarray,
+    *,
+    start: int,
+    stop: int,
+) -> np.ndarray:
+    """Reconstruct zero-default position masks for one actor-row window."""
+    result = np.zeros((stop - start, POSITION_COUNT), dtype=np.bool_)
+    lower = int(np.searchsorted(rows, start, side="left"))
+    upper = int(np.searchsorted(rows, stop, side="left"))
+    if lower == upper:
+        return result
+    local_rows = np.asarray(rows[lower:upper], dtype=np.int64) - start
+    result[local_rows] = unpack_position_masks(np.asarray(packed[lower:upper]))
+    return result
 
 
 def _validate_sequence_shard(

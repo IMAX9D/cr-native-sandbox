@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,7 +20,10 @@ from expert_v1.compile_native_bc_dataset import (
     finalize_dataset,
     load_compile_plan,
 )
-from expert_v1.native_ingest_contract import write_native_ingest_contract
+from expert_v1.native_ingest_contract import (
+    load_native_ingest_contract,
+    write_native_ingest_contract,
+)
 from expert_v1.native_replay_plan import compile_battle
 from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
@@ -40,6 +44,7 @@ from expert_v1.tick_store_v1.shard import (
 from expert_v1.training_v1.dataset import NativeExpertSequenceDataset, collate_sequences
 from expert_v1.training_v1.schema import (
     read_manifest,
+    unpack_sparse_grid,
     validate_shard,
     verify_dataset_integrity,
 )
@@ -92,8 +97,12 @@ def _tower_states() -> tuple[TowerState, ...]:
     return tuple(values)
 
 
-def _states(source: dict[str, object]) -> tuple[TickState, ...]:
-    plan = compile_battle(source)
+def _states(
+    source: dict[str, object], native_ingest_contract: object | None = None
+) -> tuple[TickState, ...]:
+    plan = compile_battle(
+        source, native_ingest_contract=native_ingest_contract
+    )
     first_card = plan.sides[0].deck[0]
     first_metadata = card_metadata(first_card.card_id)
     entity_card_id = (
@@ -167,6 +176,7 @@ class NativeBcCompilerTests(unittest.TestCase):
     ) -> tuple[Path, Path, Path]:
         contract = root / "native-contract.json"
         published = write_native_ingest_contract(contract)
+        loaded_contract = load_native_ingest_contract(contract)
         contract_value = json.loads(contract.read_text(encoding="utf-8"))
         base = json.loads(FIXTURE.read_text(encoding="utf-8"))
         base["authoritative_native_contract"] = {
@@ -252,7 +262,9 @@ class NativeBcCompilerTests(unittest.TestCase):
         mask_store = DeploymentMaskStore(tick_root)
         with AppendOnlyShardWriter(tick_root, "worker-00000") as writer:
             for source, valid_source, path, source_sha in values:
-                plan = compile_battle(valid_source)
+                plan = compile_battle(
+                    valid_source, native_ingest_contract=loaded_contract
+                )
                 slots = [
                     {
                         "side": side,
@@ -296,7 +308,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     },
                 )
                 mask_store.publish_many(capture.payloads)
-                states = _states(valid_source)
+                states = _states(valid_source, loaded_contract)
                 writer.append(
                     str(source["battle_tag"]),
                     states,
@@ -373,6 +385,16 @@ class NativeBcCompilerTests(unittest.TestCase):
             )
             self.assertGreater(integrity["shard_files"], 0)
             self.assertTrue(manifest["native_replay_validated"])
+            self.assertEqual(manifest["schema_version"], 2)
+            capacity = json.loads(
+                (output / "capacity-preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(capacity["passed"])
+            self.assertGreater(capacity["sample_actor_rows"], 0)
+            self.assertLess(capacity["sample_bytes_per_actor_row"], 4_608)
+            self.assertEqual(
+                manifest["capacity_preflight"], plan["capacity_preflight"]
+            )
             self.assertEqual(manifest["quality_gates"]["split_collisions"], 0)
             assignments = [
                 json.loads(line)
@@ -396,7 +418,14 @@ class NativeBcCompilerTests(unittest.TestCase):
             self.assertTrue(batch["entity_mask"].any())
             self.assertEqual(str(batch["entity_tokens"].dtype), "torch.int64")
             shard = output / manifest["splits"]["train"][0]
-            grid = np.load(shard / "grid.npy")
+            grid = unpack_sparse_grid(
+                np.load(shard / "grid_offsets.npy"),
+                np.load(shard / "grid_indices.npy"),
+                np.load(shard / "grid_values.npy"),
+                start=0,
+                stop=1,
+                channels=int(manifest["dimensions"]["grid_channels"]),
+            )
             tokens = np.load(shard / "entity_tokens.npy")
             self.assertEqual(grid.dtype, np.uint8)
             self.assertTrue(np.issubdtype(tokens.dtype, np.integer))
@@ -415,6 +444,105 @@ class NativeBcCompilerTests(unittest.TestCase):
             sidecar.unlink()
             with self.assertRaises(DeploymentMaskContractError):
                 create_compile_plan(tick_root, source, root / "compiled", contract)
+
+    def test_capacity_preflight_is_bound_and_low_disk_fails_before_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            disk_usage = type("DiskUsage", (), {"total": 1024**4, "used": 0, "free": 1})()
+            with patch(
+                "expert_v1.compile_native_bc_dataset.shutil.disk_usage",
+                return_value=disk_usage,
+            ):
+                with self.assertRaisesRegex(NativeBcCompileError, "capacity preflight failed"):
+                    create_compile_plan(
+                        tick_root,
+                        source,
+                        output,
+                        contract,
+                        maximum_rows_per_shard=10_000,
+                    )
+            self.assertFalse((output / "compile-plan.json").exists())
+            failed = json.loads(
+                (output / "capacity-preflight.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(failed["disk_gate_passed"])
+            self.assertFalse(failed["passed"])
+
+    def test_capacity_preflight_mutation_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            create_compile_plan(
+                tick_root,
+                source,
+                output,
+                contract,
+                maximum_rows_per_shard=10_000,
+            )
+            path = output / "capacity-preflight.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["projected_output_bytes"] += 1
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with self.assertRaisesRegex(NativeBcCompileError, "capacity preflight"):
+                load_compile_plan(output / "compile-plan.json")
+
+    def test_resigned_legacy_dense_multi_terabyte_plan_cannot_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract = self._inputs(root)
+            output = root / "compiled"
+            create_compile_plan(
+                tick_root,
+                source,
+                output,
+                contract,
+                maximum_rows_per_shard=10_000,
+            )
+            path = output / "compile-plan.json"
+            value = json.loads(path.read_text(encoding="utf-8"))
+            value["compiler"]["storage_schema"]["grid"] = (
+                "legacy_dense_actor_rows_uint8_4tb_v1"
+            )
+
+            def canonical(item: object) -> bytes:
+                return (
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+
+            value["input_content_sha256"] = hashlib.sha256(
+                canonical(
+                    {
+                        "inputs": value["inputs"],
+                        "compiler": value["compiler"],
+                    }
+                )
+            ).hexdigest()
+            value["plan_content_sha256"] = hashlib.sha256(
+                canonical(
+                    {
+                        key: item
+                        for key, item in value.items()
+                        if key != "plan_content_sha256"
+                    }
+                )
+            ).hexdigest()
+            raw = canonical(value)
+            path.write_bytes(raw)
+            (output / "compile-plan.sha256").write_text(
+                f"{hashlib.sha256(raw).hexdigest()}  compile-plan.json\n",
+                encoding="ascii",
+            )
+            with self.assertRaisesRegex(NativeBcCompileError, "compiler semantics"):
+                load_compile_plan(path)
 
     def test_source_and_episode_contract_must_equal_cli_contract(self) -> None:
         for field in (
@@ -471,7 +599,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "created_utc", "2099-01-01T00:00:00+00:00"
                 ),
                 "kind": lambda value: value.__setitem__("kind", "forged"),
-                "schema": lambda value: value.__setitem__("schema_version", 2),
+                "schema": lambda value: value.__setitem__("schema_version", 3),
                 "count": lambda value: value.__setitem__(
                     "episodes", int(value["episodes"]) + 1
                 ),
