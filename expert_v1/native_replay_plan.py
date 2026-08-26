@@ -52,7 +52,14 @@ ROYALEAPI_CARD_ALIASES = {
     "magic-archer": 26000062,
     "mother-witch": 26000083,
     "rune-giant": 26000101,
+    # These two public slugs only differ from the frozen internal name by a
+    # word boundary.  ``resolve_card`` historically accepted them after
+    # punctuation folding, but the authoritative ingest contract needs the
+    # exact RoyaleAPI token so a crawler can validate without duplicating its
+    # own card table.
+    "wall-breakers": 26000058,
     "furnace": 27000010,
+    "x-bow": 27000008,
     "the-log": 28000011,
     "barbarian-barrel": 28000015,
     "heal-spirit": 28000016,
