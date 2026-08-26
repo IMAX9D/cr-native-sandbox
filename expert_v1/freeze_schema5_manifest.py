@@ -8,6 +8,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterable
 
+from .native_ingest_contract import contract_payload_sha256
+
 
 CONTRACT_GATE = "native_static_v2"
 SOURCE_SCHEMA_VERSION = 5
@@ -37,6 +39,28 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
         output.write(payload)
         output.flush()
     temporary.replace(path)
+
+
+def _contract_binding(path: Path) -> tuple[Path, str, str]:
+    """Authenticate both semantic (canonical) and byte-exact contract IDs."""
+
+    source = path.resolve(strict=True)
+    raw = source.read_bytes()
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("native contract root is not an object")
+    canonical = str(value.get("contract_sha256") or "")
+    if canonical != contract_payload_sha256(value):
+        raise ValueError("native contract canonical SHA-256 mismatch")
+    file_sha = hashlib.sha256(raw).hexdigest()
+    sidecar = source.with_suffix(source.suffix + ".sha256")
+    try:
+        sidecar_sha = sidecar.read_text(encoding="ascii").split()[0]
+    except (OSError, IndexError) as error:
+        raise ValueError("native contract file SHA-256 sidecar is missing") from error
+    if sidecar_sha != file_sha:
+        raise ValueError("native contract file SHA-256 mismatch")
+    return source, canonical, file_sha
 
 
 def _index_rows(path: Path) -> dict[str, dict[str, Any]]:
@@ -144,9 +168,19 @@ def freeze(
     output: Path,
     target: int,
     allow_incomplete: bool,
+    native_contract_path: Path | None = None,
 ) -> dict[str, Any]:
     root = authoritative_root.resolve(strict=True)
     index_path = root / "index.jsonl"
+    contract_path: Path | None = None
+    expected_contract_sha: str | None = None
+    expected_contract_file_sha: str | None = None
+    if native_contract_path is not None:
+        (
+            contract_path,
+            expected_contract_sha,
+            expected_contract_file_sha,
+        ) = _contract_binding(native_contract_path)
     uri = "file:" + db_path.resolve(strict=True).as_posix() + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=30)
     connection.row_factory = sqlite3.Row
@@ -170,7 +204,11 @@ def freeze(
         raise RuntimeError(f"authoritative corpus is incomplete: {len(rows)}/{target}")
     if len(rows) > target:
         raise RuntimeError(f"authoritative corpus exceeds frozen target: {len(rows)}/{target}")
-    if (not allow_incomplete and len(index) != len(rows)) or len(index) < len(rows):
+    # A transactionally cap-rejected concurrent completion may have already
+    # durably appended an unaccepted recovery index row.  DB membership is the
+    # authority; require it to be a subset rather than mistaking an orphan for
+    # an accepted battle.
+    if len(index) < len(rows):
         raise RuntimeError(f"authoritative index/DB count mismatch: {len(index)}/{len(rows)}")
 
     manifest_rows: list[dict[str, Any]] = []
@@ -187,9 +225,16 @@ def freeze(
         if Path(str(index[tag].get("saved_path") or "")).resolve() != source:
             raise RuntimeError(f"accepted index path mismatch: {tag}")
         contract_sha = str(db_row["contract_sha256"] or "")
+        if expected_contract_sha is not None and contract_sha != expected_contract_sha:
+            raise RuntimeError(f"accepted DB contract mismatch: {tag}")
         row, _ = _validate_source(
             source, battle_tag=tag, contract_sha256=contract_sha
         )
+        if (
+            expected_contract_file_sha is not None
+            and row["contract_file_sha256"] != expected_contract_file_sha
+        ):
+            raise RuntimeError(f"accepted source contract file SHA mismatch: {tag}")
         manifest_rows.append(row)
         contract_set.add(contract_sha)
         file_shas.add(row["contract_file_sha256"])
@@ -213,6 +258,9 @@ def freeze(
         "authoritative_index_sha256": _sha256(index_path),
         "native_contract_sha256": next(iter(contract_set), None),
         "native_contract_file_sha256": next(iter(file_shas), None),
+        "native_contract_path": (
+            None if contract_path is None else str(contract_path)
+        ),
         "unique_players": len(player_tags),
         "manifest_path": str(output.resolve()),
         "manifest_sha256": manifest_sha,
@@ -231,6 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target", type=int, default=100_000)
     parser.add_argument("--allow-incomplete", action="store_true")
+    parser.add_argument("--native-contract", type=Path, required=True)
     return parser
 
 
@@ -242,6 +291,7 @@ def main() -> int:
         output=args.output,
         target=args.target,
         allow_incomplete=args.allow_incomplete,
+        native_contract_path=args.native_contract,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0

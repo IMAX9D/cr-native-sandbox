@@ -16,10 +16,12 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .native_capabilities import ability_log_tier
+from .native_ingest_contract import load_native_ingest_contract
 from .native_replay_plan import ReplayPlanError, compile_battle, split_card_token
 
 
@@ -260,6 +262,45 @@ def audit_one(
     raw = source.read_bytes()
     source_sha = hashlib.sha256(raw).hexdigest()
     value = json.loads(raw)
+    stamp = value.get("authoritative_native_contract")
+    expected_contract_sha = (
+        None
+        if native_ingest_contract is None
+        else str(native_ingest_contract.value.get("contract_sha256") or "")
+    )
+    expected_contract_file_sha = (
+        None
+        if native_ingest_contract is None
+        else str(native_ingest_contract.file_sha256)
+    )
+    declared_source_sha = str(manifest_row.get("source_sha256") or "")
+    declared_contract_sha = str(manifest_row.get("contract_sha256") or "")
+    declared_contract_file_sha = str(
+        manifest_row.get("contract_file_sha256") or ""
+    )
+    manifest_binding_verified = bool(
+        (not declared_source_sha or source_sha == declared_source_sha)
+        and isinstance(stamp, Mapping)
+        and (
+            not declared_contract_sha
+            or declared_contract_sha == str(stamp.get("contract_sha256") or "")
+        )
+        and (
+            not declared_contract_file_sha
+            or declared_contract_file_sha
+            == str(stamp.get("contract_file_sha256") or "")
+        )
+        and (
+            expected_contract_sha is None
+            or str(stamp.get("contract_sha256") or "")
+            == expected_contract_sha
+        )
+        and (
+            expected_contract_file_sha is None
+            or str(stamp.get("contract_file_sha256") or "")
+            == expected_contract_file_sha
+        )
+    )
     schema = int(value.get("schema_version") or manifest_row.get("schema_version") or 1)
     duration = value.get("duration_seconds")
     source_ticks = (
@@ -275,6 +316,13 @@ def audit_one(
         "source_path": str(source),
         "source_sha256": source_sha,
         "source_schema_version": schema,
+        "contract_sha256": str(
+            manifest_row.get("contract_sha256") or ""
+        ),
+        "contract_file_sha256": str(
+            manifest_row.get("contract_file_sha256") or ""
+        ),
+        "frozen_manifest_binding_verified": manifest_binding_verified,
         "duration_ticks": source_ticks,
         "deployment_actions": coordinates["card_events"],
         "ability_count_reported": ability_count,
@@ -322,6 +370,7 @@ def audit_one(
     }
     schema5_contract_verified = bool(
         schema == 5
+        and manifest_binding_verified
         and plan.authoritative_contract_provenance
         == "schema5_authoritative_native_contract_verified"
     )
@@ -430,10 +479,33 @@ def run_audit(
     *,
     workers: int = 8,
     shard_rows: int = 5_000,
+    native_contract_path: Path | None = None,
 ) -> dict[str, Any]:
     manifest = manifest.resolve()
     output = output.resolve()
     rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line]
+    native_ingest_contract = (
+        load_native_ingest_contract(native_contract_path)
+        if native_contract_path is not None
+        else None
+    )
+    if native_ingest_contract is not None:
+        expected_contract_sha = str(
+            native_ingest_contract.value.get("contract_sha256") or ""
+        )
+        expected_contract_file_sha = str(native_ingest_contract.file_sha256)
+        for index, row in enumerate(rows, start=1):
+            if (
+                int(row.get("source_schema_version") or 0) != 5
+                or len(str(row.get("source_sha256") or "")) != 64
+                or str(row.get("contract_sha256") or "")
+                != expected_contract_sha
+                or str(row.get("contract_file_sha256") or "")
+                != expected_contract_file_sha
+            ):
+                raise ValueError(
+                    f"frozen manifest row {index} is not bound to native contract"
+                )
     if output.exists():
         # The output is fully derived and versioned.  Refuse broad or source-
         # adjacent targets even when a caller supplies custom CLI arguments.
@@ -500,8 +572,13 @@ def run_audit(
         })
 
     try:
+        audit_bound = partial(
+            audit_one, native_ingest_contract=native_ingest_contract
+        )
         with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-            for index, audited in enumerate(executor.map(audit_one, rows, chunksize=32)):
+            for index, audited in enumerate(
+                executor.map(audit_bound, rows, chunksize=32)
+            ):
                 if index % shard_rows == 0:
                     close_shard(current_shard)
                     current_shard = open_shard(index // shard_rows)
@@ -578,6 +655,10 @@ def run_audit(
                     queue_row.update({
                         "schema5_authoritative_contract_verified": bool(
                             audited.get("schema5_authoritative_contract_verified")
+                        ),
+                        "contract_sha256": audited.get("contract_sha256"),
+                        "contract_file_sha256": audited.get(
+                            "contract_file_sha256"
                         ),
                         "tower_troop_levels_complete": bool(
                             audited.get("tower_troop_levels_complete")
@@ -656,6 +737,17 @@ def run_audit(
             "sha256": _sha256(manifest),
             "rows": len(rows),
         },
+        "native_contract": (
+            None
+            if native_ingest_contract is None
+            else {
+                "path": str(native_ingest_contract.source_path),
+                "contract_sha256": str(
+                    native_ingest_contract.value.get("contract_sha256") or ""
+                ),
+                "file_sha256": str(native_ingest_contract.file_sha256),
+            }
+        ),
         "semantics": {
             "does_not_call_libg": True,
             "does_not_copy_source_battles": True,
@@ -718,6 +810,7 @@ def run_audit(
         "schema_version": 1,
         "kind": "expert_100k_native_eligibility_manifest_v1",
         "source_manifest": summary["source_manifest"],
+        "native_contract": summary["native_contract"],
         "rows": len(rows),
         "shards": shard_entries,
         "queues": queue_entries,

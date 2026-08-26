@@ -21,9 +21,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--shard-rows", type=int, default=5_000)
+    parser.add_argument("--native-contract", type=Path, required=True)
     args = parser.parse_args()
     summary = run_audit(
-        args.manifest, args.output, workers=args.workers, shard_rows=args.shard_rows
+        args.manifest,
+        args.output,
+        workers=args.workers,
+        shard_rows=args.shard_rows,
+        native_contract_path=args.native_contract,
     )
     print(json.dumps({
         "output": str(args.output.resolve()),

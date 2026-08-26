@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - stdlib fallback is supported
 
 from native_core.env import NativeRoyaleEnv
 
+from .native_ingest_contract import load_native_ingest_contract
 from .native_freeze import NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
 from .native_profile import (
     ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET,
@@ -494,6 +495,7 @@ def prepare_run(
     episodes_per_shard: int,
     anchor_interval: int = 256,
     compression_level: int = 1,
+    native_contract_path: Path | None = None,
 ) -> tuple[list[NativeDatasetTask], Path, Path, dict[str, Any]]:
     output_root = output_root.resolve()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -509,6 +511,11 @@ def prepare_run(
     )
     selection_path, _ = write_selection(output_root, tasks, selection_summary)
     template_path = template_path.resolve(strict=True)
+    native_contract = (
+        None
+        if native_contract_path is None
+        else load_native_ingest_contract(native_contract_path)
+    )
     project_root = Path(__file__).resolve().parents[1]
     contract = {
         "schema_version": GENERATOR_SCHEMA_VERSION,
@@ -525,6 +532,17 @@ def prepare_run(
         "selected_battles": len(tasks),
         "template": str(template_path),
         "template_sha256": sha256_file(template_path),
+        "native_ingest_contract": (
+            None
+            if native_contract is None
+            else {
+                "path": str(native_contract.source_path),
+                "contract_sha256": str(
+                    native_contract.value.get("contract_sha256") or ""
+                ),
+                "file_sha256": str(native_contract.file_sha256),
+            }
+        ),
         "native_teacher_forced_profile": native_teacher_forced_profile(
             ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
         ),
@@ -900,7 +918,12 @@ class StoredFrameRegistry:
             return entry
 
 
-def _verify_plan(task: NativeDatasetTask, source: Mapping[str, Any]) -> BattlePlan:
+def _verify_plan(
+    task: NativeDatasetTask,
+    source: Mapping[str, Any],
+    *,
+    native_ingest_contract: Any | None = None,
+) -> BattlePlan:
     if str(source.get("battle_tag") or "") != task.battle_tag:
         raise RuntimeError("source battle_tag changed")
     if int(source.get("schema_version") or 0) != task.source_schema_version:
@@ -908,7 +931,11 @@ def _verify_plan(task: NativeDatasetTask, source: Mapping[str, Any]) -> BattlePl
     crowns = (int(source["team_crowns"]), int(source["opponent_crowns"]))
     if any(value < 0 or value > 3 for value in crowns):
         raise ValueError(f"invalid source terminal crowns: {crowns}")
-    plan = compile_battle(source, terminal_crowns=crowns)
+    plan = compile_battle(
+        source,
+        terminal_crowns=crowns,
+        native_ingest_contract=native_ingest_contract,
+    )
     if not plan.native_replay_ready:
         raise RuntimeError(f"compiled plan is not native ready: {plan.replay_tier}")
     if plan.source_schema_version not in {3, 5}:
@@ -1047,6 +1074,7 @@ def execute_task(
     maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     trace_batch_steps: int = 64,
     commit_guard: Callable[[], bool] | None = None,
+    native_ingest_contract: Any | None = None,
 ) -> TaskExecution:
     """Execute one source and commit its Tick frame only after full success."""
     recorder = RecordingCountingEnv(env)
@@ -1069,7 +1097,11 @@ def execute_task(
         source_sha_verified = True
         stage = "compile_and_provenance_validation"
         source = load_json(source_path)
-        plan = _verify_plan(task, source)
+        plan = _verify_plan(
+            task,
+            source,
+            native_ingest_contract=native_ingest_contract,
+        )
         stage = "native_teacher_forced_replay"
         result = execute_plan(
             recorder,
@@ -1512,6 +1544,7 @@ def worker_loop(
     trace_batch_steps: int,
     episodes_per_shard: int,
     lease_seconds: float,
+    native_contract_path: Path | None = None,
 ) -> dict[str, Any]:
     worker_id = f"native-worker-port-{port}"
     completed = successes = failures = stored_ticks = 0
@@ -1522,6 +1555,11 @@ def worker_loop(
     recovered_final_shards = 0
     try:
         template = load_template(template_path)
+        native_ingest_contract = (
+            None
+            if native_contract_path is None
+            else load_native_ingest_contract(native_contract_path)
+        )
         recovered_final_shards = recover_unmanifested_final_shards(
             output_root / "shards", worker_id
         )
@@ -1563,6 +1601,7 @@ def worker_loop(
                             seed=seed,
                             maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
+                            native_ingest_contract=native_ingest_contract,
                             commit_guard=lambda: _lease_is_owned(
                                 queue, worker_id, task.battle_tag
                             ),
@@ -2226,6 +2265,7 @@ def run_generation(
     episodes_per_shard: int = 256,
     lease_seconds: float = 900.0,
     retry_infrastructure_failures: bool = True,
+    native_contract_path: Path | None = None,
 ) -> dict[str, Any]:
     if workers <= 0 or workers > len(ports):
         raise ValueError("workers must be positive and no greater than port count")
@@ -2251,6 +2291,7 @@ def run_generation(
             maximum_seeds_to_test=maximum_seeds_to_test,
             trace_batch_steps=trace_batch_steps,
             episodes_per_shard=episodes_per_shard,
+            native_contract_path=native_contract_path,
         )
         reconciled = reconcile_result_files(output_root, queue_path)
         released_leases = release_interrupted_leases(queue_path)
@@ -2279,6 +2320,7 @@ def run_generation(
                     trace_batch_steps=trace_batch_steps,
                     episodes_per_shard=episodes_per_shard,
                     lease_seconds=lease_seconds,
+                    native_contract_path=native_contract_path,
                 )
                 for index in range(workers)
             ]

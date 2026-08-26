@@ -9,7 +9,7 @@ echo Ensuring four headless native libg workers are ready...
 if errorlevel 1 goto :failed
 
 echo Starting or resuming the authoritative native Tick dataset...
-"%PYTHON_EXE%" "%~dp0scripts\generate_expert_native_ticks.py" run %*
+"%PYTHON_EXE%" "%~dp0scripts\generate_expert_native_ticks.py" run --native-contract "D:\AI_data\cr-native-core\expert-v1\contracts\native-ingest-v150535029.json" %*
 if errorlevel 1 goto :failed
 
 echo.

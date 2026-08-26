@@ -37,6 +37,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--queue", type=Path, default=DEFAULT_CANDIDATES)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE)
+    parser.add_argument("--native-contract", type=Path, required=True)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--selection-seed", default="authoritative-native-full-v1"
@@ -70,6 +71,7 @@ def _prepare(args: argparse.Namespace) -> int:
             maximum_seeds_to_test=args.maximum_seeds,
             trace_batch_steps=args.trace_batch_steps,
             episodes_per_shard=args.episodes_per_shard,
+            native_contract_path=args.native_contract,
         )
         with TickStoreWorkQueue(queue) as work_queue:
             counts = work_queue.counts()
@@ -101,6 +103,7 @@ def _run(args: argparse.Namespace) -> int:
         episodes_per_shard=args.episodes_per_shard,
         lease_seconds=args.lease_seconds,
         retry_infrastructure_failures=args.retry_infrastructure_failures,
+        native_contract_path=args.native_contract,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["publication_ready"] else 2

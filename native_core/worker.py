@@ -339,12 +339,17 @@ class HeadlessWorkerPool:
                 creationflags=_creation_flags(), check=False,
             )
             services.append({"slot": slot, "port": port, "stopped": not self.service_ready(slot)})
+        # ``stop --stop-vm`` is an idempotent postcondition, not an event.  A
+        # caller recovering after a crash must receive success when the VM was
+        # already down; reporting ``False`` in that case made a safe retry look
+        # like a failed shutdown.
         vm_stopped = False
-        if not keep_vm and self.vm_ready():
-            self._adb("emu", "kill", timeout=10, check=False)
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline and self.vm_ready():
-                time.sleep(0.5)
+        if not keep_vm:
+            if self.vm_ready():
+                self._adb("emu", "kill", timeout=10, check=False)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline and self.vm_ready():
+                    time.sleep(0.5)
             vm_stopped = not self.vm_ready()
         return {"services": services, "vm_stopped": vm_stopped}
 
@@ -472,10 +477,35 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "status", "stop"))
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--avds", type=int)
+    parser.add_argument("--workers-per-avd", type=int)
     parser.add_argument("--base-port", type=int, default=37031)
     parser.add_argument("--transport", choices=("direct", "adb"), default="direct")
     parser.add_argument("--stop-vm", action="store_true")
     args = parser.parse_args()
+    if args.avds is not None or args.workers_per_avd is not None:
+        if args.avds is None or args.workers_per_avd is None:
+            raise ValueError("--avds and --workers-per-avd must be supplied together")
+        if args.base_port != 37031:
+            raise ValueError("multi-AVD CLI currently requires the default port layout")
+        multi = MultiAvdWorkerPool(
+            avds=args.avds,
+            workers_per_avd=args.workers_per_avd,
+        )
+        if args.workers != multi.workers:
+            raise ValueError(
+                f"--workers must equal --avds*--workers-per-avd ({multi.workers})"
+            )
+        if args.action == "start":
+            value = multi.ensure_ready(
+                configure_direct=args.transport == "direct"
+            )
+        elif args.action == "stop":
+            value = multi.stop(keep_vms=not args.stop_vm)
+        else:
+            value = multi.status()
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return 0
     pool = HeadlessWorkerPool(WorkerConfig(service_base_port=args.base_port))
     if args.action == "start":
         value = pool.ensure_ready(
