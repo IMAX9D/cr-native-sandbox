@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
-from expert_v1.native_pilot import _logical_state_digest
+from expert_v1.native_pilot import action_execution_tick, _logical_state_digest
 from expert_v1.tick_store_v1.schema import (
     EntityState,
     EpisodeState,
@@ -13,6 +13,14 @@ from expert_v1.tick_store_v1.schema import (
 
 
 class ExpertNativePilotTest(unittest.TestCase):
+    def test_action_execution_tick_offset_is_explicit_and_bounded(self) -> None:
+        self.assertEqual(action_execution_tick(674, 0), 674)
+        self.assertEqual(action_execution_tick(674, 1), 675)
+        with self.assertRaisesRegex(ValueError, "exactly 0 or 1"):
+            action_execution_tick(674, 2)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            action_execution_tick(-1, 0)
+
     def test_logical_digest_removes_seed_specific_native_deck_slots(self) -> None:
         mapping_a = ((0, 1, 2, 3, 4, 5, 6, 7), (0, 1, 2, 3, 4, 5, 6, 7))
         mapping_b = ((7, 6, 5, 4, 3, 2, 1, 0), (4, 5, 6, 7, 0, 1, 2, 3))

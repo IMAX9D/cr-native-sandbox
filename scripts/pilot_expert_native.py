@@ -68,6 +68,40 @@ def _task_payload(task: PilotTask) -> dict[str, Any]:
     }
 
 
+def _load_fixed_selection(
+    path: Path, *, expected_episodes: int
+) -> tuple[list[PilotTask], dict[str, Any]]:
+    """Replay an immutable prior selection instead of rescanning a manifest."""
+    tasks: list[PilotTask] = []
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            tasks.append(PilotTask(
+                battle_tag=str(value["battle_tag"]),
+                source_path=str(value["source_path"]),
+                source_sha256=str(value["source_sha256"]),
+                source_schema_version=int(value["source_schema_version"]),
+                team_crowns=int(value["team_crowns"]),
+                opponent_crowns=int(value["opponent_crowns"]),
+            ))
+    if len(tasks) != expected_episodes:
+        raise ValueError(
+            f"fixed selection contains {len(tasks)} tasks, expected {expected_episodes}"
+        )
+    tags = [task.battle_tag for task in tasks]
+    if len(tags) != len(set(tags)):
+        raise ValueError("fixed selection contains duplicate battle tags")
+    return tasks, {
+        "kind": "fixed_prior_selection_v1",
+        "requested": expected_episodes,
+        "selected": len(tasks),
+        "source_selection": str(path.resolve()),
+        "source_selection_sha256": sha256_file(path),
+    }
+
+
 def _worker_loop(
     *,
     worker_index: int,
@@ -78,6 +112,7 @@ def _worker_loop(
     seed: int,
     maximum_seeds_to_test: int,
     trace_batch_steps: int,
+    action_execution_tick_offset: int,
 ) -> dict[str, Any]:
     worker_id = f"worker-{worker_index:02d}"
     result_path = output_root / f"{worker_id}.results.jsonl"
@@ -124,6 +159,9 @@ def _worker_loop(
                             seed=seed,
                             maximum_seeds_to_test=maximum_seeds_to_test,
                             trace_batch_steps=trace_batch_steps,
+                            action_execution_tick_offset=(
+                                action_execution_tick_offset
+                            ),
                         )
                         audit = {
                             **replay.audit,
@@ -146,6 +184,12 @@ def _worker_loop(
                                     "preferred_seed": replay.audit["preferred_seed"],
                                     "seeds_tested": replay.audit["seeds_tested"],
                                     "source_seed_recovered": False,
+                                    "action_execution_tick_offset": (
+                                        action_execution_tick_offset
+                                    ),
+                                    "action_tick_provenance": replay.audit[
+                                        "action_tick_provenance"
+                                    ],
                                     "teacher_forced_success": True,
                                     "every_native_tick_present": True,
                                     "terminal_status": replay.audit["terminal_status"],
@@ -196,6 +240,9 @@ def _worker_loop(
                                 "final_attempt": final_attempt,
                                 "teacher_forced_success": False,
                                 "usable_tick_trajectory": False,
+                                "action_execution_tick_offset": (
+                                    action_execution_tick_offset
+                                ),
                                 "failure": f"{type(error).__name__}: {error}",
                             },
                         )
@@ -244,6 +291,7 @@ def _seed_probe(
     template_path: Path,
     alternate_seed: int,
     trace_batch_steps: int,
+    action_execution_tick_offset: int,
 ) -> list[dict[str, Any]]:
     template = load_template(template_path)
 
@@ -260,12 +308,14 @@ def _seed_probe(
                 template,
                 seed=alternate_seed,
                 trace_batch_steps=trace_batch_steps,
+                action_execution_tick_offset=action_execution_tick_offset,
             )
         main = main_results[task.battle_tag]
         return {
             "battle_tag": task.battle_tag,
             "port": port,
             "alternate_seed": alternate_seed,
+            "action_execution_tick_offset": action_execution_tick_offset,
             "alternate_chosen_seed": replay.audit.get("chosen_seed"),
             "alternate_teacher_forced_success": replay.audit[
                 "teacher_forced_success"
@@ -298,6 +348,12 @@ def _seed_probe(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--selection-from",
+        type=Path,
+        default=None,
+        help="reuse an exact prior selection.jsonl instead of scanning manifest",
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--template",
@@ -312,6 +368,16 @@ def main() -> int:
     parser.add_argument("--alternate-seed", type=int, default=1)
     parser.add_argument("--seed-probe-count", type=int, default=4)
     parser.add_argument("--trace-batch-steps", type=int, default=64)
+    parser.add_argument(
+        "--action-execution-tick-offset",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help=(
+            "diagnostic only: execute at time_raw+offset while preserving the "
+            "source label; production default is 0"
+        ),
+    )
     args = parser.parse_args()
     if args.workers <= 0 or args.episodes <= 0:
         raise ValueError("workers and episodes must be positive")
@@ -323,13 +389,29 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
     ports = [args.base_port + index for index in range(args.workers)]
 
-    tasks, selection = select_deployment_only_tasks(
-        args.manifest.resolve(strict=True), limit=args.episodes
-    )
+    if args.selection_from is None:
+        tasks, selection = select_deployment_only_tasks(
+            args.manifest.resolve(strict=True), limit=args.episodes
+        )
+    else:
+        tasks, selection = _load_fixed_selection(
+            args.selection_from.resolve(strict=True),
+            expected_episodes=args.episodes,
+        )
     selection_path = output_root / "selection.jsonl"
     with selection_path.open("w", encoding="utf-8", newline="\n") as handle:
         for task in tasks:
             _append_jsonl(handle, task.json())
+    if args.selection_from is not None:
+        source_selection_sha256 = sha256_file(
+            args.selection_from.resolve(strict=True)
+        )
+        emitted_selection_sha256 = sha256_file(selection_path)
+        if emitted_selection_sha256 != source_selection_sha256:
+            raise RuntimeError(
+                "fixed selection serialization changed: "
+                f"{emitted_selection_sha256} != {source_selection_sha256}"
+            )
     _atomic_json(output_root / "selection-summary.json", selection)
 
     queue_path = output_root / "work-queue.sqlite3"
@@ -359,6 +441,7 @@ def main() -> int:
                 seed=args.seed,
                 maximum_seeds_to_test=args.maximum_seeds,
                 trace_batch_steps=args.trace_batch_steps,
+                action_execution_tick_offset=args.action_execution_tick_offset,
             )
             for index, port in enumerate(ports)
         ]
@@ -394,6 +477,7 @@ def main() -> int:
         template_path=args.template.resolve(strict=True),
         alternate_seed=args.alternate_seed,
         trace_batch_steps=args.trace_batch_steps,
+        action_execution_tick_offset=args.action_execution_tick_offset,
     ) if probe_tasks else []
     with (output_root / "seed-probe.jsonl").open(
         "w", encoding="utf-8", newline="\n"
@@ -443,6 +527,18 @@ def main() -> int:
             "trace_batch_steps": args.trace_batch_steps,
             "tick_hz": 20,
             "source_filter": "schema>=3/native-ready/zero-ability",
+            "selection_mode": (
+                "manifest_scan"
+                if args.selection_from is None
+                else "fixed_prior_selection"
+            ),
+            "action_execution_tick_offset": (
+                args.action_execution_tick_offset
+            ),
+            "action_tick_provenance": (
+                "source labels remain RoyaleAPI time_raw; native execution Tick "
+                f"is source_tick+{args.action_execution_tick_offset}"
+            ),
         },
         "selection": selection,
         "queue_counts": queue_counts,

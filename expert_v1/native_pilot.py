@@ -183,6 +183,21 @@ def _logical_state_digest(
     return digest.hexdigest()
 
 
+def action_execution_tick(source_tick: int, offset: int) -> int:
+    """Map an immutable source label onto an explicit execution boundary.
+
+    Offset 0 is the production default.  Offset 1 exists only for the audited
+    RoyaleAPI marker-phase experiment; arbitrary offsets are rejected so a
+    caller cannot silently turn this diagnostic into replay correction.
+    """
+    if offset not in (0, 1):
+        raise ValueError("action execution Tick offset must be exactly 0 or 1")
+    source_tick = int(source_tick)
+    if source_tick < 0:
+        raise ValueError("source Tick must be non-negative")
+    return source_tick + offset
+
+
 def execute_deployment_trace(
     env: NativeRoyaleEnv,
     plan: BattlePlan,
@@ -194,6 +209,7 @@ def execute_deployment_trace(
     warmup_tick: int = 10,
     trace_batch_steps: int = 64,
     terminal_fence_ticks: int = 20,
+    action_execution_tick_offset: int = 0,
 ) -> TraceReplay:
     """Replay deployments and retain every complete native Tick.
 
@@ -208,6 +224,8 @@ def execute_deployment_trace(
         raise ValueError("deployment-only pilot cannot omit source abilities")
     if not 1 <= trace_batch_steps <= 64:
         raise ValueError("trace_batch_steps must be in 1..64")
+    # Validate even an empty plan before touching the Worker.
+    action_execution_tick(0, action_execution_tick_offset)
 
     started = time.perf_counter()
     reset_seconds = trace_seconds = action_seconds = normalize_seconds = 0.0
@@ -216,7 +234,8 @@ def execute_deployment_trace(
     failure: str | None = None
     terminal_seen = False
     terminal_episode: Mapping[str, Any] | None = None
-    previous_action_tick_by_side: list[int | None] = [None, None]
+    previous_source_tick_by_side: list[int | None] = [None, None]
+    previous_execution_tick_by_side: list[int | None] = [None, None]
     # ``calibration`` is a compatibility-only argument.  The old transform
     # moved source form slots and assumed card-independent shuffle; authoritative
     # libg evidence disproved that assumption.  Resolve the unobserved seed
@@ -350,15 +369,39 @@ def execute_deployment_trace(
 
     if failure is None:
         for source_tick, actions in grouped_actions(plan, mappings):
-            if source_tick < current_tick:
-                failure = f"source_tick_{source_tick}_precedes_native_tick_{current_tick}"
+            execution_tick = action_execution_tick(
+                source_tick, action_execution_tick_offset
+            )
+            if execution_tick < current_tick:
+                failure = (
+                    f"source_tick_{source_tick}_precedes_native_tick_{current_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"execution_tick_{execution_tick}_source_tick_{source_tick}_"
+                        f"precedes_native_tick_{current_tick}"
+                    )
+                )
                 break
-            if not advance_to(source_tick):
+            if not advance_to(execution_tick):
                 if failure is None and terminal_seen:
-                    failure = f"native_terminal_before_source_tick_{source_tick}"
+                    failure = (
+                        f"native_terminal_before_source_tick_{source_tick}"
+                        if action_execution_tick_offset == 0
+                        else (
+                            f"native_terminal_before_execution_tick_{execution_tick}_"
+                            f"source_tick_{source_tick}"
+                        )
+                    )
                 break
             if terminal_seen:
-                failure = f"native_terminal_before_source_tick_{source_tick}"
+                failure = (
+                    f"native_terminal_before_source_tick_{source_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"native_terminal_before_execution_tick_{execution_tick}_"
+                        f"source_tick_{source_tick}"
+                    )
+                )
                 break
             by_side = {
                 int(player["side"]): player for player in latest_state["players"]
@@ -391,7 +434,14 @@ def execute_deployment_trace(
             action_seconds += time.perf_counter() - action_started
             results = action_result.get("actions", [])
             if len(results) != len(actions):
-                failure = f"native_action_count_mismatch_tick_{source_tick}"
+                failure = (
+                    f"native_action_count_mismatch_tick_{source_tick}"
+                    if action_execution_tick_offset == 0
+                    else (
+                        f"native_action_count_mismatch_execution_tick_{execution_tick}_"
+                        f"source_tick_{source_tick}"
+                    )
+                )
                 break
             rejected = [
                 result for result in results
@@ -414,13 +464,26 @@ def execute_deployment_trace(
                     card_spec = plan.sides[side].deck[
                         source_action.logical_card_index
                     ]
-                    card_cost_raw = int(
+                    catalog_card_cost_raw = int(
                         catalog()[card_spec.card_id]["elixir"]
                     ) * 10_000
-                    previous_side_tick = previous_action_tick_by_side[side]
+                    native_resource = result_value.get("resource_before")
+                    card_cost_raw = (
+                        int(native_resource["card_cost"]) * 10_000
+                        if isinstance(native_resource, Mapping)
+                        and isinstance(native_resource.get("card_cost"), int)
+                        else catalog_card_cost_raw
+                    )
+                    previous_source_tick = previous_source_tick_by_side[side]
+                    previous_execution_tick = previous_execution_tick_by_side[side]
                     episode_snapshot = latest_state.get("episode", {})
                     event_evidence.append({
                         "source_event_index": int(action["source_event_index"]),
+                        "source_tick": int(source_tick),
+                        "execution_tick": int(execution_tick),
+                        "execution_tick_offset": int(
+                            action_execution_tick_offset
+                        ),
                         "side": side,
                         "base_token": source_action.base_token,
                         "logical_card_index": source_action.logical_card_index,
@@ -429,6 +492,7 @@ def execute_deployment_trace(
                         "y": int(action["y"]),
                         "pre_action_elixir_raw": int(player.get("elixir_raw", -1)),
                         "native_card_cost_raw": card_cost_raw,
+                        "catalog_wrapper_card_cost_raw": catalog_card_cost_raw,
                         "native_elixir_margin_raw": (
                             int(player.get("elixir_raw", -1)) - card_cost_raw
                         ),
@@ -441,10 +505,20 @@ def execute_deployment_trace(
                         "pre_action_refill_timer": int(
                             player.get("refill_timer", -1)
                         ),
+                        "source_ticks_since_previous_side_action": (
+                            None
+                            if previous_source_tick is None
+                            else source_tick - previous_source_tick
+                        ),
                         "ticks_since_previous_side_action": (
                             None
-                            if previous_side_tick is None
-                            else source_tick - previous_side_tick
+                            if previous_source_tick is None
+                            else source_tick - previous_source_tick
+                        ),
+                        "execution_ticks_since_previous_side_action": (
+                            None
+                            if previous_execution_tick is None
+                            else execution_tick - previous_execution_tick
                         ),
                         "pre_action_entity_count": len(
                             latest_state.get("entities", [])
@@ -483,7 +557,12 @@ def execute_deployment_trace(
                         ),
                     })
                 first_rejection = {
-                    "tick": source_tick,
+                    # ``tick`` remains the actual native execution Tick for
+                    # existing diagnostics.  Source provenance is explicit.
+                    "tick": execution_tick,
+                    "source_tick": source_tick,
+                    "execution_tick": execution_tick,
+                    "execution_tick_offset": action_execution_tick_offset,
                     "events": event_evidence,
                     "result_codes": [
                         int(item.get("result", {}).get("result_code", -1))
@@ -491,12 +570,14 @@ def execute_deployment_trace(
                     ],
                 }
                 failure = (
-                    f"native_rejected_tick_{source_tick}_codes_"
+                    f"native_rejected_tick_{execution_tick}_codes_"
                     f"{first_rejection['result_codes']}"
                 )
                 break
             for action in actions:
-                previous_action_tick_by_side[int(action["side"])] = source_tick
+                side = int(action["side"])
+                previous_source_tick_by_side[side] = source_tick
+                previous_execution_tick_by_side[side] = execution_tick
 
     teacher_forced_success = (
         failure is None and accepted_actions == len(plan.actions)
@@ -560,8 +641,19 @@ def execute_deployment_trace(
         "source_deployment_actions": len(plan.actions),
         "accepted_deployment_actions": accepted_actions,
         "first_rejection": first_rejection,
+        "action_execution_tick_offset": action_execution_tick_offset,
+        "action_tick_provenance": (
+            "source label is RoyaleAPI time_raw; native execution Tick is "
+            f"source_tick+{action_execution_tick_offset}; source label unchanged"
+        ),
         "reset_tick": states[0].tick if states else None,
         "last_source_action_tick": plan.actions[-1].tick if plan.actions else None,
+        "last_execution_action_tick": (
+            action_execution_tick(
+                plan.actions[-1].tick, action_execution_tick_offset
+            )
+            if plan.actions else None
+        ),
         "final_tick": states[-1].tick if states else None,
         "stored_tick_count": len(states),
         "expected_tick_count_from_bounds": tick_count_expected,
@@ -600,6 +692,7 @@ def execute_deployment_trace(
 __all__ = [
     "PilotTask",
     "TraceReplay",
+    "action_execution_tick",
     "execute_deployment_trace",
     "load_json",
     "select_deployment_only_tasks",
