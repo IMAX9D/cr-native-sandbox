@@ -142,6 +142,7 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
     rounds = value.get("rounds")
     deck_complete = levels_complete = forms_complete = towers_complete = True
     tower_levels_complete = schema == 5
+    king_tower_levels_complete = schema == 5
     tower_tokens: list[str | None] = []
     if schema < 2 or not isinstance(rounds, list) or len(rounds) != 1:
         deck_complete = levels_complete = forms_complete = towers_complete = False
@@ -151,6 +152,8 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
             players = round_zero.get(side) if isinstance(round_zero, Mapping) else None
             if not isinstance(players, list) or len(players) != 1 or not isinstance(players[0], Mapping):
                 deck_complete = levels_complete = forms_complete = towers_complete = False
+                tower_levels_complete = False
+                king_tower_levels_complete = False
                 tower_tokens.append(None)
                 continue
             player = players[0]
@@ -180,6 +183,11 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
                     and not isinstance(tower_level, bool)
                     and tower_level >= 1
                 )
+                king_tower_levels_complete &= (
+                    player.get("king_tower_level") == 16
+                    and player.get("king_tower_level_provenance")
+                    == "ranked_template_cap16_and_full_king_hp_v1"
+                )
     terminal = value.get("final_tower_hp")
     final_tower_hp_complete = False
     if schema == 5 and isinstance(terminal, Mapping):
@@ -197,7 +205,9 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
                 for key in keys
             )
             final_tower_hp_complete &= bool(
-                valid and int(hp["total"]) == sum(int(hp[key]) for key in keys[:3])
+                valid
+                and int(hp["king"]) == 7_728
+                and int(hp["total"]) == sum(int(hp[key]) for key in keys[:3])
             )
     contract_stamp = value.get("authoritative_native_contract")
     schema5_contract_stamp_complete = bool(
@@ -214,6 +224,7 @@ def _metadata_audit(value: Mapping[str, Any]) -> dict[str, Any]:
         "tower_troops_complete": towers_complete,
         "tower_troops": tower_tokens,
         "tower_troop_levels_complete": tower_levels_complete,
+        "king_tower_levels_complete": king_tower_levels_complete,
         "final_tower_hp_complete": final_tower_hp_complete,
         "schema5_contract_stamp_complete": schema5_contract_stamp_complete,
     }
@@ -319,6 +330,7 @@ def audit_one(
         or (
             schema == 5
             and metadata["tower_troop_levels_complete"]
+            and metadata["king_tower_levels_complete"]
             and metadata["final_tower_hp_complete"]
             and metadata["schema5_contract_stamp_complete"]
             and schema5_contract_verified
@@ -357,6 +369,16 @@ def audit_one(
         "mapping_complete": not mapping_limitations,
         "schema5_authoritative_contract_verified": schema5_contract_verified,
         "numeric_game_mode_id": plan.numeric_game_mode_id,
+        "native_execution_game_mode_id": plan.native_execution_game_mode_id,
+        "native_execution_game_mode_provenance": (
+            plan.native_execution_game_mode_provenance
+        ),
+        "king_tower_levels": [
+            side.king_tower_level for side in plan.sides
+        ],
+        "king_tower_level_provenance": [
+            side.king_tower_level_provenance for side in plan.sides
+        ],
         "battle_index": plan.battle_index,
         "terminal_provenance": plan.terminal_provenance,
         "mapping_limitations": mapping_limitations,
@@ -560,10 +582,19 @@ def run_audit(
                         "tower_troop_levels_complete": bool(
                             audited.get("tower_troop_levels_complete")
                         ),
+                        "king_tower_levels_complete": bool(
+                            audited.get("king_tower_levels_complete")
+                        ),
                         "final_tower_hp_complete": bool(
                             audited.get("final_tower_hp_complete")
                         ),
                         "numeric_game_mode_id": audited.get("numeric_game_mode_id"),
+                        "native_execution_game_mode_id": audited.get(
+                            "native_execution_game_mode_id"
+                        ),
+                        "native_execution_game_mode_provenance": audited.get(
+                            "native_execution_game_mode_provenance"
+                        ),
                         "battle_index": audited.get("battle_index"),
                     })
                 queue_encoded = _canonical(queue_row)

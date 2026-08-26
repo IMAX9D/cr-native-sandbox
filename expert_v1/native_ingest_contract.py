@@ -25,11 +25,39 @@ from .native_replay_plan import ROYALEAPI_CARD_ALIASES
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_SCHEMA_VERSION = 1
-CONTRACT_KIND = "cr_native_authoritative_contract_v1"
+CONTRACT_SCHEMA_VERSION = 2
+CONTRACT_KIND = "cr_native_authoritative_contract_v2"
 RUNTIME_VERSION = "150535029"
 GAME_VERSION = "15.535.29"
-STANDARD_1V1_NUMERIC_GAME_MODE_IDS = (72_000_006,)
+SOURCE_NUMERIC_GAME_MODE_IDS = (72_000_006, 72_000_450, 72_000_464)
+STANDARD_1V1_NATIVE_EXECUTION_GAME_MODE_ID = 72_000_006
+NATIVE_EXECUTION_MODE_BY_SOURCE = {
+    source_mode: STANDARD_1V1_NATIVE_EXECUTION_GAME_MODE_ID
+    for source_mode in SOURCE_NUMERIC_GAME_MODE_IDS
+}
+NATIVE_EXECUTION_GAME_MODE_PROVENANCE = (
+    "frozen_native_ingest_contract_mode_map_v1"
+)
+# Exact Ladder-mode opening probes against frozen libg 15.535.29.  These are
+# integer native results, not a floating-point 1.1**level approximation.
+KING_TOWER_MAX_HP_BY_LEVEL = {
+    1: 2_400,
+    2: 2_568,
+    3: 2_736,
+    4: 2_904,
+    5: 3_096,
+    6: 3_312,
+    7: 3_528,
+    8: 3_768,
+    9: 4_008,
+    10: 4_392,
+    11: 4_824,
+    12: 5_304,
+    13: 5_832,
+    14: 6_408,
+    15: 7_032,
+    16: 7_728,
+}
 DEFAULT_BINDING_PATH = (
     PROJECT_ROOT / "bindings" / "runtime-150535029-x86_64.json"
 )
@@ -54,7 +82,14 @@ INGEST_SCHEMA: dict[str, Any] = {
         "an observed ability event requires at least one deck token listed "
         "in ability_source_tokens; live entity identity remains tick-resolved"
     ),
-    "numeric_game_mode": "exact allowlist membership; missing/unknown rejects",
+    "numeric_game_mode": {
+        "source": "exact source allowlist membership; missing/unknown rejects",
+        "native_execution": (
+            "exact lookup in native_execution_mode_by_source; the source mode "
+            "is retained as provenance and is never written to libg implicitly"
+        ),
+        "provenance": NATIVE_EXECUTION_GAME_MODE_PROVENANCE,
+    },
 }
 
 
@@ -235,13 +270,23 @@ def build_native_ingest_contract(
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "kind": CONTRACT_KIND,
         "game_version": GAME_VERSION,
-        # The following four flat arrays are the stable cross-project reader
-        # surface.  Detailed rows below are explanatory and independently
-        # useful, but crawlers need not reimplement their derivation.
+        # These flat arrays/maps are the stable cross-project reader surface.
+        # Detailed rows below are explanatory and independently useful, but
+        # crawlers need not reimplement their derivation.
         "allowed_card_tokens": sorted(allowed_tokens),
         "allowed_tower_troops": [item["slug"] for item in tower_rows],
         "ability_source_tokens": sorted(ability_tokens),
-        "numeric_game_mode_ids": list(STANDARD_1V1_NUMERIC_GAME_MODE_IDS),
+        "source_numeric_game_mode_ids": list(SOURCE_NUMERIC_GAME_MODE_IDS),
+        "native_execution_mode_by_source": {
+            str(source_mode): execution_mode
+            for source_mode, execution_mode in sorted(
+                NATIVE_EXECUTION_MODE_BY_SOURCE.items()
+            )
+        },
+        "king_tower_max_hp_by_level": {
+            str(level): hp
+            for level, hp in sorted(KING_TOWER_MAX_HP_BY_LEVEL.items())
+        },
         "runtime": {
             "runtime_version": RUNTIME_VERSION,
             "game_version": GAME_VERSION,
@@ -330,7 +375,9 @@ class NativeIngestContract:
     base_slug_rows: Mapping[str, Mapping[str, Any]]
     tower_slugs: frozenset[str]
     ability_tokens: frozenset[str]
-    numeric_game_mode_ids: frozenset[int]
+    source_numeric_game_mode_ids: frozenset[int]
+    native_execution_mode_by_source: Mapping[int, int]
+    king_tower_max_hp_by_level: Mapping[int, int]
 
     def validate_card_token(self, token: str) -> tuple[ValidationIssue, ...]:
         normalized = str(token).strip().lower()
@@ -356,9 +403,51 @@ class NativeIngestContract:
         return (ValidationIssue("tower_troop", "native_tower_troop_mapping_missing", slug),)
 
     def validate_game_mode(self, value: Any) -> tuple[ValidationIssue, ...]:
-        if isinstance(value, int) and not isinstance(value, bool) and value in self.numeric_game_mode_ids:
+        """Validate the source mode ID (kept under this compatibility name)."""
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value in self.source_numeric_game_mode_ids
+        ):
             return ()
         return (ValidationIssue("numeric_game_mode_id", "numeric_game_mode_not_allowed", value),)
+
+    def execution_game_mode_for_source(self, value: Any) -> int:
+        issues = self.validate_game_mode(value)
+        if issues:
+            raise NativeIngestContractError(
+                f"source numeric game mode is not allowed: {value!r}"
+            )
+        return int(self.native_execution_mode_by_source[int(value)])
+
+    def validate_execution_game_mode(
+        self,
+        source_value: Any,
+        execution_value: Any,
+        provenance: Any,
+    ) -> tuple[ValidationIssue, ...]:
+        source_issues = self.validate_game_mode(source_value)
+        if source_issues:
+            return source_issues
+        expected = self.execution_game_mode_for_source(source_value)
+        issues: list[ValidationIssue] = []
+        if (
+            not isinstance(execution_value, int)
+            or isinstance(execution_value, bool)
+            or int(execution_value) != expected
+        ):
+            issues.append(ValidationIssue(
+                "native_execution_game_mode_id",
+                "native_execution_game_mode_mismatch",
+                {"source": source_value, "expected": expected, "actual": execution_value},
+            ))
+        if provenance != NATIVE_EXECUTION_GAME_MODE_PROVENANCE:
+            issues.append(ValidationIssue(
+                "native_execution_game_mode_provenance",
+                "native_execution_game_mode_provenance_invalid",
+                provenance,
+            ))
+        return tuple(issues)
 
     def validate_ability_source(
         self, deck_tokens: Sequence[str], *, observed_ability_events: int,
@@ -408,13 +497,61 @@ def load_native_ingest_contract(
     allowed = value.get("allowed_card_tokens")
     towers = value.get("allowed_tower_troops")
     abilities = value.get("ability_source_tokens")
-    modes = value.get("numeric_game_mode_ids")
-    if not all(isinstance(item, list) and item for item in (allowed, towers, abilities, modes)):
+    source_modes = value.get("source_numeric_game_mode_ids")
+    execution_modes = value.get("native_execution_mode_by_source")
+    king_tower_hp = value.get("king_tower_max_hp_by_level")
+    if not all(
+        isinstance(item, list) and item
+        for item in (allowed, towers, abilities, source_modes)
+    ):
         raise NativeIngestContractError("contract allowlist is missing or empty")
     if len(allowed) != len(set(allowed)) or len(towers) != len(set(towers)):
         raise NativeIngestContractError("contract allowlist contains duplicates")
     if not set(abilities).issubset(set(allowed)):
         raise NativeIngestContractError("ability sources are not allowed card tokens")
+    if (
+        any(
+            not isinstance(item, int) or isinstance(item, bool) or item <= 0
+            for item in source_modes
+        )
+        or len(source_modes) != len(set(source_modes))
+    ):
+        raise NativeIngestContractError("source game-mode allowlist is invalid")
+    if not isinstance(execution_modes, Mapping) or not execution_modes:
+        raise NativeIngestContractError("native execution game-mode map is missing")
+    expected_mode_keys = {str(item) for item in source_modes}
+    if set(execution_modes) != expected_mode_keys or any(
+        not isinstance(item, int) or isinstance(item, bool) or item <= 0
+        for item in execution_modes.values()
+    ):
+        raise NativeIngestContractError(
+            "native execution game-mode map does not cover the source allowlist"
+        )
+    if not isinstance(king_tower_hp, Mapping) or not king_tower_hp:
+        raise NativeIngestContractError("King Tower max-HP table is missing")
+    if any(
+        not isinstance(level, str)
+        or not level.isdigit()
+        or not isinstance(hp, int)
+        or isinstance(hp, bool)
+        for level, hp in king_tower_hp.items()
+    ):
+        raise NativeIngestContractError("King Tower max-HP table is invalid")
+    try:
+        normalized_king_tower_hp = {
+            int(level): int(hp) for level, hp in king_tower_hp.items()
+        }
+    except (TypeError, ValueError) as error:
+        raise NativeIngestContractError("King Tower max-HP table is invalid") from error
+    if (
+        any(str(level) not in king_tower_hp for level in normalized_king_tower_hp)
+        or any(level <= 0 or hp <= 0 for level, hp in normalized_king_tower_hp.items())
+        or any(
+            normalized_king_tower_hp.get(level) != hp
+            for level, hp in KING_TOWER_MAX_HP_BY_LEVEL.items()
+        )
+    ):
+        raise NativeIngestContractError("King Tower max-HP table is invalid")
 
     token_rows: dict[str, Mapping[str, Any]] = {}
     base_rows: dict[str, Mapping[str, Any]] = {}
@@ -435,14 +572,22 @@ def load_native_ingest_contract(
         base_slug_rows=base_rows,
         tower_slugs=frozenset(str(item) for item in towers),
         ability_tokens=frozenset(str(item) for item in abilities),
-        numeric_game_mode_ids=frozenset(int(item) for item in modes),
+        source_numeric_game_mode_ids=frozenset(int(item) for item in source_modes),
+        native_execution_mode_by_source={
+            int(source): int(execution)
+            for source, execution in execution_modes.items()
+        },
+        king_tower_max_hp_by_level=normalized_king_tower_hp,
     )
 
 
 def validate_ingest_metadata(
     contract: NativeIngestContract,
     *, deck_tokens: Iterable[str], tower_troop: str,
-    numeric_game_mode_id: Any, observed_ability_events: int = 0,
+    numeric_game_mode_id: Any,
+    native_execution_game_mode_id: Any,
+    native_execution_game_mode_provenance: Any,
+    observed_ability_events: int = 0,
 ) -> tuple[ValidationIssue, ...]:
     """Pure fail-closed gate suitable for a downloader before persistence."""
     deck = tuple(deck_tokens)
@@ -450,9 +595,12 @@ def validate_ingest_metadata(
     for token in deck:
         issues.extend(contract.validate_card_token(token))
     issues.extend(contract.validate_tower_troop(tower_troop))
-    issues.extend(contract.validate_game_mode(numeric_game_mode_id))
+    issues.extend(contract.validate_execution_game_mode(
+        numeric_game_mode_id,
+        native_execution_game_mode_id,
+        native_execution_game_mode_provenance,
+    ))
     issues.extend(contract.validate_ability_source(
         deck, observed_ability_events=observed_ability_events
     ))
     return tuple(issues)
-

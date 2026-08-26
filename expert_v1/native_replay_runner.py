@@ -58,6 +58,12 @@ class NativeReplayResult:
     missing_ability_event_count: int
     ability_log_tier: str
     ability_replay_complete: bool
+    numeric_game_mode_id: int | None
+    numeric_game_mode_provenance: str
+    native_execution_game_mode_id: int | None
+    native_execution_game_mode_provenance: str
+    king_tower_levels: tuple[int | None, int | None]
+    king_tower_level_provenance: tuple[str, str]
     ability_resolution_counts: dict[str, int]
     ability_resolutions: tuple[dict[str, Any], ...]
     action_execution_tick_offset: int
@@ -705,6 +711,18 @@ def execute_plan(
                         "numeric_game_mode_provenance": (
                             plan.numeric_game_mode_provenance
                         ),
+                        "native_execution_game_mode_id": (
+                            plan.native_execution_game_mode_id
+                        ),
+                        "native_execution_game_mode_provenance": (
+                            plan.native_execution_game_mode_provenance
+                        ),
+                        "king_tower_levels": tuple(
+                            side.king_tower_level for side in plan.sides
+                        ),
+                        "king_tower_level_provenance": tuple(
+                            side.king_tower_level_provenance for side in plan.sides
+                        ),
                         "battle_index": plan.battle_index,
                         "battle_index_provenance": plan.battle_index_provenance,
                         "authoritative_contract_sha256": (
@@ -816,6 +834,18 @@ def execute_plan(
             "terminal_provenance": plan.terminal_provenance,
             "numeric_game_mode_id": plan.numeric_game_mode_id,
             "numeric_game_mode_provenance": plan.numeric_game_mode_provenance,
+            "native_execution_game_mode_id": (
+                plan.native_execution_game_mode_id
+            ),
+            "native_execution_game_mode_provenance": (
+                plan.native_execution_game_mode_provenance
+            ),
+            "king_tower_levels": tuple(
+                side.king_tower_level for side in plan.sides
+            ),
+            "king_tower_level_provenance": tuple(
+                side.king_tower_level_provenance for side in plan.sides
+            ),
             "battle_index": plan.battle_index,
             "battle_index_provenance": plan.battle_index_provenance,
             "authoritative_contract_game_version": (
@@ -872,6 +902,20 @@ def execute_plan(
         ability_replay_complete=(
             missing_ability_events == 0
             and accepted_ability_actions == len(plan.ability_events)
+        ),
+        numeric_game_mode_id=plan.numeric_game_mode_id,
+        numeric_game_mode_provenance=plan.numeric_game_mode_provenance,
+        native_execution_game_mode_id=plan.native_execution_game_mode_id,
+        native_execution_game_mode_provenance=(
+            plan.native_execution_game_mode_provenance
+        ),
+        king_tower_levels=(
+            plan.sides[0].king_tower_level,
+            plan.sides[1].king_tower_level,
+        ),
+        king_tower_level_provenance=(
+            plan.sides[0].king_tower_level_provenance,
+            plan.sides[1].king_tower_level_provenance,
         ),
         ability_resolution_counts=dict(ability_resolution_counts),
         ability_resolutions=tuple(ability_resolutions),

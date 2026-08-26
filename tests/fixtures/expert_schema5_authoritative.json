@@ -6,8 +6,10 @@
   "normal_1v1": true,
   "draft": false,
   "duration_seconds": 60,
-  "numeric_game_mode_id": 72000006,
+  "numeric_game_mode_id": 72000450,
   "numeric_game_mode_provenance": "list_matchup_button_joined_by_data_index",
+  "native_execution_game_mode_id": 72000006,
+  "native_execution_game_mode_provenance": "frozen_native_ingest_contract_mode_map_v1",
   "battle_index": 1787218979,
   "battle_index_provenance": "list_replay_and_matchup_button_data_index",
   "version_timestamp": 1787218979,
@@ -29,8 +31,8 @@
     "missing_or_invalid_data_i": "reject"
   },
   "final_tower_hp": {
-    "team": {"king": 4824, "princess0": 3052, "princess1": 2500, "total": 10376},
-    "opponent": {"king": 4824, "princess0": 0, "princess1": 2200, "total": 7024},
+    "team": {"king": 7728, "princess0": 3052, "princess1": 2500, "total": 13280},
+    "opponent": {"king": 7728, "princess0": 0, "princess1": 2200, "total": 9928},
     "provenance": "list_hp_both_popup",
     "slot_mapping_provenance": "source_slots_unmapped",
     "raw_princess_mapping": {
@@ -63,6 +65,8 @@
       "card_levels": {"knight-ev1": 14, "archers": 14, "giant": 14, "skeletons": 14, "musketeer": 14, "hog-rider": 14, "cannon": 14, "arrows": 14},
       "tower_troop": "tower-princess",
       "tower_troop_level": 13,
+      "king_tower_level": 16,
+      "king_tower_level_provenance": "ranked_template_cap16_and_full_king_hp_v1",
       "complete": true
     }],
     "opponent": [{
@@ -80,6 +84,8 @@
       "card_levels": {"knight": 12, "archers": 12, "giant": 12, "skeletons": 12, "musketeer": 12, "hog-rider": 12, "cannon": 12, "arrows": 12},
       "tower_troop": "cannoneer",
       "tower_troop_level": 10,
+      "king_tower_level": 16,
+      "king_tower_level_provenance": "ranked_template_cap16_and_full_king_hp_v1",
       "complete": true
     }]
   }],
@@ -113,7 +119,7 @@
   },
   "authoritative_eligibility": {
     "status": "accepted",
-    "gate": "native_static_v1",
+    "gate": "native_static_v2",
     "source_kind": "fresh"
   }
 }

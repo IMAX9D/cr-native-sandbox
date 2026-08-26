@@ -48,13 +48,20 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
             plan = compile_battle(source, native_ingest_contract=contract)
             self.assertTrue(plan.native_replay_ready)
             self.assertEqual(plan.source_schema_version, 5)
-            self.assertEqual(plan.numeric_game_mode_id, 72_000_006)
+            self.assertEqual(plan.numeric_game_mode_id, 72_000_450)
+            self.assertEqual(plan.native_execution_game_mode_id, 72_000_006)
+            self.assertEqual(
+                plan.native_execution_game_mode_provenance,
+                "frozen_native_ingest_contract_mode_map_v1",
+            )
             self.assertEqual(plan.battle_index, 1_787_218_979)
             self.assertEqual(plan.sides[0].tower_troop_level, 13)
             self.assertEqual(plan.sides[1].tower_troop_level, 10)
+            self.assertEqual(plan.sides[0].king_tower_level, 16)
+            self.assertEqual(plan.sides[1].king_tower_level, 16)
             self.assertEqual(plan.sides[1].final_tower_hp.princess0, 0)  # type: ignore[union-attr]
             self.assertIn("source_exact_game_build_missing", plan.limitations)
-            self.assertIn("source_king_tower_level_missing", plan.limitations)
+            self.assertNotIn("source_king_tower_level_missing", plan.limitations)
             self.assertNotIn("source_numeric_game_mode_missing", plan.limitations)
             self.assertNotIn("source_tower_troop_level_missing", plan.limitations)
 
@@ -68,19 +75,34 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
             # Source Tower Troop levels 13 and 10 become native zero-based 12/9.
             self.assertEqual(replay["battle"]["deck0"]["sc"][0]["l"], 12)
             self.assertEqual(replay["battle"]["deck1"]["sc"][0]["l"], 9)
-            # Avatar/King levels remain template facts; they are never guessed.
-            self.assertEqual(replay["battle"]["avatar0"]["kt"], 11)
+            # The level-16 source anchor is written through every native field.
+            for side in range(2):
+                self.assertEqual(replay["battle"][f"avatar{side}"]["expLevel"], 16)
+                self.assertEqual(replay["battle"][f"avatar{side}"]["kt"], 16)
+                self.assertEqual(replay["battle"]["hbd"][side]["kt"], 16)
 
     def test_schema5_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source, contract = authoritative_fixture(Path(directory))
             mutations = {
                 "mode": lambda value: value.__setitem__("numeric_game_mode_id", 72_000_007),
+                "execution_mode": lambda value: value.__setitem__(
+                    "native_execution_game_mode_id", 72_000_450
+                ),
+                "execution_mode_provenance": lambda value: value.__setitem__(
+                    "native_execution_game_mode_provenance", "guessed_mode_map"
+                ),
                 "contract": lambda value: value["authoritative_native_contract"].__setitem__(
                     "contract_sha256", "0" * 64
                 ),
                 "tower_level": lambda value: value["rounds"][0]["team"][0].__setitem__(
                     "tower_troop_level", None
+                ),
+                "king_level": lambda value: value["rounds"][0]["team"][0].__setitem__(
+                    "king_tower_level", None
+                ),
+                "king_level_provenance": lambda value: value["rounds"][0]["team"][0].__setitem__(
+                    "king_tower_level_provenance", "guessed_from_deck"
                 ),
                 "tower_hp": lambda value: value["final_tower_hp"]["team"].__setitem__(
                     "total", 1
@@ -99,6 +121,28 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
                     with self.assertRaises(ReplayPlanError):
                         compile_battle(changed, native_ingest_contract=contract)
 
+    def test_all_frozen_source_modes_execute_as_uncapped_standard_1v1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source, contract = authoritative_fixture(Path(directory))
+            template = json.loads(
+                (PROJECT_ROOT / "examples" / "eight-card-bootstrap.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            for source_mode in (72_000_006, 72_000_450, 72_000_464):
+                with self.subTest(source_mode=source_mode):
+                    changed = deepcopy(source)
+                    changed["numeric_game_mode_id"] = source_mode
+                    plan = compile_battle(
+                        changed, native_ingest_contract=contract
+                    )
+                    self.assertEqual(plan.numeric_game_mode_id, source_mode)
+                    self.assertEqual(
+                        plan.native_execution_game_mode_id, 72_000_006
+                    )
+                    replay, _ = materialize_replay(plan, template)
+                    self.assertEqual(replay["battle"]["gamemode"], 72_000_006)
+
     def test_terminal_hp_compares_princess_slots_as_multiset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source, contract = authoritative_fixture(Path(directory))
@@ -107,10 +151,10 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
             self.assertIsNotNone(expected)
             episode = {
                 "crown_towers": [
-                    {"side": 0, "type": "King Tower", "hp": 4824},
+                    {"side": 0, "type": "King Tower", "hp": 7728},
                     {"side": 0, "type": "Princess Tower", "x": 3500, "hp": 2500},
                     {"side": 0, "type": "Princess Tower", "x": 14500, "hp": 3052},
-                    {"side": 1, "type": "King Tower", "hp": 4824},
+                    {"side": 1, "type": "King Tower", "hp": 7728},
                     {"side": 1, "type": "Princess Tower", "x": 3500, "hp": 2200},
                     {"side": 1, "type": "Princess Tower", "x": 14500, "hp": 0},
                 ]
@@ -143,8 +187,10 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
                     "coordinate_tier", "eligibility_tier",
                     "authoritative_native_full_candidate",
                     "schema5_authoritative_contract_verified",
-                    "tower_troop_levels_complete", "final_tower_hp_complete",
-                    "numeric_game_mode_id", "battle_index",
+                    "tower_troop_levels_complete", "king_tower_levels_complete",
+                    "final_tower_hp_complete",
+                    "numeric_game_mode_id", "native_execution_game_mode_id",
+                    "native_execution_game_mode_provenance", "battle_index",
                 )
             }
             _validate_candidate_row(candidate, 1)
@@ -153,8 +199,10 @@ class ExpertSchema5NativeIngestTests(unittest.TestCase):
             legacy["source_schema_version"] = 3
             for key in (
                 "schema5_authoritative_contract_verified",
-                "tower_troop_levels_complete", "final_tower_hp_complete",
-                "numeric_game_mode_id", "battle_index",
+                "tower_troop_levels_complete", "king_tower_levels_complete",
+                "final_tower_hp_complete",
+                "numeric_game_mode_id", "native_execution_game_mode_id",
+                "native_execution_game_mode_provenance", "battle_index",
             ):
                 legacy.pop(key, None)
             _validate_candidate_row(legacy, 2)

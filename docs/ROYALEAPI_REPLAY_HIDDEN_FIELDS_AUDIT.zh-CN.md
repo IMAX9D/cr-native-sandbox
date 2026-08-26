@@ -206,8 +206,10 @@ T+1。见 `NATIVE_COORDINATE_PHASE_FINAL_100.zh-CN.md`。
 ```json
 {
   "battle_index": 1787218979,
-  "numeric_game_mode_id": 72000006,
-  "numeric_game_mode_provenance": "list_matchup_button_joined_by_data_index"
+  "numeric_game_mode_id": 72000450,
+  "numeric_game_mode_provenance": "list_matchup_button_joined_by_data_index",
+  "native_execution_game_mode_id": 72000006,
+  "native_execution_game_mode_provenance": "frozen_native_ingest_contract_mode_map_v1"
 }
 ```
 
@@ -323,7 +325,8 @@ marker 只写 `spirit-empress`，没有 Normal/Mounted 标志。聚合 `elixir_s
 ### 9.1 列表页
 
 1. 用 `data-index` join replay/matchup button；
-2. 保存 `battle_index` 和 `numeric_game_mode_id`；
+2. 保存 `battle_index` 和来源 `numeric_game_mode_id`，再按冻结契约写入
+   `native_execution_game_mode_id` 与映射 provenance；
 3. 保存每方 `tower_troop_level`；
 4. 保存双方最终 king/princess HP；
 5. 可保存 matchup 的 `data-players=1v1` 作门禁交叉证据；

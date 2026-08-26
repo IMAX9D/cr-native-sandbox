@@ -219,6 +219,7 @@ def _validate_candidate_row(value: Mapping[str, Any], line_number: int) -> None:
         required = (
             "schema5_authoritative_contract_verified",
             "tower_troop_levels_complete",
+            "king_tower_levels_complete",
             "final_tower_hp_complete",
         )
         missing = [name for name in required if value.get(name) is not True]
@@ -229,6 +230,22 @@ def _validate_candidate_row(value: Mapping[str, Any], line_number: int) -> None:
         mode = value.get("numeric_game_mode_id")
         if not isinstance(mode, int) or isinstance(mode, bool) or mode <= 0:
             raise ValueError(f"candidate {tag} lacks schema5 numeric game mode")
+        execution_mode = value.get("native_execution_game_mode_id")
+        if (
+            not isinstance(execution_mode, int)
+            or isinstance(execution_mode, bool)
+            or execution_mode <= 0
+        ):
+            raise ValueError(
+                f"candidate {tag} lacks schema5 native execution game mode"
+            )
+        if (
+            value.get("native_execution_game_mode_provenance")
+            != "frozen_native_ingest_contract_mode_map_v1"
+        ):
+            raise ValueError(
+                f"candidate {tag} lacks schema5 execution-mode provenance"
+            )
         battle_index = value.get("battle_index")
         if (
             not isinstance(battle_index, int)
@@ -814,9 +831,11 @@ def _verify_plan(task: NativeDatasetTask, source: Mapping[str, Any]) -> BattlePl
             plan.authoritative_contract_provenance
             != "schema5_authoritative_native_contract_verified"
             or plan.numeric_game_mode_id is None
+            or plan.native_execution_game_mode_id is None
             or plan.battle_index is None
             or any(
                 side.tower_troop_level is None
+                or side.king_tower_level is None
                 or side.final_tower_hp is None
                 for side in plan.sides
             )
@@ -1090,6 +1109,24 @@ def execute_task(
         ),
         "numeric_game_mode_provenance": (
             None if plan is None else plan.numeric_game_mode_provenance
+        ),
+        "native_execution_game_mode_id": (
+            None if plan is None else plan.native_execution_game_mode_id
+        ),
+        "native_execution_game_mode_provenance": (
+            None
+            if plan is None
+            else plan.native_execution_game_mode_provenance
+        ),
+        "king_tower_levels": (
+            None
+            if plan is None
+            else [side.king_tower_level for side in plan.sides]
+        ),
+        "king_tower_level_provenance": (
+            None
+            if plan is None
+            else [side.king_tower_level_provenance for side in plan.sides]
         ),
         "battle_index": None if plan is None else plan.battle_index,
         "battle_index_provenance": (

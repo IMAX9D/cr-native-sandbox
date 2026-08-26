@@ -167,6 +167,8 @@ class SidePlan:
     tower_troop: str | None
     tower_troop_level: int | None
     tower_troop_level_provenance: str
+    king_tower_level: int | None
+    king_tower_level_provenance: str
     final_tower_hp: FinalTowerHp | None
 
 
@@ -178,6 +180,8 @@ class BattlePlan:
     source_schema_version: int
     numeric_game_mode_id: int | None
     numeric_game_mode_provenance: str
+    native_execution_game_mode_id: int | None
+    native_execution_game_mode_provenance: str
     battle_index: int | None
     battle_index_provenance: str
     authoritative_contract_game_version: str | None
@@ -507,7 +511,7 @@ def _schema_five_metadata(
     eligibility = value.get("authoritative_eligibility")
     if not isinstance(eligibility, Mapping) or (
         eligibility.get("status") != "accepted"
-        or eligibility.get("gate") != "native_static_v1"
+        or eligibility.get("gate") != "native_static_v2"
     ):
         raise ReplayPlanError("schema-v5 authoritative eligibility stamp is invalid")
 
@@ -541,14 +545,23 @@ def _schema_five_metadata(
         raise ReplayPlanError("schema-v5 exact version timestamp is incomplete")
 
     mode = value.get("numeric_game_mode_id")
-    if (
-        not _strict_int(mode, minimum=1)
-        or int(mode) not in contract.numeric_game_mode_ids
-    ):
+    if not _strict_int(mode, minimum=1):
         raise ReplayPlanError("schema-v5 numeric game mode is missing or not allowed")
     mode_provenance = str(value.get("numeric_game_mode_provenance") or "")
     if mode_provenance != "list_matchup_button_joined_by_data_index":
         raise ReplayPlanError("schema-v5 numeric game mode provenance is invalid")
+    execution_mode = value.get("native_execution_game_mode_id")
+    execution_mode_provenance = str(
+        value.get("native_execution_game_mode_provenance") or ""
+    )
+    execution_issues = contract.validate_execution_game_mode(
+        mode, execution_mode, execution_mode_provenance
+    )
+    if execution_issues:
+        details = ",".join(issue.code for issue in execution_issues)
+        raise ReplayPlanError(
+            "schema-v5 native execution game mode is invalid: " + details
+        )
     battle_index = value.get("battle_index")
     if not _strict_int(battle_index, minimum=1):
         raise ReplayPlanError("schema-v5 battle index is missing")
@@ -583,6 +596,8 @@ def _schema_five_metadata(
         "contract": contract,
         "numeric_game_mode_id": int(mode),
         "numeric_game_mode_provenance": mode_provenance,
+        "native_execution_game_mode_id": int(execution_mode),
+        "native_execution_game_mode_provenance": execution_mode_provenance,
         "battle_index": int(battle_index),
         "battle_index_provenance": battle_index_provenance,
         "contract_game_version": expected_game_version,
@@ -594,7 +609,9 @@ def _schema_five_metadata(
 
 def _side_deck(
     value: Mapping[str, Any], source_side: str, source_schema: int
-) -> tuple[tuple[CardSpec, ...], str | None, int | None, str]:
+) -> tuple[
+    tuple[CardSpec, ...], str | None, int | None, str, int | None, str,
+]:
     if source_schema >= 2:
         player = _schema_two_player(value, source_side)
         tokens = player.get("full_deck")
@@ -614,6 +631,25 @@ def _side_deck(
             if tower_level is not None
             else "legacy_not_observed"
         )
+        king_tower_level = (
+            int(player["king_tower_level"])
+            if source_schema == 5
+            and _strict_int(player.get("king_tower_level"), minimum=1)
+            else None
+        )
+        king_tower_level_provenance = (
+            str(player.get("king_tower_level_provenance") or "")
+            if source_schema == 5
+            else "legacy_not_observed"
+        )
+        if source_schema == 5 and (
+            king_tower_level != 16
+            or king_tower_level_provenance
+            != "ranked_template_cap16_and_full_king_hp_v1"
+        ):
+            raise ReplayPlanError(
+                f"schema-v5 {source_side} King Tower level evidence is invalid"
+            )
         if source_schema == 5:
             top_deck = value.get(f"{source_side}_deck")
             if top_deck != tokens:
@@ -654,10 +690,19 @@ def _side_deck(
         tower = None
         tower_level = None
         tower_level_provenance = "legacy_not_observed"
+        king_tower_level = None
+        king_tower_level_provenance = "legacy_not_observed"
     bases = [item.base_token for item in result]
     if len(set(bases)) != 8:
         raise ReplayPlanError(f"{source_side} deck has duplicate base-card identities")
-    return result, tower, tower_level, tower_level_provenance
+    return (
+        result,
+        tower,
+        tower_level,
+        tower_level_provenance,
+        king_tower_level,
+        king_tower_level_provenance,
+    )
 
 
 def compile_battle(
@@ -713,10 +758,19 @@ def compile_battle(
     tower_troops: list[str | None] = []
     tower_troop_levels: list[int | None] = []
     tower_troop_level_provenance: list[str] = []
+    king_tower_levels: list[int | None] = []
+    king_tower_level_provenance: list[str] = []
     final_tower_hp: list[FinalTowerHp | None] = []
     logical_indices: list[dict[str, int]] = []
     for source_side in SIDE_NAMES:
-        deck, tower, tower_level, tower_level_source = _side_deck(
+        (
+            deck,
+            tower,
+            tower_level,
+            tower_level_source,
+            king_tower_level,
+            king_tower_level_source,
+        ) = _side_deck(
             value, source_side, source_schema
         )
         if source_schema == 5 and tower_level is None:
@@ -727,11 +781,27 @@ def compile_battle(
         tower_troops.append(tower)
         tower_troop_levels.append(tower_level)
         tower_troop_level_provenance.append(tower_level_source)
-        final_tower_hp.append(
+        king_tower_levels.append(king_tower_level)
+        king_tower_level_provenance.append(king_tower_level_source)
+        terminal_hp = (
             _schema_five_terminal_hp(value, source_side)
             if source_schema == 5
             else None
         )
+        if source_schema == 5:
+            assert schema_five is not None
+            expected_king_hp = schema_five[
+                "contract"
+            ].king_tower_max_hp_by_level.get(king_tower_level)
+            if expected_king_hp is None:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} King Tower level has no frozen HP probe"
+                )
+            if terminal_hp is None or terminal_hp.king != expected_king_hp:
+                raise ReplayPlanError(
+                    f"schema-v5 {source_side} full King Tower HP anchor is inconsistent"
+                )
+        final_tower_hp.append(terminal_hp)
         logical_indices.append({item.base_token: index for index, item in enumerate(deck)})
 
     if source_schema == 5:
@@ -913,6 +983,8 @@ def compile_battle(
             tower_troop=tower_troops[side],
             tower_troop_level=tower_troop_levels[side],
             tower_troop_level_provenance=tower_troop_level_provenance[side],
+            king_tower_level=king_tower_levels[side],
+            king_tower_level_provenance=king_tower_level_provenance[side],
             final_tower_hp=final_tower_hp[side],
         )
         for side in range(2)
@@ -934,13 +1006,13 @@ def compile_battle(
     limitations = [
         "source_native_rng_seed_missing",
         "source_exact_game_build_missing",
-        "source_king_tower_level_missing",
         "source_initial_hand_not_observed",
         "source_tick_state_anchors_missing",
     ]
     if source_schema != 5:
         limitations.extend((
             "source_numeric_game_mode_missing",
+            "source_king_tower_level_missing",
             "source_tower_troop_level_missing",
             "source_final_six_tower_hp_missing",
         ))
@@ -1016,6 +1088,14 @@ def compile_battle(
         numeric_game_mode_provenance=(
             "legacy_unobserved" if schema_five is None
             else str(schema_five["numeric_game_mode_provenance"])
+        ),
+        native_execution_game_mode_id=(
+            None if schema_five is None
+            else int(schema_five["native_execution_game_mode_id"])
+        ),
+        native_execution_game_mode_provenance=(
+            "legacy_template_mode_unmodified" if schema_five is None
+            else str(schema_five["native_execution_game_mode_provenance"])
         ),
         battle_index=(
             None if schema_five is None else int(schema_five["battle_index"])
@@ -1127,10 +1207,11 @@ def materialize_replay(
     replay = copy.deepcopy(dict(template))
     replay["rndSeed"] = int(seed)
     battle = replay["battle"]
-    if plan.numeric_game_mode_id is not None:
-        # Schema 5 joins the numeric mode from the list page by battle index.
-        # Older sources deliberately retain the template mode instead.
-        battle["gamemode"] = int(plan.numeric_game_mode_id)
+    if plan.native_execution_game_mode_id is not None:
+        # Schema 5 keeps the list-page mode as source truth but executes the
+        # explicit frozen contract transform.  Older sources deliberately
+        # retain the template mode instead.
+        battle["gamemode"] = int(plan.native_execution_game_mode_id)
     mappings: list[tuple[int, ...]] = []
     for side, side_plan in enumerate(plan.sides):
         mapping = tuple(range(8))
@@ -1162,6 +1243,22 @@ def materialize_replay(
             "t": 0,
             "c": 0,
         }]
+        if side_plan.king_tower_level is not None:
+            king_level = int(side_plan.king_tower_level)
+            avatar = battle.get(f"avatar{side}")
+            home_battle_data = battle.get("hbd")
+            if (
+                not isinstance(avatar, dict)
+                or not isinstance(home_battle_data, list)
+                or len(home_battle_data) <= side
+                or not isinstance(home_battle_data[side], dict)
+            ):
+                raise ReplayPlanError(
+                    "native template lacks avatar/home battle data for King level"
+                )
+            avatar["expLevel"] = king_level
+            avatar["kt"] = king_level
+            home_battle_data[side]["kt"] = king_level
     return replay, (mappings[0], mappings[1])
 
 
