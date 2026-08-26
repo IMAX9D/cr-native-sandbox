@@ -5,16 +5,19 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from expert_v1.native_dataset_generator import (
     COORDINATE_PROVENANCE,
     _failure_class,
     _failure_domain,
     NativeDatasetTask,
+    PreflightFullTraceDivergence,
     RecordingCountingEnv,
     StagedTickSink,
     StoredFrameRegistry,
     execute_task,
+    execute_two_phase_plan,
     atomic_json,
     prepare_run,
     reconcile_result_files,
@@ -82,7 +85,122 @@ def write_candidates(path: Path, rows: list[dict]) -> None:
     )
 
 
+def replay_result_stub(
+    *, success: bool, chosen_seed: int = 7, failure: str | None = None,
+    action_sequence: tuple[dict, ...] = (),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        teacher_forced_success=success,
+        failure=failure,
+        accepted_actions=len(action_sequence) if success else 0,
+        accepted_deploy_actions=len(action_sequence) if success else 0,
+        accepted_ability_actions=0,
+        action_acceptance_sequence=action_sequence,
+        final_tick=80,
+        terminal_validated=False,
+        terminal_match=None,
+        terminal_diagnostic_status="native_terminal_missing",
+        source_crowns=(0, 0),
+        observed_crowns=None,
+        terminal_tower_hp_validated=False,
+        terminal_tower_hp_match=None,
+        terminal_tower_hp_diagnostic_status=(
+            "native_terminal_tower_hp_missing"
+        ),
+        source_final_tower_hp=None,
+        observed_final_tower_hp=None,
+        chosen_seed=chosen_seed,
+        seeds_tested=3,
+        seed_search_native_resets=3,
+        layout_resolution_mode="source_order_bounded_native_seed_search",
+        native_ticks_advanced=70,
+        tick_trace_batches=0,
+        tick_trace_complete_frames=0,
+        deployment_mask_probe_rpc_count=0,
+    )
+
+
 class NativeDatasetGeneratorTest(unittest.TestCase):
+    def test_failed_preflight_skips_full_trace_and_all_mask_probes(self) -> None:
+        rejected = replay_result_stub(
+            success=False,
+            failure="native_rejected_tick_21_codes_[4]",
+            action_sequence=({
+                "source_tick": 20, "execution_tick": 21,
+                "source_event_index": 0, "type": "play", "side": 0,
+                "accepted": False, "result_code": 4,
+            },),
+        )
+        with patch(
+            "expert_v1.native_dataset_generator.execute_plan",
+            return_value=rejected,
+        ) as mocked:
+            outcome = execute_two_phase_plan(
+                object(), SimpleNamespace(), {}, StagedTickSink(),
+                seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
+                tick_store_metadata={},
+            )
+
+        self.assertEqual(mocked.call_count, 1)
+        self.assertIsNone(outcome.full_trace)
+        self.assertFalse(mocked.call_args.kwargs["capture_deployment_masks"])
+        self.assertIsNone(mocked.call_args.kwargs["tick_sink"])
+        self.assertEqual(list(outcome.preflight_recorder.trace_history), [])
+        self.assertEqual(
+            outcome.preflight_recorder.native_deployment_mask_probes_attempted,
+            0,
+        )
+
+    def test_successful_preflight_reuses_seed_and_matches_full_trace(self) -> None:
+        actions = ({
+            "source_tick": 20, "execution_tick": 21,
+            "source_event_index": 0, "type": "play", "side": 0,
+            "accepted": True, "result_code": 0,
+        },)
+        preflight = replay_result_stub(
+            success=True, chosen_seed=7, action_sequence=actions
+        )
+        full = replay_result_stub(
+            success=True, chosen_seed=7, action_sequence=actions
+        )
+        full.seeds_tested = 0
+        full.seed_search_native_resets = 1
+        full.layout_resolution_mode = "fixed_preflight_seed_replay"
+        with patch(
+            "expert_v1.native_dataset_generator.execute_plan",
+            side_effect=[preflight, full],
+        ) as mocked:
+            outcome = execute_two_phase_plan(
+                object(), SimpleNamespace(), {}, StagedTickSink(),
+                seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
+                tick_store_metadata={},
+            )
+
+        self.assertEqual(mocked.call_count, 2)
+        second = mocked.call_args_list[1]
+        self.assertEqual(second.kwargs["fixed_seed"], 7)
+        self.assertTrue(second.kwargs["capture_deployment_masks"])
+        self.assertIsNotNone(second.kwargs["tick_sink"])
+        self.assertEqual(outcome.semantic_diff, {})
+
+    def test_two_phase_action_or_terminal_difference_is_a_closed_diff(self) -> None:
+        preflight = replay_result_stub(success=True, chosen_seed=7)
+        full = replay_result_stub(success=True, chosen_seed=7)
+        full.seeds_tested = 0
+        full.seed_search_native_resets = 1
+        full.layout_resolution_mode = "fixed_preflight_seed_replay"
+        full.terminal_match = False
+        with patch(
+            "expert_v1.native_dataset_generator.execute_plan",
+            side_effect=[preflight, full],
+        ):
+            outcome = execute_two_phase_plan(
+                object(), SimpleNamespace(), {}, StagedTickSink(),
+                seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
+                tick_store_metadata={},
+            )
+        self.assertEqual(set(outcome.semantic_diff or {}), {"terminal"})
+
     def test_failure_domains_keep_infrastructure_out_of_semantic_rejections(self) -> None:
         timeout = _failure_class(
             None, TimeoutError("RPC timeout"), "native_teacher_forced_replay"
@@ -121,6 +239,16 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertEqual(_failure_domain(hand), "source_integrity")
         self.assertEqual(_failure_domain(unknown), "infrastructure")
         self.assertEqual(_failure_domain(terminal), "semantic")
+        divergence = _failure_class(
+            None,
+            PreflightFullTraceDivergence({"terminal": {}}),
+            "preflight_full_trace_semantic_diff",
+        )
+        self.assertEqual(
+            divergence,
+            "infrastructure_preflight_full_trace_semantic_divergence",
+        )
+        self.assertEqual(_failure_domain(divergence), "infrastructure")
         self.assertTrue(should_retry_failure({
             "teacher_forced_success": False,
             "failure_domain": "infrastructure",
@@ -211,12 +339,22 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             first = prepare_run(**args)
             second = prepare_run(**args)
             self.assertEqual(first[0], second[0])
+            self.assertEqual(first[3]["run_contract_version"], 2)
+            self.assertEqual(
+                first[3]["native_execution_pipeline"]["contract_version"], 1
+            )
             with TickStoreWorkQueue(first[2]) as queue:
                 self.assertEqual(queue.counts(), {"pending": 2})
             changed = dict(args)
             changed["selection_seed"] = "different"
             with self.assertRaises(RuntimeError):
                 prepare_run(**changed)
+            contract_path = output / "run-contract.json"
+            stale_contract = json.loads(contract_path.read_text())
+            stale_contract.pop("native_execution_pipeline")
+            atomic_json(contract_path, stale_contract)
+            with self.assertRaisesRegex(RuntimeError, "resume contract changed"):
+                prepare_run(**args)
 
     def test_staged_episode_commits_once_and_can_be_reused_after_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -442,6 +580,19 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             "failure_class": "ability_branch_required",
             "failure_domain": "semantic",
             "terminal_diagnostic_status": "not_reached",
+            "native_preflight_contract_version": 1,
+            "native_execution_pipeline_mode": (
+                "native_preflight_then_fixed_seed_full_trace_v1"
+            ),
+            "preflight_teacher_forced_success": False,
+            "full_trace_executed": False,
+            "preflight_seconds": 0.5,
+            "full_trace_seconds": 0.0,
+            "avoided_trace_ticks": 70,
+            "preflight_full_trace_semantic_match": None,
+            "preflight_full_trace_semantic_diff": None,
+            "tick_trace_complete_frames": 0,
+            "deployment_mask_probe_rpc_count": 0,
         }
         summary = summarize_results(
             [task], [base], queue_counts={"failed": 1}, worker_reports=[{
@@ -453,6 +604,11 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertEqual(summary["true_attempted_acceptance_rate"], 0.75)
         self.assertEqual(summary["branch_required_battles"], 1)
         self.assertTrue(summary["native_action_accounting_closed"])
+        self.assertTrue(summary["two_phase_preflight_integrity"])
+        self.assertEqual(summary["preflight_rejections"], 1)
+        self.assertEqual(summary["full_trace_executions"], 0)
+        self.assertEqual(summary["preflight_seconds"], 0.5)
+        self.assertEqual(summary["avoided_trace_ticks"], 70)
 
         infrastructure = dict(base)
         infrastructure.update({

@@ -56,6 +56,7 @@ def ability_battle() -> dict:
 class FakeNativeEnv:
     def __init__(self, *, branch: bool = False) -> None:
         self.branch = branch
+        self.force_bad_layout = False
         self.tick = 10
         self.players = [
             {
@@ -68,6 +69,7 @@ class FakeNativeEnv:
         ]
         self.submitted: list[list[dict]] = []
         self.submitted_ticks: list[int] = []
+        self.reset_seeds: list[int] = []
         self.probed_slots: list[tuple[int, int]] = []
         self.deck_ids = [[26_000_000 + index for index in range(8)] for _ in range(2)]
 
@@ -93,6 +95,21 @@ class FakeNativeEnv:
         }
 
     def reset(self, replay: dict, *, warmup_steps: int) -> dict:
+        self.reset_seeds.append(int(replay.get("rndSeed", -1)))
+        self.players = [
+            {
+                "side": side, "elixir": 10, "elixir_raw": 100000,
+                "hand_deck_indices": [0, 1, 2, 3],
+                "cycle_deck_indices": [4, 5, 6, 7],
+                "next_deck_index": 4, "refill_timer": 0,
+            }
+            for side in range(2)
+        ]
+        if self.force_bad_layout:
+            for player in self.players:
+                player["hand_deck_indices"] = [1, 2, 3, 4]
+                player["cycle_deck_indices"] = [0, 5, 6, 7]
+                player["next_deck_index"] = 0
         battle = replay.get("battle", {})
         for side in (0, 1):
             rows = battle.get(f"deck{side}", {}).get("sp", [])
@@ -163,6 +180,39 @@ def template() -> dict:
 
 
 class ExpertNativeReplayAbilityTests(unittest.TestCase):
+    def test_fixed_seed_second_pass_preserves_action_and_terminal_semantics(self) -> None:
+        plan = compile_battle(ability_battle())
+        env = FakeNativeEnv()
+        preflight = execute_plan(env, plan, template(), calibration(), seed=19)
+        reset_count_after_preflight = len(env.reset_seeds)
+        full = execute_plan(
+            env,
+            plan,
+            template(),
+            calibration(),
+            seed=999,
+            fixed_seed=preflight.chosen_seed,
+        )
+
+        self.assertTrue(preflight.teacher_forced_success, preflight.failure)
+        self.assertTrue(full.teacher_forced_success, full.failure)
+        self.assertEqual(
+            preflight.action_acceptance_sequence,
+            full.action_acceptance_sequence,
+        )
+        self.assertEqual(preflight.terminal_match, full.terminal_match)
+        self.assertEqual(
+            preflight.terminal_tower_hp_match,
+            full.terminal_tower_hp_match,
+        )
+        self.assertEqual(len(env.reset_seeds), reset_count_after_preflight + 1)
+        self.assertEqual(env.reset_seeds[-1], preflight.chosen_seed)
+        self.assertEqual(full.seed_search_native_resets, 1)
+        self.assertEqual(full.seeds_tested, 0)
+        self.assertEqual(
+            full.layout_resolution_mode, "fixed_preflight_seed_replay"
+        )
+
     def test_schema3_unique_live_entity_executes_native_ability(self) -> None:
         plan = compile_battle(ability_battle())
         self.assertTrue(plan.native_replay_ready)
@@ -188,6 +238,32 @@ class ExpertNativeReplayAbilityTests(unittest.TestCase):
         self.assertEqual(profile["name"], "royaleapi_native_teacher_forced")
         self.assertEqual(profile["version"], 1)
         self.assertFalse(profile["diagnostic_override"])
+
+    def test_fixed_seed_layout_is_revalidated_before_trace_or_mask_probe(self) -> None:
+        plan = compile_battle(ability_battle())
+        env = FakeNativeEnv()
+        preflight = execute_plan(env, plan, template(), calibration())
+        self.assertTrue(preflight.teacher_forced_success, preflight.failure)
+        env.force_bad_layout = True
+        env.probed_slots.clear()
+
+        full = execute_plan(
+            env,
+            plan,
+            template(),
+            calibration(),
+            fixed_seed=preflight.chosen_seed,
+            capture_deployment_masks=True,
+        )
+        self.assertFalse(full.teacher_forced_success)
+        self.assertIn(
+            "native_seed_search_layout_revalidation_failed_sides_",
+            full.failure or "",
+        )
+        self.assertEqual(full.layout_resolution_mode, "fixed_preflight_seed_replay")
+        self.assertEqual(full.seed_search_native_resets, 1)
+        self.assertEqual(full.deployment_mask_probe_rpc_count, 0)
+        self.assertEqual(env.probed_slots, [])
 
     def test_explicit_offset_zero_remains_a_diagnostic_override(self) -> None:
         plan = compile_battle(ability_battle())

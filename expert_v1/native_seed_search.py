@@ -57,10 +57,11 @@ class NativeSeedResolution:
     replay: dict[str, Any]
     mappings: tuple[tuple[int, ...], tuple[int, ...]]
     state: dict[str, Any]
+    resolution_mode: str = "source_order_bounded_native_seed_search"
 
     def audit(self) -> dict[str, Any]:
         return {
-            "layout_resolution_mode": "source_order_bounded_native_seed_search",
+            "layout_resolution_mode": self.resolution_mode,
             "preferred_seed": self.preferred_seed,
             "chosen_seed": self.chosen_seed,
             "seeds_tested": self.seeds_tested,
@@ -283,4 +284,43 @@ def resolve_native_seed(
         seeds_tested=seeds_tested,
         maximum_seeds_to_test=maximum_seeds_to_test,
         preferred_seed=int(preferred_seed),
+    )
+
+
+def resolve_fixed_native_seed(
+    env: Any,
+    plan: BattlePlan,
+    template: Mapping[str, Any],
+    *,
+    chosen_seed: int,
+    warmup_tick: int = 10,
+) -> NativeSeedResolution:
+    """Reset exactly once with a seed selected by a prior preflight.
+
+    This is deliberately not a one-element seed *search*.  The caller has
+    already paid for the bounded search and must carry that exact seed into a
+    second, instrumented replay.  The returned state is still inspected by
+    :func:`layouts_accept_plan` in the normal runner path, so a changed native
+    layout fails closed rather than silently starting another search.
+    """
+    if warmup_tick < 0:
+        raise ValueError("warmup_tick must be nonnegative")
+    seed = int(chosen_seed)
+    replay, mappings, layouts, state = _reset_candidate(
+        env, plan, template, seed, warmup_tick
+    )
+    return NativeSeedResolution(
+        preferred_seed=seed,
+        chosen_seed=seed,
+        seeds_tested=0,
+        maximum_seeds_to_test=0,
+        cache_hit=False,
+        cache_validated=False,
+        native_resets=1,
+        source_seed_recovered=False,
+        layouts=layouts,
+        replay=replay,
+        mappings=mappings,
+        state=state,
+        resolution_mode="fixed_preflight_seed_replay",
     )

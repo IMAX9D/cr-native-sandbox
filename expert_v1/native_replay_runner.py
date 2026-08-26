@@ -38,6 +38,7 @@ from .native_replay_plan import (
 from .native_seed_search import (
     DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     layouts_accept_plan,
+    resolve_fixed_native_seed,
     resolve_native_seed,
 )
 from .tick_store_v1 import (
@@ -82,6 +83,7 @@ class NativeReplayResult:
     seed_search_cache_hit: bool
     seed_search_native_resets: int
     source_seed_recovered: bool
+    layout_resolution_mode: str
     final_tick: int
     native_ticks_advanced: int
     reset_seconds: float
@@ -110,6 +112,7 @@ class NativeReplayResult:
     source_final_tower_hp: tuple[dict[str, Any], dict[str, Any]] | None
     observed_final_tower_hp: tuple[dict[str, Any], dict[str, Any]] | None
     decision_records: tuple[dict[str, Any], ...]
+    action_acceptance_sequence: tuple[dict[str, Any], ...]
     tick_trace_batches: int
     tick_trace_complete_frames: int
     tick_trace_incomplete_terminal_frames: int
@@ -362,6 +365,7 @@ def execute_plan(
     calibration: Sequence[Mapping[str, Any]] | None = None,
     *,
     seed: int = DEFAULT_NATIVE_SEED,
+    fixed_seed: int | None = None,
     maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     warmup_tick: int = 10,
     capture_decisions: bool = True,
@@ -393,6 +397,7 @@ def execute_plan(
     ability_resolution_counts: Counter[str] = Counter()
     ability_resolutions: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
+    action_acceptance_sequence: list[dict[str, Any]] = []
     failure: str | None = None
     final_tick = 0
     terminal_validated = False
@@ -423,39 +428,28 @@ def execute_plan(
             None if exact_index is None else side_actions[exact_index].tick
         )
     reset_started = time.perf_counter()
-    seed_resolution = resolve_native_seed(
-        env,
-        plan,
-        template,
-        preferred_seed=seed,
-        maximum_seeds_to_test=maximum_seeds_to_test,
-        warmup_tick=warmup_tick,
+    seed_resolution = (
+        resolve_native_seed(
+            env,
+            plan,
+            template,
+            preferred_seed=seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
+            warmup_tick=warmup_tick,
+        )
+        if fixed_seed is None
+        else resolve_fixed_native_seed(
+            env,
+            plan,
+            template,
+            chosen_seed=fixed_seed,
+            warmup_tick=warmup_tick,
+        )
     )
     mappings = seed_resolution.mappings
     state = seed_resolution.state
     reset_seconds += time.perf_counter() - reset_started
     final_tick = int(state["tick"])
-    if capture_deployment_masks:
-        deployment_mask_capture = NativeDeploymentMaskCapture([
-            {
-                "side": side_index,
-                "deck_index": deck_index,
-                "card_id": card.card_id,
-                "level": card.level,
-                "form_flags": card.form_flags,
-                "source_token": card.source_token,
-                "base_token": card.base_token,
-            }
-            for side_index, side_plan in enumerate(plan.sides)
-            for deck_index, card in enumerate(side_plan.deck)
-        ])
-        mask_started = time.perf_counter()
-        deployment_mask_capture.capture_available(env, state)
-        deployment_mask_probe_seconds += time.perf_counter() - mask_started
-    if tick_accumulator is not None:
-        observe_started = time.perf_counter()
-        tick_accumulator.start(env.observe_train())
-        observe_seconds += time.perf_counter() - observe_started
 
     # Revalidate the authoritative source-order layout at the execution
     # boundary.  No deck slot or action Tick may be rewritten to make it pass.
@@ -500,6 +494,31 @@ def execute_plan(
             source_occupancy.add(source_key)
             execution_occupancy.add(execution_key)
         replay_groups.append((int(source_tick), execution_tick, events))
+
+    # Do not pay trace or validator-probe costs until the fixed reset has
+    # passed layout/source preconditions.  In particular, a nondeterministic
+    # fixed-seed layout mismatch must leave no partial trace/mask capture.
+    if failure is None and capture_deployment_masks:
+        deployment_mask_capture = NativeDeploymentMaskCapture([
+            {
+                "side": side_index,
+                "deck_index": deck_index,
+                "card_id": card.card_id,
+                "level": card.level,
+                "form_flags": card.form_flags,
+                "source_token": card.source_token,
+                "base_token": card.base_token,
+            }
+            for side_index, side_plan in enumerate(plan.sides)
+            for deck_index, card in enumerate(side_plan.deck)
+        ])
+        mask_started = time.perf_counter()
+        deployment_mask_capture.capture_available(env, state)
+        deployment_mask_probe_seconds += time.perf_counter() - mask_started
+    if failure is None and tick_accumulator is not None:
+        observe_started = time.perf_counter()
+        tick_accumulator.start(env.observe_train())
+        observe_seconds += time.perf_counter() - observe_started
 
     previous_source_tick = final_tick
     previous_execution_tick = final_tick
@@ -799,6 +818,35 @@ def execute_plan(
             action_result = env.joint_act(native_actions)
             action_seconds += time.perf_counter() - action_started
             results = action_result.get("actions", [])
+            # Keep a compact, phase-independent acceptance transcript.  The
+            # two-stage dataset generator compares this byte-for-byte between
+            # the cheap preflight and the fully instrumented replay.
+            for index, (native_action, source_event) in enumerate(zip(
+                native_actions, resolved_events, strict=True
+            )):
+                item = results[index] if index < len(results) else None
+                native_result = (
+                    item.get("result", {})
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("result"), Mapping)
+                    else {}
+                )
+                action_acceptance_sequence.append({
+                    "source_tick": int(source_tick),
+                    "execution_tick": int(execution_tick),
+                    "source_event_index": int(source_event["source_event_index"]),
+                    "type": str(native_action["type"]),
+                    "side": int(native_action["side"]),
+                    "accepted": (
+                        None if item is None
+                        else bool(native_result.get("accepted", False))
+                    ),
+                    "result_code": (
+                        None
+                        if item is None or "result_code" not in native_result
+                        else int(native_result["result_code"])
+                    ),
+                })
             if len(results) != len(native_actions):
                 failure = (
                     f"native_action_count_mismatch_tick_{source_tick}"
@@ -1045,6 +1093,7 @@ def execute_plan(
         seed_search_cache_hit=seed_resolution.cache_hit,
         seed_search_native_resets=seed_resolution.native_resets,
         source_seed_recovered=seed_resolution.source_seed_recovered,
+        layout_resolution_mode=seed_resolution.resolution_mode,
         final_tick=final_tick,
         native_ticks_advanced=native_ticks,
         reset_seconds=reset_seconds,
@@ -1097,6 +1146,7 @@ def execute_plan(
         source_final_tower_hp=source_final_tower_hp,
         observed_final_tower_hp=observed_final_tower_hp,
         decision_records=tuple(records),
+        action_acceptance_sequence=tuple(action_acceptance_sequence),
         tick_trace_batches=(
             0 if tick_accumulator is None else tick_accumulator.batches
         ),

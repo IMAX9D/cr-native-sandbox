@@ -72,6 +72,9 @@ TASK_KIND = "expert_authoritative_native_tick_task_v1"
 RESULT_KIND = "expert_authoritative_native_tick_result_v1"
 DIAGNOSTIC_KIND = "expert_authoritative_native_tick_failure_v1"
 COORDINATE_PROVENANCE = "royaleapi_raw_data_i_to_native_v1"
+RUN_CONTRACT_VERSION = 2
+NATIVE_PREFLIGHT_CONTRACT_VERSION = 1
+NATIVE_PREFLIGHT_MODE = "native_preflight_then_fixed_seed_full_trace_v1"
 EXACT_ABILITY_TIERS = {
     "source_reports_zero",
     "observed_ticks_identity_runtime_resolved",
@@ -468,6 +471,7 @@ def _component_hashes(project_root: Path) -> dict[str, str]:
         "expert_v1/native_dataset_generator.py",
         "expert_v1/native_replay_runner.py",
         "expert_v1/native_replay_plan.py",
+        "expert_v1/native_seed_search.py",
         "expert_v1/native_profile.py",
         "expert_v1/tick_store_v1/codec.py",
         "expert_v1/tick_store_v1/deployment_masks.py",
@@ -520,6 +524,7 @@ def prepare_run(
     contract = {
         "schema_version": GENERATOR_SCHEMA_VERSION,
         "kind": GENERATOR_KIND,
+        "run_contract_version": RUN_CONTRACT_VERSION,
         "candidate_queue": str(candidate_queue.resolve(strict=True)),
         "candidate_queue_sha256": sha256_file(candidate_queue.resolve(strict=True)),
         "selection_manifest": str(selection_path.resolve()),
@@ -554,6 +559,27 @@ def prepare_run(
             "legacy preferred only; bounded source-order search chooses each seed"
         ),
         "maximum_seeds_to_test": int(maximum_seeds_to_test),
+        "native_execution_pipeline": {
+            "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+            "mode": NATIVE_PREFLIGHT_MODE,
+            "preflight": {
+                "tick_sink": False,
+                "deployment_mask_capture": False,
+                "decision_capture": False,
+                "seed_resolution": "bounded_source_order_search",
+            },
+            "full_trace": {
+                "tick_sink": True,
+                "deployment_mask_capture": True,
+                "decision_capture": False,
+                "seed_resolution": "single_reset_with_preflight_chosen_seed",
+                "layout_revalidation": True,
+            },
+            "semantic_diff": (
+                "action_acceptance_sequence+failure+terminal+tower_hp; "
+                "any difference fails closed"
+            ),
+        },
         "trace_batch_steps": int(trace_batch_steps),
         "episodes_per_shard": int(episodes_per_shard),
         "anchor_interval": int(anchor_interval),
@@ -986,12 +1012,18 @@ def _failure_class(
         return "source_sha_mismatch"
     if isinstance(error, NativeSeedSearchError):
         return "native_seed_search_exhausted"
+    if isinstance(error, PreflightFullTraceDivergence):
+        return "infrastructure_preflight_full_trace_semantic_divergence"
     if error is not None:
         if stage == "immutable_tick_store_commit":
             return "infrastructure_tick_store_commit_failed"
         if stage == "tick_store_postcondition":
             return "infrastructure_tick_store_postcondition_failed"
-        if stage == "native_teacher_forced_replay":
+        if stage in {
+            "native_teacher_forced_replay",
+            "native_preflight",
+            "native_full_trace_replay",
+        }:
             return "infrastructure_native_replay_exception"
         if stage == "compile_and_provenance_validation":
             return "source_contract_or_compile_error"
@@ -1060,6 +1092,268 @@ class TaskExecution:
     diagnostic: dict[str, Any] | None
 
 
+class PreflightFullTraceDivergence(RuntimeError):
+    """The instrumented replay changed fixed-seed native semantics."""
+
+    def __init__(self, differences: Mapping[str, Any]) -> None:
+        self.differences = dict(differences)
+        super().__init__(
+            "native preflight/full-trace semantic divergence: "
+            + ",".join(sorted(self.differences))
+        )
+
+
+def native_replay_semantics(result: NativeReplayResult) -> dict[str, Any]:
+    """Project only semantics that instrumentation is forbidden to change."""
+    return {
+        "teacher_forced_success": bool(result.teacher_forced_success),
+        "failure": result.failure,
+        "accepted_actions": int(result.accepted_actions),
+        "accepted_deploy_actions": int(result.accepted_deploy_actions),
+        "accepted_ability_actions": int(result.accepted_ability_actions),
+        "action_acceptance_sequence": [
+            dict(row) for row in result.action_acceptance_sequence
+        ],
+        "final_tick": int(result.final_tick),
+        "terminal": {
+            "validated": bool(result.terminal_validated),
+            "match": result.terminal_match,
+            "diagnostic_status": result.terminal_diagnostic_status,
+            "source_crowns": result.source_crowns,
+            "observed_crowns": result.observed_crowns,
+        },
+        "tower_hp": {
+            "validated": bool(result.terminal_tower_hp_validated),
+            "match": result.terminal_tower_hp_match,
+            "diagnostic_status": result.terminal_tower_hp_diagnostic_status,
+            "source": result.source_final_tower_hp,
+            "observed": result.observed_final_tower_hp,
+        },
+    }
+
+
+def diff_native_replay_semantics(
+    preflight: NativeReplayResult,
+    full_trace: NativeReplayResult,
+) -> dict[str, Any]:
+    """Return an auditable top-level diff; an empty mapping is exact parity."""
+    left = native_replay_semantics(preflight)
+    right = native_replay_semantics(full_trace)
+    differences = {
+        key: {"preflight": left[key], "full_trace": right[key]}
+        for key in left
+        if left[key] != right[key]
+    }
+    if preflight.chosen_seed != full_trace.chosen_seed:
+        differences["chosen_seed"] = {
+            "preflight": preflight.chosen_seed,
+            "full_trace": full_trace.chosen_seed,
+        }
+    if full_trace.layout_resolution_mode != "fixed_preflight_seed_replay":
+        differences["full_trace_layout_resolution_mode"] = {
+            "preflight": "fixed_preflight_seed_replay",
+            "full_trace": full_trace.layout_resolution_mode,
+        }
+    if full_trace.seed_search_native_resets != 1 or full_trace.seeds_tested != 0:
+        differences["full_trace_seed_reuse"] = {
+            "expected": {"native_resets": 1, "seeds_tested": 0},
+            "actual": {
+                "native_resets": full_trace.seed_search_native_resets,
+                "seeds_tested": full_trace.seeds_tested,
+            },
+        }
+    return differences
+
+
+def _semantic_digest(result: NativeReplayResult) -> str:
+    payload = json.dumps(
+        native_replay_semantics(result),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+@dataclass(slots=True)
+class TwoPhaseNativeReplay:
+    preflight: NativeReplayResult
+    full_trace: NativeReplayResult | None
+    preflight_recorder: RecordingCountingEnv
+    full_trace_recorder: RecordingCountingEnv | None
+    preflight_seconds: float
+    full_trace_seconds: float
+    semantic_diff: dict[str, Any] | None
+
+    @property
+    def result(self) -> NativeReplayResult:
+        return self.preflight if self.full_trace is None else self.full_trace
+
+
+def execute_two_phase_plan(
+    env: Any,
+    plan: BattlePlan,
+    template: Mapping[str, Any],
+    staged: StagedTickSink,
+    *,
+    seed: int,
+    maximum_seeds_to_test: int,
+    trace_batch_steps: int,
+    tick_store_metadata: Mapping[str, Any],
+    phase_state: dict[str, Any] | None = None,
+) -> TwoPhaseNativeReplay:
+    """Cheap semantic preflight followed by a fixed-seed traced replay.
+
+    A rejected preflight never invokes ``trace_train`` or ``probe_grid`` and
+    never starts the expensive second pass.  A successful preflight owns seed
+    search; the full pass resets exactly once with that chosen seed and then
+    executes the normal layout revalidation before any trace is accepted.
+    """
+    phase_state = {} if phase_state is None else phase_state
+    preflight_recorder = RecordingCountingEnv(env)
+    phase_state["preflight_recorder"] = preflight_recorder
+    phase_started = time.perf_counter()
+    try:
+        preflight = execute_plan(
+            preflight_recorder,
+            plan,
+            template,
+            None,
+            seed=seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
+            capture_decisions=False,
+            ability_branch_choices=None,
+            tick_sink=None,
+            trace_batch_steps=trace_batch_steps,
+            capture_deployment_masks=False,
+            action_execution_tick_offset=(
+                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+            ),
+        )
+    finally:
+        preflight_seconds = time.perf_counter() - phase_started
+        phase_state["preflight_seconds"] = preflight_seconds
+    if (
+        preflight.tick_trace_batches != 0
+        or preflight.tick_trace_complete_frames != 0
+        or preflight.deployment_mask_probe_rpc_count != 0
+        or preflight_recorder.trace_history
+        or preflight_recorder.native_deployment_mask_probes_attempted != 0
+    ):
+        raise RuntimeError(
+            "native preflight unexpectedly produced Tick trace or mask probes"
+        )
+    if not preflight.teacher_forced_success:
+        return TwoPhaseNativeReplay(
+            preflight=preflight,
+            full_trace=None,
+            preflight_recorder=preflight_recorder,
+            full_trace_recorder=None,
+            preflight_seconds=preflight_seconds,
+            full_trace_seconds=0.0,
+            semantic_diff=None,
+        )
+
+    full_trace_recorder = RecordingCountingEnv(env)
+    phase_state["full_trace_recorder"] = full_trace_recorder
+    phase_state["full_trace_executed"] = True
+    full_metadata = {
+        **dict(tick_store_metadata),
+        "native_execution_pipeline": {
+            "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+            "mode": NATIVE_PREFLIGHT_MODE,
+            "preflight_chosen_seed": preflight.chosen_seed,
+            "preflight_seeds_tested": preflight.seeds_tested,
+            "preflight_semantics_sha256": _semantic_digest(preflight),
+        },
+    }
+    phase_started = time.perf_counter()
+    try:
+        full_trace = execute_plan(
+            full_trace_recorder,
+            plan,
+            template,
+            None,
+            seed=seed,
+            fixed_seed=preflight.chosen_seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
+            capture_decisions=False,
+            ability_branch_choices=None,
+            tick_sink=staged,
+            tick_store_metadata=full_metadata,
+            trace_batch_steps=trace_batch_steps,
+            capture_deployment_masks=True,
+            action_execution_tick_offset=(
+                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+            ),
+        )
+    finally:
+        full_trace_seconds = time.perf_counter() - phase_started
+        phase_state["full_trace_seconds"] = full_trace_seconds
+    semantic_diff = diff_native_replay_semantics(preflight, full_trace)
+    if not semantic_diff and staged.episode is not None:
+        staged.episode.metadata["native_execution_pipeline"].update({
+            "full_trace_semantics_sha256": _semantic_digest(full_trace),
+            "semantic_diff_count": 0,
+            "semantic_match": True,
+        })
+    return TwoPhaseNativeReplay(
+        preflight=preflight,
+        full_trace=full_trace,
+        preflight_recorder=preflight_recorder,
+        full_trace_recorder=full_trace_recorder,
+        preflight_seconds=preflight_seconds,
+        full_trace_seconds=full_trace_seconds,
+        semantic_diff=semantic_diff,
+    )
+
+
+_COUNTING_METRIC_KEYS = (
+    "native_action_batches_attempted",
+    "native_actions_attempted",
+    "native_actions_responded",
+    "native_actions_accepted",
+    "native_actions_rejected",
+    "native_deploy_actions_attempted",
+    "native_deploy_actions_accepted",
+    "native_ability_actions_attempted",
+    "native_ability_actions_accepted",
+    "native_action_exceptions",
+    "native_deployment_mask_probes_attempted",
+    "native_deployment_mask_probes_responded",
+    "native_deployment_mask_probe_exceptions",
+)
+
+
+def _combined_phase_metrics(
+    preflight: RecordingCountingEnv,
+    full_trace: RecordingCountingEnv | None,
+) -> dict[str, Any]:
+    rows = [preflight.metrics()]
+    if full_trace is not None:
+        rows.append(full_trace.metrics())
+    combined = {
+        key: sum(int(row[key]) for row in rows)
+        for key in _COUNTING_METRIC_KEYS
+    }
+    combined["native_actions_no_response"] = max(
+        0,
+        combined["native_actions_attempted"]
+        - combined["native_actions_responded"],
+    )
+    combined["native_action_response_excess"] = max(
+        0,
+        combined["native_actions_responded"]
+        - combined["native_actions_attempted"],
+    )
+    combined["true_attempted_acceptance_rate"] = (
+        combined["native_actions_accepted"]
+        / combined["native_actions_attempted"]
+        if combined["native_actions_attempted"] else None
+    )
+    return combined
+
+
 def execute_task(
     env: Any,
     task: NativeDatasetTask,
@@ -1077,15 +1371,22 @@ def execute_task(
     native_ingest_contract: Any | None = None,
 ) -> TaskExecution:
     """Execute one source and commit its Tick frame only after full success."""
-    recorder = RecordingCountingEnv(env)
+    preflight_recorder = RecordingCountingEnv(env)
+    full_trace_recorder: RecordingCountingEnv | None = None
     plan: BattlePlan | None = None
+    preflight_result: NativeReplayResult | None = None
     result: NativeReplayResult | None = None
+    two_phase: TwoPhaseNativeReplay | None = None
     staged = StagedTickSink()
     error: Exception | None = None
     error_traceback: str | None = None
     stage = "source_sha_verification"
     source_sha_verified = False
     store_entry: dict[str, Any] | None = None
+    preflight_seconds = 0.0
+    full_trace_seconds = 0.0
+    semantic_diff: dict[str, Any] | None = None
+    phase_state: dict[str, Any] = {}
     started = time.perf_counter()
     try:
         source_path = Path(task.source_path).resolve(strict=True)
@@ -1102,17 +1403,16 @@ def execute_task(
             source,
             native_ingest_contract=native_ingest_contract,
         )
-        stage = "native_teacher_forced_replay"
-        result = execute_plan(
-            recorder,
+        stage = "native_preflight"
+        two_phase = execute_two_phase_plan(
+            env,
             plan,
             template,
-            None,
+            staged,
             seed=seed,
             maximum_seeds_to_test=maximum_seeds_to_test,
-            capture_decisions=False,
-            ability_branch_choices=None,
-            tick_sink=staged,
+            trace_batch_steps=trace_batch_steps,
+            phase_state=phase_state,
             tick_store_metadata={
                 "source_path": str(source_path),
                 "source_sha256": actual_sha,
@@ -1129,16 +1429,33 @@ def execute_task(
                     ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
                 ),
             },
-            trace_batch_steps=trace_batch_steps,
-            capture_deployment_masks=True,
-            action_execution_tick_offset=(
-                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
-            ),
         )
-        if not result.teacher_forced_success:
-            stage = "first_native_difference"
+        preflight_result = two_phase.preflight
+        result = two_phase.result
+        preflight_recorder = two_phase.preflight_recorder
+        full_trace_recorder = two_phase.full_trace_recorder
+        preflight_seconds = two_phase.preflight_seconds
+        full_trace_seconds = two_phase.full_trace_seconds
+        semantic_diff = two_phase.semantic_diff
+        if not preflight_result.teacher_forced_success:
+            stage = "preflight_first_native_difference"
+        elif semantic_diff:
+            stage = "preflight_full_trace_semantic_diff"
+            raise PreflightFullTraceDivergence(semantic_diff)
+        elif not result.teacher_forced_success:
+            # A successful preflight followed by a failed full trace must have
+            # appeared in the semantic diff above.  Keep this independent
+            # guard fail-closed if that contract is ever weakened by mistake.
+            stage = "preflight_full_trace_semantic_diff"
+            raise PreflightFullTraceDivergence({
+                "unclassified_full_trace_failure": {
+                    "preflight": preflight_result.failure,
+                    "full_trace": result.failure,
+                }
+            })
         else:
             stage = "tick_store_postcondition"
+            assert full_trace_recorder is not None
             if staged.episode is None:
                 raise RuntimeError("successful replay did not stage a Tick episode")
             if len(staged.episode.states) != result.tick_trace_complete_frames:
@@ -1146,18 +1463,18 @@ def execute_task(
                     "successful replay Tick count differs from complete trace frames"
                 )
             if (
-                recorder.native_actions_attempted != result.source_actions
-                or recorder.native_actions_accepted != result.source_actions
+                full_trace_recorder.native_actions_attempted != result.source_actions
+                or full_trace_recorder.native_actions_accepted != result.source_actions
             ):
                 raise RuntimeError(
                     "successful replay action counters differ from source actions"
                 )
             if (
-                recorder.native_deployment_mask_probes_attempted
+                full_trace_recorder.native_deployment_mask_probes_attempted
                 != result.deployment_mask_probe_rpc_count
-                or recorder.native_deployment_mask_probes_responded
+                or full_trace_recorder.native_deployment_mask_probes_responded
                 != result.deployment_mask_probe_rpc_count
-                or recorder.native_deployment_mask_probe_exceptions != 0
+                or full_trace_recorder.native_deployment_mask_probe_exceptions != 0
                 or result.deployment_mask_base_probe_rpc_count != 16
                 or result.deployment_mask_slots_captured != 16
                 or not result.deployment_mask_capture_complete
@@ -1177,6 +1494,16 @@ def execute_task(
     except Exception as caught:
         error = caught
         error_traceback = traceback.format_exc()
+        preflight_recorder = phase_state.get(
+            "preflight_recorder", preflight_recorder
+        )
+        full_trace_recorder = phase_state.get("full_trace_recorder")
+        preflight_seconds = float(
+            phase_state.get("preflight_seconds", preflight_seconds)
+        )
+        full_trace_seconds = float(
+            phase_state.get("full_trace_seconds", full_trace_seconds)
+        )
 
     success = bool(
         error is None
@@ -1184,7 +1511,10 @@ def execute_task(
         and result.teacher_forced_success
         and store_entry is not None
     )
-    metrics = recorder.metrics()
+    metrics = _combined_phase_metrics(
+        preflight_recorder, full_trace_recorder
+    )
+    active_recorder = full_trace_recorder or preflight_recorder
     if success:
         failure_class = failure = None
         first_difference = None
@@ -1198,7 +1528,8 @@ def execute_task(
             "stage": stage,
             "failure_class": failure_class,
             "failure": failure,
-            "first_native_rejection": deepcopy(recorder.first_rejection),
+            "first_native_rejection": deepcopy(active_recorder.first_rejection),
+            "preflight_full_trace_semantic_diff": semantic_diff,
             "logic_freeze": (
                 None if result is None else result.logic_freeze_diagnostic
             ),
@@ -1209,6 +1540,16 @@ def execute_task(
     )
     coordinate_audit = (
         None if plan is None else asdict(plan.coordinate_audit)
+    )
+    preflight_metrics = preflight_recorder.metrics()
+    full_trace_metrics = (
+        None if full_trace_recorder is None else full_trace_recorder.metrics()
+    )
+    full_trace_executed = full_trace_recorder is not None
+    avoided_trace_ticks = (
+        int(preflight_result.native_ticks_advanced)
+        if preflight_result is not None and not full_trace_executed
+        else 0
     )
     record: dict[str, Any] = {
         "schema_version": GENERATOR_SCHEMA_VERSION,
@@ -1233,6 +1574,56 @@ def execute_task(
         "planned_deploy_actions": task.deployment_actions,
         "planned_ability_actions": task.ability_events_observed,
         "planned_actions": task.deployment_actions + task.ability_events_observed,
+        "native_preflight_contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+        "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
+        "preflight_teacher_forced_success": (
+            None
+            if preflight_result is None
+            else preflight_result.teacher_forced_success
+        ),
+        "preflight_seconds": preflight_seconds,
+        "full_trace_executed": full_trace_executed,
+        "full_trace_seconds": full_trace_seconds,
+        "avoided_trace_ticks": avoided_trace_ticks,
+        "preflight_native_ticks_advanced": (
+            0
+            if preflight_result is None
+            else preflight_result.native_ticks_advanced
+        ),
+        "full_trace_native_ticks_advanced": (
+            0
+            if two_phase is None or two_phase.full_trace is None
+            else two_phase.full_trace.native_ticks_advanced
+        ),
+        "preflight_chosen_seed": (
+            None if preflight_result is None else preflight_result.chosen_seed
+        ),
+        "preflight_seeds_tested": (
+            0 if preflight_result is None else preflight_result.seeds_tested
+        ),
+        "full_trace_layout_resolution_mode": (
+            None if result is None or not full_trace_executed
+            else result.layout_resolution_mode
+        ),
+        "preflight_native_action_metrics": preflight_metrics,
+        "full_trace_native_action_metrics": full_trace_metrics,
+        "preflight_action_acceptance_sequence": (
+            []
+            if preflight_result is None
+            else [dict(row) for row in preflight_result.action_acceptance_sequence]
+        ),
+        "full_trace_action_acceptance_sequence": (
+            []
+            if two_phase is None or two_phase.full_trace is None
+            else [
+                dict(row)
+                for row in two_phase.full_trace.action_acceptance_sequence
+            ]
+        ),
+        "preflight_full_trace_semantic_match": (
+            None if not full_trace_executed else not bool(semantic_diff)
+        ),
+        "preflight_full_trace_semantic_diff": semantic_diff,
         **metrics,
         "native_teacher_forced_profile": native_teacher_forced_profile(
             ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
@@ -1278,13 +1669,21 @@ def execute_task(
         "ability_resolution_counts": (
             {} if result is None else result.ability_resolution_counts
         ),
-        "chosen_seed": None if result is None else result.chosen_seed,
-        "seeds_tested": 0 if result is None else result.seeds_tested,
+        "chosen_seed": (
+            None if preflight_result is None else preflight_result.chosen_seed
+        ),
+        "seeds_tested": (
+            0 if preflight_result is None else preflight_result.seeds_tested
+        ),
         "seed_search_cache_hit": (
-            False if result is None else result.seed_search_cache_hit
+            False
+            if preflight_result is None
+            else preflight_result.seed_search_cache_hit
         ),
         "source_seed_recovered": (
-            False if result is None else result.source_seed_recovered
+            False
+            if preflight_result is None
+            else preflight_result.source_seed_recovered
         ),
         "native_ticks_advanced": (
             0 if result is None else result.native_ticks_advanced
@@ -1389,7 +1788,22 @@ def execute_task(
         "coordinate_audit": coordinate_audit,
         "plan": None if plan is None else plan.json(),
         "native_result": None if result is None else result.json(),
-        "native_boundary_snapshot": recorder.snapshot(),
+        "preflight_native_result": (
+            None if preflight_result is None else preflight_result.json()
+        ),
+        "full_trace_native_result": (
+            None
+            if two_phase is None or two_phase.full_trace is None
+            else two_phase.full_trace.json()
+        ),
+        "preflight_full_trace_semantic_diff": semantic_diff,
+        "native_boundary_snapshot": active_recorder.snapshot(),
+        "preflight_native_boundary_snapshot": preflight_recorder.snapshot(),
+        "full_trace_native_boundary_snapshot": (
+            None
+            if full_trace_recorder is None
+            else full_trace_recorder.snapshot()
+        ),
         "exception_traceback": error_traceback,
     }
     return TaskExecution(record=record, diagnostic=diagnostic)
@@ -1722,6 +2136,24 @@ def summarize_results(
     action_exceptions = sum(
         int(row.get("native_action_exceptions") or 0) for row in results
     )
+    preflight_seconds = sum(
+        float(row.get("preflight_seconds") or 0.0) for row in results
+    )
+    full_trace_seconds = sum(
+        float(row.get("full_trace_seconds") or 0.0) for row in results
+    )
+    avoided_trace_ticks = sum(
+        int(row.get("avoided_trace_ticks") or 0) for row in results
+    )
+    preflight_rejections = sum(
+        row.get("preflight_teacher_forced_success") is False for row in results
+    )
+    full_trace_executions = sum(
+        row.get("full_trace_executed") is True for row in results
+    )
+    semantic_divergences = sum(
+        bool(row.get("preflight_full_trace_semantic_diff")) for row in results
+    )
     deploy_attempted = sum(
         int(row.get("native_deploy_actions_attempted") or 0) for row in results
     )
@@ -1825,6 +2257,29 @@ def summarize_results(
         attempted == accepted + rejected + no_response
         and response_excess == 0
     )
+    two_phase_integrity = all(
+        int(row.get("native_preflight_contract_version", -1))
+        == NATIVE_PREFLIGHT_CONTRACT_VERSION
+        and row.get("native_execution_pipeline_mode") == NATIVE_PREFLIGHT_MODE
+        and (
+            (
+                row.get("preflight_teacher_forced_success") is False
+                and row.get("full_trace_executed") is False
+                and int(row.get("tick_trace_complete_frames") or 0) == 0
+                and int(row.get("deployment_mask_probe_rpc_count") or 0) == 0
+            )
+            or (
+                row.get("preflight_teacher_forced_success") is True
+                and row.get("full_trace_executed") is True
+                and row.get("preflight_full_trace_semantic_match") is True
+                and not row.get("preflight_full_trace_semantic_diff")
+                and row.get("full_trace_layout_resolution_mode")
+                == "fixed_preflight_seed_replay"
+            )
+            or row.get("preflight_teacher_forced_success") is None
+        )
+        for row in results
+    )
     return {
         "schema_version": GENERATOR_SCHEMA_VERSION,
         "kind": "expert_authoritative_native_tick_summary_v1",
@@ -1846,6 +2301,15 @@ def summarize_results(
         "native_action_response_excess": response_excess,
         "native_action_exceptions": action_exceptions,
         "native_action_accounting_closed": action_accounting_closed,
+        "native_preflight_contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+        "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
+        "preflight_seconds": preflight_seconds,
+        "full_trace_seconds": full_trace_seconds,
+        "preflight_rejections": preflight_rejections,
+        "full_trace_executions": full_trace_executions,
+        "avoided_trace_ticks": avoided_trace_ticks,
+        "preflight_full_trace_semantic_divergences": semantic_divergences,
+        "two_phase_preflight_integrity": two_phase_integrity,
         "true_attempted_acceptance_rate": _ratio(accepted, attempted),
         "native_deploy_actions_attempted": deploy_attempted,
         "native_deploy_actions_accepted": deploy_accepted,
@@ -1901,6 +2365,8 @@ def summarize_results(
             and coordinate_integrity
             and action_accounting_closed
             and successful_mask_integrity
+            and two_phase_integrity
+            and semantic_divergences == 0
         ),
         "source_json_copied": False,
         "semantic_rejections_are_expected_subset_evidence": True,

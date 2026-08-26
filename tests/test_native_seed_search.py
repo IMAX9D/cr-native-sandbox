@@ -8,6 +8,7 @@ from expert_v1.native_seed_search import (
     NativeSeedSearchError,
     clear_native_seed_cache,
     layout_accepts_sequence,
+    resolve_fixed_native_seed,
     resolve_native_seed,
     seed_cache_key,
 )
@@ -138,6 +139,31 @@ class NativeSeedSearchTest(unittest.TestCase):
             ),
         )
         self.assertNotEqual(seed_cache_key(plan), seed_cache_key(higher_level))
+
+    def test_fixed_seed_replay_resets_once_without_repeating_search(self) -> None:
+        plan = compile_battle(source_battle())
+        searched_env = FakeSeedEnv(compatible_seed=3)
+        searched = resolve_native_seed(
+            searched_env, plan, template(), maximum_seeds_to_test=4
+        )
+        self.assertEqual(searched_env.seeds, [1, 2, 3])
+
+        replay_env = FakeSeedEnv(compatible_seed=3)
+        replayed = resolve_fixed_native_seed(
+            replay_env,
+            plan,
+            template(),
+            chosen_seed=searched.chosen_seed,
+            warmup_tick=7,
+        )
+        self.assertEqual(replay_env.seeds, [3])
+        self.assertEqual(replayed.chosen_seed, searched.chosen_seed)
+        self.assertEqual(replayed.native_resets, 1)
+        self.assertEqual(replayed.seeds_tested, 0)
+        self.assertEqual(
+            replayed.resolution_mode, "fixed_preflight_seed_replay"
+        )
+        self.assertEqual(replayed.state["tick"], 7)
 
     def test_exhaustion_fails_closed(self) -> None:
         plan = compile_battle(source_battle())
