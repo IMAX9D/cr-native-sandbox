@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections import Counter, deque
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -45,7 +45,13 @@ from .native_seed_search import (
     DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     NativeSeedSearchError,
 )
-from .tick_store_v1.codec import encode_episode
+from .tick_store_v1.codec import EpisodeReader, encode_episode
+from .tick_store_v1.deployment_masks import (
+    EPISODE_METADATA_KEY,
+    MASK_STORE_DIRECTORY,
+    DeploymentMaskStore,
+    NativeDeploymentMaskCapture,
+)
 from .tick_store_v1.schema import TickState, require_consecutive
 from .tick_store_v1.shard import (
     FRAME_HEADER,
@@ -463,6 +469,7 @@ def _component_hashes(project_root: Path) -> dict[str, str]:
         "expert_v1/native_replay_plan.py",
         "expert_v1/native_profile.py",
         "expert_v1/tick_store_v1/codec.py",
+        "expert_v1/tick_store_v1/deployment_masks.py",
         "expert_v1/tick_store_v1/schema.py",
         "expert_v1/tick_store_v1/shard.py",
     )
@@ -535,6 +542,19 @@ def prepare_run(
         "compression": f"zlib-level-{compression_level}",
         "coordinate_provenance_required": COORDINATE_PROVENANCE,
         "ability_branch_policy": "branch_required fails closed; entity is never guessed",
+        "native_deployment_masks": {
+            "schema_version": 1,
+            "capture": "one native probe per side/deck slot when first in hand",
+            "expected_base_probe_rpcs_per_success": 16,
+            "dynamic_choice_probe_policy": (
+                "one additional probe only at each expert play Tick whose "
+                "native selection is resource-dependent"
+            ),
+            "per_tick_rpc": False,
+            "content_store": f"shards/{MASK_STORE_DIRECTORY}",
+            "dynamic_rule": "native_base_and_tower_state_projection_v1",
+            "failure_policy": "missing slot or invalid sidecar fails closed",
+        },
         "component_sha256": _component_hashes(project_root),
     }
     contract_path = output_root / "run-contract.json"
@@ -571,6 +591,9 @@ class RecordingCountingEnv:
         self.native_ability_actions_attempted = 0
         self.native_ability_actions_accepted = 0
         self.native_action_exceptions = 0
+        self.native_deployment_mask_probes_attempted = 0
+        self.native_deployment_mask_probes_responded = 0
+        self.native_deployment_mask_probe_exceptions = 0
         self.first_rejection: dict[str, Any] | None = None
 
     def __getattr__(self, name: str) -> Any:
@@ -670,6 +693,16 @@ class RecordingCountingEnv:
         finally:
             self.action_history.append(audit)
 
+    def probe_grid(self, *, side: int, deck_index: int) -> dict[str, Any]:
+        self.native_deployment_mask_probes_attempted += 1
+        try:
+            value = self.env.probe_grid(side=side, deck_index=deck_index)
+            self.native_deployment_mask_probes_responded += 1
+            return value
+        except Exception:
+            self.native_deployment_mask_probe_exceptions += 1
+            raise
+
     def metrics(self) -> dict[str, Any]:
         no_response = max(
             0, self.native_actions_attempted - self.native_actions_responded
@@ -690,6 +723,15 @@ class RecordingCountingEnv:
             "native_ability_actions_attempted": self.native_ability_actions_attempted,
             "native_ability_actions_accepted": self.native_ability_actions_accepted,
             "native_action_exceptions": self.native_action_exceptions,
+            "native_deployment_mask_probes_attempted": (
+                self.native_deployment_mask_probes_attempted
+            ),
+            "native_deployment_mask_probes_responded": (
+                self.native_deployment_mask_probes_responded
+            ),
+            "native_deployment_mask_probe_exceptions": (
+                self.native_deployment_mask_probe_exceptions
+            ),
             "true_attempted_acceptance_rate": (
                 self.native_actions_accepted / self.native_actions_attempted
                 if self.native_actions_attempted else None
@@ -712,6 +754,9 @@ class StagedEpisode:
     battle_tag: str
     states: tuple[TickState, ...]
     metadata: dict[str, Any]
+    deployment_mask_payloads: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
 
 
 class StagedTickSink:
@@ -719,6 +764,18 @@ class StagedTickSink:
 
     def __init__(self) -> None:
         self.episode: StagedEpisode | None = None
+        self._deployment_mask_metadata: dict[str, Any] | None = None
+        self._deployment_mask_payloads: dict[str, dict[str, Any]] = {}
+
+    def stage_deployment_masks(
+        self, capture: NativeDeploymentMaskCapture
+    ) -> None:
+        if self.episode is not None:
+            raise RuntimeError("deployment masks must be staged before episode")
+        if self._deployment_mask_metadata is not None:
+            raise RuntimeError("deployment masks may be staged only once")
+        self._deployment_mask_metadata = capture.metadata(require_complete=True)
+        self._deployment_mask_payloads = capture.payloads
 
     def append(
         self,
@@ -737,10 +794,19 @@ class StagedTickSink:
             "tick_start": materialized[0].tick,
             "tick_stop": materialized[-1].tick + 1,
         }
+        if self._deployment_mask_metadata is not None:
+            if (
+                normalized_metadata.get(EPISODE_METADATA_KEY)
+                != self._deployment_mask_metadata
+            ):
+                raise RuntimeError(
+                    "episode deployment-mask metadata differs from staged capture"
+                )
         self.episode = StagedEpisode(
             battle_tag=battle_tag,
             states=materialized,
             metadata=normalized_metadata,
+            deployment_mask_payloads=dict(self._deployment_mask_payloads),
         )
         return {
             "battle_tag": battle_tag,
@@ -754,8 +820,17 @@ class StagedTickSink:
 class StoredFrameRegistry:
     """Detect/reuse a checksummed orphan frame after a hard-process crash."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        deployment_mask_store: DeploymentMaskStore | None = None,
+    ) -> None:
         self.root = root.resolve()
+        self.deployment_mask_store = (
+            deployment_mask_store
+            if deployment_mask_store is not None
+            else DeploymentMaskStore(self.root)
+        )
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
         self._load_existing()
@@ -788,6 +863,18 @@ class StoredFrameRegistry:
         self, sink: WorkerShardSink, episode: StagedEpisode
     ) -> dict[str, Any]:
         with self._lock:
+            mask_metadata = episode.metadata.get(EPISODE_METADATA_KEY)
+            if episode.deployment_mask_payloads:
+                self.deployment_mask_store.publish_many(
+                    episode.deployment_mask_payloads
+                )
+                self.deployment_mask_store.verify_episode_metadata(
+                    episode.metadata, allow_cached=True
+                )
+            elif mask_metadata is not None:
+                raise RuntimeError(
+                    "episode references deployment masks without staged payloads"
+                )
             existing = self._entries.get(episode.battle_tag)
             if existing is not None:
                 blob, _ = encode_episode(
@@ -898,6 +985,8 @@ def _failure_class(
         "source_ability_ticks_missing_count_",
         "source_tick_",
         "execution_tick_",
+        "native_deployment_mask_capture_incomplete_slots_",
+        "derived_deployment_mask_rejected_source_event_",
     )):
         return "source_plan_contract_mismatch"
     if failure.startswith("native_seed_search_layout_revalidation_failed"):
@@ -1009,6 +1098,7 @@ def execute_task(
                 ),
             },
             trace_batch_steps=trace_batch_steps,
+            capture_deployment_masks=True,
             action_execution_tick_offset=(
                 ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
             ),
@@ -1029,6 +1119,22 @@ def execute_task(
             ):
                 raise RuntimeError(
                     "successful replay action counters differ from source actions"
+                )
+            if (
+                recorder.native_deployment_mask_probes_attempted
+                != result.deployment_mask_probe_rpc_count
+                or recorder.native_deployment_mask_probes_responded
+                != result.deployment_mask_probe_rpc_count
+                or recorder.native_deployment_mask_probe_exceptions != 0
+                or result.deployment_mask_base_probe_rpc_count != 16
+                or result.deployment_mask_slots_captured != 16
+                or not result.deployment_mask_capture_complete
+                or result.deployment_mask_label_checks
+                != result.source_deploy_actions
+                or result.deployment_mask_label_rejections != 0
+            ):
+                raise RuntimeError(
+                    "successful replay deployment-mask base/dynamic accounting is open"
                 )
             stage = "immutable_tick_store_commit"
             if commit_guard is not None and not commit_guard():
@@ -1163,6 +1269,42 @@ def execute_task(
         "tick_trace_incomplete_nonterminal_freeze_frames": (
             0 if result is None
             else result.tick_trace_incomplete_nonterminal_freeze_frames
+        ),
+        "deployment_mask_probe_seconds": (
+            0.0 if result is None else result.deployment_mask_probe_seconds
+        ),
+        "deployment_mask_probe_rpc_count": (
+            0 if result is None else result.deployment_mask_probe_rpc_count
+        ),
+        "deployment_mask_slots_captured": (
+            0 if result is None else result.deployment_mask_slots_captured
+        ),
+        "deployment_mask_base_probe_rpc_count": (
+            0
+            if result is None
+            else result.deployment_mask_base_probe_rpc_count
+        ),
+        "deployment_mask_dynamic_label_probe_rpc_count": (
+            0
+            if result is None
+            else result.deployment_mask_dynamic_label_probe_rpc_count
+        ),
+        "deployment_mask_capture_complete": (
+            False if result is None else result.deployment_mask_capture_complete
+        ),
+        "deployment_mask_metadata": (
+            None if result is None else result.deployment_mask_metadata
+        ),
+        "deployment_mask_label_checks": (
+            0 if result is None else result.deployment_mask_label_checks
+        ),
+        "deployment_mask_label_rejections": (
+            0 if result is None else result.deployment_mask_label_rejections
+        ),
+        "deployment_mask_first_label_rejection": (
+            None
+            if result is None
+            else result.deployment_mask_first_label_rejection
         ),
         "logic_freeze_diagnostic": (
             None if result is None else result.logic_freeze_diagnostic
@@ -1557,6 +1699,45 @@ def summarize_results(
         int(row.get("tick_store_entry", {}).get("ticks", 0))
         for row in successes
     )
+    mask_probe_rpcs = sum(
+        int(row.get("native_deployment_mask_probes_attempted") or 0)
+        for row in results
+    )
+    mask_probe_responses = sum(
+        int(row.get("native_deployment_mask_probes_responded") or 0)
+        for row in results
+    )
+    mask_probe_exceptions = sum(
+        int(row.get("native_deployment_mask_probe_exceptions") or 0)
+        for row in results
+    )
+    successful_mask_probe_rpcs = sum(
+        int(row.get("deployment_mask_probe_rpc_count") or 0)
+        for row in successes
+    )
+    dynamic_label_probe_rpcs = sum(
+        int(row.get("deployment_mask_dynamic_label_probe_rpc_count") or 0)
+        for row in results
+    )
+    successful_mask_integrity = all(
+        row.get("deployment_mask_capture_complete") is True
+        and int(row.get("deployment_mask_slots_captured") or 0) == 16
+        and int(row.get("deployment_mask_base_probe_rpc_count") or 0) == 16
+        and int(row.get("deployment_mask_probe_rpc_count") or 0)
+        == 16 + int(
+            row.get("deployment_mask_dynamic_label_probe_rpc_count") or 0
+        )
+        and isinstance(row.get("deployment_mask_metadata"), Mapping)
+        and int(row.get("deployment_mask_label_checks") or 0)
+        == int(row.get("planned_deploy_actions") or 0)
+        and int(row.get("deployment_mask_label_rejections") or 0) == 0
+        and int(row.get("native_deployment_mask_probes_attempted") or 0)
+        == int(row.get("deployment_mask_probe_rpc_count") or 0)
+        and int(row.get("native_deployment_mask_probes_responded") or 0)
+        == int(row.get("deployment_mask_probe_rpc_count") or 0)
+        and int(row.get("native_deployment_mask_probe_exceptions") or 0) == 0
+        for row in successes
+    )
     failure_classes = Counter(
         str(row.get("failure_class") or "unknown") for row in failures
     )
@@ -1639,6 +1820,16 @@ def summarize_results(
         ),
         "stored_episodes": len(successes),
         "stored_ticks": stored_ticks,
+        "native_deployment_mask_probe_rpcs": mask_probe_rpcs,
+        "native_deployment_mask_probe_responses": mask_probe_responses,
+        "native_deployment_mask_probe_exceptions": mask_probe_exceptions,
+        "native_deployment_mask_dynamic_label_probe_rpcs": (
+            dynamic_label_probe_rpcs
+        ),
+        "native_deployment_mask_probe_rpcs_per_success": _ratio(
+            successful_mask_probe_rpcs, len(successes)
+        ),
+        "native_deployment_mask_integrity": successful_mask_integrity,
         "wall_seconds": wall_seconds,
         "stored_ticks_per_wall_second": _ratio(stored_ticks, wall_seconds),
         "processed_episodes_per_hour": _ratio(
@@ -1670,6 +1861,7 @@ def summarize_results(
             and profile_integrity
             and coordinate_integrity
             and action_accounting_closed
+            and successful_mask_integrity
         ),
         "source_json_copied": False,
         "semantic_rejections_are_expected_subset_evidence": True,
@@ -1820,6 +2012,29 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
     manifest = load_json(manifest_path)
     if manifest.get("kind") != "cr_native_tick_store_v1":
         raise RuntimeError("published Tick Store manifest kind changed")
+    mask_contract = (manifest.get("metadata") or {}).get(
+        "native_deployment_masks"
+    )
+    mask_store: DeploymentMaskStore | None = None
+    referenced_masks: set[str] = set()
+    if mask_contract is not None:
+        if (
+            not isinstance(mask_contract, Mapping)
+            or mask_contract.get("required") is not True
+        ):
+            raise RuntimeError("published Tick Store mask contract is malformed")
+        expected_path = f"{MASK_STORE_DIRECTORY}/manifest.json"
+        if str(mask_contract.get("manifest") or "") != expected_path:
+            raise RuntimeError("published Tick Store mask manifest path changed")
+        mask_manifest_path = root / expected_path
+        if not mask_manifest_path.is_file():
+            raise RuntimeError("published Tick Store mask manifest is missing")
+        if sha256_file(mask_manifest_path) != str(
+            mask_contract.get("manifest_sha256") or ""
+        ):
+            raise RuntimeError("published Tick Store mask manifest hash changed")
+        mask_store = DeploymentMaskStore(root, create=False)
+        mask_store.verify_manifest()
     episodes = ticks = total_bytes = 0
     shard_names: set[str] = set()
     for shard in manifest.get("shards") or []:
@@ -1853,13 +2068,40 @@ def verify_published_tick_store(root: Path) -> dict[str, int]:
         episodes += len(entries)
         ticks += shard_ticks
         total_bytes += data.stat().st_size
+        if mask_store is not None:
+            with data.open("rb") as handle:
+                for entry in entries:
+                    handle.seek(int(entry["offset"]))
+                    raw_header = handle.read(FRAME_HEADER.size)
+                    if len(raw_header) != FRAME_HEADER.size:
+                        raise RuntimeError("Tick Store frame header disappeared")
+                    _, payload_size, _, _, _, _ = FRAME_HEADER.unpack(raw_header)
+                    payload = handle.read(payload_size)
+                    reader = EpisodeReader(payload)
+                    metadata = mask_store.verify_episode_metadata(
+                        reader.metadata, allow_cached=True
+                    )
+                    referenced_masks.update(
+                        str(item["content_sha256"])
+                        for item in metadata["entries"]
+                    )
+                    referenced_masks.update(
+                        str(variant["content_sha256"])
+                        for item in metadata["entries"]
+                        for variant in item["dynamic_label_variants"]
+                    )
     if (
         episodes != int(manifest.get("episode_count", -1))
         or ticks != int(manifest.get("tick_count", -1))
         or total_bytes != int(manifest.get("total_bytes", -1))
     ):
         raise RuntimeError("published Tick Store global counts changed")
-    return {"episodes": episodes, "ticks": ticks, "bytes": total_bytes}
+    return {
+        "episodes": episodes,
+        "ticks": ticks,
+        "bytes": total_bytes,
+        "deployment_mask_sidecars_referenced": len(referenced_masks),
+    }
 
 
 def completed_run_summary(
@@ -1895,6 +2137,17 @@ def completed_run_summary(
         "summary_sha256": sha256_file(summary_path),
         "tick_store_manifest_sha256": sha256_file(store_manifest_path),
     }
+    mask_manifest_path = (
+        output_root / "shards" / MASK_STORE_DIRECTORY / "manifest.json"
+    )
+    if "deployment_mask_store_manifest_sha256" in content:
+        if not mask_manifest_path.is_file():
+            raise RuntimeError(
+                "published native dataset deployment-mask manifest is missing"
+            )
+        expected_hashes["deployment_mask_store_manifest_sha256"] = (
+            sha256_file(mask_manifest_path)
+        )
     for key, expected in expected_hashes.items():
         if str(content.get(key) or "") != expected:
             raise RuntimeError(f"published native dataset {key} changed")
@@ -2056,6 +2309,10 @@ def run_generation(
             "resume_infrastructure_failures_requeued": infrastructure_requeued,
         })
         if summary["infrastructure_complete"]:
+            mask_manifest = registry.deployment_mask_store.build_manifest()
+            mask_manifest_path = (
+                output_root / "shards" / MASK_STORE_DIRECTORY / "manifest.json"
+            )
             store = build_store_manifest(
                 output_root / "shards",
                 source_manifest=selection_path,
@@ -2069,6 +2326,18 @@ def run_generation(
                     "coordinate_provenance": COORDINATE_PROVENANCE,
                     "ability_branch_policy": contract["ability_branch_policy"],
                     "source_json_copied": False,
+                    "native_deployment_masks": {
+                        "required": True,
+                        "schema_version": 1,
+                        "dynamic_rule": (
+                            "native_base_and_tower_state_projection_v1"
+                        ),
+                        "manifest": (
+                            f"{MASK_STORE_DIRECTORY}/manifest.json"
+                        ),
+                        "manifest_sha256": sha256_file(mask_manifest_path),
+                        "sidecars": int(mask_manifest["sidecars"]),
+                    },
                 },
             )
             summary["stored_bytes"] = int(store["total_bytes"])
@@ -2080,6 +2349,18 @@ def run_generation(
             )
             summary["tick_store_manifest_sha256"] = sha256_file(
                 output_root / "shards" / "manifest.json"
+            )
+            summary["deployment_mask_store_manifest"] = str(
+                mask_manifest_path.resolve()
+            )
+            summary["deployment_mask_store_manifest_sha256"] = sha256_file(
+                mask_manifest_path
+            )
+            summary["deployment_mask_unique_sidecars"] = int(
+                mask_manifest["sidecars"]
+            )
+            summary["deployment_mask_sidecar_bytes"] = int(
+                mask_manifest["bytes"]
             )
         atomic_json(output_root / "summary.json", summary)
         if summary["publication_ready"]:
@@ -2107,6 +2388,9 @@ def run_generation(
                     "coordinate_provenance": COORDINATE_PROVENANCE,
                     "ability_branch_policy": contract["ability_branch_policy"],
                     "first_difference_policy": "fail_closed",
+                    "native_deployment_masks": contract[
+                        "native_deployment_masks"
+                    ],
                 },
                 "counts": {
                     key: summary[key]
@@ -2115,6 +2399,9 @@ def run_generation(
                         "teacher_forced_successes", "teacher_forced_failures",
                         "stored_episodes", "stored_ticks",
                         "native_actions_attempted", "native_actions_accepted",
+                        "native_deployment_mask_probe_rpcs",
+                        "native_deployment_mask_dynamic_label_probe_rpcs",
+                        "deployment_mask_unique_sidecars",
                     )
                 },
                 "content": {
@@ -2125,6 +2412,13 @@ def run_generation(
                     "tick_store_manifest": "shards/manifest.json",
                     "tick_store_manifest_sha256": sha256_file(
                         output_root / "shards" / "manifest.json"
+                    ),
+                    "deployment_mask_store_manifest": (
+                        f"shards/{MASK_STORE_DIRECTORY}/manifest.json"
+                    ),
+                    "deployment_mask_store_manifest_sha256": sha256_file(
+                        output_root / "shards" / MASK_STORE_DIRECTORY
+                        / "manifest.json"
                     ),
                 },
             }

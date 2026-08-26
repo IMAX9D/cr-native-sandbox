@@ -68,6 +68,8 @@ class FakeNativeEnv:
         ]
         self.submitted: list[list[dict]] = []
         self.submitted_ticks: list[int] = []
+        self.probed_slots: list[tuple[int, int]] = []
+        self.deck_ids = [[26_000_000 + index for index in range(8)] for _ in range(2)]
 
     def _state(self) -> dict:
         entities = [{
@@ -91,7 +93,11 @@ class FakeNativeEnv:
         }
 
     def reset(self, replay: dict, *, warmup_steps: int) -> dict:
-        del replay
+        battle = replay.get("battle", {})
+        for side in (0, 1):
+            rows = battle.get(f"deck{side}", {}).get("sp", [])
+            if len(rows) == 8:
+                self.deck_ids[side] = [int(row["d"]) for row in rows]
         self.tick = warmup_steps
         return self._state()
 
@@ -122,6 +128,22 @@ class FakeNativeEnv:
             {"result": {"accepted": True, "result_code": 0}}
             for _ in actions
         ]}
+
+    def probe_grid(self, *, side: int, deck_index: int) -> dict:
+        self.probed_slots.append((side, deck_index))
+        rows = ["1" * 18 for _ in range(32)]
+        return {
+            "width": 18, "height": 32, "cell_size": 1000,
+            "valid_cells": 18 * 32,
+            "resolved_data_id": self.deck_ids[side][deck_index],
+            "packed_selection": 3 << 28,
+            "card_cost": 3, "card_cost_raw": 30_000,
+            "selection_form_index": -1,
+            "selection_strategy": "canonical",
+            "selection_builder_rva": "0xd5b770",
+            "selection_root_vtable_rva": "0x1234",
+            "rows": rows,
+        }
 
 
 def calibration() -> list[dict]:
@@ -281,6 +303,26 @@ class ExpertNativeReplayAbilityTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertFalse(result.terminal_validated)
         self.assertEqual(result.terminal_diagnostic_status, "native_terminal_missing")
+
+    def test_requested_mask_capture_fails_closed_when_full_deck_never_appears(self) -> None:
+        source = ability_battle()
+        source["card_plays"][0]["y"] = 9_500
+        source["card_plays"][1]["y"] = 22_500
+        plan = compile_battle(source)
+        env = FakeNativeEnv()
+        result = execute_plan(
+            env, plan, template(), calibration(),
+            capture_deployment_masks=True,
+        )
+        self.assertFalse(result.accepted)
+        self.assertIn(
+            "native_deployment_mask_capture_incomplete_slots_",
+            result.failure or "",
+        )
+        self.assertEqual(result.deployment_mask_probe_rpc_count, 10)
+        self.assertEqual(len(env.probed_slots), 10)
+        self.assertEqual(len(set(env.probed_slots)), 10)
+        self.assertFalse(result.deployment_mask_capture_complete)
 
 
 if __name__ == "__main__":

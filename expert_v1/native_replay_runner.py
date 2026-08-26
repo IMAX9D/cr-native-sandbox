@@ -40,7 +40,12 @@ from .native_seed_search import (
     layouts_accept_plan,
     resolve_native_seed,
 )
-from .tick_store_v1 import TickState, TickTraceAccumulator
+from .tick_store_v1 import (
+    NativeDeploymentMaskCapture,
+    TickState,
+    TickTraceAccumulator,
+)
+from .tick_store_v1.deployment_masks import EPISODE_METADATA_KEY
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,16 @@ class NativeReplayResult:
     step_seconds: float
     observe_seconds: float
     action_seconds: float
+    deployment_mask_probe_seconds: float
+    deployment_mask_probe_rpc_count: int
+    deployment_mask_base_probe_rpc_count: int
+    deployment_mask_dynamic_label_probe_rpc_count: int
+    deployment_mask_slots_captured: int
+    deployment_mask_capture_complete: bool
+    deployment_mask_metadata: dict[str, Any] | None
+    deployment_mask_label_checks: int
+    deployment_mask_label_rejections: int
+    deployment_mask_first_label_rejection: dict[str, Any] | None
     wall_seconds: float
     terminal_validated: bool
     terminal_match: bool | None
@@ -354,6 +369,7 @@ def execute_plan(
     tick_sink: Any | None = None,
     tick_store_metadata: Mapping[str, Any] | None = None,
     trace_batch_steps: int = 64,
+    capture_deployment_masks: bool = False,
     action_execution_tick_offset: int = (
         ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
     ),
@@ -371,6 +387,7 @@ def execute_plan(
     coordinate_audit = asdict(plan.coordinate_audit)
     started = time.perf_counter()
     reset_seconds = step_seconds = observe_seconds = action_seconds = 0.0
+    deployment_mask_probe_seconds = 0.0
     native_ticks = accepted_actions = 0
     accepted_deploy_actions = accepted_ability_actions = 0
     ability_resolution_counts: Counter[str] = Counter()
@@ -386,6 +403,11 @@ def execute_plan(
     terminal_tower_hp_validated = False
     terminal_tower_hp_match: bool | None = None
     tick_store_entry: dict[str, Any] | None = None
+    deployment_mask_capture: NativeDeploymentMaskCapture | None = None
+    deployment_mask_metadata: dict[str, Any] | None = None
+    deployment_mask_label_checks = 0
+    deployment_mask_label_rejections = 0
+    deployment_mask_first_label_rejection: dict[str, Any] | None = None
     logic_freeze_diagnostic: dict[str, Any] | None = None
     tick_accumulator = TickTraceAccumulator() if tick_sink is not None else None
     del calibration
@@ -413,6 +435,23 @@ def execute_plan(
     state = seed_resolution.state
     reset_seconds += time.perf_counter() - reset_started
     final_tick = int(state["tick"])
+    if capture_deployment_masks:
+        deployment_mask_capture = NativeDeploymentMaskCapture([
+            {
+                "side": side_index,
+                "deck_index": deck_index,
+                "card_id": card.card_id,
+                "level": card.level,
+                "form_flags": card.form_flags,
+                "source_token": card.source_token,
+                "base_token": card.base_token,
+            }
+            for side_index, side_plan in enumerate(plan.sides)
+            for deck_index, card in enumerate(side_plan.deck)
+        ])
+        mask_started = time.perf_counter()
+        deployment_mask_capture.capture_available(env, state)
+        deployment_mask_probe_seconds += time.perf_counter() - mask_started
     if tick_accumulator is not None:
         observe_started = time.perf_counter()
         tick_accumulator.start(env.observe_train())
@@ -580,6 +619,32 @@ def execute_plan(
                         f"{execution_tick}_source_tick_{source_tick}"
                     )
                 )
+                break
+            if deployment_mask_capture is not None:
+                mask_started = time.perf_counter()
+                deployment_mask_capture.capture_available(env, state)
+                deployment_mask_capture.capture_label_variants(
+                    env,
+                    state,
+                    (event for event in events if event["type"] == "play"),
+                )
+                for event in events:
+                    if event["type"] != "play":
+                        continue
+                    label_audit = deployment_mask_capture.audit_label_position(
+                        state, event
+                    )
+                    deployment_mask_label_checks += 1
+                    if not label_audit["legal"]:
+                        deployment_mask_label_rejections += 1
+                        deployment_mask_first_label_rejection = label_audit
+                        failure = (
+                            "derived_deployment_mask_rejected_source_event_"
+                            f"{event['source_event_index']}"
+                        )
+                        break
+                deployment_mask_probe_seconds += time.perf_counter() - mask_started
+            if failure is not None:
                 break
             by_side = {int(player["side"]): player for player in state["players"]}
             for event in events:
@@ -774,6 +839,29 @@ def execute_plan(
             previous_source_tick = source_tick
             previous_execution_tick = execution_tick
 
+    # The last accepted deployment can reveal one new hand slot.  One final
+    # compact observation is enough to collect it; all earlier slots were
+    # captured at their normal decision observations.  Never poll per Tick.
+    if (
+        failure is None
+        and deployment_mask_capture is not None
+        and not deployment_mask_capture.complete
+    ):
+        observe_started = time.perf_counter()
+        state = env.observe_train()
+        observe_seconds += time.perf_counter() - observe_started
+        mask_started = time.perf_counter()
+        deployment_mask_capture.capture_available(env, state)
+        deployment_mask_probe_seconds += time.perf_counter() - mask_started
+        if not deployment_mask_capture.complete:
+            failure = (
+                "native_deployment_mask_capture_incomplete_slots_"
+                + "_".join(
+                    f"{side}-{deck}"
+                    for side, deck in deployment_mask_capture.missing_slots
+                )
+            )
+
     if failure is None and plan.terminal_crowns is not None:
         # Duration is stored at one-second resolution.  A 20-Tick fence lets
         # libg emit the terminal object without accepting an unbounded run.
@@ -816,6 +904,8 @@ def execute_plan(
     )
     if teacher_forced_success and tick_sink is not None:
         assert tick_accumulator is not None
+        if deployment_mask_capture is not None:
+            deployment_mask_metadata = deployment_mask_capture.metadata()
         metadata = {
             **tick_accumulator.metadata(),
             **dict(tick_store_metadata or {}),
@@ -857,14 +947,39 @@ def execute_plan(
             ),
             "source_final_tower_hp": source_final_tower_hp,
             "source_actions": len(plan.actions) + len(plan.ability_events),
+            "deployment_mask_label_checks": deployment_mask_label_checks,
+            "deployment_mask_label_rejections": (
+                deployment_mask_label_rejections
+            ),
+            "deployment_mask_label_audit": (
+                "captured_native_base_plus_tick_tower_projection_v1"
+            ),
         }
+        if deployment_mask_metadata is not None:
+            metadata[EPISODE_METADATA_KEY] = deployment_mask_metadata
         try:
+            if deployment_mask_capture is not None:
+                stage_masks = getattr(
+                    tick_sink, "stage_deployment_masks", None
+                )
+                if not callable(stage_masks):
+                    raise RuntimeError(
+                        "Tick sink cannot stage native deployment masks"
+                    )
+                stage_masks(deployment_mask_capture)
             tick_store_entry = dict(tick_sink.append(
                 plan.battle_tag, tick_accumulator.states, metadata
             ))
         except Exception as error:
             failure = f"tick_store_write_{type(error).__name__}:{error}"
             teacher_forced_success = False
+    if (
+        deployment_mask_capture is not None
+        and deployment_mask_metadata is None
+    ):
+        deployment_mask_metadata = deployment_mask_capture.metadata(
+            require_complete=False
+        )
     if logic_freeze_diagnostic is not None:
         terminal_diagnostic_status = (
             NATIVE_LOGIC_FROZEN_BEFORE_EXECUTION_TICK
@@ -936,6 +1051,38 @@ def execute_plan(
         step_seconds=step_seconds,
         observe_seconds=observe_seconds,
         action_seconds=action_seconds,
+        deployment_mask_probe_seconds=deployment_mask_probe_seconds,
+        deployment_mask_probe_rpc_count=(
+            0
+            if deployment_mask_capture is None
+            else deployment_mask_capture.probe_rpc_count
+        ),
+        deployment_mask_base_probe_rpc_count=(
+            0
+            if deployment_mask_capture is None
+            else deployment_mask_capture.captured_slots
+        ),
+        deployment_mask_dynamic_label_probe_rpc_count=(
+            0
+            if deployment_mask_capture is None
+            else deployment_mask_capture.dynamic_label_probe_rpc_count
+        ),
+        deployment_mask_slots_captured=(
+            0
+            if deployment_mask_capture is None
+            else deployment_mask_capture.captured_slots
+        ),
+        deployment_mask_capture_complete=(
+            False
+            if deployment_mask_capture is None
+            else deployment_mask_capture.complete
+        ),
+        deployment_mask_metadata=deployment_mask_metadata,
+        deployment_mask_label_checks=deployment_mask_label_checks,
+        deployment_mask_label_rejections=deployment_mask_label_rejections,
+        deployment_mask_first_label_rejection=(
+            deployment_mask_first_label_rejection
+        ),
         wall_seconds=time.perf_counter() - started,
         terminal_validated=terminal_validated,
         terminal_match=terminal_match,
