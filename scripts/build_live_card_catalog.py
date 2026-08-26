@@ -21,6 +21,12 @@ DEFAULT_CHARACTERS_DIR = Path(r"D:\Deepseek\cr_re\decoded_csv\characters")
 DEFAULT_OUTPUT = PROJECT_ROOT / "native_core" / "data" / "live_card_catalog.json"
 VISIBLE_RARITIES = {"Common", "Rare", "Epic", "Legendary", "Champion"}
 
+# These rows carry the generic ``NotInUse`` flag in the decoded table even
+# though the original 15.535.29 runtime resolves them through the deck ``el``
+# form bit.  Keep this list evidence-based: each entry must be accepted by the
+# native form probe before it is added here.
+NATIVE_PROBED_EVOLUTION_FORMS = {"AngryBarbarians_EV1"}
+
 
 def _truthy(value: Any) -> bool:
     return value is True or str(value or "").strip().lower() in {
@@ -135,15 +141,25 @@ def build_catalog(card_map: dict[str, Any], data: dict[str, Any],
         if evolution_name is None and f"{internal_name}_EV1" in evolved:
             evolution_name = f"{internal_name}_EV1"
         evolution = evolved.get(evolution_name) if evolution_name else None
-        if isinstance(evolution, dict) and (
+        if isinstance(evolution, dict) and evolution_name not in NATIVE_PROBED_EVOLUTION_FORMS and (
             _truthy(evolution.get("NotInUse"))
             or _truthy(evolution.get("NotVisible"))
         ):
             evolution_name = None
             evolution = None
         summon = base.get("SummonCharacter")
-        unit = units.get(summon) if summon else None
-        ability = unit.get("Ability") if isinstance(unit, dict) else None
+        # Group cards can attach the button-bearing character to the second
+        # summon (Goblinstein's doctor is the important live example).
+        summon_second = base.get("SummonCharacterSecond")
+        ability = None
+        ability_character = None
+        for character in (summon, summon_second):
+            unit = units.get(character) if character else None
+            candidate = unit.get("Ability") if isinstance(unit, dict) else None
+            if candidate:
+                ability = candidate
+                ability_character = character
+                break
         base_ability = ability_metadata.get(str(ability), {})
         if card_id < 27_000_000:
             card_type = "troop"
@@ -168,6 +184,7 @@ def build_catalog(card_map: dict[str, Any], data: dict[str, Any],
             "not_in_use": _truthy(base.get("NotInUse")),
             "not_visible": _truthy(base.get("NotVisible")),
             "summon_character": summon,
+            "ability_character": ability_character,
             "active_ability": ability,
             "active_ability_mana_cost": base_ability.get("mana_cost"),
             "active_ability_max_charges": base_ability.get("max_charges"),
@@ -209,7 +226,8 @@ def build_catalog(card_map: dict[str, Any], data: dict[str, Any],
                 evolved_ids[evolution_name] if evolution_name else None
             ),
             "evolution_cycles": (
-                _integer(evolution.get("PrestigeCount"))
+                _integer(base.get("PrestigeCount"))
+                or _integer(evolution.get("PrestigeCount"))
                 if isinstance(evolution, dict) else None
             ),
         })

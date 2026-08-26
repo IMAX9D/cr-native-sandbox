@@ -6,11 +6,11 @@
   "counts": {
     "mapped": 152,
     "standard_1v1": 122,
-    "evolutions": 41,
+    "evolutions": 42,
     "hero_forms": 16,
-    "base_active_abilities": 8,
+    "base_active_abilities": 9,
     "hero_active_abilities": 16,
-    "active_ability_forms": 24
+    "active_ability_forms": 25
   },
   "cards": [
     {
@@ -1358,6 +1358,7 @@
       "not_in_use": false,
       "not_visible": false,
       "summon_character": "AngryBarbarian",
+      "ability_character": null,
       "active_ability": null,
       "active_ability_mana_cost": null,
       "active_ability_max_charges": null,
@@ -1373,9 +1374,9 @@
       "hero_ability_cast_time_ms": null,
       "hero_ability_trigger_delay_ms": null,
       "hero_ability_cooldown_ms": null,
-      "evolution_form": null,
-      "evolution_form_id": null,
-      "evolution_cycles": null
+      "evolution_form": "AngryBarbarians_EV1",
+      "evolution_form_id": 13000043,
+      "evolution_cycles": 2
     },
     {
       "card_id": 26000044,
@@ -3094,11 +3095,12 @@
       "not_in_use": false,
       "not_visible": false,
       "summon_character": "goblinstein",
-      "active_ability": null,
-      "active_ability_mana_cost": null,
-      "active_ability_max_charges": null,
-      "active_ability_cast_time_ms": null,
-      "active_ability_trigger_delay_ms": null,
+      "ability_character": "goblinstein_doctor",
+      "active_ability": "goblinstein_ability",
+      "active_ability_mana_cost": 2,
+      "active_ability_max_charges": 1,
+      "active_ability_cast_time_ms": 933,
+      "active_ability_trigger_delay_ms": 50,
       "active_ability_cooldown_ms": null,
       "hero_form": null,
       "hero_form_id": null,
