@@ -4,6 +4,7 @@ param(
     [string]$OutputRoot = 'D:\AI_data\cr-native-core\expert-v1\sequence-runs',
     [int]$MinimumBattles = 100000,
     [switch]$SkipCompile,
+    [switch]$CompileOnly,
     [switch]$Smoke
 )
 
@@ -36,7 +37,32 @@ if ($Smoke) {
     $OutputRoot = 'D:\AI_data\cr-native-core\expert-v1\runs-smoke'
 }
 
-if (-not $SkipCompile) {
+$compileNeeded = -not $SkipCompile
+if ($compileNeeded -and -not $Smoke) {
+    $existingManifest = Join-Path $DatasetRoot 'manifest.json'
+    $existingResult = Join-Path $DatasetRoot 'compile-result.json'
+    if ((Test-Path -LiteralPath $existingManifest) -and (Test-Path -LiteralPath $existingResult)) {
+        try {
+            $compiled = Get-Content -LiteralPath $existingManifest -Raw | ConvertFrom-Json
+            $result = Get-Content -LiteralPath $existingResult -Raw | ConvertFrom-Json
+            $liveHash = (Get-FileHash -LiteralPath $AcceptedManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+            $compiledSource = [System.IO.Path]::GetFullPath([string]$compiled.source_manifest.path)
+            $expectedSource = [System.IO.Path]::GetFullPath($AcceptedManifest)
+            if (
+                $compiledSource -eq $expectedSource -and
+                ([string]$compiled.source_manifest.sha256).ToLowerInvariant() -eq $liveHash -and
+                [int]$result.compiled_battles -ge $MinimumBattles
+            ) {
+                Write-Host "Compiled expert dataset is current; reusing $DatasetRoot"
+                $compileNeeded = $false
+            }
+        } catch {
+            Write-Host "Existing compiled dataset is stale or unreadable; rebuilding."
+        }
+    }
+}
+
+if ($compileNeeded) {
     $compileArgs = @(
         '-m', 'expert_v1.compile_sequence_dataset',
         '--accepted-manifest', $AcceptedManifest,
@@ -67,6 +93,10 @@ if (-not $SkipCompile) {
 $manifest = Join-Path $DatasetRoot 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifest)) {
     throw "Compiled sequence-only dataset is missing: $manifest"
+}
+if ($CompileOnly) {
+    Write-Host "Sequence-only dataset is compiled and current: $DatasetRoot"
+    exit 0
 }
 $trainArgs = @(
     '-m', 'expert_v1.training_v1.train',
