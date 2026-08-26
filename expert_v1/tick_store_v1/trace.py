@@ -71,6 +71,7 @@ class TickTraceAccumulator:
             )
 
         appended = 0
+        incomplete_terminal_suffix = False
         for index, raw_frame in enumerate(frames, start=1):
             if (
                 not isinstance(raw_frame, Mapping)
@@ -81,20 +82,24 @@ class TickTraceAccumulator:
             ):
                 raise TickStoreContractError("compact Tick trace frame contract mismatch")
             if raw_frame.get("observation_complete") is not True:
-                if index != stepped or trace.get("terminal") is not True:
-                    raise TickStoreContractError(
-                        "only the terminal compact Tick frame may be incomplete"
-                    )
-                episode = raw_frame["state"].get("episode")
-                if not isinstance(episode, Mapping) or not episode.get(
-                    "terminated", False
+                if (
+                    trace.get("terminal") is not True
+                    or int(raw_frame["state"].get("tick", -1))
+                    != self.states[-1].tick
                 ):
                     raise TickStoreContractError(
-                        "incomplete compact terminal frame lacks terminal episode"
+                        "only a frozen terminal compact Tick suffix may be incomplete"
                     )
-                self.terminal_episode = dict(episode)
+                episode = raw_frame["state"].get("episode")
+                if isinstance(episode, Mapping) and episode.get("terminated", False):
+                    self.terminal_episode = dict(episode)
                 self.incomplete_terminal_frames += 1
+                incomplete_terminal_suffix = True
                 continue
+            if incomplete_terminal_suffix:
+                raise TickStoreContractError(
+                    "compact Tick trace resumed after terminal suffix"
+                )
             state = normalize_native_state(raw_frame["state"])
             expected_tick = self.states[-1].tick + 1
             if state.tick != expected_tick:
@@ -108,6 +113,11 @@ class TickTraceAccumulator:
             episode = raw_frame["state"].get("episode")
             if isinstance(episode, Mapping) and episode.get("terminated", False):
                 self.terminal_episode = dict(episode)
+
+        if trace.get("terminal") is True and self.terminal_episode is None:
+            raise TickStoreContractError(
+                "terminal compact Tick suffix lacks final terminal episode"
+            )
 
         self.batches += 1
         final_state = frames[-1]["state"] if frames else initial["state"]

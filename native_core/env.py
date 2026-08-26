@@ -494,6 +494,7 @@ class NativeRoyaleEnv:
         *,
         trace_schema_version: int = TRACE_SCHEMA_VERSION,
         max_response_bytes: int = MAX_TRACE_RESPONSE_BYTES,
+        allow_nonterminal_freeze: bool = False,
     ) -> dict[str, Any]:
         """Advance up to 64 native 20 Hz Ticks in one compact RPC.
 
@@ -501,6 +502,10 @@ class NativeRoyaleEnv:
         normalize and delta-encode them without first allocating GUI/debug
         enrichments.  The initial frame is the pre-transition boundary and
         each complete frame is one authoritative 50 ms transition later.
+
+        ``allow_nonterminal_freeze`` is only for a post-action duration fence:
+        it accepts a final incomplete suffix whose logic Tick never advances.
+        Never enable it while advancing toward a future expert action.
         """
         if not 1 <= steps <= MAX_TRACE_STEPS:
             raise ValueError("trace steps must be in 1..64")
@@ -526,6 +531,7 @@ class NativeRoyaleEnv:
             raw,
             steps=steps,
             max_response_bytes=max_response_bytes,
+            allow_nonterminal_freeze=allow_nonterminal_freeze,
         )
 
     def _decode_train_trace_result(
@@ -534,6 +540,7 @@ class NativeRoyaleEnv:
         *,
         steps: int,
         max_response_bytes: int,
+        allow_nonterminal_freeze: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(raw, Mapping):
             raise NativeHostError("compact Tick trace result must be an object")
@@ -563,6 +570,7 @@ class NativeRoyaleEnv:
             raise NativeHostError("compact Tick trace frame count mismatch")
 
         previous_tick: int | None = None
+        incomplete_suffix_started = False
         for index, frame in enumerate([initial, *frames]):
             if (
                 not isinstance(frame, Mapping)
@@ -575,6 +583,10 @@ class NativeRoyaleEnv:
                 raise NativeHostError("compact Tick trace frame contract mismatch")
             state = frame["state"]
             if frame["observation_complete"]:
+                if incomplete_suffix_started:
+                    raise NativeHostError(
+                        "compact Tick trace resumed after a frozen suffix"
+                    )
                 self._validate_training_state(state)
                 tick = int(state["tick"])
                 if previous_tick is not None and tick != previous_tick + 1:
@@ -583,10 +595,30 @@ class NativeRoyaleEnv:
                         f"{previous_tick}->{tick}"
                     )
                 previous_tick = tick
-            elif index != stepped or result.get("terminal") is not True:
-                raise NativeHostError(
-                    "incomplete compact observation is only valid at terminal"
+            else:
+                terminal_frame = (
+                    result.get("terminal") is True
+                    and previous_tick is not None
+                    and int(state.get("tick", -1)) == previous_tick
                 )
+                nonterminal_freeze = (
+                    allow_nonterminal_freeze
+                    and result.get("terminal") is False
+                    and previous_tick is not None
+                    and int(state.get("tick", -1)) == previous_tick
+                )
+                if not terminal_frame and not nonterminal_freeze:
+                    raise NativeHostError(
+                        "incomplete compact observation is only valid at terminal: "
+                        f"index={index}, stepped={stepped}, "
+                        f"state_tick={state.get('tick')}, previous_tick={previous_tick}, "
+                        f"terminal={result.get('terminal')}, "
+                        f"allow_nonterminal_freeze={allow_nonterminal_freeze}"
+                    )
+                if nonterminal_freeze:
+                    result["nonterminal_freeze"] = True
+                if terminal_frame or nonterminal_freeze:
+                    incomplete_suffix_started = True
 
         if result.get("initial_tick") != int(initial["state"]["tick"]):
             raise NativeHostError("compact Tick trace initial tick mismatch")

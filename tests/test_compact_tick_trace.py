@@ -164,21 +164,42 @@ class CompactTickTraceTest(unittest.TestCase):
             env.trace_train(2)
 
     def test_terminal_no_progress_frame_is_metadata_not_duplicate_tick(self) -> None:
-        value = trace(100, 1)
-        value["frames"][0] = {
-            "frame_index": 1,
-            "advanced_steps": 1,
-            "observation_complete": False,
-            "state": {"tick": 100, "episode": {"terminated": True}},
-        }
+        value = trace(100, 3)
+        value["frames"] = [
+            {
+                "frame_index": index,
+                "advanced_steps": index,
+                "observation_complete": False,
+                "state": {"tick": 100, "episode": {"terminated": True}},
+            }
+            for index in (1, 2, 3)
+        ]
         value["terminal"] = True
         value["final_tick"] = 100
         env = FakeEnv(value)
-        decoded = env.trace_train(1)
+        decoded = env.trace_train(3)
         accumulator = TickTraceAccumulator()
         self.assertEqual(accumulator.extend(decoded), 0)
         self.assertEqual([state.tick for state in accumulator.states], [100])
-        self.assertEqual(accumulator.incomplete_terminal_frames, 1)
+        self.assertEqual(accumulator.incomplete_terminal_frames, 3)
+
+    def test_nonterminal_freeze_requires_explicit_final_fence_opt_in(self) -> None:
+        value = trace(100, 3)
+        value["frames"][1:] = [
+            {
+                "frame_index": index,
+                "advanced_steps": index,
+                "observation_complete": False,
+                "state": {"tick": 101, "episode": {"terminated": False}},
+            }
+            for index in (2, 3)
+        ]
+        value["final_tick"] = 101
+        env = FakeEnv(value)
+        with self.assertRaisesRegex(NativeHostError, "only valid at terminal"):
+            env.trace_train(3)
+        decoded = env.trace_train(3, allow_nonterminal_freeze=True)
+        self.assertIs(decoded["nonterminal_freeze"], True)
 
     def test_step_bound_is_enforced_before_rpc(self) -> None:
         env = FakeEnv(trace(100, 1))
