@@ -63,7 +63,8 @@ scripts\start_expert_one_click_v1.ps1 -Smoke
 - crawler 使用 `config.authoritative.toml` 内自己的 22 lane、128 全局并发配置；
 - eligibility audit 使用 20 个线程；
 - 原生生成每 AVD 固定 4 Worker；crawler 完全停止后若可用内存至少 16 GiB，使用 2 AVD/8 Worker（38031–38038），否则使用 1 AVD/4 Worker（38031–38034）；
-- BC 编译使用 32 个 I/O 校验线程和 10 个进程 Worker；
+- BC 编译请求最多 32 个 I/O 校验线程和 10 个进程 Worker；实际进程数由容量预检
+  按当前可用内存自动向下收敛并写入 receipt，无需换数据根重跑；
 - 训练数据加载和 CUDA 设备选择沿用正式 `training_v1` 配置。
 
 原生布局首次选择后单独写入 journal，恢复时直接读取，绝不会因当前 RAM 波动重新选择。非默认端口会 fail-closed；若要改变语义或并发，应使用新的 `--data-root`，避免拿新参数静默续跑旧产物。

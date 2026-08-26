@@ -59,9 +59,11 @@ probe 冒充精确 Mask。
 ## 断点与并发
 
 `compile-plan.json` 固化输入、编译器组件 SHA 和 `capacity-preflight.json` SHA。
-在正式写 shard 前会确定性编译最多 100 场样本，实测 bytes/actor-row、编译速度
-和峰值 RSS，按全量 actor rows 外推并加 35% 安全余量与至少 10 GiB/5% 文件系统
-保留空间；磁盘或单 Worker 内存门不通过即 fail-closed，不会开始全量写入。
+在正式写 shard 前会按内容哈希、时长和 Tick payload/state density 分层抽取最多
+100 场，实测逐场 bytes/actor-row、编译速度和峰值 RSS。容量投影使用样本中的
+单场最大 bytes/actor-row（不是均值），再加 35% 安全余量。每个 shard 写入前还会
+通过跨进程 reservation ledger 重新检查磁盘，并始终保留 `max(10 GiB, 文件系统
+容量的 5%)`；并行编译不能相互超售空间。磁盘或内存门不通过即 fail-closed。
 
 输出默认按约 512K actor rows 切成
 确定性 shard；每个 shard 写入独立临时目录、计算全部 `.npy` SHA 后原子改名。
@@ -80,5 +82,7 @@ python -m expert_v1.compile_native_bc_dataset `
 
 多进程/多批次可先 `--plan-only`，再让 N 个进程分别使用
 `--worker-count N --worker-index 0..N-1`；全部结束后执行 `--finalize-only`。
+`--process-workers` 是请求上限，编译器会按容量预检的内存建议自动收敛，并把
+requested/effective 数值写入 Worker receipt。
 `manifest.json` 是最终可见性边界，只在所有 shard 通过训练 schema 后原子发布，
 并同时生成 `manifest.sha256` 与完整 `shard_file_sha256` 覆盖。
