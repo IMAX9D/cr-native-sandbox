@@ -49,6 +49,9 @@ native command execution boundary：T + 1
 | source SHA-256 | 100/100 相同 |
 | chosen seed（结果中直接记录） | 99/99 相同 |
 
+审计不仅比较结果行里的 source 字段，还重新读取并 SHA-256 计算了 100 个源 JSON；
+磁盘内容与 selection 声明也全部相同。
+
 冻结样本 `089Y82CPYYY9` 的 v9 chosen seed 是 `28`。v10 在 compact trace 抛错
 时，通用 error row 没有序列化 `chosen_seed`，因此不能声称“100/100 都有两份
 直接记录”。但 seed resolution 在执行 offset 被应用之前完成，且两次运行的
@@ -139,6 +142,30 @@ seed 相等是由执行路径结构确定的，机器报告明确标为 structur
 作用是检查新相位是否造成明显系统性退化；当前证据是 match 净增 3、旧成功集合
 没有 match→mismatch，因而不推翻动作边界的单调证据。
 
+## 按对局时长分层：剩余问题是长局缺锚累计漂移
+
+| 源对局时长 | v9 success | v10 success | v10 成功率 |
+|---|---:|---:|---:|
+| `<= 180s` | 12 / 13 | 13 / 13 | 100.00% |
+| `181–240s` | 49 / 55 | 52 / 55 | 94.55% |
+| `> 240s` | 22 / 32 | 24 / 32 | 75.00% |
+
+T+1 消除了三个时长层中的全部 code13，但 v10 的剩余 11 个原始 failure 高度集中
+在长局：`181–240s` 只有 3 场失败，`>240s` 有 8 场失败；后者包含 7 个真实
+code4 和单列的 logic-freeze。
+
+这符合“缺少中局状态锚点导致累计漂移”的特征：当前 source 只提供专家动作，
+teacher-forced libg 会从初始状态持续生成后续世界；对局越长，未观测 RNG、单位
+交互、塔血和终局时序的微小差异越容易累积，最终可能让生成态 command gate 比
+源动作序列更早关闭。短局已经 13/13，说明剩余失败不能继续笼统归因于坐标或统一
+Tick 相位。
+
+因此下一阶段应把两个问题分开：
+
+1. 命令相位采用 T+1；
+2. 针对长局研究可验证的周期状态锚点或分段 replay，不用另一个全局 offset 去掩盖
+   累计漂移。
+
 ## Tick Store 全量解码与 SHA 审计
 
 两边所有成功 episode 都逐 Tick 完整解码，不是只检查 manifest：
@@ -201,11 +228,12 @@ D:\AI_data\cr-native-core\expert-v1\native-teacher-forced-pilot-100-data-i-phase
 报告 SHA-256：
 
 ```text
-659d1d8f1574a15ca70dc4976b9809e372ad090e5c99af28f48e3ebf8e0d7666
+4de9c74f17937114acaeecf28cfe268e0b4a939e17681c8da9a091b2ca58a0e6
 ```
 
 报告包含 100 条逐 tag 迁移、原始与归一化分母、冻结证据、terminal 迁移、两边
-全部 shard/episode/Tick/SHA 验证结果及 11 条固定断言；当前全部为 `true`。
+全部 shard/episode/Tick/SHA 验证结果、时长分层及 12 条固定断言；当前全部为
+`true`。
 
 复核命令：
 

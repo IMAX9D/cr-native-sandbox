@@ -302,6 +302,39 @@ def _terminal_counts(
     )
 
 
+def _duration_bucket(duration_seconds: int) -> str:
+    if duration_seconds <= 180:
+        return "le_180_seconds"
+    if duration_seconds <= 240:
+        return "181_to_240_seconds"
+    return "gt_240_seconds"
+
+
+def _duration_outcomes(
+    rows: Mapping[str, Mapping[str, Any]],
+    duration_by_tag: Mapping[str, int],
+) -> dict[str, dict[str, Any]]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for bucket in ("le_180_seconds", "181_to_240_seconds", "gt_240_seconds"):
+        bucket_tags = sorted(
+            tag
+            for tag, duration in duration_by_tag.items()
+            if _duration_bucket(duration) == bucket
+        )
+        success_tags = [
+            tag for tag in bucket_tags if rows[tag].get("teacher_forced_success")
+        ]
+        failure_tags = [tag for tag in bucket_tags if tag not in success_tags]
+        buckets[bucket] = {
+            "total": len(bucket_tags),
+            "success": len(success_tags),
+            "failure": len(failure_tags),
+            "success_rate": len(success_tags) / len(bucket_tags),
+            "failure_tags": failure_tags,
+        }
+    return buckets
+
+
 def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
     v9_root = v9_root.resolve(strict=True)
     v10_root = v10_root.resolve(strict=True)
@@ -347,16 +380,24 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
     directly_comparable_tags = tags - {LOGIC_FREEZE_TAG}
     direct_source_equal = []
     chosen_seed_equal = []
+    duration_by_tag: dict[str, int] = {}
     per_tag: list[dict[str, Any]] = []
     transitions: dict[tuple[str, str], list[str]] = defaultdict(list)
     for tag in sorted(tags):
         selection_source = str(selections[tag]["source_sha256"])
+        source_path = Path(str(selections[tag]["source_path"])).resolve(strict=True)
+        actual_source_sha256 = sha256_file(source_path)
+        source_document = _json(source_path)
+        duration_by_tag[tag] = int(source_document["duration_seconds"])
         v9_source = v9[tag].get("source_sha256")
         v10_source = v10[tag].get("source_sha256")
         source_equal = (
-            v9_source == v10_source == selection_source
+            v9_source == v10_source == selection_source == actual_source_sha256
             if v10_source is not None
-            else v9_source == selection_source and tag == LOGIC_FREEZE_TAG
+            else (
+                v9_source == selection_source == actual_source_sha256
+                and tag == LOGIC_FREEZE_TAG
+            )
         )
         if not source_equal:
             raise RuntimeError(f"source SHA-256 mismatch: {tag}")
@@ -373,7 +414,9 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
                 "battle_tag": tag,
                 "phase_comparable": tag in directly_comparable_tags,
                 "transition": f"{before}->{after}",
+                "duration_seconds": duration_by_tag[tag],
                 "selection_source_sha256": selection_source,
+                "actual_source_sha256": actual_source_sha256,
                 "source_sha256_equal": source_equal,
                 "chosen_seed_evidence": (
                     "recorded_equal"
@@ -453,6 +496,8 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
         v10[tag].get("terminal_status") in {"match", "mismatch"}
         for tag in v10_success
     )
+    v9_duration_outcomes = _duration_outcomes(v9, duration_by_tag)
+    v10_duration_outcomes = _duration_outcomes(v10, duration_by_tag)
 
     assertions = {
         "selection_byte_identical_100": selection_bytes_equal and len(tags) == 100,
@@ -477,6 +522,14 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
         "phase_comparable_success_83_to_89": comparable_v9_categories["success"]
         == 83
         and comparable_v10_categories["success"] == 89,
+        "v10_duration_strata_13_of_13_52_of_55_24_of_32": (
+            v10_duration_outcomes["le_180_seconds"]["success"] == 13
+            and v10_duration_outcomes["le_180_seconds"]["total"] == 13
+            and v10_duration_outcomes["181_to_240_seconds"]["success"] == 52
+            and v10_duration_outcomes["181_to_240_seconds"]["total"] == 55
+            and v10_duration_outcomes["gt_240_seconds"]["success"] == 24
+            and v10_duration_outcomes["gt_240_seconds"]["total"] == 32
+        ),
         "v9_tick_store_full_decode_and_sha": v9_store[
             "all_episodes_fully_decoded"
         ]
@@ -633,6 +686,17 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
                 "not a substitute for original hidden per-Tick state truth."
             ),
         },
+        "duration_stratification": {
+            "v9": v9_duration_outcomes,
+            "v10": v10_duration_outcomes,
+            "interpretation": (
+                "After adopting T+1, success is 13/13 at <=180 seconds, "
+                "52/55 at 181-240 seconds, and 24/32 above 240 seconds. "
+                "The residual failures are concentrated in longer battles, "
+                "consistent with cumulative teacher-forced generated-state drift "
+                "when the action-only source supplies no mid-battle state anchors."
+            ),
+        },
         "tick_store_validation": {"v9": v9_store, "v10": v10_store},
         "recommendation": {
             "promote_native_execution_boundary_to_source_tick_plus_1": True,
@@ -651,7 +715,9 @@ def audit(v9_root: Path, v10_root: Path) -> dict[str, Any]:
                 "battle is a native logic freeze before the T+1 boundary, not an "
                 "offset-1 action rejection. Terminal diagnostics add 3 matches and "
                 "1 mismatch overall and do not outweigh the monotonic command-phase "
-                "evidence."
+                "evidence. Residual failure concentration in >240-second battles "
+                "identifies missing mid-battle anchors/cumulative drift as the next "
+                "limitation, not a reason to keep the wrong command boundary."
             ),
         },
         "assertions": assertions,
