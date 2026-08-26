@@ -110,6 +110,26 @@ class ExpertAbilityEvent:
 
 
 @dataclass(frozen=True)
+class CoordinateAudit:
+    """How RoyaleAPI marker coordinates became native arena coordinates.
+
+    RoyaleAPI's ``data-i`` is a per-marker coordinate inversion flag.  The
+    replay viewer first rotates raw coordinates when it is ``1``.  Native
+    side 0 uses the opposite arena orientation from that viewer, so the two
+    rotations cancel for ``data-i == 1`` and only ``data-i == 0`` is rotated
+    here.  Older captures did not retain the raw flag and remain an explicit,
+    unverified compatibility fallback.
+    """
+
+    transform: str
+    raw_data_i_events: int
+    data_i_zero_events: int
+    data_i_one_events: int
+    legacy_xy_fallback_events: int
+    data_i_values: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class SidePlan:
     side: int
     source_side: str
@@ -137,6 +157,8 @@ class BattlePlan:
     original_state_exact: bool
     state_provenance: str
     action_provenance: str
+    coordinate_provenance: str
+    coordinate_audit: CoordinateAudit
     hand_provenance: str
     ability_provenance: str
     terminal_provenance: str
@@ -166,6 +188,55 @@ def split_card_token(token: str) -> tuple[str, int]:
     if not value:
         raise ReplayPlanError(f"empty card token after form parsing: {token!r}")
     return value, flags
+
+
+def _native_event_coordinates(
+    event: Mapping[str, Any], *, event_index: int,
+) -> tuple[int, int, int | None]:
+    """Return ``(native_x, native_y, data_i)`` from one replay marker.
+
+    Frozen schema-v3 sources retain the authoritative marker fields.  Do not
+    trust their historical derived ``x/y`` values: the old crawler always
+    rotated those values and therefore mirrored every ``data-i == 1`` battle.
+    Schema-v1/v2 records may lack one or all raw fields; only those records use
+    the old ``x/y`` compatibility path and are surfaced in ``CoordinateAudit``.
+    """
+
+    raw_x = event.get("x_raw")
+    raw_y = event.get("y_raw")
+    data_i = event.get("data_i")
+    has_exact_marker = (
+        isinstance(raw_x, int) and not isinstance(raw_x, bool)
+        and isinstance(raw_y, int) and not isinstance(raw_y, bool)
+        and isinstance(data_i, int) and not isinstance(data_i, bool)
+    )
+    if has_exact_marker:
+        if data_i not in (0, 1):
+            raise ReplayPlanError(
+                f"event {event_index} data_i must be 0 or 1"
+            )
+        if not 0 <= raw_x <= 18_000 or not 0 <= raw_y <= 32_000:
+            raise ReplayPlanError(
+                f"event {event_index} raw coordinates are outside the arena"
+            )
+        if data_i == 0:
+            x, y = 18_000 - raw_x, 32_000 - raw_y
+        else:
+            x, y = raw_x, raw_y
+        marker_flag: int | None = data_i
+    else:
+        try:
+            x, y = int(event["x"]), int(event["y"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ReplayPlanError(
+                f"event {event_index} coordinates are missing"
+            ) from error
+        marker_flag = None
+    if not 0 <= x <= 17_999 or not 0 <= y <= 31_999:
+        raise ReplayPlanError(
+            f"event {event_index} coordinates are outside the arena"
+        )
+    return x, y, marker_flag
 
 
 def card_spec(token: str, level: int | None) -> CardSpec:
@@ -389,6 +460,8 @@ def compile_battle(
     per_side_indices: list[list[int]] = [[], []]
     same_side_ticks: set[tuple[int, int]] = set()
     side_action_counts = [0, 0]
+    coordinate_flag_counts = [0, 0]
+    legacy_coordinate_events = 0
     for event_index, event in enumerate(plays):
         if not isinstance(event, Mapping):
             raise ReplayPlanError(f"event {event_index} is not an object")
@@ -412,12 +485,13 @@ def compile_battle(
         same_side_ticks.add(tick_key)
         logical = logical_indices[side][base_token]
         per_side_indices[side].append(logical)
-        try:
-            x, y = int(event["x"]), int(event["y"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ReplayPlanError(f"event {event_index} coordinates are missing") from error
-        if not 0 <= x <= 17_999 or not 0 <= y <= 31_999:
-            raise ReplayPlanError(f"event {event_index} coordinates are outside the arena")
+        x, y, coordinate_flag = _native_event_coordinates(
+            event, event_index=event_index
+        )
+        if coordinate_flag is None:
+            legacy_coordinate_events += 1
+        else:
+            coordinate_flag_counts[coordinate_flag] += 1
         actions.append(ExpertAction(
             tick=tick, side=side, logical_card_index=logical,
             base_token=base_token, x=x, y=y, source_event_index=event_index,
@@ -430,6 +504,31 @@ def compile_battle(
         for index in range(len(actions) - 1)
     ):
         raise ReplayPlanError("card events are not sorted by tick")
+
+    raw_coordinate_events = sum(coordinate_flag_counts)
+    if raw_coordinate_events and not legacy_coordinate_events:
+        coordinate_provenance = "royaleapi_raw_data_i_to_native_v1"
+        coordinate_transform = (
+            "data_i=0:rotate_18000_32000;data_i=1:identity"
+        )
+    elif raw_coordinate_events:
+        coordinate_provenance = "mixed_raw_data_i_and_legacy_xy_fallback"
+        coordinate_transform = (
+            "raw:data_i=0_rotate,data_i=1_identity;legacy:stored_xy"
+        )
+    else:
+        coordinate_provenance = "legacy_stored_xy_fallback_unverified"
+        coordinate_transform = "legacy:stored_xy"
+    coordinate_audit = CoordinateAudit(
+        transform=coordinate_transform,
+        raw_data_i_events=raw_coordinate_events,
+        data_i_zero_events=coordinate_flag_counts[0],
+        data_i_one_events=coordinate_flag_counts[1],
+        legacy_xy_fallback_events=legacy_coordinate_events,
+        data_i_values=tuple(
+            flag for flag, count in enumerate(coordinate_flag_counts) if count
+        ),
+    )
 
     cycles = [compatible_cycle(indices) for indices in per_side_indices]
     ability_counts = [_ability_count(value, source_side) for source_side in SIDE_NAMES]
@@ -475,6 +574,8 @@ def compile_battle(
         "source_tower_level_missing",
         "source_tick_state_anchors_missing",
     ]
+    if legacy_coordinate_events:
+        limitations.append("legacy_precomputed_coordinates_unverified")
     if source_schema < 2:
         limitations.extend((
             "card_forms_missing", "card_levels_missing", "tower_troops_missing",
@@ -550,6 +651,8 @@ def compile_battle(
         original_state_exact=False,
         state_provenance="native_generated_unanchored",
         action_provenance="observed_deployments",
+        coordinate_provenance=coordinate_provenance,
+        coordinate_audit=coordinate_audit,
         hand_provenance=(
             "inferred_exact_all_actions"
             if all(cycle.first_exact_action_index == 0 for cycle in cycles)

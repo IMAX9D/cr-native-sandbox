@@ -78,6 +78,14 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         plan = compile_battle(battle())
         self.assertTrue(plan.native_replay_ready)
         self.assertFalse(plan.original_state_exact)
+        self.assertEqual(
+            plan.coordinate_provenance,
+            "legacy_stored_xy_fallback_unverified",
+        )
+        self.assertEqual(plan.coordinate_audit.legacy_xy_fallback_events, 32)
+        self.assertIn(
+            "legacy_precomputed_coordinates_unverified", plan.limitations
+        )
         self.assertEqual(plan.sides[0].cycle.first_exact_action_index, 4)
         self.assertEqual(plan.sides[1].cycle.first_exact_action_index, 4)
         template = json.loads(
@@ -107,6 +115,56 @@ class ExpertNativeReplayPlanTest(unittest.TestCase):
         self.assertEqual(
             [row["d"] for row in replay["battle"]["deck0"]["sp"]],
             [card.card_id for card in plan.sides[0].deck],
+        )
+
+    def test_data_i_zero_rotates_raw_marker_and_ignores_legacy_xy(self) -> None:
+        value = battle()
+        for event in value["card_plays"]:
+            event.update({
+                "x_raw": 17_000,
+                "y_raw": 31_000,
+                "data_i": 0,
+                "x": 12_345,
+                "y": 23_456,
+            })
+        plan = compile_battle(value)
+        self.assertEqual((plan.actions[0].x, plan.actions[0].y), (1_000, 1_000))
+        self.assertEqual(
+            plan.coordinate_provenance, "royaleapi_raw_data_i_to_native_v1"
+        )
+        self.assertEqual(plan.coordinate_audit.data_i_zero_events, 32)
+        self.assertEqual(plan.coordinate_audit.data_i_one_events, 0)
+        self.assertEqual(plan.coordinate_audit.legacy_xy_fallback_events, 0)
+        self.assertNotIn(
+            "legacy_precomputed_coordinates_unverified", plan.limitations
+        )
+
+    def test_data_i_one_keeps_raw_marker_and_ignores_legacy_xy(self) -> None:
+        value = battle()
+        for event in value["card_plays"]:
+            event.update({
+                "x_raw": 1_250,
+                "y_raw": 2_500,
+                "data_i": 1,
+                "x": 12_345,
+                "y": 23_456,
+            })
+        plan = compile_battle(value)
+        self.assertEqual((plan.actions[0].x, plan.actions[0].y), (1_250, 2_500))
+        self.assertEqual(plan.coordinate_audit.data_i_zero_events, 0)
+        self.assertEqual(plan.coordinate_audit.data_i_one_events, 32)
+        self.assertEqual(
+            plan.json()["coordinate_audit"]["data_i_values"], (1,)
+        )
+
+    def test_partial_raw_marker_uses_explicit_legacy_fallback(self) -> None:
+        value = battle()
+        value["card_plays"][0].update({"x_raw": 1_000, "y_raw": 2_000})
+        plan = compile_battle(value)
+        self.assertEqual((plan.actions[0].x, plan.actions[0].y), (8_500, 10_500))
+        self.assertEqual(
+            plan.coordinate_provenance,
+            "legacy_stored_xy_fallback_unverified",
         )
 
     def test_missing_ability_is_fail_closed_from_native_candidate(self) -> None:
