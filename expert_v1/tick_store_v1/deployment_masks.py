@@ -40,7 +40,8 @@ EXPECTED_DECK_INDICES = tuple(range(8))
 EXPECTED_SLOT_COUNT = len(EXPECTED_SIDES) * len(EXPECTED_DECK_INDICES)
 POCKET_DEPTH_CELLS = 5
 LANE_SPLIT_COLUMN = 9
-DYNAMIC_RULE = "native_base_and_tower_state_projection_v1"
+GLOBAL_DEPLOY_CARD_IDS = frozenset({26_000_032, 27_000_013})
+DYNAMIC_RULE = "native_base_and_tower_state_projection_v2"
 CAPTURE_STRATEGY = (
     "probe_once_when_each_side_deck_index_first_enters_native_hand_plus_"
     "exact_play_tick_variants_for_native_dynamic_choice"
@@ -293,11 +294,19 @@ class NativeDeploymentMaskCapture:
             if not isinstance(raw_hand, list) or len(raw_hand) != 4:
                 raise DeploymentMaskContractError("native hand must contain four slots")
             hand = [_integer(value, "hand.deck_index") for value in raw_hand]
-            if len(set(hand)) != 4 or any(index not in EXPECTED_DECK_INDICES for index in hand):
+            # libg exposes -1 while a just-played slot waits for its refill
+            # timer.  This is a valid, losslessly stored transient state; probe
+            # only the currently materialized unique deck indices.
+            visible = [index for index in hand if index != -1]
+            if (
+                not visible
+                or len(set(visible)) != len(visible)
+                or any(index not in EXPECTED_DECK_INDICES for index in visible)
+            ):
                 raise DeploymentMaskContractError("native hand deck indices are invalid")
             pending.extend(
                 (side, deck_index)
-                for deck_index in sorted(hand)
+                for deck_index in sorted(visible)
                 if (side, deck_index) not in self._entries
             )
 
@@ -364,9 +373,17 @@ class NativeDeploymentMaskCapture:
             raw_hand = player.get("hand_deck_indices")
             if side not in EXPECTED_SIDES or not isinstance(raw_hand, list):
                 raise DeploymentMaskContractError("native player hand is invalid")
-            hands[side] = {
-                _integer(value, "hand.deck_index") for value in raw_hand
-            }
+            hand = [_integer(value, "hand.deck_index") for value in raw_hand]
+            visible = [value for value in hand if value != -1]
+            if (
+                not visible
+                or len(set(visible)) != len(visible)
+                or any(value not in EXPECTED_DECK_INDICES for value in visible)
+            ):
+                raise DeploymentMaskContractError(
+                    "native player hand deck indices are invalid"
+                )
+            hands[side] = set(visible)
         calls = 0
         labelled_slots = {
             (
@@ -1048,14 +1065,19 @@ def derive_deployment_rows(
     native_rows = payload["rows"]
     # A wrapper's public deck ID does not determine deployment semantics.
     # Mirror is 28,000,006 (spell namespace) even when its native selection
-    # resolves to a troop/building.  The exact Tick sidecar is authoritative.
-    del card_id
+    # resolves to a troop/building.  The exact resolved Tick sidecar remains
+    # authoritative, while Miner/Goblin Drill are explicit global-deploy
+    # exceptions in the ordinary troop/building namespaces.
     resolved_data_id = int(payload["resolved_data_id"])
     if resolved_data_id <= 0:
         raise DeploymentMaskContractError(
             "native resolved_data_id is invalid for deployment semantics"
         )
-    if resolved_data_id // 1_000_000 == 28:
+    if (
+        resolved_data_id // 1_000_000 == 28
+        or int(card_id) in GLOBAL_DEPLOY_CARD_IDS
+        or resolved_data_id in GLOBAL_DEPLOY_CARD_IDS
+    ):
         return tuple(native_rows)
 
     result = [
@@ -1084,10 +1106,14 @@ def derive_deployment_rows(
     ]
     left_alive = any(tower["x"] < 9000 for tower in living_enemy_princesses)
     right_alive = any(tower["x"] >= 9000 for tower in living_enemy_princesses)
+    # Native/source coordinates use the river-edge half-cell boundary.  The
+    # unlocked five-row pocket is 16..20 for side 0 and its exact 180-degree
+    # mirror 11..15 for side 1.  Starting at 17/ending at 14 rejects valid
+    # source placements such as (3500, 16501) after the left tower falls.
     pocket_rows = (
-        range(17, 17 + POCKET_DEPTH_CELLS)
+        range(16, 16 + POCKET_DEPTH_CELLS)
         if side == 0
-        else range(15 - POCKET_DEPTH_CELLS, 15)
+        else range(16 - POCKET_DEPTH_CELLS, 16)
     )
     if not left_alive:
         for row in pocket_rows:

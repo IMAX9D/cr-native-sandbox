@@ -45,8 +45,10 @@ from .native_replay_plan import (
 )
 from .native_replay_runner import NativeReplayResult, execute_plan, load_template
 from .native_seed_search import (
+    DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS,
     DEFAULT_MAXIMUM_SEEDS_TO_TEST,
     NativeSeedSearchError,
+    compatible_native_seed_search,
 )
 from .tick_store_v1.codec import EpisodeReader, encode_episode
 from .tick_store_v1.deployment_masks import (
@@ -79,9 +81,9 @@ RESULT_KIND = "expert_authoritative_native_tick_result_v1"
 DIAGNOSTIC_KIND = "expert_authoritative_native_tick_failure_v1"
 COORDINATE_PROVENANCE = "royaleapi_raw_data_i_to_native_v1"
 RUN_CONTRACT_VERSION = 2
-NATIVE_PREFLIGHT_CONTRACT_VERSION = 2
+NATIVE_PREFLIGHT_CONTRACT_VERSION = 3
 NATIVE_PREFLIGHT_MODE = (
-    "native_preflight_then_fixed_seed_full_or_failure_prefix_v2"
+    "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
 )
 AUDIT_PREFIX_DIRECTORY = "audit-prefix-shards"
 REPLAY_EXTENT_METADATA_KEY = "native_replay_extent_v1"
@@ -1423,6 +1425,216 @@ def _semantic_digest(result: NativeReplayResult) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def accepted_source_event_prefix(result: NativeReplayResult) -> int:
+    """Count the contiguous accepted source-event prefix of one preflight."""
+
+    accepted = 0
+    for row in result.action_acceptance_sequence:
+        if row.get("accepted") is not True:
+            break
+        accepted += 1
+    return accepted
+
+
+@dataclass(frozen=True)
+class SemanticSeedPreflightSelection:
+    selected: NativeReplayResult
+    audit: dict[str, Any]
+
+
+def execute_bounded_semantic_preflights(
+    env: Any,
+    recorder: RecordingCountingEnv,
+    plan: BattlePlan,
+    template: Mapping[str, Any],
+    *,
+    seed: int,
+    maximum_seeds_to_test: int,
+    maximum_compatible_seeds: int = (
+        DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+    ),
+    trace_batch_steps: int,
+) -> SemanticSeedPreflightSelection:
+    """Select a seed using at most N layout-compatible semantic preflights.
+
+    Every candidate replay is no-trace/no-mask and uses an exact fixed seed.
+    The first complete replay wins immediately.  If none completes, the seed
+    with the longest contiguous accepted source-event prefix wins; ties keep
+    canonical ascending candidate order.  Ability branches remain unselected,
+    so this search can never invent an ability identity.
+    """
+
+    search = compatible_native_seed_search(
+        env,
+        plan,
+        template,
+        preferred_seed=seed,
+        maximum_seeds_to_test=maximum_seeds_to_test,
+        maximum_compatible_seeds=maximum_compatible_seeds,
+        warmup_tick=10,
+    )
+    selected: NativeReplayResult | None = None
+    selected_prefix = -1
+    candidate_rows: list[dict[str, Any]] = []
+    for ordinal, candidate in enumerate(search):
+        result = execute_plan(
+            recorder,
+            plan,
+            template,
+            None,
+            seed=seed,
+            fixed_seed=candidate.chosen_seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
+            capture_decisions=False,
+            ability_branch_choices=None,
+            tick_sink=None,
+            trace_batch_steps=trace_batch_steps,
+            capture_deployment_masks=False,
+            action_execution_tick_offset=(
+                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+            ),
+        )
+        prefix = accepted_source_event_prefix(result)
+        candidate_rows.append({
+            "ordinal": ordinal,
+            "seed": int(candidate.chosen_seed),
+            "raw_seeds_scanned_when_found": int(candidate.seeds_tested),
+            "teacher_forced_success": bool(result.teacher_forced_success),
+            "accepted_source_event_prefix": prefix,
+            "failure": result.failure,
+            "semantics_sha256": _semantic_digest(result),
+        })
+        if result.teacher_forced_success:
+            selected = result
+            selected_prefix = prefix
+            break
+        if selected is None or prefix > selected_prefix:
+            selected = result
+            selected_prefix = prefix
+    if selected is None:
+        # The search iterator raises NativeSeedSearchError when it scans no
+        # compatible layout.  This guard protects mock/custom iterators too.
+        raise NativeSeedSearchError(
+            battle_tag=plan.battle_tag,
+            seeds_tested=int(search.seeds_scanned),
+            maximum_seeds_to_test=int(maximum_seeds_to_test),
+            preferred_seed=int(seed),
+        )
+    audit = {
+        "schema_version": 1,
+        "kind": "bounded_semantic_seed_preflight_v1",
+        "maximum_compatible_seeds": int(maximum_compatible_seeds),
+        "raw_seed_scan_limit": int(maximum_seeds_to_test),
+        "raw_seeds_scanned": int(search.seeds_scanned),
+        "layout_compatible_candidates_tested": len(candidate_rows),
+        "layout_compatible_candidates_found": int(
+            search.compatible_seeds_yielded
+        ),
+        "layout_scan_native_resets": int(search.native_resets),
+        "semantic_preflight_native_resets": len(candidate_rows),
+        "selected_seed": int(selected.chosen_seed),
+        "selected_accepted_source_event_prefix": int(selected_prefix),
+        "selected_teacher_forced_success": bool(
+            selected.teacher_forced_success
+        ),
+        "selection_rule": (
+            "first_full_success_else_longest_accepted_source_event_prefix_"
+            "then_canonical_seed_order"
+        ),
+        "ability_identity_policy": "branch_required_fails_closed_no_guess",
+        "candidates": candidate_rows,
+    }
+    return SemanticSeedPreflightSelection(selected=selected, audit=audit)
+
+
+def semantic_seed_audit_valid(
+    audit: Any,
+    *,
+    chosen_seed: Any,
+    teacher_forced_success: Any,
+) -> bool:
+    """Recompute the bounded selection rule from a persisted audit row."""
+
+    if not isinstance(audit, Mapping):
+        return False
+    candidates = audit.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    try:
+        maximum = int(audit["maximum_compatible_seeds"])
+        tested = int(audit["layout_compatible_candidates_tested"])
+        found = int(audit["layout_compatible_candidates_found"])
+        raw_scanned = int(audit["raw_seeds_scanned"])
+        raw_limit = int(audit["raw_seed_scan_limit"])
+        layout_resets = int(audit["layout_scan_native_resets"])
+        semantic_resets = int(audit["semantic_preflight_native_resets"])
+        selected_seed = int(audit["selected_seed"])
+        selected_prefix = int(audit["selected_accepted_source_event_prefix"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        audit.get("schema_version") != 1
+        or audit.get("kind") != "bounded_semantic_seed_preflight_v1"
+        or not 1 <= maximum <= DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+        or tested != len(candidates)
+        or not 1 <= tested <= maximum
+        or found != tested
+        or not tested <= raw_scanned <= raw_limit
+        or layout_resets != raw_scanned
+        or semantic_resets != tested
+        or audit.get("ability_identity_policy")
+        != "branch_required_fails_closed_no_guess"
+        or audit.get("selection_rule")
+        != (
+            "first_full_success_else_longest_accepted_source_event_prefix_"
+            "then_canonical_seed_order"
+        )
+        or selected_seed != chosen_seed
+        or audit.get("selected_teacher_forced_success")
+        is not teacher_forced_success
+    ):
+        return False
+    normalized: list[tuple[int, int, bool, int]] = []
+    previous_seed = 0
+    for expected_ordinal, row in enumerate(candidates):
+        if not isinstance(row, Mapping):
+            return False
+        try:
+            ordinal = int(row["ordinal"])
+            seed = int(row["seed"])
+            prefix = int(row["accepted_source_event_prefix"])
+            scan_at_found = int(row["raw_seeds_scanned_when_found"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        success = row.get("teacher_forced_success")
+        digest = str(row.get("semantics_sha256") or "")
+        if (
+            ordinal != expected_ordinal
+            or seed <= previous_seed
+            or prefix < 0
+            or not ordinal + 1 <= scan_at_found <= raw_scanned
+            or not isinstance(success, bool)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return False
+        previous_seed = seed
+        normalized.append((ordinal, seed, success, prefix))
+    successful = [row for row in normalized if row[2]]
+    expected = (
+        successful[0]
+        if successful
+        else max(normalized, key=lambda row: (row[3], -row[0]))
+    )
+    if successful and expected[0] != len(normalized) - 1:
+        # Search must stop immediately after the first full success.
+        return False
+    return bool(
+        selected_seed == expected[1]
+        and selected_prefix == expected[3]
+        and teacher_forced_success is expected[2]
+    )
+
+
 @dataclass(slots=True)
 class TwoPhaseNativeReplay:
     preflight: NativeReplayResult
@@ -1436,6 +1648,7 @@ class TwoPhaseNativeReplay:
     failure_prefix_recorder: RecordingCountingEnv | None = None
     failure_prefix_seconds: float = 0.0
     failure_prefix_staged: bool = False
+    semantic_seed_audit: dict[str, Any] = field(default_factory=dict)
 
     @property
     def result(self) -> NativeReplayResult:
@@ -1591,35 +1804,36 @@ def execute_two_phase_plan(
     trace_batch_steps: int,
     tick_store_metadata: Mapping[str, Any],
     phase_state: dict[str, Any] | None = None,
+    maximum_compatible_seeds: int = (
+        DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+    ),
 ) -> TwoPhaseNativeReplay:
     """Cheap semantic preflight followed by a fixed-seed traced replay.
 
-    A rejected preflight never invokes ``trace_train`` or ``probe_grid`` and
-    never starts the expensive second pass.  A successful preflight owns seed
-    search; the full pass resets exactly once with that chosen seed and then
-    executes the normal layout revalidation before any trace is accepted.
+    Rejected candidate preflights never invoke ``trace_train`` or
+    ``probe_grid``.  At most ``maximum_compatible_seeds`` layout-compatible
+    seeds are considered; a full success wins, otherwise the farthest safe
+    source-event prefix owns the one fixed-seed audit trace.  The selected
+    seed is reset exactly once for the traced pass and parity is mandatory.
     """
     phase_state = {} if phase_state is None else phase_state
     preflight_recorder = RecordingCountingEnv(env)
     phase_state["preflight_recorder"] = preflight_recorder
     phase_started = time.perf_counter()
     try:
-        preflight = execute_plan(
+        semantic_selection = execute_bounded_semantic_preflights(
+            env,
             preflight_recorder,
             plan,
             template,
-            None,
             seed=seed,
             maximum_seeds_to_test=maximum_seeds_to_test,
-            capture_decisions=False,
-            ability_branch_choices=None,
-            tick_sink=None,
             trace_batch_steps=trace_batch_steps,
-            capture_deployment_masks=False,
-            action_execution_tick_offset=(
-                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
-            ),
+            maximum_compatible_seeds=maximum_compatible_seeds,
         )
+        preflight = semantic_selection.selected
+        semantic_seed_audit = semantic_selection.audit
+        phase_state["semantic_seed_audit"] = semantic_seed_audit
     finally:
         preflight_seconds = time.perf_counter() - phase_started
         phase_state["preflight_seconds"] = preflight_seconds
@@ -1675,7 +1889,18 @@ def execute_two_phase_plan(
                 else _prefix_extent_metadata(
                     preflight,
                     prefix_result,
-                    base=tick_store_metadata,
+                    base={
+                        **dict(tick_store_metadata),
+                        "native_execution_pipeline": {
+                            "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+                            "mode": NATIVE_PREFLIGHT_MODE,
+                            "preflight_chosen_seed": preflight.chosen_seed,
+                            "preflight_semantics_sha256": _semantic_digest(
+                                preflight
+                            ),
+                            "semantic_seed_selection": semantic_seed_audit,
+                        },
+                    },
                 )
             )
             if extent_metadata is not None and prefix_staged is not None:
@@ -1697,6 +1922,7 @@ def execute_two_phase_plan(
             failure_prefix_recorder=prefix_recorder,
             failure_prefix_seconds=prefix_seconds,
             failure_prefix_staged=prefix_was_staged,
+            semantic_seed_audit=semantic_seed_audit,
         )
 
     full_trace_recorder = RecordingCountingEnv(env)
@@ -1708,8 +1934,9 @@ def execute_two_phase_plan(
             "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
             "mode": NATIVE_PREFLIGHT_MODE,
             "preflight_chosen_seed": preflight.chosen_seed,
-            "preflight_seeds_tested": preflight.seeds_tested,
+            "preflight_seeds_tested": semantic_seed_audit["raw_seeds_scanned"],
             "preflight_semantics_sha256": _semantic_digest(preflight),
+            "semantic_seed_selection": semantic_seed_audit,
         },
     }
     phase_started = time.perf_counter()
@@ -1750,6 +1977,7 @@ def execute_two_phase_plan(
         preflight_seconds=preflight_seconds,
         full_trace_seconds=full_trace_seconds,
         semantic_diff=semantic_diff,
+        semantic_seed_audit=semantic_seed_audit,
     )
 
 
@@ -1840,6 +2068,7 @@ def execute_task(
     full_trace_seconds = 0.0
     failure_prefix_seconds = 0.0
     semantic_diff: dict[str, Any] | None = None
+    semantic_seed_audit: dict[str, Any] | None = None
     token_coverage_actor_evidence: list[dict[str, Any]] = []
     phase_state: dict[str, Any] = {}
     started = time.perf_counter()
@@ -1895,6 +2124,7 @@ def execute_task(
         full_trace_seconds = two_phase.full_trace_seconds
         failure_prefix_seconds = two_phase.failure_prefix_seconds
         semantic_diff = two_phase.semantic_diff
+        semantic_seed_audit = two_phase.semantic_seed_audit
         if not preflight_result.teacher_forced_success:
             stage = "preflight_first_native_difference"
             if semantic_diff:
@@ -1988,6 +2218,9 @@ def execute_task(
         )
         failure_prefix_seconds = float(
             phase_state.get("failure_prefix_seconds", failure_prefix_seconds)
+        )
+        semantic_seed_audit = phase_state.get(
+            "semantic_seed_audit", semantic_seed_audit
         )
 
     success = bool(
@@ -2101,8 +2334,11 @@ def execute_task(
             None if preflight_result is None else preflight_result.chosen_seed
         ),
         "preflight_seeds_tested": (
-            0 if preflight_result is None else preflight_result.seeds_tested
+            0
+            if semantic_seed_audit is None
+            else int(semantic_seed_audit.get("raw_seeds_scanned") or 0)
         ),
+        "semantic_seed_preflight": semantic_seed_audit,
         "full_trace_layout_resolution_mode": (
             None if result is None or not full_trace_executed
             else result.layout_resolution_mode
@@ -2180,7 +2416,9 @@ def execute_task(
             None if preflight_result is None else preflight_result.chosen_seed
         ),
         "seeds_tested": (
-            0 if preflight_result is None else preflight_result.seeds_tested
+            0
+            if semantic_seed_audit is None
+            else int(semantic_seed_audit.get("raw_seeds_scanned") or 0)
         ),
         "seed_search_cache_hit": (
             False
@@ -2850,6 +3088,16 @@ def summarize_results(
         int(row.get("native_preflight_contract_version", -1))
         == NATIVE_PREFLIGHT_CONTRACT_VERSION
         and row.get("native_execution_pipeline_mode") == NATIVE_PREFLIGHT_MODE
+        and (
+            row.get("preflight_teacher_forced_success") is None
+            or semantic_seed_audit_valid(
+                row.get("semantic_seed_preflight"),
+                chosen_seed=row.get("preflight_chosen_seed"),
+                teacher_forced_success=row.get(
+                    "preflight_teacher_forced_success"
+                ),
+            )
+        )
         and (
             (
                 row.get("preflight_teacher_forced_success") is False

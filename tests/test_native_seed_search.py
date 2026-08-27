@@ -7,6 +7,7 @@ from expert_v1.native_replay_plan import compile_battle, materialize_replay
 from expert_v1.native_seed_search import (
     NativeSeedSearchError,
     clear_native_seed_cache,
+    compatible_native_seed_search,
     layout_accepts_sequence,
     resolve_fixed_native_seed,
     resolve_native_seed,
@@ -56,15 +57,19 @@ def template() -> dict:
 
 
 class FakeSeedEnv:
-    def __init__(self, compatible_seed: int) -> None:
-        self.compatible_seed = compatible_seed
+    def __init__(self, compatible_seed: int | set[int]) -> None:
+        self.compatible_seeds = (
+            {compatible_seed}
+            if isinstance(compatible_seed, int)
+            else set(compatible_seed)
+        )
         self.seeds: list[int] = []
 
     def reset(self, replay: dict, *, warmup_steps: int) -> dict:
         self.assert_source_order(replay)
         seed = int(replay["rndSeed"])
         self.seeds.append(seed)
-        if seed == self.compatible_seed:
+        if seed in self.compatible_seeds:
             layout = [0, 1, 2, 3, 4, 5, 6, 7]
         else:
             layout = [1, 2, 3, 4, 0, 5, 6, 7]
@@ -139,6 +144,38 @@ class NativeSeedSearchTest(unittest.TestCase):
             ),
         )
         self.assertNotEqual(seed_cache_key(plan), seed_cache_key(higher_level))
+
+    def test_semantic_candidates_count_only_layout_compatible_seeds(self) -> None:
+        plan = compile_battle(source_battle())
+        env = FakeSeedEnv({2, 5, 6, 9})
+        search = compatible_native_seed_search(
+            env,
+            plan,
+            template(),
+            maximum_seeds_to_test=20,
+            maximum_compatible_seeds=3,
+            warmup_tick=7,
+        )
+        candidates = list(search)
+        self.assertEqual([row.chosen_seed for row in candidates], [2, 5, 6])
+        self.assertEqual(search.seeds_scanned, 6)
+        self.assertEqual(search.native_resets, 6)
+        self.assertEqual(search.compatible_seeds_yielded, 3)
+        self.assertEqual(env.seeds, [1, 2, 3, 4, 5, 6])
+        self.assertTrue(all(row.state["tick"] == 7 for row in candidates))
+
+    def test_semantic_candidate_scan_can_exhaust_after_partial_yield(self) -> None:
+        plan = compile_battle(source_battle())
+        search = compatible_native_seed_search(
+            FakeSeedEnv({2, 5}),
+            plan,
+            template(),
+            maximum_seeds_to_test=6,
+            maximum_compatible_seeds=8,
+        )
+        self.assertEqual([row.chosen_seed for row in search], [2, 5])
+        self.assertEqual(search.seeds_scanned, 6)
+        self.assertEqual(search.compatible_seeds_yielded, 2)
 
     def test_fixed_seed_replay_resets_once_without_repeating_search(self) -> None:
         plan = compile_battle(source_battle())

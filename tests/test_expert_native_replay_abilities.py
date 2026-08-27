@@ -180,6 +180,50 @@ def template() -> dict:
 
 
 class ExpertNativeReplayAbilityTests(unittest.TestCase):
+    def test_premature_native_terminal_is_semantic_not_protocol_mismatch(self) -> None:
+        class PrematureTerminalEnv(FakeNativeEnv):
+            def step(self, steps: int) -> dict:
+                before = self.tick
+                self.tick = min(self.tick + steps, 15)
+                return {
+                    "tick_after": self.tick,
+                    "stepped": self.tick - before,
+                    "episode": {"terminated": True, "truncated": False},
+                }
+
+        result = execute_plan(
+            PrematureTerminalEnv(),
+            compile_battle(ability_battle()),
+            template(),
+            calibration(),
+        )
+        self.assertFalse(result.teacher_forced_success)
+        self.assertEqual(
+            result.failure,
+            "native_terminal_before_execution_tick_21_source_tick_20",
+        )
+
+    def test_true_tick_overshoot_remains_a_protocol_mismatch(self) -> None:
+        class OvershootEnv(FakeNativeEnv):
+            def step(self, steps: int) -> dict:
+                self.tick += steps + 1
+                return {
+                    "tick_after": self.tick,
+                    "stepped": steps + 1,
+                    "episode": {"terminated": False, "truncated": False},
+                }
+
+        result = execute_plan(
+            OvershootEnv(),
+            compile_battle(ability_battle()),
+            template(),
+            calibration(),
+        )
+        self.assertEqual(
+            result.failure,
+            "native_tick_mismatch_22_expected_execution_tick_21_source_tick_20",
+        )
+
     def test_fixed_seed_second_pass_preserves_action_and_terminal_semantics(self) -> None:
         plan = compile_battle(ability_battle())
         env = FakeNativeEnv()

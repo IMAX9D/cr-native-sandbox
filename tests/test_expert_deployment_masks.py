@@ -17,6 +17,7 @@ from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    deployment_label_is_legal,
     derive_deployment_rows,
     normalize_native_probe,
     resolve_deployment_reference,
@@ -228,6 +229,33 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
         ):
             normalize_native_probe(broken)
 
+    def test_transient_refill_sentinel_does_not_abort_mask_capture(self) -> None:
+        capture = NativeDeploymentMaskCapture(deck_slots())
+        env = ProbeEnv()
+        transient = state(10, [0, 1, -1, 3])
+        self.assertEqual(capture.capture_available(env, transient), 6)
+        self.assertEqual(set(env.calls), {
+            (side, deck_index)
+            for side in (0, 1)
+            for deck_index in (0, 1, 3)
+        })
+        # The actor-side label validator also ignores the other side's pending
+        # refill sentinel while retaining exact membership checks.
+        capture.capture_label_variants(
+            env, transient, [{"side": 0, "deck_index": 0}]
+        )
+        for invalid in (
+            [0, 0, -1, 3],
+            [0, 1, -2, 3],
+            [-1, -1, -1, -1],
+        ):
+            with self.assertRaisesRegex(
+                DeploymentMaskContractError, "deck indices are invalid"
+            ):
+                NativeDeploymentMaskCapture(deck_slots()).capture_available(
+                    ProbeEnv(), state(11, invalid)
+                )
+
     def test_dynamic_choice_is_reprobed_only_at_exact_expert_play_tick(self) -> None:
         capture = NativeDeploymentMaskCapture(deck_slots())
         env = DynamicProbeEnv()
@@ -317,6 +345,7 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             (100, 26_000_000, 4),  # mirrored Knight
             (200, 27_000_000, 4),  # mirrored Cannon
             (300, 28_000_011, 3),  # mirrored Log
+            (400, 26_000_032, 3),  # mirrored Miner (global deploy)
         ):
             env.mirror_resolved_data_id = resolved_data_id
             env.mirror_cost = cost
@@ -325,8 +354,8 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
                 state(tick, [0, 1, 2, 3]),
                 [{"side": 0, "deck_index": 1}],
             )
-        self.assertEqual(capture.probe_rpc_count, 19)
-        self.assertEqual(capture.dynamic_label_probe_rpc_count, 3)
+        self.assertEqual(capture.probe_rpc_count, 20)
+        self.assertEqual(capture.dynamic_label_probe_rpc_count, 4)
         normalized = validate_episode_mask_metadata(capture.metadata())
         entry = next(
             item for item in normalized["entries"]
@@ -337,7 +366,7 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
         self.assertTrue(entry["tick_variant_required"])
         self.assertEqual(
             [variant["tick"] for variant in entry["dynamic_label_variants"]],
-            [100, 200, 300],
+            [100, 200, 300, 400],
         )
         with tempfile.TemporaryDirectory() as directory:
             store = DeploymentMaskStore(Path(directory))
@@ -349,6 +378,7 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
                 100: (26_000_000, 4, False),
                 200: (27_000_000, 4, False),
                 300: (28_000_011, 3, True),
+                400: (26_000_032, 3, True),
             }
             for tick, (resolved_data_id, cost, enemy_half_legal) in expected.items():
                 reference = resolve_deployment_reference(entry, tick=tick)
@@ -364,7 +394,10 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
                 )
                 self.assertEqual(rows[25][0] == "1", enemy_half_legal)
             exact_states = []
-            for tick, elixir_raw in ((100, 40_000), (200, 30_000), (300, 30_000)):
+            for tick, elixir_raw in (
+                (100, 40_000), (200, 30_000),
+                (300, 30_000), (400, 30_000),
+            ):
                 base_state = tick_state(tick)
                 exact_states.append(TickState(
                     tick=tick,
@@ -384,9 +417,10 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
                     {"tick": 100, "side": 0, "deck_index": 0, "x": 500, "y": 500},
                     {"tick": 200, "side": 0, "deck_index": 0, "x": 500, "y": 500},
                     {"tick": 300, "side": 0, "deck_index": 0, "x": 500, "y": 25_500},
+                    {"tick": 400, "side": 0, "deck_index": 0, "x": 500, "y": 25_500},
                 ],
             )
-            self.assertEqual(cost_audit["legal"], 2)
+            self.assertEqual(cost_audit["legal"], 3)
             self.assertEqual(cost_audit["violations"][0]["tick"], 200)
             self.assertEqual(
                 cost_audit["violations"][0]["reasons"],
@@ -395,7 +429,7 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 DeploymentMaskContractError, "lacks one exact",
             ):
-                resolve_deployment_reference(entry, tick=400)
+                resolve_deployment_reference(entry, tick=500)
 
     def test_offline_dynamic_projection_is_bit_exact_with_online_cache_rule(self) -> None:
         sidecar = normalize_native_probe(probe())
@@ -417,6 +451,51 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             spell_sidecar, tower_mapping(), side=0, card_id=28_000_001
         )
         self.assertEqual(spell, tuple(spell_sidecar["rows"]))
+
+    def test_smoke_regressions_global_miner_and_destroyed_tower_edge(self) -> None:
+        sidecar = normalize_native_probe(probe())
+        miner = derive_deployment_rows(
+            sidecar, tower_mapping(), side=0, card_id=26_000_032
+        )
+        self.assertTrue(
+            deployment_label_is_legal(miner, x=7_500, y=17_500),
+            "Miner is a native global-deploy troop",
+        )
+        drill = derive_deployment_rows(
+            sidecar, tower_mapping(), side=0, card_id=27_000_013
+        )
+        self.assertTrue(deployment_label_is_legal(drill, x=7_500, y=17_500))
+        ordinary = derive_deployment_rows(
+            sidecar, tower_mapping(), side=0, card_id=26_000_000
+        )
+        self.assertFalse(
+            deployment_label_is_legal(ordinary, x=7_500, y=17_500),
+            "ordinary troops remain ownership-limited",
+        )
+        skeletons = derive_deployment_rows(
+            sidecar,
+            tower_mapping(destroy_enemy_left=True),
+            side=0,
+            card_id=26_000_010,
+        )
+        self.assertTrue(
+            deployment_label_is_legal(skeletons, x=3_500, y=16_501),
+            "destroyed-left-tower pocket includes native river-edge row",
+        )
+        self.assertFalse(
+            deployment_label_is_legal(skeletons, x=13_500, y=16_501),
+            "destroying the left tower does not unlock the right pocket",
+        )
+        mirrored = derive_deployment_rows(
+            sidecar,
+            tower_mapping(destroy_enemy_left=True),
+            side=1,
+            card_id=26_000_010,
+        )
+        self.assertFalse(
+            deployment_label_is_legal(mirrored, x=3_500, y=15_499),
+            "side-1 cannot use a pocket opened by destruction on its own side",
+        )
 
     def test_sidecar_is_content_addressed_and_offline_labels_are_auditable(self) -> None:
         capture = NativeDeploymentMaskCapture(deck_slots())

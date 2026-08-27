@@ -39,6 +39,7 @@ SCALAR_SIZE = 64
 PRIVILEGED_SIZE = 33
 POCKET_DEPTH_CELLS = 5
 LANE_SPLIT_COLUMN = 9
+GLOBAL_DEPLOY_CARD_IDS = frozenset({26_000_032, 27_000_013})
 
 
 def _tower_role(entity: Mapping[str, Any]) -> str | None:
@@ -67,7 +68,10 @@ def deployment_mask(
         len(row) != ARENA_COLUMNS for row in native_rows
     ):
         raise ValueError("native deployment mask must be 18x32")
-    if card_id // 1_000_000 == 28:  # spells retain the native full target mask
+    if (
+        card_id // 1_000_000 == 28
+        or card_id in GLOBAL_DEPLOY_CARD_IDS
+    ):  # spells and native global-deploy cards retain their full target mask
         return list(native_rows)
     result = [
         "".join(
@@ -119,9 +123,9 @@ def deployment_mask(
     for row in own_rows:
         allowed[row] = [True] * ARENA_COLUMNS
     pocket_rows = (
-        range(17, 17 + POCKET_DEPTH_CELLS)
+        range(16, 16 + POCKET_DEPTH_CELLS)
         if side == 0
-        else range(15 - POCKET_DEPTH_CELLS, 15)
+        else range(16 - POCKET_DEPTH_CELLS, 16)
     )
     if not left_alive:
         for row in pocket_rows:
@@ -182,7 +186,10 @@ class ActionMaskCache:
         )
         if raw.shape != (ARENA_ROWS, ARENA_COLUMNS):
             raise ValueError("native deployment mask must be 18x32")
-        if card_id // 1_000_000 != 28:
+        if (
+            card_id // 1_000_000 != 28
+            and card_id not in GLOBAL_DEPLOY_CARD_IDS
+        ):
             raw = raw & raw[:, ::-1] & raw[::-1, :] & raw[::-1, ::-1]
         result = np.ascontiguousarray(raw.reshape(-1))
         result.setflags(write=False)
@@ -216,9 +223,9 @@ class ActionMaskCache:
             for entity in living_enemy_princesses
         )
         pocket_rows = (
-            slice(17, 17 + POCKET_DEPTH_CELLS)
+            slice(16, 16 + POCKET_DEPTH_CELLS)
             if side == 0
-            else slice(15 - POCKET_DEPTH_CELLS, 15)
+            else slice(16 - POCKET_DEPTH_CELLS, 16)
         )
         if not left_alive:
             allowed[pocket_rows, :LANE_SPLIT_COLUMN] = True
@@ -256,7 +263,10 @@ class ActionMaskCache:
             deck_index=deck_index,
             card_id=card_id,
         )
-        if card_id // 1_000_000 == 28:
+        if (
+            card_id // 1_000_000 == 28
+            or card_id in GLOBAL_DEPLOY_CARD_IDS
+        ):
             return static
         return static & self._dynamic_mask(state, side=side)
 

@@ -19,6 +19,7 @@ from .upgrade_base_cycles import INITIAL_MASKS, INITIAL_QUEUES
 
 
 DEFAULT_MAXIMUM_SEEDS_TO_TEST = 4096
+DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS = 8
 
 
 class NativeSeedSearchError(RuntimeError):
@@ -78,6 +79,101 @@ class NativeSeedResolution:
 class _CachedSeed:
     seed: int
     seeds_tested: int
+
+
+@dataclass
+class CompatibleNativeSeedSearch:
+    """Lazy canonical scan yielding at most N layout-compatible seeds.
+
+    Raw seed scans and semantic candidates are deliberately separate counters:
+    incompatible layouts never consume the bounded semantic-preflight budget.
+    The object is stateful only so callers can publish exact scan/reset counts
+    after stopping early on the first fully successful semantic preflight.
+    """
+
+    env: Any
+    plan: BattlePlan
+    template: Mapping[str, Any]
+    preferred_seed: int = DEFAULT_NATIVE_SEED
+    maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST
+    maximum_compatible_seeds: int = DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+    warmup_tick: int = 10
+    seeds_scanned: int = 0
+    native_resets: int = 0
+    compatible_seeds_yielded: int = 0
+
+    def __post_init__(self) -> None:
+        if self.maximum_seeds_to_test <= 0:
+            raise ValueError("maximum_seeds_to_test must be positive")
+        if self.maximum_compatible_seeds <= 0:
+            raise ValueError("maximum_compatible_seeds must be positive")
+        if self.warmup_tick < 0:
+            raise ValueError("warmup_tick must be nonnegative")
+
+    def __iter__(self) -> Iterable[NativeSeedResolution]:
+        for seed in _candidate_seeds(
+            int(self.preferred_seed), int(self.maximum_seeds_to_test)
+        ):
+            replay, mappings, layouts, state = _reset_candidate(
+                self.env,
+                self.plan,
+                self.template,
+                seed,
+                int(self.warmup_tick),
+            )
+            self.seeds_scanned += 1
+            self.native_resets += 1
+            players = sorted(state["players"], key=lambda item: int(item["side"]))
+            if not all(layouts_accept_plan(self.plan, players)):
+                continue
+            self.compatible_seeds_yielded += 1
+            yield NativeSeedResolution(
+                preferred_seed=int(self.preferred_seed),
+                chosen_seed=seed,
+                seeds_tested=self.seeds_scanned,
+                maximum_seeds_to_test=int(self.maximum_seeds_to_test),
+                cache_hit=False,
+                cache_validated=False,
+                native_resets=self.native_resets,
+                source_seed_recovered=False,
+                layouts=layouts,
+                replay=replay,
+                mappings=mappings,
+                state=state,
+                resolution_mode="layout_compatible_semantic_candidate_v1",
+            )
+            if self.compatible_seeds_yielded >= self.maximum_compatible_seeds:
+                return
+        if self.compatible_seeds_yielded == 0:
+            raise NativeSeedSearchError(
+                battle_tag=self.plan.battle_tag,
+                seeds_tested=self.seeds_scanned,
+                maximum_seeds_to_test=int(self.maximum_seeds_to_test),
+                preferred_seed=int(self.preferred_seed),
+            )
+
+
+def compatible_native_seed_search(
+    env: Any,
+    plan: BattlePlan,
+    template: Mapping[str, Any],
+    *,
+    preferred_seed: int = DEFAULT_NATIVE_SEED,
+    maximum_seeds_to_test: int = DEFAULT_MAXIMUM_SEEDS_TO_TEST,
+    maximum_compatible_seeds: int = DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS,
+    warmup_tick: int = 10,
+) -> CompatibleNativeSeedSearch:
+    """Create a lazy, bounded search for semantic-preflight candidates."""
+
+    return CompatibleNativeSeedSearch(
+        env=env,
+        plan=plan,
+        template=template,
+        preferred_seed=int(preferred_seed),
+        maximum_seeds_to_test=int(maximum_seeds_to_test),
+        maximum_compatible_seeds=int(maximum_compatible_seeds),
+        warmup_tick=int(warmup_tick),
+    )
 
 
 _CACHE: dict[tuple[Any, ...], _CachedSeed] = {}

@@ -613,16 +613,6 @@ def execute_plan(
                         last_native_tick=final_tick,
                     )
                     break
-                if final_tick != execution_tick:
-                    failure = (
-                        f"native_tick_mismatch_{final_tick}_expected_{execution_tick}"
-                        if action_execution_tick_offset == 0
-                        else (
-                            f"native_tick_mismatch_{final_tick}_expected_execution_"
-                            f"tick_{execution_tick}_source_tick_{source_tick}"
-                        )
-                    )
-                    break
                 if episode.get("terminated") or episode.get("truncated"):
                     failure = (
                         f"native_terminal_before_source_tick_{source_tick}"
@@ -630,6 +620,16 @@ def execute_plan(
                         else (
                             f"native_terminal_before_execution_tick_{execution_tick}_"
                             f"source_tick_{source_tick}"
+                        )
+                    )
+                    break
+                if final_tick != execution_tick:
+                    failure = (
+                        f"native_tick_mismatch_{final_tick}_expected_{execution_tick}"
+                        if action_execution_tick_offset == 0
+                        else (
+                            f"native_tick_mismatch_{final_tick}_expected_execution_"
+                            f"tick_{execution_tick}_source_tick_{source_tick}"
                         )
                     )
                     break

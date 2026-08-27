@@ -131,6 +131,57 @@ def replay_result_stub(
     )
 
 
+class FakeCompatibleSeedSearch:
+    def __init__(
+        self, seed: int = 7, *, scanned: int = 3,
+        seeds: list[int] | None = None,
+    ) -> None:
+        self.seeds = [seed] if seeds is None else list(seeds)
+        self.seeds_scanned = scanned
+        self.native_resets = scanned
+        self.compatible_seeds_yielded = len(self.seeds)
+
+    def __iter__(self):
+        for index, seed in enumerate(self.seeds):
+            yield SimpleNamespace(
+                chosen_seed=seed,
+                seeds_tested=min(self.seeds_scanned, index + 1),
+            )
+
+
+def semantic_audit(
+    *, seed: int = 7, success: bool = False, prefix: int = 0
+) -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "bounded_semantic_seed_preflight_v1",
+        "maximum_compatible_seeds": 8,
+        "raw_seed_scan_limit": 16,
+        "raw_seeds_scanned": 3,
+        "layout_compatible_candidates_tested": 1,
+        "layout_compatible_candidates_found": 1,
+        "layout_scan_native_resets": 3,
+        "semantic_preflight_native_resets": 1,
+        "selected_seed": seed,
+        "selected_accepted_source_event_prefix": prefix,
+        "selected_teacher_forced_success": success,
+        "selection_rule": (
+            "first_full_success_else_longest_accepted_source_event_prefix_"
+            "then_canonical_seed_order"
+        ),
+        "ability_identity_policy": "branch_required_fails_closed_no_guess",
+        "candidates": [{
+            "ordinal": 0,
+            "seed": seed,
+            "raw_seeds_scanned_when_found": 3,
+            "teacher_forced_success": success,
+            "accepted_source_event_prefix": prefix,
+            "failure": None if success else "ability_branch_required",
+            "semantics_sha256": "a" * 64,
+        }],
+    }
+
+
 class NativeDatasetGeneratorTest(unittest.TestCase):
     def test_failed_preflight_runs_fixed_seed_prefix_without_mask_probes(self) -> None:
         rejected = replay_result_stub(
@@ -145,7 +196,10 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         with patch(
             "expert_v1.native_dataset_generator.execute_plan",
             return_value=rejected,
-        ) as mocked:
+        ) as mocked, patch(
+            "expert_v1.native_dataset_generator.compatible_native_seed_search",
+            return_value=FakeCompatibleSeedSearch(),
+        ):
             outcome = execute_two_phase_plan(
                 object(), SimpleNamespace(battle_tag="PREFIX"), {}, StagedTickSink(),
                 seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
@@ -184,7 +238,10 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         with patch(
             "expert_v1.native_dataset_generator.execute_plan",
             side_effect=[preflight, full],
-        ) as mocked:
+        ) as mocked, patch(
+            "expert_v1.native_dataset_generator.compatible_native_seed_search",
+            return_value=FakeCompatibleSeedSearch(),
+        ):
             outcome = execute_two_phase_plan(
                 object(), SimpleNamespace(), {}, StagedTickSink(),
                 seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
@@ -224,6 +281,9 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         with patch(
             "expert_v1.native_dataset_generator.execute_plan",
             side_effect=[preflight, prefix],
+        ), patch(
+            "expert_v1.native_dataset_generator.compatible_native_seed_search",
+            return_value=FakeCompatibleSeedSearch(),
         ):
             outcome = execute_two_phase_plan(
                 object(), SimpleNamespace(battle_tag="PREFIX"), {}, StagedTickSink(),
@@ -252,6 +312,9 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         with patch(
             "expert_v1.native_dataset_generator.execute_plan",
             side_effect=[preflight, full],
+        ), patch(
+            "expert_v1.native_dataset_generator.compatible_native_seed_search",
+            return_value=FakeCompatibleSeedSearch(),
         ):
             outcome = execute_two_phase_plan(
                 object(), SimpleNamespace(), {}, StagedTickSink(),
@@ -400,7 +463,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             self.assertEqual(first[0], second[0])
             self.assertEqual(first[3]["run_contract_version"], 2)
             self.assertEqual(
-                first[3]["native_execution_pipeline"]["contract_version"], 2
+                first[3]["native_execution_pipeline"]["contract_version"], 3
             )
             with TickStoreWorkQueue(first[2]) as queue:
                 self.assertEqual(queue.counts(), {"pending": 2})
@@ -672,11 +735,15 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             "failure_class": "ability_branch_required",
             "failure_domain": "semantic",
             "terminal_diagnostic_status": "not_reached",
-            "native_preflight_contract_version": 2,
+            "native_preflight_contract_version": 3,
             "native_execution_pipeline_mode": (
-                "native_preflight_then_fixed_seed_full_or_failure_prefix_v2"
+                "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
             ),
             "preflight_teacher_forced_success": False,
+            "preflight_chosen_seed": 7,
+            "semantic_seed_preflight": semantic_audit(
+                seed=7, success=False, prefix=0
+            ),
             "full_trace_executed": False,
             "preflight_seconds": 0.5,
             "full_trace_seconds": 0.0,
