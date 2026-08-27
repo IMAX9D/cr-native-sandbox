@@ -3020,6 +3020,46 @@ def execute_task(
                 "native_teacher_forced_profile": native_teacher_forced_profile(
                     ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
                 ),
+                "state_provenance": plan.state_provenance,
+                "action_provenance": plan.action_provenance,
+                "coordinate_provenance": plan.coordinate_provenance,
+                "coordinate_audit": asdict(plan.coordinate_audit),
+                "ability_provenance": plan.ability_provenance,
+                "terminal_provenance": plan.terminal_provenance,
+                "numeric_game_mode_id": plan.numeric_game_mode_id,
+                "numeric_game_mode_provenance": (
+                    plan.numeric_game_mode_provenance
+                ),
+                "native_execution_game_mode_id": (
+                    plan.native_execution_game_mode_id
+                ),
+                "native_execution_game_mode_provenance": (
+                    plan.native_execution_game_mode_provenance
+                ),
+                "king_tower_levels": tuple(
+                    side.king_tower_level for side in plan.sides
+                ),
+                "king_tower_level_provenance": tuple(
+                    side.king_tower_level_provenance for side in plan.sides
+                ),
+                "battle_index": plan.battle_index,
+                "battle_index_provenance": plan.battle_index_provenance,
+                "authoritative_contract_game_version": (
+                    plan.authoritative_contract_game_version
+                ),
+                "authoritative_contract_sha256": (
+                    plan.authoritative_contract_sha256
+                ),
+                "authoritative_contract_file_sha256": (
+                    plan.authoritative_contract_file_sha256
+                ),
+                "source_final_tower_hp": tuple(
+                    asdict(side.final_tower_hp)  # type: ignore[arg-type]
+                    for side in plan.sides
+                ) if all(
+                    side.final_tower_hp is not None for side in plan.sides
+                ) else None,
+                "source_actions": len(plan.actions) + len(plan.ability_events),
             },
         )
         preflight_result = two_phase.preflight
