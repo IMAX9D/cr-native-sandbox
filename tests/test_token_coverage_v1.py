@@ -24,6 +24,8 @@ from expert_v1.token_coverage_v1 import (
     seal_ability_resolution_transcript,
     summarize_success_token_coverage,
     verify_coverage_receipt_sha256,
+    _contract_index,
+    _successful_deploy_label,
 )
 
 
@@ -264,6 +266,32 @@ class TokenCoverageV1Test(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.contract = build_native_ingest_contract()
         cls.card_ids, cls.ability_ids = _native_ids(cls.contract)
+
+    def test_dynamic_wrapper_subform_requires_exact_libg_provenance(self) -> None:
+        index = _contract_index(self.contract)
+        label = {
+            "source_event_index": 7,
+            "source_token": "spirit-empress",
+            "resolved_native_form_id": 26_000_104,
+            "identity_provenance": "libg_dynamic_choice_exact_v1",
+            "accepted": True,
+            "mask_legal": True,
+            "compiled": True,
+        }
+        self.assertEqual(
+            _successful_deploy_label(
+                label, deck={"spirit-empress"}, index=index
+            ),
+            (7, "spirit-empress", 26_000_104),
+        )
+        forged = dict(label)
+        forged["identity_provenance"] = "libg_deployment_mask_exact_v1"
+        with self.assertRaisesRegex(
+            TokenCoverageError, "does not belong to token spirit-empress"
+        ):
+            _successful_deploy_label(
+                forged, deck={"spirit-empress"}, index=index
+            )
 
     def _source_and_transcripts(
         self,

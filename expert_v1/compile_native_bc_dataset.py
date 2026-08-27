@@ -107,7 +107,8 @@ PREFIX_MASK_PROVENANCE = "partial_native_visible_hand_complete_v1"
 PREFIX_TIMING_TARGET = "right_censored_at_failure_tick_v1"
 ENTITY_NUMERIC_FIELDS = ("level_ratio", "hp_ratio", "log_max_hp")
 MAX_ABILITY_SLOTS = 16
-CAPACITY_PREFLIGHT_KIND = "cr_native_bc_capacity_preflight_v1"
+CAPACITY_PREFLIGHT_KIND = "cr_native_bc_capacity_preflight_v2"
+CAPACITY_PREFLIGHT_SCHEMA_VERSION = 2
 CAPACITY_PREFLIGHT_FILENAME = "capacity-preflight.json"
 CAPACITY_SAMPLE_BATTLES = 100
 CAPACITY_SAFETY_FACTOR = 1.35
@@ -1726,13 +1727,15 @@ def validate_compile_plan(
         (
             value.battle_tag,
             value.tick_count,
+            value.compiled_tick_count,
             value.tick_payload_size,
         )
         for value in expected_capacity_sample
     ] != [
         (
             str(value["battle_tag"]),
-            int(value["tick_count"]),
+            int(value["stored_tick_count"]),
+            int(value["compiled_tick_count"]),
             int(value["tick_payload_size"]),
         )
         for value in actual_capacity_sample
@@ -2212,7 +2215,7 @@ def _stratified_capacity_sample(
             for index, value in enumerate(ordered)
         }
 
-    tick_bins = rank_bins(lambda value: value.tick_count)
+    tick_bins = rank_bins(lambda value: value.compiled_tick_count)
     density_bins = rank_bins(
         lambda value: value.tick_payload_size / value.tick_count
     )
@@ -2289,7 +2292,7 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
     if (
         value.get("kind") != CAPACITY_PREFLIGHT_KIND
         or _require_integer(value.get("schema_version"), "capacity.schema_version", minimum=1)
-        != 1
+        != CAPACITY_PREFLIGHT_SCHEMA_VERSION
     ):
         raise NativeBcCompileError("capacity preflight kind/schema changed")
     content_sha = _require_sha(value.get("content_sha256"), "capacity.content_sha256")
@@ -2305,8 +2308,9 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
     ):
         raise NativeBcCompileError("capacity sample selection contract changed")
     episode_fields = {
-        "battle_tag", "tick_count", "tick_payload_size",
-        "tick_payload_bytes_per_tick", "actor_rows", "array_payload_bytes",
+        "battle_tag", "stored_tick_count", "compiled_tick_count",
+        "tick_payload_size", "tick_payload_bytes_per_stored_tick",
+        "actor_rows", "array_payload_bytes",
         "array_payload_bytes_per_actor_row", "mean_entities_per_actor_row",
         "max_entities_per_actor_row",
     }
@@ -2319,8 +2323,13 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
             raise NativeBcCompileError("capacity sample episode is malformed")
         _require_keys(episode, episode_fields, "capacity sample episode")
         tag = str(episode.get("battle_tag") or "")
-        ticks = _require_integer(
-            episode.get("tick_count"), "capacity.episode.tick_count", minimum=1
+        stored_ticks = _require_integer(
+            episode.get("stored_tick_count"),
+            "capacity.episode.stored_tick_count", minimum=1
+        )
+        compiled_ticks = _require_integer(
+            episode.get("compiled_tick_count"),
+            "capacity.episode.compiled_tick_count", minimum=1
         )
         payload_size = _require_integer(
             episode.get("tick_payload_size"),
@@ -2342,9 +2351,11 @@ def _read_capacity_preflight(path: Path) -> dict[str, Any]:
         if (
             not tag
             or tag in tags
-            or rows != ticks * 2
+            or compiled_ticks > stored_ticks
+            or rows != compiled_ticks * 2
             or not _float_equal(
-                episode.get("tick_payload_bytes_per_tick"), payload_size / ticks
+                episode.get("tick_payload_bytes_per_stored_tick"),
+                payload_size / stored_ticks,
             )
             or not _float_equal(
                 episode.get("array_payload_bytes_per_actor_row"), payload / rows
@@ -2713,7 +2724,9 @@ def _build_capacity_preflight(
         for estimate in episode_estimates:
             episode = selected_by_tag[str(estimate["battle_tag"])]
             if (
-                int(estimate["tick_count"]) != episode.tick_count
+                int(estimate["stored_tick_count"]) != episode.tick_count
+                or int(estimate["compiled_tick_count"])
+                != episode.compiled_tick_count
                 or int(estimate["tick_payload_size"]) != episode.tick_payload_size
             ):
                 raise NativeBcCompileError(
@@ -2758,7 +2771,7 @@ def _build_capacity_preflight(
         )
         body: dict[str, Any] = {
             "kind": CAPACITY_PREFLIGHT_KIND,
-            "schema_version": 1,
+            "schema_version": CAPACITY_PREFLIGHT_SCHEMA_VERSION,
             "sample_selection_strategy": CAPACITY_SELECTION_STRATEGY,
             "sample_episodes": episode_estimates,
             "sample_battles": len(selected),
@@ -4237,9 +4250,6 @@ def _compile_output_shard(
                     )
             else:
                 states = stored_states
-            maximum_entities = max(
-                maximum_entities, max((len(state.entities) for state in states), default=0)
-            )
             label_stop = (
                 None
                 if episode.replay_extent == FULL_SUCCESS_EXTENT
@@ -4336,6 +4346,9 @@ def _compile_output_shard(
                 ),
                 default=0,
             )
+            maximum_entities = max(
+                maximum_entities, maximum_episode_entities
+            )
             sparse_mask_row_bytes = sum(
                 8
                 * (
@@ -4355,9 +4368,10 @@ def _compile_output_shard(
             )
             capacity_episode_estimates.append({
                 "battle_tag": episode.battle_tag,
-                "tick_count": int(episode.tick_count),
+                "stored_tick_count": int(episode.tick_count),
+                "compiled_tick_count": int(episode.compiled_tick_count),
                 "tick_payload_size": int(episode.tick_payload_size),
-                "tick_payload_bytes_per_tick": (
+                "tick_payload_bytes_per_stored_tick": (
                     episode.tick_payload_size / episode.tick_count
                 ),
                 "actor_rows": actor_rows,
@@ -5132,6 +5146,15 @@ def _final_compiled_token_coverage(
                         str(card.source_token),
                         int(payload["resolved_data_id"]),
                         str(reference["content_sha256"]),
+                        (
+                            "libg_dynamic_choice_exact_v1"
+                            if (
+                                str(card.source_token) == "mirror"
+                                or str(payload.get("selection_strategy") or "")
+                                == "native_dynamic_choice"
+                            )
+                            else "libg_deployment_mask_exact_v1"
+                        ),
                     ))
                 actual_deploy = sorted(
                     (
@@ -5141,6 +5164,7 @@ def _final_compiled_token_coverage(
                         str(label.get("source_token") or ""),
                         int(label.get("resolved_native_form_id", -1)),
                         str(label.get("mask_content_sha256") or ""),
+                        str(label.get("identity_provenance") or ""),
                     )
                     for label in actor.get("deploy_labels") or []
                     if isinstance(label, Mapping)

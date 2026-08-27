@@ -1072,7 +1072,11 @@ def build_full_success_token_evidence(
             "mask_content_sha256": digest,
             "identity_provenance": (
                 "libg_dynamic_choice_exact_v1"
-                if str(spec.source_token) == "mirror"
+                if (
+                    str(spec.source_token) == "mirror"
+                    or str(payload.get("selection_strategy") or "")
+                    == "native_dynamic_choice"
+                )
                 else "libg_deployment_mask_exact_v1"
             ),
             "accepted": True,

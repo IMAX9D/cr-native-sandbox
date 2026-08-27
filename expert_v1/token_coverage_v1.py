@@ -631,15 +631,20 @@ def _successful_deploy_label(
         minimum=1,
     )
     spec = index["token_specs"][token]
-    if token == "mirror":
-        if (
-            resolved_id not in index["all_native_card_ids"]
-            or label.get("identity_provenance")
-            != "libg_dynamic_choice_exact_v1"
-        ):
-            raise TokenCoverageError(
-                "Mirror deployment requires an exact libg dynamic-choice identity"
-            )
+    dynamic_exact = (
+        label.get("identity_provenance")
+        == "libg_dynamic_choice_exact_v1"
+    )
+    if dynamic_exact:
+        # Dynamic wrappers (currently Mirror and Spirit Empress) resolve to
+        # a libg-owned sub-form which is not necessarily a standalone source
+        # card in the frozen ingest catalog.  The compiler has already bound
+        # this positive ID to the exact play-Tick sidecar and final label row.
+        pass
+    elif token == "mirror":
+        raise TokenCoverageError(
+            "Mirror deployment requires an exact libg dynamic-choice identity"
+        )
     elif resolved_id not in spec["allowed_resolved_ids"]:
         raise TokenCoverageError(
             f"deploy resolved native ID does not belong to token {token}"
