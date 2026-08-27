@@ -3447,7 +3447,6 @@ def _compile_actor(
         if (
             len(hand_indices) != 4
             or any(value < -1 or value >= 8 for value in hand_indices)
-            or sum(value == -1 for value in hand_indices) not in (0, 1)
             or len({value for value in hand_indices if value >= 0})
             != sum(value >= 0 for value in hand_indices)
         ):

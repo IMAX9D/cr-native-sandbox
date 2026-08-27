@@ -641,12 +641,10 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     next_card = arrays["next_card_token"]
     if np.any(own_deck == 0):
         raise DatasetContractError("own deck cannot contain PAD")
-    # Native hand refills transiently expose one -1, compiled as PAD=0.  PAD is
-    # a real empty slot here, never a guessed card identity.  The native cycle
-    # still exposes an exact non-PAD next card during this transient.
+    # Native hand refills may transiently expose multiple -1 slots, compiled
+    # as PAD=0.  Every PAD is a real empty slot, never a guessed card identity.
+    # The native cycle still exposes an exact non-PAD next card meanwhile.
     empty_hand = hand == 0
-    if np.any(empty_hand.sum(axis=1) > 1):
-        raise DatasetContractError("native hand may contain at most one refill PAD")
     if np.any(next_card == 0):
         raise DatasetContractError("next card cannot contain PAD")
     if np.any(np.sort(own_deck, axis=1)[:, 1:] == np.sort(own_deck, axis=1)[:, :-1]):

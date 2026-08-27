@@ -718,8 +718,8 @@ class NativeBcCompilerTests(unittest.TestCase):
             own = players[0]
             players[0] = replace(
                 own,
-                hand=(own.hand[0], own.hand[1], -1, own.hand[3]),
-                refill_timer=0,
+                hand=(own.hand[0], -1, -1, own.hand[3]),
+                refill_timer=450,
             )
             transient = replace(state, players=tuple(players))
             refill = _compile_actor(
@@ -728,9 +728,25 @@ class NativeBcCompilerTests(unittest.TestCase):
                 action_label_tick_stop_exclusive=state.tick + 1,
                 timing_censor_tick_exclusive=state.tick + 1,
             )
-            self.assertEqual(int(refill["hand_tokens"][0, 2]), 0)
-            self.assertEqual(int(refill["card_mask"][0, 2]), 0)
+            self.assertEqual(list(refill["hand_tokens"][0, 1:3]), [0, 0])
+            self.assertEqual(list(refill["card_mask"][0, 1:3]), [0, 0])
             self.assertEqual(int(refill["card_label_mask"][0]), 0)
+
+            players[0] = replace(
+                own,
+                hand=(-1, -1, -1, -1),
+                refill_timer=900,
+            )
+            all_empty = replace(state, players=tuple(players))
+            empty_arrays = _compile_actor(
+                [all_empty], metadata, native_plan, **common,
+                replay_extent="valid_prefix",
+                action_label_tick_stop_exclusive=state.tick + 1,
+                timing_censor_tick_exclusive=state.tick + 1,
+            )
+            self.assertEqual(list(empty_arrays["hand_tokens"][0]), [0, 0, 0, 0])
+            self.assertEqual(list(empty_arrays["card_mask"][0]), [0, 0, 0, 0])
+            self.assertEqual(int(empty_arrays["card_label_mask"][0]), 0)
 
             action_players = list(source_action_state.players)
             action_own = action_players[0]

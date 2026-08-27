@@ -100,18 +100,27 @@ class TickStoreV1Test(unittest.TestCase):
         transient = replace(
             source[1],
             players=(
-                PlayerPrivate(0, 42_000, (0, 1, -1, 3), 4, 0),
+                PlayerPrivate(0, 42_000, (0, -1, -1, 3), 4, 450),
                 source[1].players[1],
             ),
         )
         source[1] = transient
+        source[2] = replace(
+            source[2],
+            players=(
+                PlayerPrivate(0, 42_000, (-1, -1, -1, -1), 4, 900),
+                source[2].players[1],
+            ),
+        )
         blob, _ = encode_episode(
             source, {"battle_tag": "REFILL"}, anchor_interval=16
         )
         decoded = list(EpisodeReader(blob).iter_ticks())
         self.assertEqual(decoded, source)
-        self.assertEqual(decoded[1].players[0].hand, (0, 1, -1, 3))
-        self.assertEqual(decoded[1].players[0].refill_timer, 0)
+        self.assertEqual(decoded[1].players[0].hand, (0, -1, -1, 3))
+        self.assertEqual(decoded[1].players[0].refill_timer, 450)
+        self.assertEqual(decoded[2].players[0].hand, (-1, -1, -1, -1))
+        self.assertEqual(decoded[2].players[0].refill_timer, 900)
 
     def test_native_empty_slot_allows_zero_timer_but_keeps_cycle_guards(self) -> None:
         def raw(hand: list[int], *, timer: int = 0, next_index: int = 4) -> dict:
@@ -137,10 +146,17 @@ class TickStoreV1Test(unittest.TestCase):
         players = _normalize_players(raw([0, 1, -1, 3], timer=0))
         self.assertEqual(players[0].hand, (0, 1, -1, 3))
         self.assertEqual(players[0].refill_timer, 0)
+        self.assertEqual(
+            _normalize_players(raw([0, -1, -1, 3], timer=450))[0].hand,
+            (0, -1, -1, 3),
+        )
+        self.assertEqual(
+            _normalize_players(raw([-1, -1, -1, -1], timer=900))[0].hand,
+            (-1, -1, -1, -1),
+        )
         for hand in (
             [0, 0, -1, 3],      # duplicate visible card
             [0, 1, -2, 3],      # value below native sentinel
-            [-1, 1, -1, 3],     # more than one empty slot
         ):
             with self.assertRaises(TickStoreContractError):
                 _normalize_players(raw(hand))

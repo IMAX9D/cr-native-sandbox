@@ -212,7 +212,6 @@ def _normalize_players(state: Mapping[str, Any]) -> tuple[PlayerPrivate, PlayerP
         if len(hand) != 4 or any(value < -1 or value > 7 for value in hand):
             raise TickStoreContractError("hand_deck_indices must contain four values in -1..7")
         visible = [value for value in hand if value >= 0]
-        empty_slots = 4 - len(visible)
         next_deck_index = _integer(
             raw.get("next_deck_index"), "next_deck_index", default=-1
         )
@@ -221,7 +220,6 @@ def _normalize_players(state: Mapping[str, Any]) -> tuple[PlayerPrivate, PlayerP
         )
         if (
             len(set(visible)) != len(visible)
-            or empty_slots not in (0, 1)
             or next_deck_index not in range(8)
             or next_deck_index in visible
             or not 0 <= refill_timer <= 10_000

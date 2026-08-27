@@ -59,7 +59,38 @@ class ExpertTrainingV1Tests(unittest.TestCase):
         with self.assertRaises(DatasetContractError):
             validate_shard(shard, self.manifest)
 
+    def test_multiple_refill_pads_are_valid_but_never_selectable(self) -> None:
+        shard = self.root / self.manifest["splits"]["train"][0]
+        hand_path = shard / "hand_tokens.npy"
+        card_mask_path = shard / "card_mask.npy"
+        kind_mask_path = shard / "action_kind_mask.npy"
+        hand = np.load(hand_path)
+        card_mask = np.load(card_mask_path)
+        kind_mask = np.load(kind_mask_path)
+        hand[1, 1:3] = 0
+        card_mask[1, 1:3] = 0
+        hand[2, :] = 0
+        card_mask[2, :] = 0
+        kind_mask[2, 0] = 0
+        np.save(hand_path, hand, allow_pickle=False)
+        np.save(card_mask_path, card_mask, allow_pickle=False)
+        np.save(kind_mask_path, kind_mask, allow_pickle=False)
+        self.assertEqual(
+            validate_shard(shard, self.manifest),
+            {"sequences": 4, "rows": 80},
+        )
+
+        labels_path = shard / "card_label_mask.npy"
+        slots_path = shard / "card_slot.npy"
+        labels = np.load(labels_path)
+        slots = np.load(slots_path)
+        labels[2] = 1
+        slots[2] = 0
+        np.save(labels_path, labels, allow_pickle=False)
+        np.save(slots_path, slots, allow_pickle=False)
+        with self.assertRaisesRegex(DatasetContractError, "empty hand slot"):
+            validate_shard(shard, self.manifest)
+
 
 if __name__ == "__main__":
     unittest.main()
-
