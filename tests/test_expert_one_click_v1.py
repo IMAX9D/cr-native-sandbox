@@ -1156,6 +1156,72 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 with self.assertRaisesRegex(OneClickError, "artifact SHA changed"):
                     orchestrator.collect()
 
+    def test_collect_accepts_expected_supervisor_exit_at_exact_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "crawler-runtime.py"
+            runtime.write_text("value=1\n", encoding="utf-8")
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root / "crawler",
+                crawler_python=root / "crawler-python.exe",
+                training_python=root / "python.exe",
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+                target=1,
+            )
+            config.authoritative_db.write_bytes(b"sqlite-checkpoint")
+            config.authoritative_root.mkdir(parents=True)
+            (config.authoritative_root / "index.jsonl").write_text(
+                '{"battle_tag":"A"}\n', encoding="utf-8"
+            )
+            fingerprint = file_fingerprint(runtime)
+            fence = CollectionRuntimeFence(
+                inputs=(fingerprint,),
+                legacy_inputs=(fingerprint,),
+                crawler_runtime_inputs=(fingerprint,),
+                supervisor_runtime_inputs=(fingerprint,),
+                supervisor_process_evidence={
+                    "runtime_files_predate_process": True
+                },
+            )
+            orchestrator = OneClickOrchestrator(config)
+            with (
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_settings",
+                    return_value={},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_db_invariants",
+                    return_value={"accepted": 1},
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._collection_runtime_fence",
+                    return_value=fence,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._authoritative_count",
+                    return_value=1,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._crawler_active",
+                    return_value=False,
+                ),
+                mock.patch(
+                    "expert_v1.one_click_v1._sqlite_quick_check_and_checkpoint",
+                    return_value={"quick_check": "ok"},
+                ),
+            ):
+                orchestrator.collect()
+            stage = orchestrator.journal.value["stages"]["collect_schema5_v3"]
+            self.assertEqual(stage["status"], "completed")
+            self.assertEqual(stage["details"]["accepted"], 1)
+            self.assertFalse(stage["details"]["crawler_process_evidence"])
+
     def test_running_collect_state_migration_archives_exact_old_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

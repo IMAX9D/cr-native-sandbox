@@ -22,7 +22,7 @@
 控制状态保存在：
 
 ```text
-D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v4\control\state.json
+D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v5\control\state.json
 ```
 
 每个阶段在开始时写入输入文件 SHA-256，在完成时写入输出文件 SHA-256。重新双击时，已完成阶段只有在输入、输出逐字节未变化时才跳过；任何漂移都会停止并保留现场。单实例 OS 文件锁阻止两个入口同时写同一批数据，另一个固定的全局锁阻止不同数据根同时争用 AVD/ADB/direct ports。
@@ -55,12 +55,12 @@ scripts\start_expert_one_click_v1.ps1 -Status
 scripts\start_expert_one_click_v1.ps1 -Smoke
 ```
 
-日志保存在 `...\one-click-schema5-v3-current-frontier-v4\logs`。该根目录绑定
+日志保存在 `...\one-click-schema5-v3-current-frontier-v5\logs`。该根目录绑定
 2026-08-27 当前全球/各国家排行榜重新冻结的 unseen-only 玩家 frontier，且每个玩家
 只读取最新首屏，并使用 contract v3 的 Tower Troop 16 精确国王等级证据（国王塔受伤
 时仍有效），并把纯采集阶段的列表内存滞回门设为 6/7.5 GiB；AVD 仍只会在 crawler
 完全停止后按独立的16 GiB门选择。旧 `one-click-schema5-v3`、`current-frontier-v1`
-、`current-frontier-v2` 和 `current-frontier-v3` journal 保留为审计证据，不会被
+、`current-frontier-v2`、`current-frontier-v3` 和 `current-frontier-v4` journal 保留为审计证据，不会被
 新语义静默续写。当前生产代理数按冷启动并行实测冻结为19条互异健康出口；不再为了
 凑满已经不可用的21条而让 supervisor 退出。失败时不要删除状态或产物；修复外部原因后重新双击，
 流程会从当前阶段恢复。

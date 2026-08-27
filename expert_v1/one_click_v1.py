@@ -61,7 +61,7 @@ from expert_v1.token_coverage_v1 import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_ROOT = Path(
-    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v4"
+    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v5"
 )
 DEFAULT_CRAWLER_ROOT = Path(r"D:\皇室战争数据集")
 DEFAULT_CRAWLER_PYTHON = Path(
@@ -2770,6 +2770,40 @@ class OneClickOrchestrator:
                         f"{accepted}/{config.target}"
                     )
                 active = _crawler_active(config)
+                if accepted == config.target:
+                    # The authoritative supervisor exits normally as soon as
+                    # it writes the target-th accepted battle.  Treating that
+                    # expected exit as a failed start creates a terminal race.
+                    # A live supervisor is authenticated; an already-exited
+                    # one proceeds to the same DB checkpoint/invariant fence.
+                    if active:
+                        if not _crawler_active(
+                            config,
+                            runtime_inputs=fence.crawler_runtime_inputs,
+                            runtime_fingerprints_verified=True,
+                        ):
+                            raise OneClickError(
+                                "authoritative supervisor runtime changed at target"
+                            )
+                        last_process_evidence = _crawler_process_runtime_evidence(
+                            config, fence.crawler_runtime_inputs
+                        )
+                    self.journal.progress("collect_schema5_v3", {
+                        "accepted": accepted,
+                        "target": config.target,
+                        "remaining": 0,
+                        "crawler_active": active,
+                        "runtime_inputs_sha256": hashlib.sha256(
+                            _canonical(inputs)
+                        ).hexdigest(),
+                        "crawler_process_evidence": last_process_evidence,
+                    })
+                    print(
+                        f"[collection] {accepted:,}/{config.target:,} remaining=0",
+                        flush=True,
+                    )
+                    _verify_fingerprints(inputs)
+                    break
                 if not active:
                     self.runner.run(
                         crawler_command(config, "start"),
@@ -2803,14 +2837,6 @@ class OneClickOrchestrator:
                     f"remaining={config.target - accepted:,}",
                     flush=True,
                 )
-                if accepted == config.target:
-                    # Target fence: detect a same-iteration mutation that
-                    # occurred after the poll's first verification.
-                    _verify_fingerprints(inputs)
-                    last_process_evidence = _crawler_process_runtime_evidence(
-                        config, fence.crawler_runtime_inputs
-                    )
-                    break
                 self.sleep(config.poll_seconds)
 
             _verify_fingerprints(inputs)
