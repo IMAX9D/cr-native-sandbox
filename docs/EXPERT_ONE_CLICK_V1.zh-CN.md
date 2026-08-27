@@ -65,7 +65,7 @@ scripts\start_expert_one_click_v1.ps1 -Smoke
 
 默认针对当前 20 逻辑核 / 32 GB 主机：
 
-- crawler 使用 `config.authoritative.toml` 内自己的 22 lane、128 全局并发配置；
+- crawler 使用 `config.authoritative.toml` 内当前可用的 21 个互异健康出口、128 全局并发配置；第 22 个出口在冷启动实测无法形成独立健康出口，因此未把重复或失效线路伪装成并发；
 - eligibility audit 使用 20 个线程；
 - 原生生成每 AVD 固定 4 Worker；crawler 完全停止后若可用内存至少 16 GiB，使用 2 AVD/8 Worker（38031–38038），否则使用 1 AVD/4 Worker（38031–38034）；
 - BC 编译请求最多 32 个 I/O 校验线程和 10 个进程 Worker；实际进程数由容量预检
@@ -84,8 +84,9 @@ scripts\start_expert_one_click_v1.ps1 -Smoke
 完整 teacher-forced 成功局会在 generator 结果中留下两个 actor 的内容寻址
 证据。部署标签绑定实际 Tick 的 Mask sidecar 与 `resolved_data_id`；技能标签
 绑定冻结 source marker、libg candidate entity/card、selected entity，以及
-Tick Store 中该实体的精确 native form。失败 Prefix 的证据数组必须为空，
-它永远不能增加训练覆盖。
+Tick Store 中该实体的精确 native form。通过严格 censor 验证的 Prefix 只允许
+贡献失败点之前已经被 libg 接受、且最终数组和 Mask 重新认证成功的标签；失败动作
+本身与失败点之后的数据永远不能贡献训练覆盖。
 
 BC compiler 会再次读取 frozen source、generator result、Tick Store 和 Mask，
 独立重建这些连接。每个观察到的 token 至少需要一条完整成功且最终编译的
@@ -97,3 +98,8 @@ SHA 和无缺口 gate 一并绑定最终 dataset manifest。
 本版不进行无限 repair loop。任一 token、形态或技能仍有缺口时，compiler
 先持久化完整 deficit receipt，再以 `FAILED_COVERAGE` 停止；one-click journal
 会保留该路径作为证据，不会发布 manifest，也不会进入 smoke 或正式训练。
+
+独立的 200 场全链 Smoke 使用显式的 `smoke_deficits_preserved_v1` 编译准入，
+允许在保留完整 deficit receipt 的前提下发布 `production_ready=false`、
+`smoke_only=true` 的非生产数据，以验证编译器和两个训练 batch。该开关不会由正式
+双击入口传入；正式训练也会拒绝这种 manifest，因而不会把小样本覆盖缺口带入生产。
