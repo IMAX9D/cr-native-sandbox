@@ -38,6 +38,7 @@ from expert_v1.one_click_v1 import (  # noqa: E402
     _canonical,
     _crawler_active,
     _read_json,
+    _verify_fingerprints,
     build_frozen_source_token_coverage_receipt,
     component_fingerprints,
     file_fingerprint,
@@ -89,6 +90,25 @@ class SmokeConfig(OneClickConfig):
     @property
     def training_run_id(self) -> str:
         return "expert-v3-current-chain-smoke"
+
+
+def validate_output_isolation(config: SmokeConfig) -> None:
+    output = config.data_root.resolve()
+    authoritative = config.authoritative_root.resolve()
+    production_state = Path(
+        r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3"
+    ).resolve()
+    if (
+        output == production_state
+        or output == authoritative
+        or output.is_relative_to(authoritative)
+        or authoritative.is_relative_to(output)
+        or config.authoritative_db.resolve().is_relative_to(output)
+        or output.is_relative_to(config.crawler_root.resolve())
+    ):
+        raise ChainSmokeError(
+            "smoke output overlaps authoritative/crawler/production state"
+        )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -298,7 +318,35 @@ class V3ChainSmokeRunner:
         orchestrator: OneClickOrchestrator | None = None,
     ) -> None:
         self.config = config
+        validate_output_isolation(config)
         self.orchestrator = orchestrator or OneClickOrchestrator(config)
+
+    def _preflight(self) -> None:
+        config = self.config
+        validate_output_isolation(config)
+        if (
+            config.authoritative_root.name.casefold()
+            != "authoritative-schema5-v3"
+            or config.avds != 2
+            or config.workers_per_avd != 4
+            or config.workers != 8
+            or config.ports != DEFAULT_PORTS
+        ):
+            raise ChainSmokeError("current-v3 smoke identity/layout changed")
+        for required in (
+            config.crawler_config,
+            config.authoritative_db,
+            config.authoritative_root / "index.jsonl",
+            config.native_contract,
+            config.native_contract.with_suffix(
+                config.native_contract.suffix + ".sha256"
+            ),
+            config.template,
+            config.training_python,
+        ):
+            if not required.exists():
+                raise ChainSmokeError(f"required smoke dependency missing: {required}")
+        native_contract_binding(config.native_contract)
 
     def snapshot(self) -> None:
         config = self.config
@@ -409,6 +457,7 @@ class V3ChainSmokeRunner:
             _atomic_json(config.frozen_metadata, metadata)
             if _crawler_active(config):
                 raise ChainSmokeError("crawler resumed during snapshot fence")
+            _verify_fingerprints(inputs)
             return [
                 file_fingerprint(config.source_pool_manifest),
                 file_fingerprint(config.source_pool_metadata),
@@ -420,6 +469,7 @@ class V3ChainSmokeRunner:
         self.orchestrator._run_stage("freeze_schema5_v3", inputs, action)
 
     def run(self) -> None:
+        self._preflight()
         if _crawler_active(self.config):
             raise ChainSmokeError(
                 "pause authoritative collection before running the 2-AVD smoke"

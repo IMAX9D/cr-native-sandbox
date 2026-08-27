@@ -213,7 +213,7 @@ class ExpertV3ChainSmokeTest(unittest.TestCase):
             config = SmokeConfig(
                 project_root=PROJECT_ROOT,
                 data_root=root / "smoke",
-                crawler_root=root,
+                crawler_root=root / "crawler",
                 crawler_python=root / "crawler-python.exe",
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
@@ -238,6 +238,7 @@ class ExpertV3ChainSmokeTest(unittest.TestCase):
 
             runner = V3ChainSmokeRunner(config, orchestrator=FakeOrchestrator())
             with (
+                mock.patch.object(runner, "_preflight"),
                 mock.patch.object(runner, "snapshot", side_effect=lambda: calls.append("snapshot")),
                 mock.patch(
                     "scripts.run_expert_v3_chain_smoke._crawler_active",
@@ -260,7 +261,7 @@ class ExpertV3ChainSmokeTest(unittest.TestCase):
             config = SmokeConfig(
                 project_root=PROJECT_ROOT,
                 data_root=root / "smoke",
-                crawler_root=root,
+                crawler_root=root / "crawler",
                 crawler_python=root / "crawler-python.exe",
                 training_python=root / "python.exe",
                 crawler_config=root / "crawler.toml",
@@ -287,6 +288,7 @@ class ExpertV3ChainSmokeTest(unittest.TestCase):
 
             runner = V3ChainSmokeRunner(config, orchestrator=FakeOrchestrator())
             with (
+                mock.patch.object(runner, "_preflight"),
                 mock.patch.object(
                     runner, "snapshot", side_effect=lambda: calls.append("snapshot")
                 ),
@@ -316,6 +318,31 @@ class ExpertV3ChainSmokeTest(unittest.TestCase):
             self.assertEqual(config.workers, 8)
             self.assertEqual(config.ports, tuple(range(38031, 38039)))
             self.assertEqual(value["stages"]["freeze_schema5_v3"], "pending")
+
+    def test_preflight_rejects_output_overlap_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authoritative = root / "authoritative-schema5-v3"
+            config = SmokeConfig(
+                project_root=PROJECT_ROOT,
+                data_root=authoritative,
+                crawler_root=root / "crawler",
+                crawler_python=root / "crawler-python.exe",
+                training_python=root / "python.exe",
+                crawler_config=root / "crawler.toml",
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=authoritative,
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+                target=2,
+                workers=8,
+                avds=2,
+                workers_per_avd=4,
+                ports=tuple(range(38031, 38039)),
+            )
+            with self.assertRaisesRegex(ChainSmokeError, "overlaps"):
+                V3ChainSmokeRunner(config)
+            self.assertFalse(authoritative.exists())
 
 
 if __name__ == "__main__":
