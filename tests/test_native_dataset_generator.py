@@ -20,6 +20,7 @@ from expert_v1.native_dataset_generator import (
     StoredFrameRegistry,
     execute_task,
     execute_two_phase_plan,
+    native_result_pipeline_contract_valid,
     atomic_json,
     prepare_run,
     reconcile_result_files,
@@ -211,9 +212,9 @@ def semantic_audit(
     *, seed: int = 7, success: bool = False, prefix: int = 0
 ) -> dict:
     return {
-        "schema_version": 1,
-        "kind": "bounded_semantic_seed_preflight_v1",
-        "maximum_compatible_seeds": 8,
+        "schema_version": 2,
+        "kind": "single_semantic_seed_preflight_v2",
+        "maximum_compatible_seeds": 1,
         "raw_seed_scan_limit": 16,
         "raw_seeds_scanned": 3,
         "layout_compatible_candidates_tested": 1,
@@ -223,10 +224,7 @@ def semantic_audit(
         "selected_seed": seed,
         "selected_accepted_source_event_prefix": prefix,
         "selected_teacher_forced_success": success,
-        "selection_rule": (
-            "first_full_success_else_longest_accepted_source_event_prefix_"
-            "then_canonical_seed_order"
-        ),
+        "selection_rule": "first_layout_compatible_seed_only",
         "ability_identity_policy": "branch_required_fails_closed_no_guess",
         "candidates": [{
             "ordinal": 0,
@@ -240,7 +238,48 @@ def semantic_audit(
     }
 
 
+def current_result_pipeline_fields(*, success: bool, seed: int = 7) -> dict:
+    return {
+        "native_preflight_contract_version": 4,
+        "native_execution_pipeline_mode": (
+            "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
+        ),
+        "preflight_teacher_forced_success": success,
+        "preflight_chosen_seed": seed,
+        "chosen_seed": seed,
+        "semantic_seed_preflight": semantic_audit(
+            seed=seed, success=success, prefix=0
+        ),
+    }
+
+
 class NativeDatasetGeneratorTest(unittest.TestCase):
+    def test_current_preflight_not_reached_diagnostic_has_no_artifacts(self) -> None:
+        diagnostic = {
+            "native_preflight_contract_version": 4,
+            "native_execution_pipeline_mode": (
+                "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
+            ),
+            "preflight_teacher_forced_success": None,
+            "preflight_chosen_seed": None,
+            "chosen_seed": None,
+            "semantic_seed_preflight": None,
+            "tick_store_entry": None,
+            "audit_prefix_tick_store_entry": None,
+            "token_coverage_actor_evidence": [],
+            "prefix_token_coverage_actor_evidence": [],
+        }
+        self.assertTrue(native_result_pipeline_contract_valid(diagnostic))
+        for field, value in (
+            ("chosen_seed", 7),
+            ("semantic_seed_preflight", {}),
+            ("tick_store_entry", {}),
+            ("prefix_token_coverage_actor_evidence", [{}]),
+        ):
+            changed = dict(diagnostic)
+            changed[field] = value
+            self.assertFalse(native_result_pipeline_contract_valid(changed), field)
+
     def test_failed_preflight_runs_fixed_seed_prefix_without_mask_probes(self) -> None:
         rejected = replay_result_stub(
             success=False,
@@ -539,9 +578,15 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             first = prepare_run(**args)
             second = prepare_run(**args)
             self.assertEqual(first[0], second[0])
-            self.assertEqual(first[3]["run_contract_version"], 3)
+            self.assertEqual(first[3]["run_contract_version"], 4)
             self.assertEqual(
-                first[3]["native_execution_pipeline"]["contract_version"], 3
+                first[3]["native_execution_pipeline"]["contract_version"], 4
+            )
+            self.assertEqual(
+                first[3]["native_execution_pipeline"]
+                ["semantic_seed_preflight"]
+                ["layout_compatible_candidate_limit"],
+                1,
             )
             with TickStoreWorkQueue(first[2]) as queue:
                 self.assertEqual(queue.counts(), {"pending": 2})
@@ -550,9 +595,18 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 prepare_run(**changed)
             contract_path = output / "run-contract.json"
-            stale_contract = json.loads(contract_path.read_text())
-            stale_contract.pop("native_execution_pipeline")
-            atomic_json(contract_path, stale_contract)
+            cap8_contract = json.loads(contract_path.read_text())
+            cap8_contract["run_contract_version"] = 3
+            cap8_contract["native_execution_pipeline"].update({
+                "contract_version": 3,
+                "mode": (
+                    "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+                ),
+            })
+            cap8_contract["native_execution_pipeline"].pop(
+                "semantic_seed_preflight"
+            )
+            atomic_json(contract_path, cap8_contract)
             with self.assertRaisesRegex(RuntimeError, "resume contract changed"):
                 prepare_run(**args)
 
@@ -620,13 +674,31 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             sink = WorkerShardSink(shards, "worker", episodes_per_shard=1)
             entry = sink.append("CRASH-WINDOW", tick_states(), {"stable": 1})
             sink.finalize()
-            atomic_json(root / "results" / "CRASH_WINDOW.json", {
+            result_path = root / "results" / "CRASH_WINDOW.json"
+            current_result = {
+                **current_result_pipeline_fields(success=True),
                 "schema_version": 1,
                 "kind": "expert_authoritative_native_tick_result_v1",
                 "battle_tag": "CRASH-WINDOW",
                 "teacher_forced_success": True,
                 "tick_store_entry": entry,
+            }
+            legacy_result = json.loads(json.dumps(current_result))
+            legacy_result["native_preflight_contract_version"] = 3
+            legacy_result["native_execution_pipeline_mode"] = (
+                "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+            )
+            legacy_result["semantic_seed_preflight"].update({
+                "schema_version": 1,
+                "kind": "bounded_semantic_seed_preflight_v1",
+                "maximum_compatible_seeds": 8,
             })
+            atomic_json(result_path, legacy_result)
+            with self.assertRaisesRegex(RuntimeError, "stale/invalid"):
+                reconcile_result_files(root, queue_path)
+            with TickStoreWorkQueue(queue_path) as queue:
+                self.assertEqual(queue.counts(), {"leased": 1})
+            atomic_json(result_path, current_result)
             self.assertEqual(reconcile_result_files(root, queue_path), 1)
             with TickStoreWorkQueue(queue_path) as queue:
                 self.assertEqual(queue.counts(), {"done": 1})
@@ -663,6 +735,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             entry = sink.append("PREFIX-CRASH", tick_states(), {"audit": True})
             sink.finalize()
             atomic_json(root / "results" / "PREFIX_CRASH.json", {
+                **current_result_pipeline_fields(success=False),
                 "schema_version": 1,
                 "kind": "expert_authoritative_native_tick_result_v1",
                 "battle_tag": "PREFIX-CRASH",
@@ -813,9 +886,9 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             "failure_class": "ability_branch_required",
             "failure_domain": "semantic",
             "terminal_diagnostic_status": "not_reached",
-            "native_preflight_contract_version": 3,
+            "native_preflight_contract_version": 4,
             "native_execution_pipeline_mode": (
-                "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+                "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
             ),
             "preflight_teacher_forced_success": False,
             "preflight_chosen_seed": 7,

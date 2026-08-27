@@ -123,6 +123,13 @@ form slot 原样保留，并在未知 seed 空间按升序做有界原生搜索�
 初始手牌变量，不是恢复出的真人原始 seed。详见
 `NATIVE_TEACHER_FORCED_GUARD_AND_SEED_SEARCH.zh-CN.md`。
 
+生产 generator 的 pipeline contract v4 只把升序扫描得到的**第一个**双边布局兼容
+seed 送入无 trace semantic preflight。raw seed 仍由真实 libg reset 逐一验证，搜索
+上限仍为 4096；变化仅是取消对第 2～8 个布局兼容 seed 的重复完整语义 replay。
+固定 seed 的 full/audit-prefix trace 与 preflight parity、技能实体 fail-closed 均保持
+不变。审计记录为 `single_semantic_seed_preflight_v2` 且 candidate limit 必须等于 1；
+旧 cap=8 pipeline v3 的 run contract、结果或 Tick Store 不能续接到 v4 输出目录。
+
 ## 4. 高效并发执行
 
 生产执行采用动态工作队列，不做同步 vector barrier：

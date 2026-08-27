@@ -19,7 +19,10 @@ from .upgrade_base_cycles import INITIAL_MASKS, INITIAL_QUEUES
 
 
 DEFAULT_MAXIMUM_SEEDS_TO_TEST = 4096
-DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS = 8
+# Production deliberately evaluates only the canonical first layout-compatible
+# seed.  The generic iterator still accepts an explicit larger diagnostic cap,
+# but generator contracts freeze this default and reject overrides.
+DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS = 1
 
 
 class NativeSeedSearchError(RuntimeError):

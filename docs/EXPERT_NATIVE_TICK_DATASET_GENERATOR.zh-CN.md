@@ -82,6 +82,12 @@ data_i=1 -> identity
 
 输出是“同版本 libg + 专家原始动作序列”的原生 teacher-forced 轨迹，不声明恢复 RoyaleAPI 未提供的原始 RNG/隐藏状态。每场 seed 只用于寻找与已观察八卡循环兼容的初始手牌布局。schema 5 会把来源 numeric game mode 与塔兵等级准确送入 replay；King Tower level 和 exact source build 仍是缺失字段，不能由此宣称原始状态完全一致。
 
+正式 run contract v4 将 semantic candidate limit 固定为 1：升序 raw seed scan 保持
+不变，找到首个双边布局兼容 seed 后只执行一次无 trace/no-mask preflight。该 seed
+随后固定用于 full trace 或 censored prefix trace，并继续要求逐字段 semantic parity。
+技能多候选仍直接失败，不能借性能优化选择或猜测技能实体。cap=8 的 v3 产物因
+contract version、pipeline mode、audit kind 与显式 candidate-limit 字段不同而不能续跑。
+
 schema 5 的终局六塔 HP 是诊断锚点，不影响 teacher-forced 动作接受的定义。由于
 来源 Princess 槽位 0/1 尚无 native 左右映射证据，比较采用 King 精确值、两个
 Princess HP 多重集合和 total；结果单独写入 tower-HP diagnostic 字段。

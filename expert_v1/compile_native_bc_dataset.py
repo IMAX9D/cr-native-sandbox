@@ -39,6 +39,14 @@ import numpy as np
 
 from .native_capabilities import ability_cards
 from .native_ingest_contract import load_native_ingest_contract
+from .native_dataset_generator import (
+    DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS,
+    NATIVE_PREFLIGHT_CONTRACT_VERSION,
+    NATIVE_PREFLIGHT_MODE,
+    SEMANTIC_SEED_AUDIT_KIND,
+    SEMANTIC_SEED_AUDIT_SCHEMA_VERSION,
+    native_episode_pipeline_contract_valid,
+)
 from .native_replay_plan import BattlePlan, compile_battle
 from .tick_store_v1.deployment_masks import (
     DeploymentMaskStore,
@@ -165,6 +173,8 @@ class EpisodeInput:
     terminal_target: str = "unknown_unanchored_v1"
     extent_sha256: str = "0" * 64
     mask_metadata_sha256: str = "0" * 64
+    native_pipeline_sha256: str = "0" * 64
+    chosen_seed: int = 0
     prefix_ability_evidence: tuple[dict[str, Any], ...] = ()
 
 
@@ -762,6 +772,21 @@ def _authenticate_native_generation_receipt(
         or contract_binding.get("file_sha256") != contract_file_sha256
     ):
         raise NativeBcCompileError("native coverage contract identity changed")
+    pipeline = receipt.get("native_execution_pipeline")
+    if not isinstance(pipeline, Mapping) or dict(pipeline) != {
+        "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+        "mode": NATIVE_PREFLIGHT_MODE,
+        "semantic_seed_audit_schema_version": (
+            SEMANTIC_SEED_AUDIT_SCHEMA_VERSION
+        ),
+        "semantic_seed_audit_kind": SEMANTIC_SEED_AUDIT_KIND,
+        "layout_compatible_candidate_limit": (
+            DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+        ),
+    }:
+        raise NativeBcCompileError(
+            "native generation receipt pipeline is not current cap=1 v4"
+        )
     target = _require_integer(receipt.get("target_battles"), "coverage target", minimum=1)
     selected = _require_integer(receipt.get("selected_battles"), "coverage selected")
     processed = _require_integer(receipt.get("processed_battles"), "coverage processed")
@@ -889,6 +914,7 @@ def _authenticate_native_generation_receipt(
         ),
         "audit_prefix_manifest_path": str(prefix_manifest_path),
         "audit_prefix_manifest_sha256": sha256_file(prefix_manifest_path),
+        "native_execution_pipeline": dict(pipeline),
     }
 
 
@@ -1105,6 +1131,7 @@ def validate_compile_plan(
             "compiler_sha256", "training_schema_sha256",
             "deployment_masks_sha256", "native_coverage_validator_sha256",
             "token_coverage_validator_sha256",
+            "native_dataset_generator_sha256", "native_seed_search_sha256",
         },
         "compile-plan components",
     )
@@ -1262,7 +1289,8 @@ def validate_compile_plan(
         "compiled_tick_count", "observation_tick_start",
         "observation_tick_stop_exclusive", "action_label_tick_stop_exclusive",
         "timing_censor_tick_exclusive", "timing_target", "terminal_target",
-        "extent_sha256", "mask_metadata_sha256",
+        "extent_sha256", "mask_metadata_sha256", "native_pipeline_sha256",
+        "chosen_seed",
         "prefix_ability_evidence",
     }
     shard_fields = {
@@ -1319,9 +1347,10 @@ def validate_compile_plan(
             )
             for name in (
                 "tick_payload_sha256", "source_sha256", "component_sha256",
-                "extent_sha256", "mask_metadata_sha256",
+                "extent_sha256", "mask_metadata_sha256", "native_pipeline_sha256",
             ):
                 _require_sha(item.get(name), f"episode.{name}")
+            _require_integer(item.get("chosen_seed"), "episode.chosen_seed", minimum=1)
             for name in (
                 "tick_store_root", "tick_data_path", "tick_index_path", "source_path"
             ):
@@ -1912,6 +1941,12 @@ def validate_compile_plan(
             ).resolve(),
             "token_coverage_validator_sha256": (
                 Path(__file__).parent / "token_coverage_v1.py"
+            ).resolve(),
+            "native_dataset_generator_sha256": (
+                Path(__file__).parent / "native_dataset_generator.py"
+            ).resolve(),
+            "native_seed_search_sha256": (
+                Path(__file__).parent / "native_seed_search.py"
             ).resolve(),
         }
         for name, path in component_paths.items():
@@ -2679,6 +2714,16 @@ def create_compile_plan(
         raise NativeBcCompileError(
             "full/prefix Tick Store episode sets differ from native results"
         )
+    result_rows = {
+        str(row.get("battle_tag") or ""): row
+        for row in _json_lines(
+            Path(str(native_generation_coverage["results_path"]))
+        )
+    }
+    if set(result_rows) != set(episode_entries) | set(prefix_episode_entries):
+        raise NativeBcCompileError(
+            "authenticated native result set differs from Full/Prefix episodes"
+        )
     source_token_coverage = (
         None
         if source_token_coverage_receipt is None
@@ -2727,12 +2772,6 @@ def create_compile_plan(
         )
     prefix_ability_by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
     if prefix_episode_entries and source_token_coverage is not None:
-        result_rows = {
-            str(row.get("battle_tag") or ""): row
-            for row in _json_lines(
-                Path(str(native_generation_coverage["results_path"]))
-            )
-        }
         prefix_actor_evidence: list[Mapping[str, Any]] = []
         for tag in sorted(prefix_episode_entries):
             actors = result_rows.get(tag, {}).get(
@@ -2816,6 +2855,14 @@ def create_compile_plan(
                 raise NativeBcCompileError(f"Tick/source SHA identity mismatch: {tag}")
             if int(metadata.get("source_schema_version", -1)) != 5:
                 raise NativeBcCompileError(f"Tick episode is not schema-v5: {tag}")
+            result_row = result_rows[tag]
+            if not native_episode_pipeline_contract_valid(
+                metadata, result_row
+            ):
+                raise NativeBcCompileError(
+                    f"Tick episode/result pipeline is not current cap=1 v4: {tag}"
+                )
+            native_pipeline = metadata["native_execution_pipeline"]
             masks = active_mask_store.verify_episode_metadata(
                 metadata,
                 require_complete=replay_extent == FULL_SUCCESS_EXTENT,
@@ -2912,6 +2959,8 @@ def create_compile_plan(
                 "player_tags": players,
                 **extent_contract,
                 "mask_metadata_sha256": _digest(dict(masks)),
+                "native_pipeline_sha256": _digest(dict(native_pipeline)),
+                "chosen_seed": int(result_row["preflight_chosen_seed"]),
                 "prefix_ability_evidence": prefix_ability_by_tag.get(tag, []),
             }
         )
@@ -3073,6 +3122,12 @@ def create_compile_plan(
             ),
             "token_coverage_validator_sha256": sha256_file(
                 (Path(__file__).parent / "token_coverage_v1.py").resolve()
+            ),
+            "native_dataset_generator_sha256": sha256_file(
+                (Path(__file__).parent / "native_dataset_generator.py").resolve()
+            ),
+            "native_seed_search_sha256": sha256_file(
+                (Path(__file__).parent / "native_seed_search.py").resolve()
             ),
         },
     }
@@ -3840,6 +3895,35 @@ def _compile_output_shard(
                 raise NativeBcCompileError(
                     f"compiled replay extent differs from plan: {episode.battle_tag}"
                 )
+            pipeline = metadata.get("native_execution_pipeline")
+            if not isinstance(pipeline, Mapping):
+                raise NativeBcCompileError(
+                    f"compiled episode lacks native pipeline: {episode.battle_tag}"
+                )
+            pipeline_result = {
+                "native_preflight_contract_version": (
+                    NATIVE_PREFLIGHT_CONTRACT_VERSION
+                ),
+                "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
+                "preflight_teacher_forced_success": (
+                    episode.replay_extent == FULL_SUCCESS_EXTENT
+                ),
+                "preflight_chosen_seed": episode.chosen_seed,
+                "chosen_seed": episode.chosen_seed,
+                "semantic_seed_preflight": pipeline.get(
+                    "semantic_seed_selection"
+                ),
+            }
+            if (
+                _digest(dict(pipeline)) != episode.native_pipeline_sha256
+                or not native_episode_pipeline_contract_valid(
+                    metadata, pipeline_result
+                )
+            ):
+                raise NativeBcCompileError(
+                    "compiled episode pipeline differs from authenticated plan: "
+                    f"{episode.battle_tag}"
+                )
             active_tick_store_root = Path(episode.tick_store_root)
             active_mask_store = DeploymentMaskStore(
                 active_tick_store_root, create=False
@@ -4409,6 +4493,36 @@ def _final_compiled_token_coverage(
                 reader = ShardReader(Path(reader_key[0]), Path(reader_key[1]))
                 readers[reader_key] = reader
             episode = reader.episode(tag)
+            episode_pipeline = episode.metadata.get(
+                "native_execution_pipeline"
+            )
+            pipeline_result = {
+                "native_preflight_contract_version": (
+                    NATIVE_PREFLIGHT_CONTRACT_VERSION
+                ),
+                "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
+                "preflight_teacher_forced_success": (
+                    episode_input["replay_extent"] == FULL_SUCCESS_EXTENT
+                ),
+                "preflight_chosen_seed": episode_input["chosen_seed"],
+                "chosen_seed": episode_input["chosen_seed"],
+                "semantic_seed_preflight": (
+                    episode_pipeline.get("semantic_seed_selection")
+                    if isinstance(episode_pipeline, Mapping)
+                    else None
+                ),
+            }
+            if (
+                not isinstance(episode_pipeline, Mapping)
+                or _digest(dict(episode_pipeline))
+                != episode_input["native_pipeline_sha256"]
+                or not native_episode_pipeline_contract_valid(
+                    episode.metadata, pipeline_result
+                )
+            ):
+                raise NativeBcCompileError(
+                    f"final token episode pipeline changed: {tag}"
+                )
             stored_states = tuple(episode.iter_ticks())
             is_prefix = episode_input["replay_extent"] == VALID_PREFIX_EXTENT
             states = (
@@ -5098,6 +5212,12 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         ).resolve(),
         "token_coverage_validator_sha256": (
             Path(__file__).parent / "token_coverage_v1.py"
+        ).resolve(),
+        "native_dataset_generator_sha256": (
+            Path(__file__).parent / "native_dataset_generator.py"
+        ).resolve(),
+        "native_seed_search_sha256": (
+            Path(__file__).parent / "native_seed_search.py"
         ).resolve(),
     }
     for name, path in component_paths.items():

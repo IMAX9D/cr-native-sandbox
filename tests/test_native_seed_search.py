@@ -177,6 +177,19 @@ class NativeSeedSearchTest(unittest.TestCase):
         self.assertEqual(search.seeds_scanned, 6)
         self.assertEqual(search.compatible_seeds_yielded, 2)
 
+    def test_semantic_candidate_default_stops_after_first_compatible_seed(self) -> None:
+        plan = compile_battle(source_battle())
+        env = FakeSeedEnv({2, 5, 6})
+        search = compatible_native_seed_search(
+            env,
+            plan,
+            template(),
+            maximum_seeds_to_test=10,
+        )
+        self.assertEqual([row.chosen_seed for row in search], [2])
+        self.assertEqual(env.seeds, [1, 2])
+        self.assertEqual(search.compatible_seeds_yielded, 1)
+
     def test_fixed_seed_replay_resets_once_without_repeating_search(self) -> None:
         plan = compile_battle(source_battle())
         searched_env = FakeSeedEnv(compatible_seed=3)

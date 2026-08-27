@@ -32,6 +32,14 @@ from expert_v1.native_ingest_contract import (
     CONTRACT_KIND as NATIVE_CONTRACT_KIND,
     CONTRACT_SCHEMA_VERSION as NATIVE_CONTRACT_SCHEMA_VERSION,
 )
+from expert_v1.native_dataset_generator import (
+    DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS,
+    NATIVE_PREFLIGHT_CONTRACT_VERSION,
+    NATIVE_PREFLIGHT_MODE,
+    SEMANTIC_SEED_AUDIT_KIND,
+    SEMANTIC_SEED_AUDIT_SCHEMA_VERSION,
+    native_result_pipeline_contract_valid,
+)
 from expert_v1.token_coverage_v1 import (
     RECEIPT_KIND as TOKEN_COVERAGE_RECEIPT_KIND,
     RECEIPT_SCHEMA_VERSION as TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION,
@@ -1863,6 +1871,11 @@ def validate_native_result_records(
                 raise OneClickError(
                     f"native result is not a unique final attempt at line {line_number}"
                 )
+            if not native_result_pipeline_contract_valid(row):
+                raise OneClickError(
+                    "native result is not current cap=1 pipeline v4 at "
+                    f"line {line_number}"
+                )
             seen.add(tag)
             cohort_name = (
                 "ability_positive" if expected[tag] else "ability_zero"
@@ -2739,6 +2752,17 @@ class OneClickOrchestrator:
                 "native_contract": native_contract_binding(
                     config.native_contract
                 ),
+                "native_execution_pipeline": {
+                    "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+                    "mode": NATIVE_PREFLIGHT_MODE,
+                    "semantic_seed_audit_schema_version": (
+                        SEMANTIC_SEED_AUDIT_SCHEMA_VERSION
+                    ),
+                    "semantic_seed_audit_kind": SEMANTIC_SEED_AUDIT_KIND,
+                    "layout_compatible_candidate_limit": (
+                        DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+                    ),
+                },
                 "source_token_coverage": file_fingerprint(
                     config.source_token_coverage_receipt
                 ),

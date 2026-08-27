@@ -76,6 +76,77 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "expert_schema5_authoritative.json"
 
 
+def current_semantic_audit(*, success: bool, seed: int = 7) -> dict:
+    return {
+        "schema_version": 2,
+        "kind": "single_semantic_seed_preflight_v2",
+        "maximum_compatible_seeds": 1,
+        "raw_seed_scan_limit": 4096,
+        "raw_seeds_scanned": 3,
+        "layout_compatible_candidates_tested": 1,
+        "layout_compatible_candidates_found": 1,
+        "layout_scan_native_resets": 3,
+        "semantic_preflight_native_resets": 1,
+        "selected_seed": seed,
+        "selected_accepted_source_event_prefix": 1,
+        "selected_teacher_forced_success": success,
+        "selection_rule": "first_layout_compatible_seed_only",
+        "ability_identity_policy": "branch_required_fails_closed_no_guess",
+        "candidates": [{
+            "ordinal": 0,
+            "seed": seed,
+            "raw_seeds_scanned_when_found": 3,
+            "teacher_forced_success": success,
+            "accepted_source_event_prefix": 1,
+            "failure": None if success else "semantic",
+            "semantics_sha256": "a" * 64,
+        }],
+    }
+
+
+def current_result_pipeline(*, success: bool, seed: int = 7) -> dict:
+    return {
+        "native_preflight_contract_version": 4,
+        "native_execution_pipeline_mode": (
+            "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
+        ),
+        "preflight_teacher_forced_success": success,
+        "preflight_chosen_seed": seed,
+        "chosen_seed": seed,
+        "semantic_seed_preflight": current_semantic_audit(
+            success=success, seed=seed
+        ),
+    }
+
+
+def current_pipeline_metadata(*, success: bool, seed: int = 7) -> dict:
+    audit = current_semantic_audit(success=success, seed=seed)
+    value = {
+        "contract_version": 4,
+        "mode": "single_semantic_seed_preflight_then_fixed_seed_trace_v4",
+        "preflight_chosen_seed": seed,
+        "preflight_seeds_tested": 3,
+        "preflight_semantics_sha256": "a" * 64,
+        "semantic_seed_selection": audit,
+    }
+    if success:
+        value.update({
+            "full_trace_semantics_sha256": "a" * 64,
+            "semantic_diff_count": 0,
+            "semantic_match": True,
+        })
+    return value
+
+
+CURRENT_RECEIPT_PIPELINE = {
+    "contract_version": 4,
+    "mode": "single_semantic_seed_preflight_then_fixed_seed_trace_v4",
+    "semantic_seed_audit_schema_version": 2,
+    "semantic_seed_audit_kind": "single_semantic_seed_preflight_v2",
+    "layout_compatible_candidate_limit": 1,
+}
+
+
 def create_compile_plan(*args: object, **kwargs: object) -> dict[str, object]:
     """Keep legacy test call sites terse while exercising the explicit API."""
 
@@ -365,6 +436,9 @@ class NativeBcCompilerTests(unittest.TestCase):
                             else published["file_sha256"]
                         ),
                         "native_deployment_masks_v1": capture.metadata(),
+                        "native_execution_pipeline": current_pipeline_metadata(
+                            success=True
+                        ),
                     },
                 )
             writer.finalize()
@@ -407,6 +481,7 @@ class NativeBcCompilerTests(unittest.TestCase):
             "".join(
                 json.dumps(
                     {
+                        **current_result_pipeline(success=True),
                         "kind": "expert_authoritative_native_tick_result_v1",
                         "battle_tag": f"SCHEMA5FIXTURE{number}",
                         "final_attempt": True,
@@ -443,6 +518,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "candidate_queue": file_fingerprint(candidate_queue),
                     "results": file_fingerprint(results_path),
                     "native_contract": native_contract_binding(contract),
+                    "native_execution_pipeline": CURRENT_RECEIPT_PIPELINE,
                     "target_battles": 3,
                     "selected_battles": 3,
                     "processed_battles": 3,
@@ -866,6 +942,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     ).hexdigest()
                     actors.append(actor)
                 result_rows.append({
+                    **current_result_pipeline(success=True),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": tag,
                     "final_attempt": True,
@@ -1046,6 +1123,42 @@ class NativeBcCompilerTests(unittest.TestCase):
                     maximum_rows_per_shard=10_000,
                 )
 
+    def test_resigned_cap8_results_are_rejected_before_compile_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(root)
+            coverage = json.loads(receipt.read_text(encoding="utf-8"))
+            results_path = Path(coverage["results"]["path"])
+            rows = [json.loads(line) for line in results_path.read_text().splitlines()]
+            rows[0]["native_preflight_contract_version"] = 3
+            rows[0]["native_execution_pipeline_mode"] = (
+                "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+            )
+            rows[0]["semantic_seed_preflight"].update({
+                "schema_version": 1,
+                "kind": "bounded_semantic_seed_preflight_v1",
+                "maximum_compatible_seeds": 8,
+            })
+            results_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            # Re-sign the containing receipt fingerprint; semantic identity,
+            # not a stale outer digest, must be the rejection reason.
+            coverage["results"] = file_fingerprint(results_path)
+            receipt.write_text(json.dumps(coverage) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "candidate/result join failed"
+            ):
+                create_compile_plan(
+                    tick_root,
+                    source,
+                    root / "resigned-cap8",
+                    contract,
+                    receipt,
+                    maximum_rows_per_shard=10_000,
+                )
+
     def test_ability_failures_require_explicit_waiver_at_compiler_admission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1084,6 +1197,7 @@ class NativeBcCompilerTests(unittest.TestCase):
             ] + [{"battle_tag": "ABILITYFAIL", "ability_events_observed": 1}]
             result_rows = [
                 {
+                    **current_result_pipeline(success=True),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": f"SCHEMA5FIXTURE{number}",
                     "final_attempt": True,
@@ -1092,6 +1206,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                 for number in range(3)
             ] + [
                 {
+                    **current_result_pipeline(success=False),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": "ABILITYFAIL",
                     "final_attempt": True,

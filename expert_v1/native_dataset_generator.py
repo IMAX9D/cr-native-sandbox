@@ -81,11 +81,14 @@ TASK_KIND = "expert_authoritative_native_tick_task_v1"
 RESULT_KIND = "expert_authoritative_native_tick_result_v1"
 DIAGNOSTIC_KIND = "expert_authoritative_native_tick_failure_v1"
 COORDINATE_PROVENANCE = "royaleapi_raw_data_i_to_native_v1"
-RUN_CONTRACT_VERSION = 3
-NATIVE_PREFLIGHT_CONTRACT_VERSION = 3
+RUN_CONTRACT_VERSION = 4
+NATIVE_PREFLIGHT_CONTRACT_VERSION = 4
 NATIVE_PREFLIGHT_MODE = (
-    "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+    "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
 )
+SEMANTIC_SEED_AUDIT_SCHEMA_VERSION = 2
+SEMANTIC_SEED_AUDIT_KIND = "single_semantic_seed_preflight_v2"
+SEMANTIC_SEED_SELECTION_RULE = "first_layout_compatible_seed_only"
 AUDIT_PREFIX_DIRECTORY = "audit-prefix-shards"
 REPLAY_EXTENT_METADATA_KEY = "native_replay_extent_v1"
 REPLAY_EXTENT_KIND = "cr_native_replay_extent_v1"
@@ -576,6 +579,15 @@ def prepare_run(
         "native_execution_pipeline": {
             "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
             "mode": NATIVE_PREFLIGHT_MODE,
+            "semantic_seed_preflight": {
+                "layout_compatible_candidate_limit": (
+                    DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+                ),
+                "selection_rule": SEMANTIC_SEED_SELECTION_RULE,
+                "raw_seed_scan": (
+                    "canonical ascending libg resets until first compatible layout"
+                ),
+            },
             "preflight": {
                 "tick_sink": False,
                 "deployment_mask_capture": False,
@@ -1540,14 +1552,19 @@ def execute_bounded_semantic_preflights(
     ),
     trace_batch_steps: int,
 ) -> SemanticSeedPreflightSelection:
-    """Select a seed using at most N layout-compatible semantic preflights.
+    """Run exactly one semantic preflight on the first compatible seed.
 
     Every candidate replay is no-trace/no-mask and uses an exact fixed seed.
-    The first complete replay wins immediately.  If none completes, the seed
-    with the longest contiguous accepted source-event prefix wins; ties keep
-    canonical ascending candidate order.  Ability branches remain unselected,
-    so this search can never invent an ability identity.
+    Raw seed scanning remains canonical and bounded, but only its first
+    layout-compatible result enters semantic replay.  Ability branches remain
+    unselected, so this search can never invent an ability identity.
     """
+
+    if maximum_compatible_seeds != DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS:
+        raise ValueError(
+            "production semantic preflight requires exactly one "
+            "layout-compatible seed"
+        )
 
     search = compatible_native_seed_search(
         env,
@@ -1606,8 +1623,8 @@ def execute_bounded_semantic_preflights(
             preferred_seed=int(seed),
         )
     audit = {
-        "schema_version": 1,
-        "kind": "bounded_semantic_seed_preflight_v1",
+        "schema_version": SEMANTIC_SEED_AUDIT_SCHEMA_VERSION,
+        "kind": SEMANTIC_SEED_AUDIT_KIND,
         "maximum_compatible_seeds": int(maximum_compatible_seeds),
         "raw_seed_scan_limit": int(maximum_seeds_to_test),
         "raw_seeds_scanned": int(search.seeds_scanned),
@@ -1622,10 +1639,7 @@ def execute_bounded_semantic_preflights(
         "selected_teacher_forced_success": bool(
             selected.teacher_forced_success
         ),
-        "selection_rule": (
-            "first_full_success_else_longest_accepted_source_event_prefix_"
-            "then_canonical_seed_order"
-        ),
+        "selection_rule": SEMANTIC_SEED_SELECTION_RULE,
         "ability_identity_policy": "branch_required_fails_closed_no_guess",
         "candidates": candidate_rows,
     }
@@ -1658,9 +1672,9 @@ def semantic_seed_audit_valid(
     except (KeyError, TypeError, ValueError):
         return False
     if (
-        audit.get("schema_version") != 1
-        or audit.get("kind") != "bounded_semantic_seed_preflight_v1"
-        or not 1 <= maximum <= DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
+        audit.get("schema_version") != SEMANTIC_SEED_AUDIT_SCHEMA_VERSION
+        or audit.get("kind") != SEMANTIC_SEED_AUDIT_KIND
+        or maximum != DEFAULT_MAXIMUM_COMPATIBLE_SEMANTIC_SEEDS
         or tested != len(candidates)
         or not 1 <= tested <= maximum
         or found != tested
@@ -1669,11 +1683,7 @@ def semantic_seed_audit_valid(
         or semantic_resets != tested
         or audit.get("ability_identity_policy")
         != "branch_required_fails_closed_no_guess"
-        or audit.get("selection_rule")
-        != (
-            "first_full_success_else_longest_accepted_source_event_prefix_"
-            "then_canonical_seed_order"
-        )
+        or audit.get("selection_rule") != SEMANTIC_SEED_SELECTION_RULE
         or selected_seed != chosen_seed
         or audit.get("selected_teacher_forced_success")
         is not teacher_forced_success
@@ -1704,19 +1714,101 @@ def semantic_seed_audit_valid(
             return False
         previous_seed = seed
         normalized.append((ordinal, seed, success, prefix))
-    successful = [row for row in normalized if row[2]]
-    expected = (
-        successful[0]
-        if successful
-        else max(normalized, key=lambda row: (row[3], -row[0]))
-    )
-    if successful and expected[0] != len(normalized) - 1:
-        # Search must stop immediately after the first full success.
-        return False
+    expected = normalized[0]
     return bool(
         selected_seed == expected[1]
         and selected_prefix == expected[3]
         and teacher_forced_success is expected[2]
+        and int(candidates[0]["raw_seeds_scanned_when_found"]) == raw_scanned
+    )
+
+
+def native_result_pipeline_contract_valid(row: Any) -> bool:
+    """Validate one persisted result against the current cap=1 pipeline."""
+
+    if not isinstance(row, Mapping):
+        return False
+    success = row.get("preflight_teacher_forced_success")
+    chosen = row.get("preflight_chosen_seed")
+    if (
+        row.get("native_preflight_contract_version")
+        == NATIVE_PREFLIGHT_CONTRACT_VERSION
+        and row.get("native_execution_pipeline_mode") == NATIVE_PREFLIGHT_MODE
+        and success is None
+    ):
+        return bool(
+            chosen is None
+            and row.get("chosen_seed") is None
+            and row.get("semantic_seed_preflight") is None
+            and row.get("tick_store_entry") is None
+            and row.get("audit_prefix_tick_store_entry") is None
+            and row.get("token_coverage_actor_evidence") in (None, [])
+            and row.get("prefix_token_coverage_actor_evidence") in (None, [])
+        )
+    if (
+        row.get("native_preflight_contract_version")
+        != NATIVE_PREFLIGHT_CONTRACT_VERSION
+        or row.get("native_execution_pipeline_mode") != NATIVE_PREFLIGHT_MODE
+        or not isinstance(success, bool)
+        or isinstance(chosen, bool)
+        or not isinstance(chosen, int)
+        or chosen <= 0
+        or row.get("chosen_seed") != chosen
+    ):
+        return False
+    return semantic_seed_audit_valid(
+        row.get("semantic_seed_preflight"),
+        chosen_seed=chosen,
+        teacher_forced_success=success,
+    )
+
+
+def native_episode_pipeline_contract_valid(
+    metadata: Any,
+    result_row: Any,
+) -> bool:
+    """Bind one Full/Prefix episode to its authenticated current result."""
+
+    if (
+        not native_result_pipeline_contract_valid(result_row)
+        or not isinstance(
+            result_row.get("preflight_teacher_forced_success"), bool
+        )
+    ):
+        return False
+    if not isinstance(metadata, Mapping):
+        return False
+    pipeline = metadata.get("native_execution_pipeline")
+    if not isinstance(pipeline, Mapping):
+        return False
+    chosen = int(result_row["preflight_chosen_seed"])
+    audit = result_row["semantic_seed_preflight"]
+    candidates = audit.get("candidates") if isinstance(audit, Mapping) else None
+    selected = candidates[0] if isinstance(candidates, list) and candidates else None
+    if (
+        pipeline.get("contract_version") != NATIVE_PREFLIGHT_CONTRACT_VERSION
+        or pipeline.get("mode") != NATIVE_PREFLIGHT_MODE
+        or pipeline.get("preflight_chosen_seed") != chosen
+        or pipeline.get("semantic_seed_selection") != audit
+        or not isinstance(selected, Mapping)
+        or pipeline.get("preflight_semantics_sha256")
+        != selected.get("semantics_sha256")
+    ):
+        return False
+    preflight_sha = selected.get("semantics_sha256")
+    extent = metadata.get(REPLAY_EXTENT_METADATA_KEY)
+    if isinstance(extent, Mapping):
+        return bool(
+            extent.get("fixed_seed_replay") is True
+            and extent.get("chosen_seed") == chosen
+            and extent.get("preflight_semantics_sha256") == preflight_sha
+            and extent.get("prefix_replay_semantics_sha256") == preflight_sha
+            and extent.get("semantic_match") is True
+        )
+    return bool(
+        pipeline.get("full_trace_semantics_sha256") == preflight_sha
+        and pipeline.get("semantic_diff_count") == 0
+        and pipeline.get("semantic_match") is True
     )
 
 
@@ -1963,10 +2055,9 @@ def execute_two_phase_plan(
     """Cheap semantic preflight followed by a fixed-seed traced replay.
 
     Rejected candidate preflights never invoke ``trace_train`` or
-    ``probe_grid``.  At most ``maximum_compatible_seeds`` layout-compatible
-    seeds are considered; a full success wins, otherwise the farthest safe
-    source-event prefix owns the one fixed-seed audit trace.  The selected
-    seed is reset exactly once for the traced pass and parity is mandatory.
+    ``probe_grid``.  Only the first layout-compatible seed is semantically
+    replayed.  It is reset exactly once for the traced full/prefix pass and
+    parity is mandatory.
     """
     phase_state = {} if phase_state is None else phase_state
     preflight_recorder = RecordingCountingEnv(env)
@@ -3464,6 +3555,10 @@ def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
             if record.get("kind") != RESULT_KIND:
                 continue
             tag = str(record["battle_tag"])
+            if not native_result_pipeline_contract_valid(record):
+                raise RuntimeError(
+                    f"native result pipeline contract is stale/invalid: {tag}"
+                )
             row = queue.connection.execute(
                 "SELECT status FROM tasks WHERE battle_tag=?", (tag,)
             ).fetchone()

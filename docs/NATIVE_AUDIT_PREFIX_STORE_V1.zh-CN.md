@@ -5,7 +5,7 @@
 - `shards/`：仅保存完整 teacher-forced 成功局，带完整部署 Mask，供 BC 编译器训练；
 - `audit-prefix-shards/`：保存确定性 semantic preflight 失败局在首次失败前的连续原生 Tick，固定为 `training_admission=actor_bc_censored_prefix_v1`。
 
-失败前缀使用 bounded semantic preflight 选出的 seed 固定重置，不猜测技能实体。Prefix trace 同时采集部署 Mask；只允许 partial slot metadata，但必须逐 Tick 证明每个可见手牌 deck index 均有内容寻址 native sidecar。合法的 `-1` 补牌空槽被无损保存为 PAD，且 card mask 恒为 false。重放的 failure、接受动作序列、最终 Tick、终局诊断等语义必须与 preflight 完全一致，否则按 instrumentation/infrastructure divergence 处理且不发布前缀。
+失败前缀使用升序扫描得到的首个 layout-compatible seed 固定重置；生产 semantic candidate limit=1，不猜测技能实体。Prefix trace 同时采集部署 Mask；只允许 partial slot metadata，但必须逐 Tick 证明每个可见手牌 deck index 均有内容寻址 native sidecar。合法的 `-1` 补牌空槽被无损保存为 PAD，且 card mask 恒为 false。重放的 failure、接受动作序列、最终 Tick、终局诊断等语义必须与 preflight 完全一致，否则按 instrumentation/infrastructure divergence 处理且不发布前缀。
 
 每个前缀 episode 的 `native_replay_extent_v1` 固化：观察 Tick 范围、首次失败 source/execution Tick、首个无效事件、动作标签停止边界、timing censor 边界、已安全接受的历史动作摘要、可见手牌 Mask 覆盖审计，以及 `terminal_target=unknown_censored`。失败 Tick 可以作为 pre-action 审计状态物理保存，但只有 `tick < timing_censor_tick_exclusive` 的 Actor 行可进入训练；失败 Tick 及之后所有动作标签为 false，末端 timing 是 right-censor，不生成终局目标。
 

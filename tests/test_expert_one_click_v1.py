@@ -38,6 +38,44 @@ from expert_v1.one_click_v1 import (
 )
 
 
+def current_pipeline_fields(*, success: bool, seed: int = 7) -> dict:
+    audit = {
+        "schema_version": 2,
+        "kind": "single_semantic_seed_preflight_v2",
+        "maximum_compatible_seeds": 1,
+        "raw_seed_scan_limit": 4096,
+        "raw_seeds_scanned": 3,
+        "layout_compatible_candidates_tested": 1,
+        "layout_compatible_candidates_found": 1,
+        "layout_scan_native_resets": 3,
+        "semantic_preflight_native_resets": 1,
+        "selected_seed": seed,
+        "selected_accepted_source_event_prefix": 1,
+        "selected_teacher_forced_success": success,
+        "selection_rule": "first_layout_compatible_seed_only",
+        "ability_identity_policy": "branch_required_fails_closed_no_guess",
+        "candidates": [{
+            "ordinal": 0,
+            "seed": seed,
+            "raw_seeds_scanned_when_found": 3,
+            "teacher_forced_success": success,
+            "accepted_source_event_prefix": 1,
+            "failure": None if success else "semantic",
+            "semantics_sha256": "a" * 64,
+        }],
+    }
+    return {
+        "native_preflight_contract_version": 4,
+        "native_execution_pipeline_mode": (
+            "single_semantic_seed_preflight_then_fixed_seed_trace_v4"
+        ),
+        "preflight_teacher_forced_success": success,
+        "preflight_chosen_seed": seed,
+        "chosen_seed": seed,
+        "semantic_seed_preflight": audit,
+    }
+
+
 class ExpertOneClickV1Test(unittest.TestCase):
     @staticmethod
     def _contract(
@@ -387,12 +425,14 @@ class ExpertOneClickV1Test(unittest.TestCase):
             results = root / "results.jsonl"
             rows = [
                 {
+                    **current_pipeline_fields(success=True),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": "A",
                     "final_attempt": True,
                     "teacher_forced_success": True,
                 },
                 {
+                    **current_pipeline_fields(success=False),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": "B",
                     "final_attempt": True,
@@ -451,6 +491,28 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 waiver_reason=None,
             )
             self.assertTrue(admitted["gate"]["admitted"])
+            legacy = json.loads(json.dumps(rows))
+            legacy[0]["native_preflight_contract_version"] = 3
+            legacy[0]["native_execution_pipeline_mode"] = (
+                "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
+            )
+            legacy[0]["semantic_seed_preflight"].update({
+                "schema_version": 1,
+                "kind": "bounded_semantic_seed_preflight_v1",
+                "maximum_compatible_seeds": 8,
+            })
+            results.write_text(
+                "".join(json.dumps(row) + "\n" for row in legacy),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(OneClickError, "current cap=1"):
+                validate_native_result_records(
+                    results, queue, expected_rows=2
+                )
+            results.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
             rows[1]["final_attempt"] = False
             results.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),
@@ -519,6 +581,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
             )
             results = root / "results.jsonl"
             prefix = {
+                **current_pipeline_fields(success=False),
                 "kind": "expert_authoritative_native_tick_result_v1",
                 "battle_tag": "PREFIX",
                 "final_attempt": True,
@@ -544,6 +607,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
             }
             rows = [
                 {
+                    **current_pipeline_fields(success=True),
                     "kind": "expert_authoritative_native_tick_result_v1",
                     "battle_tag": "FULL",
                     "final_attempt": True,
@@ -634,6 +698,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 ).hexdigest()
                 actors.append(actor)
             row = {
+                **current_pipeline_fields(success=False),
                 "kind": "expert_authoritative_native_tick_result_v1",
                 "battle_tag": "PREFIX",
                 "final_attempt": True,
