@@ -452,6 +452,29 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
         )
         self.assertEqual(spell, tuple(spell_sidecar["rows"]))
 
+    def test_spell_base_namespace_survives_hero_form_resolution(self) -> None:
+        barrel_probe = probe()
+        barrel_probe["resolved_data_id"] = 203_000_107
+        barrel_sidecar = normalize_native_probe(barrel_probe)
+        barrel = derive_deployment_rows(
+            barrel_sidecar,
+            tower_mapping(),
+            side=0,
+            card_id=28_000_015,
+        )
+        self.assertEqual(barrel, tuple(barrel_sidecar["rows"]))
+        self.assertEqual(sum(row.count("1") for row in barrel), 576)
+
+        troop_sidecar = normalize_native_probe(probe())
+        troop = derive_deployment_rows(
+            troop_sidecar,
+            tower_mapping(),
+            side=0,
+            card_id=26_000_000,
+        )
+        self.assertNotEqual(troop, tuple(troop_sidecar["rows"]))
+        self.assertLess(sum(row.count("1") for row in troop), 576)
+
     def test_smoke_regressions_global_miner_and_destroyed_tower_edge(self) -> None:
         sidecar = normalize_native_probe(probe())
         miner = derive_deployment_rows(

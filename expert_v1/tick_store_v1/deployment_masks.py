@@ -1077,18 +1077,24 @@ def derive_deployment_rows(
         raise DeploymentMaskContractError("side must be 0 or 1")
     payload = normalize_sidecar(sidecar)
     native_rows = payload["rows"]
-    # A wrapper's public deck ID does not determine deployment semantics.
-    # Mirror is 28,000,006 (spell namespace) even when its native selection
-    # resolves to a troop/building.  The exact resolved Tick sidecar remains
-    # authoritative, while Miner/Goblin Drill are explicit global-deploy
-    # exceptions in the ordinary troop/building namespaces.
+    # Public/base spell identity remains authoritative for deployment-mask
+    # *category*: hero/evolution wrappers can resolve to a 203-series form ID
+    # without turning a spell such as Barbarian Barrel into a troop footprint.
+    # Mirror is the deliberate exception: it follows its exact Tick-resolved
+    # troop/building/spell selection rather than its public wrapper namespace.
+    # Miner/Goblin Drill remain explicit global-deploy exceptions in the
+    # ordinary troop/building namespaces.
     resolved_data_id = int(payload["resolved_data_id"])
     if resolved_data_id <= 0:
         raise DeploymentMaskContractError(
             "native resolved_data_id is invalid for deployment semantics"
         )
     if (
-        resolved_data_id // 1_000_000 == 28
+        (
+            int(card_id) // 1_000_000 == 28
+            and int(card_id) != MIRROR_CARD_ID
+        )
+        or resolved_data_id // 1_000_000 == 28
         or int(card_id) in GLOBAL_DEPLOY_CARD_IDS
         or resolved_data_id in GLOBAL_DEPLOY_CARD_IDS
     ):
