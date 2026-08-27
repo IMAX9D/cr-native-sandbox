@@ -719,7 +719,6 @@ class OneClickConfig:
     avds: int = 1
     workers_per_avd: int = 4
     ports: tuple[int, ...] = DEFAULT_PORTS
-    minimum_native_success_rate: float = 0.50
     minimum_ability_positive_success_count: int = (
         DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT
     )
@@ -1183,6 +1182,8 @@ def compile_command(config: OneClickConfig) -> tuple[str, ...]:
         "expert_v1.compile_native_bc_dataset",
         "--tick-store-root",
         str(config.tick_store_root),
+        "--audit-prefix-store-root",
+        str(config.audit_prefix_store_root),
         "--schema5-manifest",
         str(config.frozen_manifest),
         "--output-root",
@@ -1921,8 +1922,20 @@ def validate_native_result_records(
                         not isinstance(extent, Mapping)
                         or extent.get("kind") != "cr_native_replay_extent_v1"
                         or extent.get("extent") != "valid_prefix"
-                        or extent.get("training_admission") != "audit_only"
+                        or extent.get("training_admission")
+                        != "actor_bc_censored_prefix_v1"
                         or extent.get("terminal_target") != "unknown_censored"
+                        or extent.get("timing_target")
+                        != "right_censored_at_failure_tick_v1"
+                        or extent.get("deployment_masks")
+                        != "partial_native_visible_hand_complete_v1"
+                        or not isinstance(extent.get("mask_coverage"), Mapping)
+                        or extent["mask_coverage"].get(
+                            "all_retained_visible_hand_slots_covered"
+                        ) is not True
+                        or int(extent["mask_coverage"].get(
+                            "rejected_deploy_labels", -1
+                        )) != 0
                         or extent.get("failure_tick_has_labels") is not False
                         or row.get("failure_domain") != "semantic"
                         or row.get("failure_prefix_semantic_match") is not True
@@ -1930,11 +1943,72 @@ def validate_native_result_records(
                         or int(
                             row.get("native_deployment_mask_probes_attempted")
                             or 0
-                        ) != 0
+                        ) <= 0
                     ):
                         raise OneClickError("audit-prefix result contract changed")
+                    prefix_evidence = row.get(
+                        "prefix_token_coverage_actor_evidence"
+                    )
+                    if require_token_evidence:
+                        if not isinstance(prefix_evidence, list) or len(
+                            prefix_evidence
+                        ) != 2:
+                            raise OneClickError(
+                                "audit-prefix result lacks two actor token records"
+                            )
+                        evidence_sides: set[int] = set()
+                        extent_sha = hashlib.sha256(
+                            canonical_json_bytes(extent)
+                        ).hexdigest()
+                        for actor in prefix_evidence:
+                            if not isinstance(actor, Mapping):
+                                raise OneClickError(
+                                    "audit-prefix actor token evidence is invalid"
+                                )
+                            claimed = str(
+                                actor.get("native_evidence_sha256") or ""
+                            )
+                            body = {
+                                key: value for key, value in actor.items()
+                                if key != "native_evidence_sha256"
+                            }
+                            side = int(actor.get("actor_side", -1))
+                            if (
+                                actor.get("kind")
+                                != "cr_native_censored_prefix_actor_token_evidence_v1"
+                                or actor.get("battle_tag") != tag
+                                or actor.get("full_success") is not False
+                                or actor.get("censored_prefix") is not True
+                                or actor.get("prefix_admission") is not True
+                                or actor.get("action_label_tick_stop_exclusive")
+                                != extent.get("action_label_tick_stop_exclusive")
+                                or actor.get("timing_target")
+                                != extent.get("timing_target")
+                                or actor.get("replay_extent_sha256") != extent_sha
+                                or side not in (0, 1)
+                                or side in evidence_sides
+                                or claimed
+                                != hashlib.sha256(_canonical(body)).hexdigest()
+                                or any(
+                                    label.get("compiled") is not False
+                                    for field in ("deploy_labels", "ability_labels")
+                                    for label in actor.get(field) or []
+                                    if isinstance(label, Mapping)
+                                )
+                            ):
+                                raise OneClickError(
+                                    "audit-prefix actor token evidence identity/hash changed"
+                                )
+                            evidence_sides.add(side)
+                            token_evidence_actor_records += 1
                     prefix_tags.add(tag)
                 else:
+                    if require_token_evidence and row.get(
+                        "prefix_token_coverage_actor_evidence"
+                    ) not in (None, []):
+                        raise OneClickError(
+                            "unframed failure exposes prefix token evidence"
+                        )
                     unframed_tags.add(tag)
                 cohort["failures"] += 1
                 failure_class = str(row.get("failure_class") or "unknown")
@@ -2617,7 +2691,7 @@ class OneClickOrchestrator:
                     prefix_store_manifest
                 ),
                 "success_rate": success_rate,
-                "minimum_success_rate": config.minimum_native_success_rate,
+                "full_success_rate_semantics": "diagnostic_only",
                 "ability_coverage": ability_coverage,
                 "failure_class_counts": summary.get("failure_class_counts") or {},
                 "failure_domain_counts": summary.get("failure_domain_counts") or {},
@@ -2656,11 +2730,10 @@ class OneClickOrchestrator:
                 != config.target
                 or summary.get("missing_result_tags") != []
                 or summary.get("unexpected_result_tags") != []
-                or success_rate < config.minimum_native_success_rate
                 or (ability_coverage.get("gate") or {}).get("admitted") is not True
                 or int(result_audit["successes"]) != successes
                 or int(result_audit["token_coverage_actor_evidence_records"])
-                != successes * 2
+                != (successes + prefix_stored) * 2
                 or int(result_audit["failures"]) != failures
                 or result_audit["failure_class_counts"]
                 != (summary.get("failure_class_counts") or {})
@@ -2671,8 +2744,7 @@ class OneClickOrchestrator:
                     "native generator failed complete-attempt/success coverage: "
                     f"selected={selected}, processed={processed}, "
                     f"successes={successes}, failures={failures}, stored={stored}, "
-                    f"rate={success_rate:.6f}, "
-                    f"minimum={config.minimum_native_success_rate:.6f}, "
+                    f"diagnostic_full_rate={success_rate:.6f}, "
                     f"ability={json.dumps(ability_coverage, ensure_ascii=False)}"
                 )
             return fingerprint_files(
@@ -2794,6 +2866,10 @@ class OneClickOrchestrator:
                 config.tick_validation_receipt,
                 config.tick_store_root / "manifest.json",
                 config.tick_store_root / "deployment-masks-v1" / "manifest.json",
+                config.audit_prefix_store_root / "manifest.json",
+                config.audit_prefix_store_root
+                / "deployment-masks-v1"
+                / "manifest.json",
                 config.frozen_manifest,
                 config.native_contract,
                 config.native_generation_receipt,
@@ -2851,6 +2927,20 @@ class OneClickOrchestrator:
                 or source.get("sha256") != sha256_file(config.frozen_manifest)
                 or int((manifest.get("coverage") or {}).get("battles", -1))
                 != int(coverage_receipt.get("stored_episodes", -2))
+                + int(coverage_receipt.get("audit_prefix_episodes", -3))
+                or (manifest.get("coverage") or {}).get(
+                    "training_episode_union_exact"
+                ) is not True
+                or int(
+                    (manifest.get("coverage") or {}).get(
+                        "full_success_episodes", -1
+                    )
+                ) != int(coverage_receipt.get("stored_episodes", -2))
+                or int(
+                    (manifest.get("coverage") or {}).get(
+                        "censored_prefix_episodes", -1
+                    )
+                ) != int(coverage_receipt.get("audit_prefix_episodes", -2))
                 or (manifest.get("native_generation_coverage") or {}).get(
                     "receipt_sha256"
                 )
@@ -2926,6 +3016,9 @@ class OneClickOrchestrator:
             config.tick_store_root / "manifest.json",
             config.audit_prefix_store_root / "manifest.json",
             config.tick_store_root / "deployment-masks-v1" / "manifest.json",
+            config.audit_prefix_store_root
+            / "deployment-masks-v1"
+            / "manifest.json",
             config.native_generation_receipt,
         ]
         inputs = fingerprint_files(generation_artifacts) + [
@@ -3253,7 +3346,6 @@ def _default_config(args: argparse.Namespace) -> OneClickConfig:
         avds=avds,
         workers_per_avd=workers_per_avd,
         ports=selected_ports,
-        minimum_native_success_rate=args.minimum_native_success_rate,
         minimum_ability_positive_success_count=(
             args.minimum_ability_positive_success_count
         ),
@@ -3315,14 +3407,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ports", nargs="+", type=int, default=list(DEFAULT_PORTS))
     parser.add_argument(
-        "--minimum-native-success-rate", type=float, default=0.50
-    )
-    parser.add_argument(
-        "--allow-lower-native-success-rate",
-        action="store_true",
-        help="explicit waiver required to lower the default 50%% coverage gate",
-    )
-    parser.add_argument(
         "--minimum-ability-positive-success-count",
         type=int,
         default=DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT,
@@ -3369,19 +3453,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.audit_workers <= 0
         or args.compile_io_workers <= 0
         or args.compile_process_workers <= 0
-        or not 0 < args.minimum_native_success_rate <= 1
         or args.minimum_ability_positive_success_count < 0
         or not 0 <= args.minimum_ability_positive_success_rate <= 1
     ):
         raise OneClickError("invalid one-click concurrency/target configuration")
-    if (
-        args.minimum_native_success_rate < 0.50
-        and not args.allow_lower_native_success_rate
-    ):
-        raise OneClickError(
-            "lowering native success coverage below 50% requires "
-            "--allow-lower-native-success-rate"
-        )
     lowered_ability_gate = (
         args.minimum_ability_positive_success_count
         < DEFAULT_MINIMUM_ABILITY_POSITIVE_SUCCESS_COUNT

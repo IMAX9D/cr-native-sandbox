@@ -202,6 +202,9 @@ class NativeExpertSequenceDataset(Dataset[dict[str, torch.Tensor]]):
             ):
                 item[name] = torch.from_numpy(np.asarray(arrays[name][sl]).copy()).bool()
         else:
+            item["replay_extent"] = torch.from_numpy(
+                np.asarray(arrays["replay_extent"][sl]).copy()
+            ).long()
             item["grid"] = torch.from_numpy(
                 unpack_sparse_grid(
                     arrays["grid_offsets"],

@@ -17,9 +17,9 @@ from typing import Any, Mapping
 import numpy as np
 
 
-SCHEMA_VERSION = 2
-DATASET_KIND = "cr_native_expert_bc_dataset_v2"
-SHARD_KIND = "cr_native_expert_bc_shard_v2"
+SCHEMA_VERSION = 3
+DATASET_KIND = "cr_native_expert_bc_dataset_v3"
+SHARD_KIND = "cr_native_expert_bc_shard_v3"
 OBSERVATION_NATIVE = "native_state_v1"
 OBSERVATION_SEQUENCE = "sequence_only_v1"
 ARENA_ROWS = 32
@@ -77,6 +77,10 @@ NATIVE_REQUIRED_ARRAYS = {
     "ability_label_mask",
     "ability_position_label_mask",
     "sample_weight",
+    # 0=complete full-success replay, 1=semantic valid-prefix replay.  The
+    # value is data provenance, not a model feature; the loader exposes it so
+    # audits can prove that censoring never crosses a recurrent sequence.
+    "replay_extent",
 }
 
 # Sequence-only data is deliberately a different physical contract.  In
@@ -394,6 +398,50 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
                     raise DatasetContractError(
                         "shard metadata hash disagrees with file coverage"
                     )
+            token_coverage = value.get("token_coverage") or {}
+            if (
+                token_coverage.get("enforced") is not True
+                or (token_coverage.get("gate") or {}).get("admitted") is not True
+            ):
+                raise DatasetContractError(
+                    "production dataset requires admitted token coverage"
+                )
+            coverage = value.get("coverage") or {}
+            full_episodes = int(coverage.get("full_success_episodes", -1))
+            prefix_episodes = int(coverage.get("censored_prefix_episodes", -1))
+            full_rows = int(coverage.get("full_success_rows", -1))
+            prefix_rows = int(coverage.get("censored_prefix_rows", -1))
+            if (
+                coverage.get("training_episode_union_exact") is not True
+                or full_episodes < 0
+                or prefix_episodes < 0
+                or full_episodes + prefix_episodes
+                != int(coverage.get("battles", -2))
+                or full_rows < 0
+                or prefix_rows < 0
+                or full_rows + prefix_rows != int(coverage.get("rows", -2))
+                or int(coverage.get("actor_sequences", -1))
+                != 2 * (full_episodes + prefix_episodes)
+            ):
+                raise DatasetContractError(
+                    "production full/prefix training union is not exact"
+                )
+            mask_provenance = value.get("mask_provenance") or {}
+            if (
+                mask_provenance.get("kind")
+                != "content_addressed_full_and_partial_native_sidecars_v1"
+                or mask_provenance.get("prefix_policy")
+                != "partial_native_visible_hand_complete_v1"
+                or not isinstance(
+                    mask_provenance.get("full_referenced_sidecar_sha256"), list
+                )
+                or not isinstance(
+                    mask_provenance.get("prefix_referenced_sidecar_sha256"), list
+                )
+            ):
+                raise DatasetContractError(
+                    "production prefix mask provenance is incomplete"
+                )
         if feature_schema.get("entity_identity") != "categorical_card_vocabulary_v1":
             raise DatasetContractError(
                 "native entity identity must use categorical card-vocabulary tokens"
@@ -588,22 +636,46 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
     own_deck = arrays["own_deck_tokens"]
     hand = arrays["hand_tokens"]
     next_card = arrays["next_card_token"]
-    if np.any(own_deck == 0) or np.any(hand == 0) or np.any(next_card == 0):
-        raise DatasetContractError("own deck, current hand and next card cannot contain PAD")
+    if np.any(own_deck == 0):
+        raise DatasetContractError("own deck cannot contain PAD")
+    # Native hand refills transiently expose one -1, compiled as PAD=0.  PAD is
+    # a real empty slot here, never a guessed card identity.  The native cycle
+    # still exposes an exact non-PAD next card during this transient.
+    empty_hand = hand == 0
+    if np.any(empty_hand.sum(axis=1) > 1):
+        raise DatasetContractError("native hand may contain at most one refill PAD")
+    if np.any(next_card == 0):
+        raise DatasetContractError("next card cannot contain PAD")
     if np.any(np.sort(own_deck, axis=1)[:, 1:] == np.sort(own_deck, axis=1)[:, :-1]):
         raise DatasetContractError("own deck contains duplicate card tokens")
-    if np.any(np.sort(hand, axis=1)[:, 1:] == np.sort(hand, axis=1)[:, :-1]):
-        raise DatasetContractError("current hand contains duplicate card tokens")
+    visible_hand = hand[:, :, None] == hand[:, None, :]
+    visible_hand &= hand[:, :, None] != 0
+    duplicate_visible = np.triu(visible_hand, k=1).any(axis=(1, 2))
+    if np.any(duplicate_visible):
+        raise DatasetContractError("current visible hand contains duplicate card tokens")
     hand_in_deck = (hand[:, :, None] == own_deck[:, None, :]).any(axis=-1)
-    if np.any(~hand_in_deck):
+    if np.any(~hand_in_deck & ~empty_hand):
         raise DatasetContractError("current hand is not a subset of own deck")
     if np.any(~(next_card[:, None] == own_deck).any(axis=-1)):
         raise DatasetContractError("next card is not in own deck")
-    if np.any((next_card[:, None] == hand).any(axis=-1)):
+    if np.any(
+        (next_card[:, None] == hand).any(axis=-1)
+    ):
         raise DatasetContractError("next card is already in current hand")
     card_mask = arrays["card_mask"].astype(bool)
     if np.any(card_mask & (hand == 0)):
         raise DatasetContractError("PAD hand slot cannot be legal")
+    card_rows = arrays["card_label_mask"].astype(bool)
+    slots = arrays["card_slot"].astype(np.int64)
+    if np.any(
+        card_rows
+        & (
+            (slots < 0)
+            | (slots >= HAND_SIZE)
+            | (hand[np.arange(rows), np.clip(slots, 0, HAND_SIZE - 1)] == 0)
+        )
+    ):
+        raise DatasetContractError("expert card label cannot select an empty hand slot")
     kind_rows = arrays["kind_label_mask"].astype(bool)
     kinds = arrays["action_kind"].astype(np.int64)
     if np.any((kinds[kind_rows] < 0) | (kinds[kind_rows] >= 2)):
@@ -620,8 +692,13 @@ def validate_shard(shard: Path, manifest: Mapping[str, Any]) -> dict[str, int]:
         raise DatasetContractError("an observed expert action requires a timing label")
     if np.any(kind_rows & ~play_now):
         raise DatasetContractError("conditional action-kind label requires play_now")
-    card_rows = arrays["card_label_mask"].astype(bool)
-    slots = arrays["card_slot"].astype(np.int64)
+    replay_extent = arrays["replay_extent"]
+    if replay_extent.dtype != np.uint8 or np.any(replay_extent > 1):
+        raise DatasetContractError("replay_extent must be uint8 full/prefix provenance")
+    for start, stop in zip(offsets[:-1], offsets[1:]):
+        values = replay_extent[int(start):int(stop)]
+        if not len(values) or np.any(values != values[0]):
+            raise DatasetContractError("replay extent cannot change within a sequence")
     if np.any((slots[card_rows] < 0) | (slots[card_rows] >= HAND_SIZE)):
         raise DatasetContractError("card label outside hand slots")
     if np.any(~arrays["card_mask"][np.flatnonzero(card_rows), slots[card_rows]].astype(bool)):
@@ -780,9 +857,26 @@ def _validate_native_shard_metadata(
             or pair[0].get("source_sha256") != pair[1].get("source_sha256")
             or pair[0].get("source_group") != pair[1].get("source_group")
             or pair[0].get("player_tags") != pair[1].get("player_tags")
+            or pair[0].get("replay_extent") != pair[1].get("replay_extent")
+            or pair[0].get("timing_target") != pair[1].get("timing_target")
+            or pair[0].get("terminal_target") != pair[1].get("terminal_target")
+            or pair[0].get("extent_sha256") != pair[1].get("extent_sha256")
+            or pair[0].get("mask_metadata_sha256")
+            != pair[1].get("mask_metadata_sha256")
         ):
             raise DatasetContractError("native shard actor sequence pairing changed")
         battle_tags.append(str(pair[0].get("battle_tag") or ""))
+        extent = str(pair[0].get("replay_extent") or "")
+        expected_extent = 0 if extent == "full_success" else 1
+        if extent not in {"full_success", "valid_prefix"}:
+            raise DatasetContractError("native shard replay extent is invalid")
+        for sequence_index in (index, index + 1):
+            start = int(arrays["sequence_offsets"][sequence_index])
+            stop = int(arrays["sequence_offsets"][sequence_index + 1])
+            if np.any(arrays["replay_extent"][start:stop] != expected_extent):
+                raise DatasetContractError(
+                    "native shard row/sequence replay extent disagrees"
+                )
     hashes = value.get("file_sha256")
     actual_npy = {file.name for file in shard.glob("*.npy") if file.is_file()}
     if not isinstance(hashes, Mapping) or set(str(key) for key in hashes) != actual_npy:

@@ -10,7 +10,7 @@ tick mismatch ends that replay and preserves an audit record.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 import time
@@ -120,10 +120,16 @@ class NativeReplayResult:
     collected_tick_states: tuple[TickState, ...]
     logic_freeze_diagnostic: dict[str, Any] | None
     tick_store_entry: dict[str, Any] | None
+    # Runtime-only payloads are needed to publish a censored Prefix Store.
+    # They are deliberately excluded from json()/semantic parity digests.
+    deployment_mask_payloads: dict[str, dict[str, Any]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def json(self) -> dict[str, Any]:
         fields = dict(self.__dict__)
         collected_states = fields.pop("collected_tick_states")
+        fields.pop("deployment_mask_payloads", None)
         return {
             "schema_version": 1,
             "kind": "expert_native_replay_result_v1",
@@ -1176,6 +1182,10 @@ def execute_plan(
         ),
         logic_freeze_diagnostic=logic_freeze_diagnostic,
         tick_store_entry=tick_store_entry,
+        deployment_mask_payloads=(
+            {} if deployment_mask_capture is None
+            else deployment_mask_capture.payloads
+        ),
     )
 
 

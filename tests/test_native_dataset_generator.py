@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -34,6 +35,12 @@ from expert_v1.tick_store_v1.schema import (
     EpisodeState,
     PlayerPrivate,
     TickState,
+)
+from expert_v1.tick_store_v1.deployment_masks import (
+    DYNAMIC_RULE,
+    EPISODE_METADATA_KEY,
+    DeploymentMaskStore,
+    NativeDeploymentMaskCapture,
 )
 from expert_v1.tick_store_v1.shard import (
     AUDIT_PREFIX_STORE_KIND,
@@ -94,7 +101,53 @@ def replay_result_stub(
     *, success: bool, chosen_seed: int = 7, failure: str | None = None,
     action_sequence: tuple[dict, ...] = (),
     collected_states: tuple[TickState, ...] = (),
+    with_masks: bool = False,
 ) -> SimpleNamespace:
+    mask_metadata = None
+    mask_payloads = {}
+    mask_probe_count = 0
+    if with_masks:
+        slots = [
+            {
+                "side": side,
+                "deck_index": deck_index,
+                "card_id": 26_000_000 + deck_index,
+                "level": 16,
+                "form_flags": 0,
+                "source_token": f"card-{deck_index}",
+                "base_token": f"card-{deck_index}",
+            }
+            for side in (0, 1)
+            for deck_index in range(8)
+        ]
+
+        class Probe:
+            def probe_grid(self, *, side: int, deck_index: int) -> dict:
+                rows = ["1" * 18 for _ in range(32)]
+                return {
+                    "width": 18, "height": 32, "cell_size": 1000,
+                    "valid_cells": 576,
+                    "resolved_data_id": 26_000_000 + deck_index,
+                    "packed_selection": 0,
+                    "card_cost": 1, "card_cost_raw": 10_000,
+                    "selection_form_index": -1,
+                    "selection_strategy": "canonical",
+                    "selection_builder_rva": "0x1",
+                    "selection_root_vtable_rva": "0x2",
+                    "rows": rows,
+                }
+
+        capture = NativeDeploymentMaskCapture(slots)
+        capture.capture_available(Probe(), {
+            "tick": 10,
+            "players": [
+                {"side": 0, "hand_deck_indices": [0, 1, 2, 3]},
+                {"side": 1, "hand_deck_indices": [4, 5, 6, 7]},
+            ],
+        })
+        mask_metadata = capture.metadata(require_complete=False)
+        mask_payloads = capture.payloads
+        mask_probe_count = capture.probe_rpc_count
     return SimpleNamespace(
         teacher_forced_success=success,
         failure=failure,
@@ -127,7 +180,11 @@ def replay_result_stub(
         tick_trace_complete_frames=len(collected_states),
         tick_trace_incomplete_terminal_frames=0,
         tick_trace_incomplete_nonterminal_freeze_frames=0,
-        deployment_mask_probe_rpc_count=0,
+        deployment_mask_probe_rpc_count=mask_probe_count,
+        deployment_mask_metadata=mask_metadata,
+        deployment_mask_payloads=mask_payloads,
+        deployment_mask_label_checks=0,
+        deployment_mask_label_rejections=0,
     )
 
 
@@ -211,7 +268,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         second = mocked.call_args_list[1]
         self.assertEqual(second.kwargs["fixed_seed"], 7)
         self.assertTrue(second.kwargs["collect_tick_states_on_failure"])
-        self.assertFalse(second.kwargs["capture_deployment_masks"])
+        self.assertTrue(second.kwargs["capture_deployment_masks"])
         self.assertIsNone(second.kwargs["tick_sink"])
         self.assertFalse(outcome.failure_prefix_staged)
         self.assertEqual(list(outcome.preflight_recorder.trace_history), [])
@@ -273,6 +330,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             failure=preflight.failure,
             action_sequence=action,
             collected_states=tuple(tick_states(12)),
+            with_masks=True,
         )
         prefix.seeds_tested = 0
         prefix.seed_search_native_resets = 1
@@ -294,12 +352,22 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertTrue(outcome.failure_prefix_staged)
         self.assertIsNotNone(staged.episode)
         extent = staged.episode.metadata["native_replay_extent_v1"]
-        self.assertEqual(extent["training_admission"], "audit_only")
+        self.assertEqual(
+            extent["training_admission"], "actor_bc_censored_prefix_v1"
+        )
         self.assertEqual(extent["action_label_tick_stop_exclusive"], 21)
         self.assertEqual(extent["timing_censor_tick_exclusive"], 21)
         self.assertFalse(extent["failure_tick_has_labels"])
         self.assertEqual(extent["terminal_target"], "unknown_censored")
-        self.assertNotIn("native_deployment_masks_v1", staged.episode.metadata)
+        self.assertEqual(
+            extent["timing_target"], "right_censored_at_failure_tick_v1"
+        )
+        self.assertTrue(
+            extent["mask_coverage"][
+                "all_retained_visible_hand_slots_covered"
+            ]
+        )
+        self.assertIn("native_deployment_masks_v1", staged.episode.metadata)
         self.assertEqual(staged.episode.states[-1].tick, 21)
 
     def test_two_phase_action_or_terminal_difference_is_a_closed_diff(self) -> None:
@@ -461,7 +529,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             first = prepare_run(**args)
             second = prepare_run(**args)
             self.assertEqual(first[0], second[0])
-            self.assertEqual(first[3]["run_contract_version"], 2)
+            self.assertEqual(first[3]["run_contract_version"], 3)
             self.assertEqual(
                 first[3]["native_execution_pipeline"]["contract_version"], 3
             )
@@ -798,7 +866,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 "schema_version": 1,
                 "kind": "cr_native_replay_extent_v1",
                 "extent": "valid_prefix",
-                "training_admission": "audit_only",
+                "training_admission": "actor_bc_censored_prefix_v1",
                 "source_episode_complete": False,
                 "every_native_tick_present_within_extent": True,
                 "fixed_seed_replay": True,
@@ -818,20 +886,41 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 "observation_tick_stop_exclusive": 14,
                 "action_label_tick_stop_exclusive": 13,
                 "timing_censor_tick_exclusive": 13,
+                "timing_target": "right_censored_at_failure_tick_v1",
                 "failure_tick_has_labels": False,
                 "terminal_target": "unknown_censored",
                 "terminal_validated": False,
-                "deployment_masks": "not_collected_audit_prefix",
+                "deployment_masks": "partial_native_visible_hand_complete_v1",
+                "mask_coverage": {
+                    "all_retained_visible_hand_slots_covered": True,
+                    "retained_ticks": 3,
+                    "actor_ticks": 6,
+                    "visible_slot_references": 24,
+                    "empty_slot_actor_ticks": 0,
+                    "captured_slots": 8,
+                    "safe_deploy_labels": 0,
+                    "checked_deploy_labels": 0,
+                    "rejected_deploy_labels": 0,
+                },
                 "trace_batches": 1,
                 "trace_complete_frames": 4,
                 "trace_incomplete_terminal_frames": 0,
                 "trace_incomplete_nonterminal_freeze_frames": 0,
             }
+            mask_result = replay_result_stub(
+                success=False, with_masks=True
+            )
+            mask_store = DeploymentMaskStore(root)
+            mask_store.publish_many(mask_result.deployment_mask_payloads)
+            mask_manifest = mask_store.build_manifest()
             sink = WorkerShardSink(root, "prefix", episodes_per_shard=1)
             sink.append(
                 "PREFIX",
                 tick_states(),
-                {"native_replay_extent_v1": extent},
+                {
+                    "native_replay_extent_v1": extent,
+                    EPISODE_METADATA_KEY: mask_result.deployment_mask_metadata,
+                },
             )
             sink.finalize()
             build_store_manifest(
@@ -841,13 +930,24 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 expected_ticks=4,
                 store_kind=AUDIT_PREFIX_STORE_KIND,
                 store_metadata={
-                    "training_admission": "audit_only",
-                    "native_deployment_masks": {"required": False},
+                    "training_admission": "actor_bc_censored_prefix_v1",
+                    "native_deployment_masks": {
+                        "required": True,
+                        "partial": True,
+                        "schema_version": 1,
+                        "dynamic_rule": DYNAMIC_RULE,
+                        "manifest": "deployment-masks-v1/manifest.json",
+                        "manifest_sha256": hashlib.sha256(
+                            (root / "deployment-masks-v1" / "manifest.json")
+                            .read_bytes()
+                        ).hexdigest(),
+                        "sidecars": mask_manifest["sidecars"],
+                    },
                 },
             )
             physical = verify_published_audit_prefix_store(root)
             self.assertEqual(physical["battle_tags"], ["PREFIX"])
-            self.assertEqual(physical["deployment_mask_sidecars_referenced"], 0)
+            self.assertEqual(physical["deployment_mask_sidecars_referenced"], 8)
             with self.assertRaisesRegex(RuntimeError, "manifest kind"):
                 verify_published_tick_store(root)
 

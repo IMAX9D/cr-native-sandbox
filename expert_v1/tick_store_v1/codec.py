@@ -96,8 +96,12 @@ def _encode_player(player: PlayerPrivate) -> bytes:
 
 
 def _decode_player(cursor: _Cursor) -> PlayerPrivate:
-    side, elixir, h0, h1, h2, h3, next_index = _decode_values(cursor, 7)
-    return PlayerPrivate(side, elixir, (h0, h1, h2, h3), next_index)
+    side, elixir, h0, h1, h2, h3, next_index, refill_timer = _decode_values(
+        cursor, 8
+    )
+    return PlayerPrivate(
+        side, elixir, (h0, h1, h2, h3), next_index, refill_timer
+    )
 
 
 def _encode_tower(tower: TowerState) -> bytes:
@@ -269,7 +273,11 @@ def decode_delta(previous: TickState, data: bytes | memoryview) -> TickState:
     players: list[PlayerPrivate] = []
     for player in previous.players:
         values = _apply(player.values(), cursor.uvarint(), cursor)
-        players.append(PlayerPrivate(player.side, values[0], values[1:5], values[5]))
+        players.append(
+            PlayerPrivate(
+                player.side, values[0], values[1:5], values[5], values[6]
+            )
+        )
     towers = _decode_keyed_delta(
         cursor,
         {item.key: item for item in previous.towers},
@@ -353,7 +361,7 @@ def encode_episode(
         raw_bytes += raw_size
     header = EPISODE_HEADER.pack(
         EPISODE_MAGIC,
-        1,
+        2,
         anchor_interval,
         len(metadata_bytes),
         len(chunks),
@@ -378,7 +386,7 @@ class EpisodeReader:
         magic, version, interval, metadata_size, chunks, ticks = EPISODE_HEADER.unpack(
             self.blob[: EPISODE_HEADER.size]
         )
-        if magic != EPISODE_MAGIC or version != 1:
+        if magic != EPISODE_MAGIC or version != 2:
             raise TickCodecError("unsupported episode blob")
         self.anchor_interval = interval
         self.tick_count = ticks
@@ -438,4 +446,3 @@ class EpisodeReader:
         if offset < 0 or offset >= len(states):
             raise KeyError(tick)
         return states[offset]
-

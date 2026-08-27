@@ -1,15 +1,15 @@
-# 原生失败前缀审计 Store v1
+# 原生失败前缀 Actor-BC Store v2
 
 正式原生生成使用两个物理隔离的 Tick Store：
 
 - `shards/`：仅保存完整 teacher-forced 成功局，带完整部署 Mask，供 BC 编译器训练；
-- `audit-prefix-shards/`：仅保存确定性 semantic preflight 失败局在首次失败前的连续原生 Tick，固定为 `training_admission=audit_only`。
+- `audit-prefix-shards/`：保存确定性 semantic preflight 失败局在首次失败前的连续原生 Tick，固定为 `training_admission=actor_bc_censored_prefix_v1`。
 
-失败前缀使用 preflight 已选出的 seed 固定重置，不重新搜索 seed，不采集部署 Mask。重放的 failure、接受动作序列、最终 Tick、终局诊断等语义必须与 preflight 完全一致，否则按 instrumentation/infrastructure divergence 处理且不发布前缀。
+失败前缀使用 bounded semantic preflight 选出的 seed 固定重置，不猜测技能实体。Prefix trace 同时采集部署 Mask；只允许 partial slot metadata，但必须逐 Tick 证明每个可见手牌 deck index 均有内容寻址 native sidecar。合法的 `-1` 补牌空槽被无损保存为 PAD，且 card mask 恒为 false。重放的 failure、接受动作序列、最终 Tick、终局诊断等语义必须与 preflight 完全一致，否则按 instrumentation/infrastructure divergence 处理且不发布前缀。
 
-每个前缀 episode 的 `native_replay_extent_v1` 固化：观察 Tick 范围、首次失败 source/execution Tick、首个无效事件、动作标签停止边界、timing censor 边界、已安全接受的历史动作摘要，以及 `terminal_target=unknown_censored`。失败 Tick 可以作为失败前的 pre-action 审计状态保存，但 `failure_tick_has_labels=false`，不得生成 PLAY、WAIT、卡牌、位置、技能或终局标签。
+每个前缀 episode 的 `native_replay_extent_v1` 固化：观察 Tick 范围、首次失败 source/execution Tick、首个无效事件、动作标签停止边界、timing censor 边界、已安全接受的历史动作摘要、可见手牌 Mask 覆盖审计，以及 `terminal_target=unknown_censored`。失败 Tick 可以作为 pre-action 审计状态物理保存，但只有 `tick < timing_censor_tick_exclusive` 的 Actor 行可进入训练；失败 Tick 及之后所有动作标签为 false，末端 timing 是 right-censor，不生成终局目标。
 
-Audit Prefix Store 使用独立 kind `cr_native_tick_prefix_audit_store_v1`。BC compiler 遇到该 kind 必须明确拒绝，不能通过参数或 waiver 加入训练。
+Prefix Store 保持独立 kind `cr_native_tick_prefix_audit_store_v1` 和独立 `deployment-masks-v1`。BC compiler 必须通过显式第二输入读取它，重新认证 extent、partial Mask、source action、native accepted transcript 和 prefix actor evidence；不得把 Prefix 文件混入 Full Store 或绕过 censor。
 
 One-click 的不可豁免覆盖门为：
 
@@ -18,6 +18,7 @@ full_success_tags ∩ audit_prefix_tags = ∅
 full_success_tags ∪ audit_prefix_tags = frozen_100k_tags
 unframed_episodes = 0
 audit_tick_coverage_rate = 1.0
+compiled_full_episode_tags ∪ compiled_prefix_episode_tags = frozen_100k_tags
 ```
 
-原有训练门保持独立：full-success rate 默认至少 50%，ability-positive coverage 仍须通过。RPC、source-integrity、seed-search、固定 seed 重放不一致或首帧前失败均不得伪造 Prefix；这些情况会令 one-click 停止并保留诊断现场。
+Full-success rate 继续记录为诊断指标，但不再要求至少 50%。训练覆盖由 Full + 安全 Prefix 的 100,000 场并集承担；卡牌、形态与 ability 的逐-token 门必须从最终编译数组的有效标签独立复算。RPC、source-integrity、seed-search、固定 seed 重放不一致、Mask 不完整或首帧前失败均不得伪造 Prefix；这些情况会令 one-click 停止并保留诊断现场。

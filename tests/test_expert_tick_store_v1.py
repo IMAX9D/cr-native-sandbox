@@ -93,6 +93,24 @@ class TickStoreV1Test(unittest.TestCase):
         self.assertFalse(hasattr(projection, "opponent_player"))
         self.assertFalse(hasattr(projection.episode, "logic_state"))
 
+    def test_refill_empty_slot_and_timer_roundtrip_losslessly(self) -> None:
+        source = frames(20)
+        transient = replace(
+            source[1],
+            players=(
+                PlayerPrivate(0, 42_000, (0, 1, -1, 3), 4, 600),
+                source[1].players[1],
+            ),
+        )
+        source[1] = transient
+        blob, _ = encode_episode(
+            source, {"battle_tag": "REFILL"}, anchor_interval=16
+        )
+        decoded = list(EpisodeReader(blob).iter_ticks())
+        self.assertEqual(decoded, source)
+        self.assertEqual(decoded[1].players[0].hand, (0, 1, -1, 3))
+        self.assertEqual(decoded[1].players[0].refill_timer, 600)
+
     def test_shard_recovers_truncated_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

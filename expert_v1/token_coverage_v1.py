@@ -974,12 +974,20 @@ def authenticate_generator_ability_evidence(
         tag = str(record.get("battle_tag") or "")
         actor_side = _integer(record.get("actor_side"), "generator actor_side")
         actor_key = (tag, actor_side)
+        full_actor = (
+            record.get("full_success") is True
+            and record.get("prefix_admission") is False
+        )
+        prefix_actor = (
+            record.get("full_success") is False
+            and record.get("censored_prefix") is True
+            and record.get("prefix_admission") is True
+        )
         if (
             not tag
             or actor_side not in (0, 1)
             or actor_key in seen_actors
-            or record.get("full_success") is not True
-            or record.get("prefix_admission") is not False
+            or not (full_actor or prefix_actor)
         ):
             raise TokenCoverageError("native generator actor evidence is invalid")
         seen_actors.add(actor_key)
@@ -1247,7 +1255,8 @@ def summarize_success_token_coverage(
     resolved_form_ids: dict[str, Counter[int]] = defaultdict(Counter)
     resolved_ability_ids: dict[str, Counter[int]] = defaultdict(Counter)
     seen_records: set[tuple[str, int]] = set()
-    total_records = full_success_records = ignored_failed_records = 0
+    total_records = full_success_records = censored_prefix_records = 0
+    ignored_failed_records = 0
 
     for raw_record in records:
         total_records += 1
@@ -1263,17 +1272,28 @@ def summarize_success_token_coverage(
         full_success = record.get("full_success")
         if not isinstance(full_success, bool):
             raise TokenCoverageError("actor full_success must be a boolean")
+        censored_prefix = record.get("censored_prefix", False)
+        if not isinstance(censored_prefix, bool) or (
+            full_success and censored_prefix
+        ):
+            raise TokenCoverageError(
+                "actor full-success/prefix admission is malformed"
+            )
         deploy_rows = _sequence(record.get("deploy_labels", []), "deploy_labels")
         ability_rows = _sequence(record.get("ability_labels", []), "ability_labels")
-        if not full_success:
+        if not full_success and not censored_prefix:
             ignored_failed_records += 1
             continue
-        full_success_records += 1
+        if full_success:
+            full_success_records += 1
+        else:
+            censored_prefix_records += 1
         deck = set(_unique_strings(record.get("deck_tokens"), "actor deck_tokens"))
         if len(deck) != 8 or not deck <= index["allowed_set"]:
             raise TokenCoverageError("successful actor deck must contain eight tokens")
-        for token in deck:
-            card_episodes[token].add(key)
+        if full_success:
+            for token in deck:
+                card_episodes[token].add(key)
 
         seen_events: set[tuple[str, int]] = set()
         for raw_label in deploy_rows:
@@ -1354,6 +1374,7 @@ def summarize_success_token_coverage(
         "contract_sha256": index["contract_sha256"],
         "records": total_records,
         "full_success_records": full_success_records,
+        "censored_prefix_records": censored_prefix_records,
         "ignored_failed_records": ignored_failed_records,
         "card_tokens": cards,
         "form_tokens": forms,

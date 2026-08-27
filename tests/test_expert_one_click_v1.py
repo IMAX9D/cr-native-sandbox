@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import ExitStack
 from pathlib import Path
@@ -521,10 +522,17 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 "audit_prefix_extent": {
                     "kind": "cr_native_replay_extent_v1",
                     "extent": "valid_prefix",
-                    "training_admission": "audit_only",
+                    "training_admission": "actor_bc_censored_prefix_v1",
                     "terminal_target": "unknown_censored",
+                    "timing_target": "right_censored_at_failure_tick_v1",
+                    "deployment_masks": "partial_native_visible_hand_complete_v1",
+                    "mask_coverage": {
+                        "all_retained_visible_hand_slots_covered": True,
+                        "rejected_deploy_labels": 0,
+                    },
                     "failure_tick_has_labels": False,
                 },
+                "native_deployment_mask_probes_attempted": 1,
             }
             rows = [
                 {
@@ -552,6 +560,83 @@ class ExpertOneClickV1Test(unittest.TestCase):
             )
             with self.assertRaisesRegex(OneClickError, "audit-prefix"):
                 validate_native_result_records(results, queue, expected_rows=2)
+
+    def test_prefix_actor_evidence_hash_is_required_for_token_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue.jsonl"
+            queue.write_text(
+                json.dumps({"battle_tag": "PREFIX", "ability_events_observed": 0})
+                + "\n",
+                encoding="utf-8",
+            )
+            extent = {
+                "kind": "cr_native_replay_extent_v1",
+                "extent": "valid_prefix",
+                "training_admission": "actor_bc_censored_prefix_v1",
+                "action_label_tick_stop_exclusive": 20,
+                "timing_target": "right_censored_at_failure_tick_v1",
+                "terminal_target": "unknown_censored",
+                "deployment_masks": "partial_native_visible_hand_complete_v1",
+                "mask_coverage": {
+                    "all_retained_visible_hand_slots_covered": True,
+                    "rejected_deploy_labels": 0,
+                },
+                "failure_tick_has_labels": False,
+            }
+            extent_sha = hashlib.sha256(
+                json.dumps(
+                    extent, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            actors = []
+            for side in (0, 1):
+                actor = {
+                    "kind": "cr_native_censored_prefix_actor_token_evidence_v1",
+                    "battle_tag": "PREFIX",
+                    "actor_side": side,
+                    "full_success": False,
+                    "censored_prefix": True,
+                    "prefix_admission": True,
+                    "action_label_tick_stop_exclusive": 20,
+                    "timing_target": "right_censored_at_failure_tick_v1",
+                    "replay_extent_sha256": extent_sha,
+                    "deck_tokens": [f"card-{index}" for index in range(8)],
+                    "deploy_labels": [],
+                    "ability_labels": [],
+                }
+                actor["native_evidence_sha256"] = hashlib.sha256(
+                    json.dumps(
+                        actor, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                actors.append(actor)
+            row = {
+                "kind": "expert_authoritative_native_tick_result_v1",
+                "battle_tag": "PREFIX",
+                "final_attempt": True,
+                "teacher_forced_success": False,
+                "token_coverage_actor_evidence": [],
+                "prefix_token_coverage_actor_evidence": actors,
+                "failure_class": "native_action_rejected",
+                "failure_domain": "semantic",
+                "failure_prefix_semantic_match": True,
+                "audit_prefix_tick_store_entry": {"ticks": 12},
+                "audit_prefix_extent": extent,
+                "native_deployment_mask_probes_attempted": 1,
+            }
+            results = root / "results.jsonl"
+            results.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            audit = validate_native_result_records(
+                results, queue, expected_rows=1, require_token_evidence=True
+            )
+            self.assertEqual(audit["token_coverage_actor_evidence_records"], 2)
+            actors[0]["deck_tokens"][0] = "tampered"
+            results.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(OneClickError, "identity/hash"):
+                validate_native_result_records(
+                    results, queue, expected_rows=1, require_token_evidence=True
+                )
 
     def test_ability_positive_waiver_requires_a_reason(self) -> None:
         result = {

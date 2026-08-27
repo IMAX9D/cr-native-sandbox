@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -19,11 +20,14 @@ from expert_v1.compile_native_bc_dataset import (
     NativeBcCompileError,
     _acquire_capacity_reservation,
     _assign_components,
+    _ability_vocab,
+    _card_vocab,
+    _compile_actor,
     _release_capacity_reservation,
     _stratified_capacity_sample,
     _validate_tick_store,
     compile_planned_shards,
-    create_compile_plan,
+    create_compile_plan as _create_compile_plan,
     finalize_dataset,
     load_compile_plan,
 )
@@ -69,6 +73,18 @@ from expert_v1.training_v1.schema import (
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "expert_schema5_authoritative.json"
+
+
+def create_compile_plan(*args: object, **kwargs: object) -> dict[str, object]:
+    """Keep legacy test call sites terse while exercising the explicit API."""
+
+    if "audit_prefix_store_root" not in kwargs:
+        receipt = Path(args[4])
+        coverage = json.loads(receipt.read_text(encoding="utf-8"))
+        kwargs["audit_prefix_store_root"] = Path(
+            coverage["audit_prefix_store"]["path"]
+        ).parent
+    return _create_compile_plan(*args, **kwargs)  # type: ignore[arg-type,return-value]
 
 
 class _Probe:
@@ -360,6 +376,7 @@ class NativeBcCompilerTests(unittest.TestCase):
         )
         prefix_root = root / "audit-prefix-shards"
         prefix_root.mkdir()
+        DeploymentMaskStore(prefix_root).build_manifest()
         prefix_manifest = build_store_manifest(
             prefix_root,
             source_manifest=index,
@@ -502,7 +519,7 @@ class NativeBcCompilerTests(unittest.TestCase):
             )
             self.assertGreater(integrity["shard_files"], 0)
             self.assertTrue(manifest["native_replay_validated"])
-            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(manifest["schema_version"], 3)
             capacity = json.loads(
                 (output / "capacity-preflight.json").read_text(encoding="utf-8")
             )
@@ -561,6 +578,73 @@ class NativeBcCompilerTests(unittest.TestCase):
             del batch
             dataset._arrays.clear()
             del dataset
+
+    def test_prefix_model_inputs_match_full_and_refill_pad_is_never_legal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source_manifest, contract_path, _receipt = self._inputs(
+                root, include_ability=False
+            )
+            source_row = json.loads(source_manifest.read_text().splitlines()[0])
+            source = json.loads(Path(source_row["source_path"]).read_text())
+            loaded = load_native_ingest_contract(contract_path)
+            native_plan = replace(
+                compile_battle(source, native_ingest_contract=loaded),
+                actions=(),
+                ability_events=(),
+            )
+            manifest = json.loads((tick_root / "manifest.json").read_text())
+            shard = manifest["shards"][0]
+            with ShardReader(
+                tick_root / shard["data_file"],
+                tick_root / shard["index_file"],
+            ) as reader:
+                episode = reader.episode(str(source["battle_tag"]))
+                state = next(episode.iter_ticks())
+                metadata = dict(episode.metadata)
+            contract = dict(loaded.value)
+            _cards, native_cards, source_cards = _card_vocab(contract)
+            _abilities, native_abilities = _ability_vocab(contract)
+            common = dict(
+                actor_side=0,
+                tick_store_root=tick_root,
+                id_to_card_token=native_cards,
+                source_to_card_token=source_cards,
+                id_to_ability_token=native_abilities,
+                max_ability_slots=16,
+            )
+            full = _compile_actor([state], metadata, native_plan, **common)
+            prefix = _compile_actor(
+                [state], metadata, native_plan, **common,
+                replay_extent="valid_prefix",
+                action_label_tick_stop_exclusive=state.tick + 1,
+                timing_censor_tick_exclusive=state.tick + 1,
+            )
+            for name in (
+                "public_scalars", "own_deck_tokens", "hand_tokens",
+                "next_card_token", "card_mask", "action_kind_mask",
+                "ability_tokens", "ability_mask", "grid_indices", "grid_values",
+            ):
+                np.testing.assert_array_equal(full[name], prefix[name])
+            self.assertEqual(int(prefix["replay_extent"][0]), 1)
+
+            players = list(state.players)
+            own = players[0]
+            players[0] = replace(
+                own,
+                hand=(own.hand[0], own.hand[1], -1, own.hand[3]),
+                refill_timer=600,
+            )
+            transient = replace(state, players=tuple(players))
+            refill = _compile_actor(
+                [transient], metadata, native_plan, **common,
+                replay_extent="valid_prefix",
+                action_label_tick_stop_exclusive=state.tick + 1,
+                timing_censor_tick_exclusive=state.tick + 1,
+            )
+            self.assertEqual(int(refill["hand_tokens"][0, 2]), 0)
+            self.assertEqual(int(refill["card_mask"][0, 2]), 0)
+            self.assertEqual(int(refill["card_label_mask"][0]), 0)
 
     def test_missing_mask_sidecar_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -913,10 +997,19 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "audit_prefix_extent": {
                         "kind": "cr_native_replay_extent_v1",
                         "extent": "valid_prefix",
-                        "training_admission": "audit_only",
+                        "training_admission": "actor_bc_censored_prefix_v1",
                         "terminal_target": "unknown_censored",
+                        "timing_target": "right_censored_at_failure_tick_v1",
+                        "deployment_masks": (
+                            "partial_native_visible_hand_complete_v1"
+                        ),
+                        "mask_coverage": {
+                            "all_retained_visible_hand_slots_covered": True,
+                            "rejected_deploy_labels": 0,
+                        },
                         "failure_tick_has_labels": False,
                     },
+                    "native_deployment_mask_probes_attempted": 1,
                 }
             ]
             candidate_queue.write_text(
@@ -976,14 +1069,13 @@ class NativeBcCompilerTests(unittest.TestCase):
                 waiver_reason="known issue CR-ABILITY-1",
             )
             receipt.write_text(json.dumps(value) + "\n", encoding="utf-8")
-            plan = create_compile_plan(
-                tick_root, source, root / "waived", contract, receipt,
-                maximum_rows_per_shard=10_000,
-            )
-            self.assertEqual(
-                plan["inputs"]["native_generation_receipt_sha256"],
-                hashlib.sha256(receipt.read_bytes()).hexdigest(),
-            )
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "missing from schema-v5 index"
+            ):
+                create_compile_plan(
+                    tick_root, source, root / "waived", contract, receipt,
+                    maximum_rows_per_shard=10_000,
+                )
 
     def test_fully_resigned_capacity_arithmetic_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1247,7 +1339,7 @@ class NativeBcCompilerTests(unittest.TestCase):
                     "created_utc", "2099-01-01T00:00:00+00:00"
                 ),
                 "kind": lambda value: value.__setitem__("kind", "forged"),
-                "schema": lambda value: value.__setitem__("schema_version", 4),
+                "schema": lambda value: value.__setitem__("schema_version", 5),
                 "count": lambda value: value.__setitem__(
                     "episodes", int(value["episodes"]) + 1
                 ),

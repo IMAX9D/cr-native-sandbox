@@ -75,11 +75,18 @@ from .token_coverage_v1 import (
 )
 
 
-COMPILER_KIND = "cr_native_tick_store_bc_compiler_v3"
-PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v3"
+COMPILER_KIND = "cr_native_tick_store_bc_compiler_v4"
+PLAN_KIND = "cr_native_tick_store_bc_compile_plan_v4"
 ASSIGNMENT_KIND = "cr_native_tick_store_bc_split_assignment_v1"
 OBSERVATION_MODE = "native_state_v1"
 ACTION_EXECUTION_OFFSET_METADATA = "action_execution_tick_offset"
+REPLAY_EXTENT_METADATA_KEY = "native_replay_extent_v1"
+REPLAY_EXTENT_KIND = "cr_native_replay_extent_v1"
+FULL_SUCCESS_EXTENT = "full_success"
+VALID_PREFIX_EXTENT = "valid_prefix"
+PREFIX_TRAINING_ADMISSION = "actor_bc_censored_prefix_v1"
+PREFIX_MASK_PROVENANCE = "partial_native_visible_hand_complete_v1"
+PREFIX_TIMING_TARGET = "right_censored_at_failure_tick_v1"
 ENTITY_NUMERIC_FIELDS = ("level_ratio", "hp_ratio", "log_max_hp")
 MAX_ABILITY_SLOTS = 16
 CAPACITY_PREFLIGHT_KIND = "cr_native_bc_capacity_preflight_v1"
@@ -145,6 +152,18 @@ class EpisodeInput:
     player_tags: tuple[str, ...]
     split: str
     component_sha256: str
+    tick_store_root: str = ""
+    replay_extent: str = FULL_SUCCESS_EXTENT
+    compiled_tick_count: int = 0
+    observation_tick_start: int = -1
+    observation_tick_stop_exclusive: int = -1
+    action_label_tick_stop_exclusive: int = -1
+    timing_censor_tick_exclusive: int = -1
+    timing_target: str = "native_tick_hazard_v1"
+    terminal_target: str = "unknown_unanchored_v1"
+    extent_sha256: str = "0" * 64
+    mask_metadata_sha256: str = "0" * 64
+    prefix_ability_evidence: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,25 +308,34 @@ def _player_tags(source: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(sorted(result))
 
 
-def _validate_tick_store(root: Path, *, workers: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _validate_tick_store(
+    root: Path,
+    *,
+    workers: int,
+    expected_kind: str = TICK_STORE_KIND,
+    allow_empty: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise NativeBcCompileError(f"Tick Store manifest is missing: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    if manifest.get("kind") == AUDIT_PREFIX_STORE_KIND:
+    if (
+        expected_kind == TICK_STORE_KIND
+        and manifest.get("kind") == AUDIT_PREFIX_STORE_KIND
+    ):
         raise NativeBcCompileError(
             "audit-prefix Tick Store is training_admission=audit_only and "
             "cannot be compiled as BC data"
         )
     if (
-        manifest.get("kind") != TICK_STORE_KIND
+        manifest.get("kind") != expected_kind
         or int(manifest.get("schema_version", -1)) != 1
         or manifest.get("every_native_tick_present") is not True
         or int(manifest.get("tick_hz", -1)) != 20
     ):
         raise NativeBcCompileError("Tick Store manifest contract changed")
     raw_shards = manifest.get("shards")
-    if not isinstance(raw_shards, list) or not raw_shards:
+    if not isinstance(raw_shards, list) or (not raw_shards and not allow_empty):
         raise NativeBcCompileError("Tick Store contains no immutable shards")
 
     def verify_one(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -358,6 +386,118 @@ def _episode_index(shards: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, A
                     "tick_index_path": str(shard["index_path"]),
                 }
     return result
+
+
+def _episode_extent_contract(
+    metadata: Mapping[str, Any],
+    *,
+    tick_count: int,
+    replay_extent: str,
+) -> dict[str, Any]:
+    """Normalize the immutable row/censor provenance for one Tick episode."""
+
+    if replay_extent == FULL_SUCCESS_EXTENT:
+        body = {
+            "replay_extent": FULL_SUCCESS_EXTENT,
+            "compiled_tick_count": int(tick_count),
+            "observation_tick_start": -1,
+            "observation_tick_stop_exclusive": -1,
+            "action_label_tick_stop_exclusive": -1,
+            "timing_censor_tick_exclusive": -1,
+            "timing_target": "native_tick_hazard_v1",
+            "terminal_target": "unknown_unanchored_v1",
+        }
+        return {
+            **body,
+            "extent_sha256": hashlib.sha256(
+                canonical_json_bytes(body)
+            ).hexdigest(),
+        }
+    if replay_extent != VALID_PREFIX_EXTENT:
+        raise NativeBcCompileError(f"unsupported replay extent: {replay_extent}")
+    raw = metadata.get(REPLAY_EXTENT_METADATA_KEY)
+    if not isinstance(raw, Mapping):
+        raise NativeBcCompileError("audit-prefix episode lacks replay extent metadata")
+    required = {
+        "kind", "extent", "training_admission", "source_episode_complete",
+        "every_native_tick_present_within_extent", "semantic_match",
+        "failure_domain", "failure_tick_has_labels", "terminal_target",
+        "terminal_validated", "deployment_masks", "mask_coverage",
+        "observation_tick_start", "observation_tick_stop_exclusive",
+        "action_label_tick_stop_exclusive", "timing_censor_tick_exclusive",
+        "timing_target",
+    }
+    if not required <= set(raw):
+        raise NativeBcCompileError("audit-prefix replay extent fields are incomplete")
+    start = _require_integer(raw.get("observation_tick_start"), "prefix observation start")
+    stop = _require_integer(raw.get("observation_tick_stop_exclusive"), "prefix observation stop")
+    action_stop = _require_integer(
+        raw.get("action_label_tick_stop_exclusive"), "prefix action-label stop"
+    )
+    censor = _require_integer(
+        raw.get("timing_censor_tick_exclusive"), "prefix timing censor"
+    )
+    if (
+        raw.get("kind") != REPLAY_EXTENT_KIND
+        or raw.get("extent") != VALID_PREFIX_EXTENT
+        or raw.get("training_admission") != PREFIX_TRAINING_ADMISSION
+        or raw.get("source_episode_complete") is not False
+        or raw.get("every_native_tick_present_within_extent") is not True
+        or raw.get("semantic_match") is not True
+        or raw.get("failure_domain") != "semantic"
+        or raw.get("failure_tick_has_labels") is not False
+        or raw.get("terminal_target") != "unknown_censored"
+        or raw.get("terminal_validated") is not False
+        or raw.get("deployment_masks") != PREFIX_MASK_PROVENANCE
+        or raw.get("timing_target") != PREFIX_TIMING_TARGET
+        or stop - start != int(tick_count)
+        or not start < action_stop <= censor <= stop
+    ):
+        raise NativeBcCompileError("audit-prefix replay extent contract changed")
+    compiled_ticks = censor - start
+    if compiled_ticks <= 0:
+        raise NativeBcCompileError("audit-prefix has no pre-censor Tick rows")
+    coverage = raw.get("mask_coverage")
+    if not isinstance(coverage, Mapping):
+        raise NativeBcCompileError("audit-prefix mask coverage is missing")
+    coverage_fields = {
+        "all_retained_visible_hand_slots_covered", "retained_ticks",
+        "actor_ticks", "visible_slot_references", "empty_slot_actor_ticks",
+        "safe_deploy_labels", "checked_deploy_labels", "rejected_deploy_labels",
+    }
+    if not coverage_fields <= set(coverage):
+        raise NativeBcCompileError("audit-prefix mask coverage fields are incomplete")
+    if (
+        coverage.get("all_retained_visible_hand_slots_covered") is not True
+        or _require_integer(coverage.get("retained_ticks"), "prefix retained_ticks")
+        != compiled_ticks
+        or _require_integer(coverage.get("actor_ticks"), "prefix actor_ticks")
+        != compiled_ticks * 2
+        or _require_integer(
+            coverage.get("rejected_deploy_labels"), "prefix rejected deploy labels"
+        ) != 0
+        or _require_integer(
+            coverage.get("checked_deploy_labels"), "prefix checked deploy labels"
+        )
+        != _require_integer(
+            coverage.get("safe_deploy_labels"), "prefix safe deploy labels"
+        )
+    ):
+        raise NativeBcCompileError("audit-prefix mask coverage accounting changed")
+    body = dict(raw)
+    return {
+        "replay_extent": VALID_PREFIX_EXTENT,
+        "compiled_tick_count": compiled_ticks,
+        "observation_tick_start": start,
+        "observation_tick_stop_exclusive": stop,
+        "action_label_tick_stop_exclusive": action_stop,
+        "timing_censor_tick_exclusive": censor,
+        "timing_target": PREFIX_TIMING_TARGET,
+        "terminal_target": "unknown_censored",
+        "extent_sha256": hashlib.sha256(
+            canonical_json_bytes(body)
+        ).hexdigest(),
+    }
 
 
 def _read_source_input(
@@ -433,7 +573,10 @@ def _assign_components(
     for values in components.values():
         tags_in_component = sorted(str(value["battle_tag"]) for value in values)
         component_sha = _digest({"seed": seed, "battle_tags": tags_in_component})
-        weight = sum(int(value["tick_count"]) * 2 for value in values)
+        weight = sum(
+            int(value.get("compiled_tick_count", value["tick_count"])) * 2
+            for value in values
+        )
         ordered.append((component_sha, values, weight))
     ordered.sort(key=lambda value: value[0])
     total = sum(value[2] for value in ordered)
@@ -655,7 +798,6 @@ def _authenticate_native_generation_receipt(
         or prefix_manifest.get("kind") != AUDIT_PREFIX_STORE_KIND
         or int(prefix_manifest.get("episode_count", -1)) != prefix_stored
         or float(receipt.get("success_rate", -1)) != successes / target
-        or successes / target < float(receipt.get("minimum_success_rate", 2))
     ):
         raise NativeBcCompileError(
             "native generation coverage does not match compiled episode admission"
@@ -727,6 +869,13 @@ def _authenticate_native_generation_receipt(
         "source_token_coverage": receipt.get("source_token_coverage"),
         "ability_coverage": recomputed,
         "stored_episodes": stored,
+        "audit_prefix_episodes": prefix_stored,
+        "success_tags": sorted(str(value) for value in audit.get("success_tags") or []),
+        "audit_prefix_tags": sorted(
+            str(value) for value in audit.get("audit_prefix_tags") or []
+        ),
+        "audit_prefix_manifest_path": str(prefix_manifest_path),
+        "audit_prefix_manifest_sha256": sha256_file(prefix_manifest_path),
     }
 
 
@@ -860,7 +1009,7 @@ def validate_compile_plan(
     if (
         plan.get("kind") != PLAN_KIND
         or _require_integer(plan.get("schema_version"), "plan.schema_version", minimum=1)
-        != 3
+        != 4
     ):
         raise NativeBcCompileError("compile-plan kind/schema changed")
     if not isinstance(plan.get("created_utc"), str) or not plan["created_utc"]:
@@ -883,6 +1032,12 @@ def validate_compile_plan(
             "source_token_coverage_receipt_path",
             "source_token_coverage_receipt_sha256",
             "source_token_coverage_canonical_sha256",
+            "audit_prefix_store_root", "audit_prefix_store_manifest_path",
+            "audit_prefix_store_manifest_sha256",
+            "audit_prefix_store_content_sha256",
+            "referenced_audit_prefix_deployment_mask_sha256",
+            "audit_prefix_deployment_mask_manifest_sha256",
+            "audit_prefix_deployment_mask_content_sha256",
         },
         "compile-plan inputs",
     )
@@ -901,12 +1056,12 @@ def validate_compile_plan(
         or _require_integer(
             compiler.get("schema_version"), "compiler.schema_version", minimum=1
         )
-        != 3
+        != 4
         or compiler.get("actor_information") != "public_only_v1"
         or compiler.get("action_alignment") != "source_tick_plus_episode_metadata_offset"
         or compiler.get("entity_identity") != "discrete_native_card_token_v1"
         or compiler.get("mask_policy")
-        != "content_addressed_native_sidecar_fail_closed_v1"
+        != "full_complete_prefix_visible_hand_partial_fail_closed_v1"
         or compiler.get("storage_schema") != {
             "grid": GRID_STORAGE,
             "selected_position_mask": POSITION_MASK_STORAGE,
@@ -959,6 +1114,10 @@ def validate_compile_plan(
         "native_contract_sha256", "deployment_mask_manifest_sha256",
         "deployment_mask_content_sha256", "native_generation_receipt_sha256",
         "native_generation_results_sha256",
+        "audit_prefix_store_manifest_sha256",
+        "audit_prefix_store_content_sha256",
+        "audit_prefix_deployment_mask_manifest_sha256",
+        "audit_prefix_deployment_mask_content_sha256",
     ):
         _require_sha(inputs.get(name), f"inputs.{name}")
     if inputs.get("source_token_coverage_receipt_path") is None:
@@ -986,8 +1145,22 @@ def validate_compile_plan(
         raise NativeBcCompileError("referenced deployment masks are not sorted unique")
     for value in referenced_masks:
         _require_sha(value, "referenced deployment mask")
+    referenced_prefix_masks = inputs.get(
+        "referenced_audit_prefix_deployment_mask_sha256"
+    )
+    if (
+        not isinstance(referenced_prefix_masks, list)
+        or referenced_prefix_masks
+        != sorted(set(str(value) for value in referenced_prefix_masks))
+    ):
+        raise NativeBcCompileError(
+            "referenced audit-prefix deployment masks are not sorted unique"
+        )
+    for value in referenced_prefix_masks:
+        _require_sha(value, "referenced audit-prefix deployment mask")
 
     tick_root = Path(str(plan.get("tick_store_root") or "")).resolve()
+    prefix_root = Path(str(inputs.get("audit_prefix_store_root") or "")).resolve()
     output_root = Path(str(plan.get("output_root") or "")).resolve()
     if str(tick_root) != str(plan["tick_store_root"]):
         raise NativeBcCompileError("compile-plan Tick Store path is not canonical absolute")
@@ -995,6 +1168,14 @@ def validate_compile_plan(
         raise NativeBcCompileError("compile-plan output path is not canonical absolute")
     if Path(str(inputs["tick_store_manifest_path"])).resolve() != tick_root / "manifest.json":
         raise NativeBcCompileError("compile-plan Tick Store manifest path disagrees with root")
+    if (
+        str(prefix_root) != str(inputs["audit_prefix_store_root"])
+        or Path(str(inputs["audit_prefix_store_manifest_path"])).resolve()
+        != prefix_root / "manifest.json"
+    ):
+        raise NativeBcCompileError(
+            "compile-plan audit-prefix Tick Store path is not canonical"
+        )
     if plan_path is not None and output_root != plan_path.resolve().parent:
         raise NativeBcCompileError("compile-plan output root disagrees with its location")
     capacity_reference = plan.get("capacity_preflight")
@@ -1062,9 +1243,14 @@ def validate_compile_plan(
     if not isinstance(raw_shards, list) or not raw_shards:
         raise NativeBcCompileError("compile-plan has no output shards")
     episode_fields = {
-        "battle_tag", "tick_data_path", "tick_index_path", "tick_count",
+        "battle_tag", "tick_store_root", "tick_data_path", "tick_index_path", "tick_count",
         "tick_payload_sha256", "tick_payload_size", "source_path", "source_sha256", "source_group",
-        "player_tags", "split", "component_sha256",
+        "player_tags", "split", "component_sha256", "replay_extent",
+        "compiled_tick_count", "observation_tick_start",
+        "observation_tick_stop_exclusive", "action_label_tick_stop_exclusive",
+        "timing_censor_tick_exclusive", "timing_target", "terminal_target",
+        "extent_sha256", "mask_metadata_sha256",
+        "prefix_ability_evidence",
     }
     shard_fields = {
         "relative_path", "split", "index", "episodes", "estimated_rows",
@@ -1106,28 +1292,132 @@ def validate_compile_plan(
             ):
                 raise NativeBcCompileError(f"compile-plan episode identity is invalid: {tag}")
             _require_integer(item.get("tick_count"), "episode.tick_count", minimum=1)
+            compiled_ticks = _require_integer(
+                item.get("compiled_tick_count"),
+                "episode.compiled_tick_count",
+                minimum=1,
+            )
+            if compiled_ticks > int(item["tick_count"]):
+                raise NativeBcCompileError("compiled prefix rows exceed stored Tick extent")
             _require_integer(
                 item.get("tick_payload_size"),
                 "episode.tick_payload_size",
                 minimum=1,
             )
-            for name in ("tick_payload_sha256", "source_sha256", "component_sha256"):
+            for name in (
+                "tick_payload_sha256", "source_sha256", "component_sha256",
+                "extent_sha256", "mask_metadata_sha256",
+            ):
                 _require_sha(item.get(name), f"episode.{name}")
-            for name in ("tick_data_path", "tick_index_path", "source_path"):
+            for name in (
+                "tick_store_root", "tick_data_path", "tick_index_path", "source_path"
+            ):
                 raw_path = str(item.get(name) or "")
                 if not Path(raw_path).is_absolute() or str(Path(raw_path).resolve()) != raw_path:
                     raise NativeBcCompileError(f"episode.{name} is not canonical absolute")
-            if tick_root not in Path(str(item["tick_data_path"])).resolve().parents:
+            extent = str(item.get("replay_extent") or "")
+            expected_root = tick_root if extent == FULL_SUCCESS_EXTENT else prefix_root
+            if extent not in {FULL_SUCCESS_EXTENT, VALID_PREFIX_EXTENT}:
+                raise NativeBcCompileError("compile-plan replay extent is invalid")
+            if Path(str(item["tick_store_root"])).resolve() != expected_root:
+                raise NativeBcCompileError("episode Tick root disagrees with replay extent")
+            if expected_root not in Path(str(item["tick_data_path"])).resolve().parents:
                 raise NativeBcCompileError("episode Tick data escapes Tick Store root")
-            if tick_root not in Path(str(item["tick_index_path"])).resolve().parents:
+            if expected_root not in Path(str(item["tick_index_path"])).resolve().parents:
                 raise NativeBcCompileError("episode Tick index escapes Tick Store root")
+            if extent == VALID_PREFIX_EXTENT:
+                if (
+                    item.get("timing_target") != PREFIX_TIMING_TARGET
+                    or item.get("terminal_target") != "unknown_censored"
+                    or _require_integer(
+                        item.get("timing_censor_tick_exclusive"),
+                        "episode timing censor",
+                    )
+                    - _require_integer(
+                        item.get("observation_tick_start"),
+                        "episode observation start",
+                    )
+                    != compiled_ticks
+                    or _require_integer(
+                        item.get("action_label_tick_stop_exclusive"),
+                        "episode action label stop",
+                    )
+                    > int(item["timing_censor_tick_exclusive"])
+                ):
+                    raise NativeBcCompileError(
+                        "compile-plan audit-prefix censor contract changed"
+                    )
+            prefix_ability = item.get("prefix_ability_evidence")
+            if not isinstance(prefix_ability, list):
+                raise NativeBcCompileError(
+                    "compile-plan prefix ability evidence must be an array"
+                )
+            normalized_prefix_ability: list[tuple[int, int, int, int, str, str]] = []
+            for raw_evidence in prefix_ability:
+                if not isinstance(raw_evidence, Mapping):
+                    raise NativeBcCompileError(
+                        "compile-plan prefix ability evidence is malformed"
+                    )
+                if set(raw_evidence) != {
+                    "actor_side", "source_event_index", "selected_entity_id",
+                    "selected_native_form_id", "resolved_token",
+                    "transcript_sha256",
+                }:
+                    raise NativeBcCompileError(
+                        "compile-plan prefix ability evidence fields changed"
+                    )
+                actor_side = _require_integer(
+                    raw_evidence.get("actor_side"), "prefix ability actor_side"
+                )
+                event_index = _require_integer(
+                    raw_evidence.get("source_event_index"),
+                    "prefix ability source_event_index",
+                )
+                entity_id = _require_integer(
+                    raw_evidence.get("selected_entity_id"),
+                    "prefix ability selected_entity_id",
+                    minimum=1,
+                )
+                native_form_id = _require_integer(
+                    raw_evidence.get("selected_native_form_id"),
+                    "prefix ability selected_native_form_id",
+                    minimum=1,
+                )
+                resolved_token = str(raw_evidence.get("resolved_token") or "")
+                if not resolved_token:
+                    raise NativeBcCompileError(
+                        "prefix ability resolved token is missing"
+                    )
+                transcript_sha = _require_sha(
+                    raw_evidence.get("transcript_sha256"),
+                    "prefix ability transcript_sha256",
+                )
+                if actor_side not in (0, 1):
+                    raise NativeBcCompileError("prefix ability actor side is invalid")
+                normalized_prefix_ability.append(
+                    (
+                        actor_side, event_index, entity_id, native_form_id,
+                        resolved_token, transcript_sha,
+                    )
+                )
+            if normalized_prefix_ability != sorted(set(normalized_prefix_ability)):
+                raise NativeBcCompileError(
+                    "compile-plan prefix ability evidence is not sorted unique"
+                )
+            if extent == FULL_SUCCESS_EXTENT and prefix_ability:
+                raise NativeBcCompileError(
+                    "full-success episode carries prefix ability evidence"
+                )
             normalized_episodes.append(item)
             all_episodes.append(item)
         if [value["battle_tag"] for value in normalized_episodes] != sorted(
             value["battle_tag"] for value in normalized_episodes
         ):
             raise NativeBcCompileError("compile-plan shard episodes are not deterministic")
-        expected_rows = sum(int(value["tick_count"]) * 2 for value in normalized_episodes)
+        expected_rows = sum(
+            int(value["compiled_tick_count"]) * 2
+            for value in normalized_episodes
+        )
         if int(raw_shard.get("estimated_rows", -1)) != expected_rows:
             raise NativeBcCompileError("compile-plan shard estimated_rows changed")
         expected_content = _digest({"split": split, "episodes": normalized_episodes})
@@ -1150,7 +1440,7 @@ def validate_compile_plan(
         rows = 0
         index = 0
         for value in values:
-            cost = int(value["tick_count"]) * 2
+            cost = int(value["compiled_tick_count"]) * 2
             if pending and rows + cost > maximum_rows:
                 expected_groups.append((split, index, pending))
                 pending, rows, index = [], 0, index + 1
@@ -1176,6 +1466,7 @@ def validate_compile_plan(
             "source_group": value["source_group"],
             "source_sha256": value["source_sha256"],
             "tick_count": value["tick_count"],
+            "compiled_tick_count": value["compiled_tick_count"],
         }
         for value in all_episodes
     ]
@@ -1194,7 +1485,9 @@ def validate_compile_plan(
             raise NativeBcCompileError("compile-plan split/component assignment changed")
     if _require_integer(plan.get("episodes"), "plan.episodes") != len(all_episodes):
         raise NativeBcCompileError("compile-plan episode count changed")
-    expected_rows = sum(int(value["tick_count"]) * 2 for value in all_episodes)
+    expected_rows = sum(
+        int(value["compiled_tick_count"]) * 2 for value in all_episodes
+    )
     if _require_integer(plan.get("estimated_rows"), "plan.estimated_rows") != expected_rows:
         raise NativeBcCompileError("compile-plan estimated row count changed")
     if (
@@ -1243,6 +1536,16 @@ def validate_compile_plan(
                 "native generation results",
             ),
             (tick_root / "deployment-masks-v1" / "manifest.json", inputs["deployment_mask_manifest_sha256"], "mask manifest"),
+            (
+                Path(str(inputs["audit_prefix_store_manifest_path"])),
+                inputs["audit_prefix_store_manifest_sha256"],
+                "audit-prefix Tick Store manifest",
+            ),
+            (
+                prefix_root / "deployment-masks-v1" / "manifest.json",
+                inputs["audit_prefix_deployment_mask_manifest_sha256"],
+                "audit-prefix mask manifest",
+            ),
         )
         if inputs.get("source_token_coverage_receipt_path") is not None:
             files += ((
@@ -1258,6 +1561,18 @@ def validate_compile_plan(
         )
         if tick_manifest.get("content_sha256") != inputs["tick_store_content_sha256"]:
             raise NativeBcCompileError("compile-plan Tick Store content SHA changed")
+        prefix_manifest = json.loads(
+            Path(str(inputs["audit_prefix_store_manifest_path"])).read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        if (
+            prefix_manifest.get("content_sha256")
+            != inputs["audit_prefix_store_content_sha256"]
+        ):
+            raise NativeBcCompileError(
+                "compile-plan audit-prefix Tick Store content SHA changed"
+            )
         contract, contract_file_sha = _load_contract(contract_path)
         if (
             contract_file_sha != inputs["native_contract_file_sha256"]
@@ -1270,7 +1585,10 @@ def validate_compile_plan(
             native_contract=contract_path,
             contract_sha256=str(inputs["native_contract_sha256"]),
             contract_file_sha256=str(inputs["native_contract_file_sha256"]),
-            expected_episodes=len(all_episodes),
+            expected_episodes=sum(
+                value["replay_extent"] == FULL_SUCCESS_EXTENT
+                for value in all_episodes
+            ),
         )
         if native_coverage["receipt_sha256"] != inputs[
             "native_generation_receipt_sha256"
@@ -1283,6 +1601,25 @@ def validate_compile_plan(
             != Path(str(inputs["native_generation_results_path"])).resolve()
         ):
             raise NativeBcCompileError("compile-plan native results identity changed")
+        planned_full_tags = {
+            str(value["battle_tag"])
+            for value in all_episodes
+            if value["replay_extent"] == FULL_SUCCESS_EXTENT
+        }
+        planned_prefix_tags = {
+            str(value["battle_tag"])
+            for value in all_episodes
+            if value["replay_extent"] == VALID_PREFIX_EXTENT
+        }
+        if (
+            set(native_coverage["success_tags"]) != planned_full_tags
+            or set(native_coverage["audit_prefix_tags"]) != planned_prefix_tags
+            or Path(native_coverage["audit_prefix_manifest_path"]).resolve()
+            != prefix_root / "manifest.json"
+        ):
+            raise NativeBcCompileError(
+                "compile-plan full/prefix result union changed"
+            )
         if inputs.get("source_token_coverage_receipt_path") is not None:
             source_coverage = _authenticate_source_token_coverage_receipt(
                 Path(str(inputs["source_token_coverage_receipt_path"])),
@@ -1300,6 +1637,74 @@ def validate_compile_plan(
                 raise NativeBcCompileError(
                     "compile-plan source token coverage identity changed"
                 )
+            if planned_prefix_tags:
+                result_rows = {
+                    str(row.get("battle_tag") or ""): row
+                    for row in _json_lines(
+                        Path(str(inputs["native_generation_results_path"]))
+                    )
+                }
+                raw_prefix_actors: list[Mapping[str, Any]] = []
+                for tag in sorted(planned_prefix_tags):
+                    actors = result_rows.get(tag, {}).get(
+                        "prefix_token_coverage_actor_evidence"
+                    )
+                    if not isinstance(actors, list) or len(actors) != 2:
+                        raise NativeBcCompileError(
+                            f"compile-plan prefix ability evidence is missing: {tag}"
+                        )
+                    raw_prefix_actors.extend(
+                        actor for actor in actors if isinstance(actor, Mapping)
+                    )
+                try:
+                    rebuilt_prefix = authenticate_generator_ability_evidence(
+                        raw_prefix_actors,
+                        contract,
+                        source_coverage["source_coverage"],
+                        expected_source_events_sha256=str(
+                            source_coverage["source_coverage"]
+                            ["ability_event_registry"]["source_events_sha256"]
+                        ),
+                    )
+                except Exception as error:
+                    raise NativeBcCompileError(
+                        f"compile-plan prefix ability authentication failed: {error}"
+                    ) from error
+                rebuilt_by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
+                for transcript in rebuilt_prefix["transcripts"]:
+                    rebuilt_by_tag[str(transcript["battle_tag"])].append({
+                        "actor_side": int(transcript["actor_side"]),
+                        "source_event_index": int(
+                            transcript["source_event_index"]
+                        ),
+                        "selected_entity_id": int(
+                            transcript["selected_entity_id"]
+                        ),
+                        "selected_native_form_id": int(
+                            transcript["selected_native_form_id"]
+                        ),
+                        "resolved_token": str(transcript["resolved_token"]),
+                        "transcript_sha256": str(
+                            transcript["transcript_sha256"]
+                        ),
+                    })
+                for values in rebuilt_by_tag.values():
+                    values.sort(
+                        key=lambda value: (
+                            int(value["actor_side"]),
+                            int(value["source_event_index"]),
+                            int(value["selected_entity_id"]),
+                            str(value["transcript_sha256"]),
+                        )
+                    )
+                for episode in all_episodes:
+                    if episode["replay_extent"] == VALID_PREFIX_EXTENT and (
+                        episode["prefix_ability_evidence"]
+                        != rebuilt_by_tag.get(str(episode["battle_tag"]), [])
+                    ):
+                        raise NativeBcCompileError(
+                            "compile-plan prefix ability evidence differs from results"
+                        )
         _validate_plan_vocabulary(plan, contract)
         mask_store = DeploymentMaskStore(tick_root, create=False)
         mask_manifest = mask_store.verify_manifest()
@@ -1312,6 +1717,25 @@ def validate_compile_plan(
             raise NativeBcCompileError("compile-plan references masks outside mask manifest")
         for digest in referenced_masks:
             mask_store.load(digest)
+        prefix_mask_store = DeploymentMaskStore(prefix_root, create=False)
+        prefix_mask_manifest = prefix_mask_store.verify_manifest()
+        if (
+            prefix_mask_manifest.get("content_sha256")
+            != inputs["audit_prefix_deployment_mask_content_sha256"]
+        ):
+            raise NativeBcCompileError(
+                "compile-plan audit-prefix mask-store content SHA changed"
+            )
+        prefix_manifest_masks = {
+            str(value["content_sha256"])
+            for value in prefix_mask_manifest.get("entries", [])
+        }
+        if not set(referenced_prefix_masks).issubset(prefix_manifest_masks):
+            raise NativeBcCompileError(
+                "compile-plan references masks outside audit-prefix mask manifest"
+            )
+        for digest in referenced_prefix_masks:
+            prefix_mask_store.load(digest)
         # Rebuild the episode join from the immutable inputs.  This prevents a
         # re-signed plan from omitting a battle, swapping a source path, or
         # pointing a tag at a different Tick frame while preserving plausible
@@ -1320,10 +1744,22 @@ def validate_compile_plan(
             tick_root, workers=min(16, max(1, os.cpu_count() or 1))
         )
         tick_episodes = _episode_index(tick_shards)
+        _prefix_tick_manifest, prefix_tick_shards = _validate_tick_store(
+            prefix_root,
+            workers=min(16, max(1, os.cpu_count() or 1)),
+            expected_kind=AUDIT_PREFIX_STORE_KIND,
+            allow_empty=True,
+        )
+        prefix_tick_episodes = _episode_index(prefix_tick_shards)
         planned_by_tag = {
             str(value["battle_tag"]): value for value in all_episodes
         }
-        if set(planned_by_tag) != set(tick_episodes):
+        if (
+            planned_full_tags != set(tick_episodes)
+            or planned_prefix_tags != set(prefix_tick_episodes)
+            or planned_full_tags & planned_prefix_tags
+            or set(planned_by_tag) != planned_full_tags | planned_prefix_tags
+        ):
             raise NativeBcCompileError(
                 "compile-plan battle set differs from immutable Tick Store"
             )
@@ -1342,6 +1778,7 @@ def validate_compile_plan(
             )
         readers: dict[tuple[str, str], ShardReader] = {}
         actual_referenced_masks: set[str] = set()
+        actual_referenced_prefix_masks: set[str] = set()
         try:
             for tag in sorted(planned_by_tag):
                 planned = planned_by_tag[tag]
@@ -1366,7 +1803,10 @@ def validate_compile_plan(
                     raise NativeBcCompileError(
                         f"compile-plan Schema5 episode join changed: {tag}"
                     )
-                tick_entry = tick_episodes[tag]
+                is_prefix = planned["replay_extent"] == VALID_PREFIX_EXTENT
+                tick_entry = (
+                    prefix_tick_episodes[tag] if is_prefix else tick_episodes[tag]
+                )
                 expected_tick_fields = {
                     "tick_data_path": str(tick_entry["tick_data_path"]),
                     "tick_index_path": str(tick_entry["tick_index_path"]),
@@ -1408,10 +1848,30 @@ def validate_compile_plan(
                     raise NativeBcCompileError(
                         f"compile-plan source/Tick SHA join changed: {tag}"
                     )
-                episode_masks = mask_store.verify_episode_metadata(metadata)
+                active_mask_store = prefix_mask_store if is_prefix else mask_store
+                episode_masks = active_mask_store.verify_episode_metadata(
+                    metadata, require_complete=not is_prefix
+                )
+                extent_contract = _episode_extent_contract(
+                    metadata,
+                    tick_count=int(tick_entry["ticks"]),
+                    replay_extent=str(planned["replay_extent"]),
+                )
+                if any(
+                    planned[name] != value
+                    for name, value in extent_contract.items()
+                ) or planned["mask_metadata_sha256"] != _digest(dict(episode_masks)):
+                    raise NativeBcCompileError(
+                        f"compile-plan replay extent/mask provenance changed: {tag}"
+                    )
+                actual_target = (
+                    actual_referenced_prefix_masks
+                    if is_prefix
+                    else actual_referenced_masks
+                )
                 for entry in episode_masks["entries"]:
-                    actual_referenced_masks.add(str(entry["content_sha256"]))
-                    actual_referenced_masks.update(
+                    actual_target.add(str(entry["content_sha256"]))
+                    actual_target.update(
                         str(variant["content_sha256"])
                         for variant in entry.get("dynamic_label_variants", [])
                     )
@@ -1421,6 +1881,10 @@ def validate_compile_plan(
         if sorted(actual_referenced_masks) != referenced_masks:
             raise NativeBcCompileError(
                 "compile-plan referenced deployment-mask set changed"
+            )
+        if sorted(actual_referenced_prefix_masks) != referenced_prefix_masks:
+            raise NativeBcCompileError(
+                "compile-plan referenced audit-prefix deployment-mask set changed"
             )
         component_paths = {
             "compiler_sha256": Path(__file__).resolve(),
@@ -1964,7 +2428,7 @@ def _build_capacity_preflight(
         "split": "capacity",
         "index": 0,
         "episodes": [asdict(value) for value in selected],
-        "estimated_rows": sum(value.tick_count * 2 for value in selected),
+        "estimated_rows": sum(value.compiled_tick_count * 2 for value in selected),
         "content_sha256": _digest(
             {"capacity_sample": [asdict(value) for value in selected]}
         ),
@@ -2142,6 +2606,7 @@ def create_compile_plan(
     native_generation_receipt: Path,
     source_token_coverage_receipt: Path | None = None,
     *,
+    audit_prefix_store_root: Path,
     seed: int = 20260827,
     validation_fraction: float = 0.05,
     test_fraction: float = 0.05,
@@ -2153,6 +2618,7 @@ def create_compile_plan(
     schema5_manifest = schema5_manifest.resolve(strict=True)
     native_contract = native_contract.resolve(strict=True)
     native_generation_receipt = native_generation_receipt.resolve(strict=True)
+    audit_prefix_store_root = audit_prefix_store_root.resolve(strict=True)
     source_token_coverage_receipt = (
         None
         if source_token_coverage_receipt is None
@@ -2172,6 +2638,13 @@ def create_compile_plan(
     contract_sha256 = str(contract["contract_sha256"])
     store, shards = _validate_tick_store(tick_store_root, workers=io_workers)
     episode_entries = _episode_index(shards)
+    prefix_store, prefix_shards = _validate_tick_store(
+        audit_prefix_store_root,
+        workers=io_workers,
+        expected_kind=AUDIT_PREFIX_STORE_KIND,
+        allow_empty=True,
+    )
+    prefix_episode_entries = _episode_index(prefix_shards)
     native_generation_coverage = _authenticate_native_generation_receipt(
         native_generation_receipt,
         schema5_manifest=schema5_manifest,
@@ -2180,6 +2653,19 @@ def create_compile_plan(
         contract_file_sha256=contract_file_sha256,
         expected_episodes=len(episode_entries),
     )
+    if (
+        Path(native_generation_coverage["audit_prefix_manifest_path"]).resolve()
+        != audit_prefix_store_root / "manifest.json"
+        or int(native_generation_coverage["audit_prefix_episodes"])
+        != len(prefix_episode_entries)
+        or set(native_generation_coverage["success_tags"]) != set(episode_entries)
+        or set(native_generation_coverage["audit_prefix_tags"])
+        != set(prefix_episode_entries)
+        or set(episode_entries) & set(prefix_episode_entries)
+    ):
+        raise NativeBcCompileError(
+            "full/prefix Tick Store episode sets differ from native results"
+        )
     source_token_coverage = (
         None
         if source_token_coverage_receipt is None
@@ -2213,12 +2699,12 @@ def create_compile_plan(
         if tag in indexed:
             raise NativeBcCompileError(f"duplicate schema-v5 index battle: {tag}")
         indexed[tag] = row
-    missing = sorted(set(episode_entries) - set(indexed))
+    wanted = set(episode_entries) | set(prefix_episode_entries)
+    missing = sorted(wanted - set(indexed))
     if missing:
         raise NativeBcCompileError(
             f"Tick Store episodes missing from schema-v5 index: {missing[:5]}"
         )
-    wanted = set(episode_entries)
     with ThreadPoolExecutor(max_workers=max(1, int(io_workers))) as executor:
         loaded = list(
             executor.map(
@@ -2226,14 +2712,90 @@ def create_compile_plan(
                 (indexed[tag] for tag in sorted(wanted)),
             )
         )
+    prefix_ability_by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    if prefix_episode_entries and source_token_coverage is not None:
+        result_rows = {
+            str(row.get("battle_tag") or ""): row
+            for row in _json_lines(
+                Path(str(native_generation_coverage["results_path"]))
+            )
+        }
+        prefix_actor_evidence: list[Mapping[str, Any]] = []
+        for tag in sorted(prefix_episode_entries):
+            actors = result_rows.get(tag, {}).get(
+                "prefix_token_coverage_actor_evidence"
+            )
+            if not isinstance(actors, list) or len(actors) != 2:
+                raise NativeBcCompileError(
+                    f"audit-prefix result lacks actor token evidence: {tag}"
+                )
+            prefix_actor_evidence.extend(
+                actor for actor in actors if isinstance(actor, Mapping)
+            )
+        if len(prefix_actor_evidence) != len(prefix_episode_entries) * 2:
+            raise NativeBcCompileError(
+                "audit-prefix actor token evidence sides are malformed"
+            )
+        try:
+            authenticated_prefix = authenticate_generator_ability_evidence(
+                prefix_actor_evidence,
+                contract,
+                source_token_coverage["source_coverage"],
+                expected_source_events_sha256=str(
+                    source_token_coverage["source_coverage"]
+                    ["ability_event_registry"]["source_events_sha256"]
+                ),
+            )
+        except Exception as error:
+            raise NativeBcCompileError(
+                f"audit-prefix ability evidence authentication failed: {error}"
+            ) from error
+        for transcript in authenticated_prefix["transcripts"]:
+            prefix_ability_by_tag[str(transcript["battle_tag"])].append({
+                "actor_side": int(transcript["actor_side"]),
+                "source_event_index": int(transcript["source_event_index"]),
+                "selected_entity_id": int(transcript["selected_entity_id"]),
+                "selected_native_form_id": int(
+                    transcript["selected_native_form_id"]
+                ),
+                "resolved_token": str(transcript["resolved_token"]),
+                "transcript_sha256": str(transcript["transcript_sha256"]),
+            })
+        for values in prefix_ability_by_tag.values():
+            values.sort(
+                key=lambda value: (
+                    int(value["actor_side"]),
+                    int(value["source_event_index"]),
+                    int(value["selected_entity_id"]),
+                    str(value["transcript_sha256"]),
+                )
+            )
     source_rows: list[dict[str, Any]] = []
     mask_store = DeploymentMaskStore(tick_store_root, create=False)
     mask_manifest = mask_store.verify_manifest()
+    prefix_mask_store = DeploymentMaskStore(
+        audit_prefix_store_root, create=False
+    )
+    prefix_mask_manifest = prefix_mask_store.verify_manifest()
+    replay_contract = load_native_ingest_contract(native_contract)
     referenced_masks: set[str] = set()
+    referenced_prefix_masks: set[str] = set()
     for item in loaded:
         assert item is not None
         tag, source, path, source_sha, source_group, players = item
-        entry = episode_entries[tag]
+        replay_extent = (
+            FULL_SUCCESS_EXTENT if tag in episode_entries else VALID_PREFIX_EXTENT
+        )
+        entry = (
+            episode_entries[tag]
+            if replay_extent == FULL_SUCCESS_EXTENT
+            else prefix_episode_entries[tag]
+        )
+        active_mask_store = (
+            mask_store
+            if replay_extent == FULL_SUCCESS_EXTENT
+            else prefix_mask_store
+        )
         with ShardReader(Path(entry["tick_data_path"]), Path(entry["tick_index_path"])) as reader:
             episode = reader.episode(tag)
             metadata = dict(episode.metadata)
@@ -2241,10 +2803,48 @@ def create_compile_plan(
                 raise NativeBcCompileError(f"Tick/source SHA identity mismatch: {tag}")
             if int(metadata.get("source_schema_version", -1)) != 5:
                 raise NativeBcCompileError(f"Tick episode is not schema-v5: {tag}")
-            masks = mask_store.verify_episode_metadata(metadata)
+            masks = active_mask_store.verify_episode_metadata(
+                metadata,
+                require_complete=replay_extent == FULL_SUCCESS_EXTENT,
+            )
+            extent_contract = _episode_extent_contract(
+                metadata,
+                tick_count=int(entry["ticks"]),
+                replay_extent=replay_extent,
+            )
+            if replay_extent == VALID_PREFIX_EXTENT:
+                prefix_plan = compile_battle(
+                    source,
+                    native_ingest_contract=replay_contract,
+                )
+                prefix_events = {
+                    (int(event.side), int(event.source_event_index)): event
+                    for event in prefix_plan.ability_events
+                }
+                for evidence in prefix_ability_by_tag.get(tag, []):
+                    event = prefix_events.get((
+                        int(evidence["actor_side"]),
+                        int(evidence["source_event_index"]),
+                    ))
+                    if (
+                        event is None
+                        or int(event.tick)
+                        + int(metadata[ACTION_EXECUTION_OFFSET_METADATA])
+                        >= int(extent_contract[
+                            "action_label_tick_stop_exclusive"
+                        ])
+                    ):
+                        raise NativeBcCompileError(
+                            f"audit-prefix ability evidence crosses censor: {tag}"
+                        )
+            target_masks = (
+                referenced_masks
+                if replay_extent == FULL_SUCCESS_EXTENT
+                else referenced_prefix_masks
+            )
             for value in masks["entries"]:
-                referenced_masks.add(str(value["content_sha256"]))
-                referenced_masks.update(
+                target_masks.add(str(value["content_sha256"]))
+                target_masks.update(
                     str(variant["content_sha256"])
                     for variant in value.get("dynamic_label_variants", [])
                 )
@@ -2283,6 +2883,11 @@ def create_compile_plan(
         source_rows.append(
             {
                 "battle_tag": tag,
+                "tick_store_root": str(
+                    tick_store_root
+                    if replay_extent == FULL_SUCCESS_EXTENT
+                    else audit_prefix_store_root
+                ),
                 "tick_data_path": entry["tick_data_path"],
                 "tick_index_path": entry["tick_index_path"],
                 "tick_count": int(entry["ticks"]),
@@ -2292,6 +2897,9 @@ def create_compile_plan(
                 "source_sha256": source_sha,
                 "source_group": source_group,
                 "player_tags": players,
+                **extent_contract,
+                "mask_metadata_sha256": _digest(dict(masks)),
+                "prefix_ability_evidence": prefix_ability_by_tag.get(tag, []),
             }
         )
     assignments, split_audit = _assign_components(
@@ -2317,7 +2925,7 @@ def create_compile_plan(
         rows = 0
         shard_index = 0
         for episode in by_split[split]:
-            cost = episode.tick_count * 2
+            cost = episode.compiled_tick_count * 2
             if pending and rows + cost > maximum_rows_per_shard:
                 relative = f"shards/{split}-{shard_index:05d}"
                 content = _digest(
@@ -2359,7 +2967,9 @@ def create_compile_plan(
             tick_store_root=tick_store_root,
             episodes=episodes,
             raw_plan=worker_contract,
-            estimated_total_rows=sum(value.tick_count * 2 for value in episodes),
+            estimated_total_rows=sum(
+                value.compiled_tick_count * 2 for value in episodes
+            ),
             maximum_rows_per_shard=maximum_rows_per_shard,
             planned_shards=len(shard_specs),
         )
@@ -2368,6 +2978,14 @@ def create_compile_plan(
         "tick_store_manifest_path": str(tick_store_root / "manifest.json"),
         "tick_store_manifest_sha256": sha256_file(tick_store_root / "manifest.json"),
         "tick_store_content_sha256": store["content_sha256"],
+        "audit_prefix_store_root": str(audit_prefix_store_root),
+        "audit_prefix_store_manifest_path": str(
+            audit_prefix_store_root / "manifest.json"
+        ),
+        "audit_prefix_store_manifest_sha256": sha256_file(
+            audit_prefix_store_root / "manifest.json"
+        ),
+        "audit_prefix_store_content_sha256": prefix_store["content_sha256"],
         "schema5_manifest_path": str(schema5_manifest),
         "schema5_manifest_sha256": sha256_file(schema5_manifest),
         "native_contract_path": str(native_contract),
@@ -2378,6 +2996,15 @@ def create_compile_plan(
             mask_store.root / "manifest.json"
         ),
         "deployment_mask_content_sha256": mask_manifest["content_sha256"],
+        "referenced_audit_prefix_deployment_mask_sha256": sorted(
+            referenced_prefix_masks
+        ),
+        "audit_prefix_deployment_mask_manifest_sha256": sha256_file(
+            prefix_mask_store.root / "manifest.json"
+        ),
+        "audit_prefix_deployment_mask_content_sha256": prefix_mask_manifest[
+            "content_sha256"
+        ],
         "native_generation_receipt_path": str(native_generation_receipt),
         "native_generation_receipt_sha256": native_generation_coverage[
             "receipt_sha256"
@@ -2406,7 +3033,7 @@ def create_compile_plan(
     }
     compiler_contract = {
         "kind": COMPILER_KIND,
-        "schema_version": 3,
+        "schema_version": 4,
         "seed": int(seed),
         "validation_fraction": float(validation_fraction),
         "test_fraction": float(test_fraction),
@@ -2419,7 +3046,7 @@ def create_compile_plan(
         },
         "action_alignment": "source_tick_plus_episode_metadata_offset",
         "entity_identity": "discrete_native_card_token_v1",
-        "mask_policy": "content_addressed_native_sidecar_fail_closed_v1",
+        "mask_policy": "full_complete_prefix_visible_hand_partial_fail_closed_v1",
         "components": {
             "compiler_sha256": sha256_file(Path(__file__).resolve()),
             "training_schema_sha256": sha256_file(
@@ -2441,7 +3068,7 @@ def create_compile_plan(
     )
     plan = {
         "kind": PLAN_KIND,
-        "schema_version": 3,
+        "schema_version": 4,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input_content_sha256": input_content_sha256,
         "inputs": input_contract,
@@ -2449,7 +3076,9 @@ def create_compile_plan(
         "tick_store_root": str(tick_store_root),
         "output_root": str(output_root),
         "episodes": len(episodes),
-        "estimated_rows": sum(value.tick_count * 2 for value in episodes),
+        "estimated_rows": sum(
+            value.compiled_tick_count * 2 for value in episodes
+        ),
         "split_audit": split_audit,
         "card_vocabulary": card_vocabulary,
         "native_card_id_to_token": {str(key): value for key, value in id_to_card_token.items()},
@@ -2643,6 +3272,10 @@ def _compile_actor(
     source_to_card_token: Mapping[str, int],
     id_to_ability_token: Mapping[int, int],
     max_ability_slots: int,
+    replay_extent: str = FULL_SUCCESS_EXTENT,
+    action_label_tick_stop_exclusive: int | None = None,
+    timing_censor_tick_exclusive: int | None = None,
+    prefix_ability_evidence: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, np.ndarray]:
     if not states:
         raise NativeBcCompileError(f"empty Tick episode: {plan.battle_tag}")
@@ -2651,7 +3284,12 @@ def _compile_actor(
         raise NativeBcCompileError(f"unsupported action execution offset: {offset}")
     events = _event_maps(plan, offset)
     mask_store = DeploymentMaskStore(tick_store_root, create=False)
-    mask_metadata = mask_store.verify_episode_metadata(metadata)
+    is_prefix = replay_extent == VALID_PREFIX_EXTENT
+    if replay_extent not in {FULL_SUCCESS_EXTENT, VALID_PREFIX_EXTENT}:
+        raise NativeBcCompileError("unsupported actor replay extent")
+    mask_metadata = mask_store.verify_episode_metadata(
+        metadata, require_complete=not is_prefix
+    )
     mask_entries = {
         (int(value["side"]), int(value["deck_index"])): value
         for value in mask_metadata["entries"]
@@ -2698,6 +3336,9 @@ def _compile_actor(
         "ability_label_mask": np.zeros(count, dtype=np.uint8),
         "ability_position_label_mask": np.zeros(count, dtype=np.uint8),
         "sample_weight": np.ones(count, dtype=np.float32),
+        "replay_extent": np.full(
+            count, 1 if is_prefix else 0, dtype=np.uint8
+        ),
     }
     revealed_enemy: list[int] = []
     grid_offsets = np.zeros(count + 1, dtype=np.int64)
@@ -2735,12 +3376,33 @@ def _compile_actor(
         grid_offsets[row + 1] = grid_entry_count
         arrays["public_scalars"][row] = _public_scalars(actor, state)
         hand_indices = actor.own_player.hand
-        if len(set(hand_indices)) != 4 or any(value < 0 or value >= 8 for value in hand_indices):
-            raise NativeBcCompileError(f"invalid exact native hand: {plan.battle_tag}/{state.tick}")
-        arrays["hand_tokens"][row] = deck_tokens[list(hand_indices)]
+        if (
+            len(hand_indices) != 4
+            or any(value < -1 or value >= 8 for value in hand_indices)
+            or sum(value == -1 for value in hand_indices) not in (0, 1)
+            or len({value for value in hand_indices if value >= 0})
+            != sum(value >= 0 for value in hand_indices)
+            or (sum(value == -1 for value in hand_indices) == 1)
+            != (int(actor.own_player.refill_timer) > 0)
+        ):
+            raise NativeBcCompileError(
+                f"invalid exact native hand/refill transient: "
+                f"{plan.battle_tag}/{state.tick}"
+            )
+        arrays["hand_tokens"][row] = np.asarray(
+            [0 if value == -1 else deck_tokens[value] for value in hand_indices],
+            dtype=np.int16,
+        )
         next_index = actor.own_player.next_deck_index
-        if next_index < 0 or next_index >= 8 or next_index in hand_indices:
-            raise NativeBcCompileError(f"invalid exact next card: {plan.battle_tag}/{state.tick}")
+        if (
+            next_index < 0
+            or next_index >= 8
+            or next_index in hand_indices
+        ):
+            raise NativeBcCompileError(
+                f"invalid exact next-card/refill semantics: "
+                f"{plan.battle_tag}/{state.tick}"
+            )
         arrays["next_card_token"][row] = deck_tokens[next_index]
 
         for entity in actor.entities:
@@ -2769,8 +3431,20 @@ def _compile_actor(
         card_position_masks: dict[int, np.ndarray] = {}
         if command_allowed:
             for hand_slot, deck_index in enumerate(hand_indices):
-                reference = mask_entries[(actor_side, int(deck_index))]
+                if int(deck_index) == -1:
+                    continue
+                reference = mask_entries.get((actor_side, int(deck_index)))
+                if reference is None:
+                    raise NativeBcCompileError(
+                        f"visible native hand slot lacks mask coverage: "
+                        f"{plan.battle_tag}/{state.tick}/{actor_side}/{deck_index}"
+                    )
                 current_event = events.get((state.tick, actor_side))
+                if (
+                    action_label_tick_stop_exclusive is not None
+                    and state.tick >= action_label_tick_stop_exclusive
+                ):
+                    current_event = None
                 card_supervised = current_event is not None and current_event[0] == "deploy"
                 selected_reference = resolve_deployment_reference(
                     reference,
@@ -2837,16 +3511,42 @@ def _compile_actor(
         # conditional card/kind masks.  Keeping legal forced-WAIT observations
         # is important for dynamic-choice cards whose exact non-play Tick mask
         # is intentionally unavailable.
-        arrays["timing_label_mask"][row] = command_allowed
+        before_censor = (
+            timing_censor_tick_exclusive is None
+            or state.tick < timing_censor_tick_exclusive
+        )
+        arrays["timing_label_mask"][row] = command_allowed and before_censor
 
         event = events.get((state.tick, actor_side))
+        if (
+            event is not None
+            and action_label_tick_stop_exclusive is not None
+            and state.tick >= action_label_tick_stop_exclusive
+        ):
+            event = None
         if event is None:
+            continue
+        if not bool(arrays["timing_label_mask"][row]):
+            raise NativeBcCompileError(
+                f"expert action reaches censored/forbidden Tick: "
+                f"{plan.battle_tag}/{state.tick}"
+            )
+        kind, value = event
+        prefix_ability = (
+            None
+            if prefix_ability_evidence is None or kind != "ability"
+            else prefix_ability_evidence.get(int(value.source_event_index))
+        )
+        if is_prefix and kind == "ability" and prefix_ability is None:
+            # A failed replay has no authenticated per-ability identity
+            # transcript.  Its accepted pre-boundary event still supervises
+            # the timing hazard, but never manufactures a conditional token.
+            arrays["play_now"][row] = 1
             continue
         if not any_action:
             raise NativeBcCompileError(
                 f"expert action has no legal native action kind: {plan.battle_tag}/{state.tick}"
             )
-        kind, value = event
         arrays["play_now"][row] = 1
         arrays["kind_label_mask"][row] = 1
         if kind == "deploy":
@@ -2881,15 +3581,40 @@ def _compile_actor(
         else:
             arrays["action_kind"][row] = 1
             legal_slots = np.flatnonzero(arrays["ability_mask"][row])
-            if len(legal_slots) != 1:
-                raise NativeBcCompileError(
-                    f"expert ability is not uniquely legal: {plan.battle_tag}/{state.tick}"
+            if prefix_ability is None:
+                selected_slots = legal_slots
+            else:
+                selected_entity_id = int(
+                    prefix_ability["selected_entity_id"]
                 )
-            arrays["ability_slot"][row] = int(legal_slots[0])
+                selected_slots = np.asarray(
+                    [
+                        slot
+                        for slot, entity in enumerate(ability_candidates)
+                        if int(entity.key) == selected_entity_id
+                        and int(entity.card_id)
+                        == int(prefix_ability["selected_native_form_id"])
+                        and bool(arrays["ability_mask"][row, slot])
+                    ],
+                    dtype=np.int64,
+                )
+            if len(selected_slots) != 1:
+                raise NativeBcCompileError(
+                    f"expert ability identity is not uniquely authenticated: "
+                    f"{plan.battle_tag}/{state.tick}"
+                )
+            arrays["ability_slot"][row] = int(selected_slots[0])
             arrays["ability_label_mask"][row] = 1
-    missing_events = [key for key in events if key[1] == actor_side and not any(
-        state.tick == key[0] for state in states
-    )]
+    missing_events = [
+        key
+        for key in events
+        if key[1] == actor_side
+        and (
+            action_label_tick_stop_exclusive is None
+            or key[0] < action_label_tick_stop_exclusive
+        )
+        and not any(state.tick == key[0] for state in states)
+    ]
     if missing_events:
         raise NativeBcCompileError(
             f"expert action Tick is absent from Tick Store: {plan.battle_tag}/{missing_events[:3]}"
@@ -2992,12 +3717,18 @@ def _verify_existing_shard(
             "source_sha256": str(episode["source_sha256"]),
             "source_group": str(episode["source_group"]),
             "player_tags": list(episode["player_tags"]),
+            "replay_extent": str(episode["replay_extent"]),
+            "timing_target": str(episode["timing_target"]),
+            "terminal_target": str(episode["terminal_target"]),
+            "extent_sha256": str(episode["extent_sha256"]),
+            "mask_metadata_sha256": str(episode["mask_metadata_sha256"]),
         }
         for episode in raw_spec["episodes"]
         for side in (0, 1)
     ]
     expected_rows = sum(
-        int(episode["tick_count"]) * 2 for episode in raw_spec["episodes"]
+        int(episode["compiled_tick_count"]) * 2
+        for episode in raw_spec["episodes"]
     )
     expected_sequences = len(expected_identity)
     maximum_entities = int(np.diff(entity_offsets).max(initial=0))
@@ -3080,15 +3811,98 @@ def _compile_output_shard(
             native_episode = reader.episode(episode.battle_tag)
             if hashlib.sha256(native_episode.blob).hexdigest() != episode.tick_payload_sha256:
                 raise NativeBcCompileError(f"Tick payload changed: {episode.battle_tag}")
-            states = list(native_episode.iter_ticks())
+            stored_states = list(native_episode.iter_ticks())
+            if len(stored_states) != episode.tick_count:
+                raise NativeBcCompileError(
+                    f"stored Tick count changed: {episode.battle_tag}"
+                )
+            metadata = dict(native_episode.metadata)
+            extent_contract = _episode_extent_contract(
+                metadata,
+                tick_count=episode.tick_count,
+                replay_extent=episode.replay_extent,
+            )
+            if any(
+                getattr(episode, name) != value
+                for name, value in extent_contract.items()
+            ):
+                raise NativeBcCompileError(
+                    f"compiled replay extent differs from plan: {episode.battle_tag}"
+                )
+            active_tick_store_root = Path(episode.tick_store_root)
+            active_mask_store = DeploymentMaskStore(
+                active_tick_store_root, create=False
+            )
+            mask_metadata = active_mask_store.verify_episode_metadata(
+                metadata,
+                require_complete=episode.replay_extent == FULL_SUCCESS_EXTENT,
+            )
+            if _digest(dict(mask_metadata)) != episode.mask_metadata_sha256:
+                raise NativeBcCompileError(
+                    f"compiled mask metadata differs from plan: {episode.battle_tag}"
+                )
+            if episode.replay_extent == VALID_PREFIX_EXTENT:
+                states = [
+                    state
+                    for state in stored_states
+                    if state.tick < episode.timing_censor_tick_exclusive
+                ]
+                if (
+                    len(states) != episode.compiled_tick_count
+                    or not states
+                    or states[0].tick != episode.observation_tick_start
+                    or states[-1].tick + 1
+                    != episode.timing_censor_tick_exclusive
+                    or any(state.episode.terminated for state in states)
+                ):
+                    raise NativeBcCompileError(
+                        f"audit-prefix retained rows cross censor/terminal boundary: "
+                        f"{episode.battle_tag}"
+                    )
+                coverage = metadata[REPLAY_EXTENT_METADATA_KEY]["mask_coverage"]
+                visible_references = sum(
+                    value >= 0
+                    for state in states
+                    for player in state.players
+                    for value in player.hand
+                )
+                empty_actor_ticks = sum(
+                    -1 in player.hand
+                    for state in states
+                    for player in state.players
+                )
+                safe_deploy_labels = sum(
+                    int(action.tick)
+                    + int(metadata[ACTION_EXECUTION_OFFSET_METADATA])
+                    < episode.action_label_tick_stop_exclusive
+                    for action in plan.actions
+                )
+                if (
+                    int(coverage["visible_slot_references"])
+                    != visible_references
+                    or int(coverage["empty_slot_actor_ticks"])
+                    != empty_actor_ticks
+                    or int(coverage["safe_deploy_labels"])
+                    != safe_deploy_labels
+                ):
+                    raise NativeBcCompileError(
+                        f"audit-prefix mask coverage differs from retained Tick rows: "
+                        f"{episode.battle_tag}"
+                    )
+            else:
+                states = stored_states
             maximum_entities = max(
                 maximum_entities, max((len(state.entities) for state in states), default=0)
             )
-            metadata = dict(native_episode.metadata)
+            label_stop = (
+                None
+                if episode.replay_extent == FULL_SUCCESS_EXTENT
+                else episode.action_label_tick_stop_exclusive
+            )
             label_audit = verify_deployment_labels(
                 states,
                 metadata,
-                DeploymentMaskStore(tick_store_root, create=False),
+                active_mask_store,
                 (
                     {
                         "tick": int(action.tick)
@@ -3099,24 +3913,55 @@ def _compile_output_shard(
                         "y": int(action.y),
                     }
                     for action in plan.actions
+                    if label_stop is None
+                    or int(action.tick)
+                    + int(metadata[ACTION_EXECUTION_OFFSET_METADATA])
+                    < label_stop
                 ),
+                require_complete=episode.replay_extent == FULL_SUCCESS_EXTENT,
             )
             if label_audit.get("all_legal") is not True:
                 raise NativeBcCompileError(
                     f"native deployment label audit failed: {episode.battle_tag} "
                     f"{label_audit.get('violations', [])[:3]}"
                 )
+            if episode.replay_extent == VALID_PREFIX_EXTENT and int(
+                metadata[REPLAY_EXTENT_METADATA_KEY]["mask_coverage"][
+                    "checked_deploy_labels"
+                ]
+            ) != int(label_audit["checked"]):
+                raise NativeBcCompileError(
+                    f"audit-prefix checked deployment count changed: "
+                    f"{episode.battle_tag}"
+                )
             for actor_side in (0, 1):
+                actor_prefix_abilities = {
+                    int(value["source_event_index"]): value
+                    for value in episode.prefix_ability_evidence
+                    if int(value["actor_side"]) == actor_side
+                }
                 arrays = _compile_actor(
                     states,
                     metadata,
                     plan,
                     actor_side=actor_side,
-                    tick_store_root=tick_store_root,
+                    tick_store_root=active_tick_store_root,
                     id_to_card_token=id_to_card_token,
                     source_to_card_token=source_to_card_token,
                     id_to_ability_token=id_to_ability_token,
                     max_ability_slots=maximum_abilities,
+                    replay_extent=episode.replay_extent,
+                    action_label_tick_stop_exclusive=(
+                        None
+                        if episode.replay_extent == FULL_SUCCESS_EXTENT
+                        else episode.action_label_tick_stop_exclusive
+                    ),
+                    timing_censor_tick_exclusive=(
+                        None
+                        if episode.replay_extent == FULL_SUCCESS_EXTENT
+                        else episode.timing_censor_tick_exclusive
+                    ),
+                    prefix_ability_evidence=actor_prefix_abilities,
                 )
                 compiled.append(arrays)
                 episode_compiled.append(arrays)
@@ -3127,6 +3972,11 @@ def _compile_output_shard(
                         "source_sha256": episode.source_sha256,
                         "source_group": episode.source_group,
                         "player_tags": list(episode.player_tags),
+                        "replay_extent": episode.replay_extent,
+                        "timing_target": episode.timing_target,
+                        "terminal_target": episode.terminal_target,
+                        "extent_sha256": episode.extent_sha256,
+                        "mask_metadata_sha256": episode.mask_metadata_sha256,
                     }
                 )
             actor_rows = sum(len(value["play_now"]) for value in episode_compiled)
@@ -3431,9 +4281,32 @@ def _final_compiled_token_coverage(
         tag for tag, row in by_tag.items()
         if row.get("teacher_forced_success") is True
     }
-    if success_tags != compiled_tags:
+    full_tags = {
+        str(episode["battle_tag"])
+        for shard in plan["shards"]
+        for episode in shard["episodes"]
+        if episode["replay_extent"] == FULL_SUCCESS_EXTENT
+    }
+    prefix_tags = {
+        str(episode["battle_tag"])
+        for shard in plan["shards"]
+        for episode in shard["episodes"]
+        if episode["replay_extent"] == VALID_PREFIX_EXTENT
+    }
+    failed_prefix_tags = {
+        tag
+        for tag, row in by_tag.items()
+        if row.get("teacher_forced_success") is False
+        and isinstance(row.get("audit_prefix_tick_store_entry"), Mapping)
+    }
+    if (
+        success_tags != full_tags
+        or failed_prefix_tags != prefix_tags
+        or compiled_tags != full_tags | prefix_tags
+        or full_tags & prefix_tags
+    ):
         raise NativeBcCompileError(
-            "compiled tags differ from full-success native token evidence"
+            "compiled full/prefix tags differ from native result union"
         )
 
     sequence_locations: dict[tuple[str, int], tuple[Path, int]] = {}
@@ -3470,15 +4343,21 @@ def _final_compiled_token_coverage(
         Path(str(plan["inputs"]["native_contract_path"]))
     )
     actor_records: list[dict[str, Any]] = []
+    prefix_actor_records: list[dict[str, Any]] = []
+    prefix_generator_actor_records: list[dict[str, Any]] = []
     readers: dict[tuple[str, str], ShardReader] = {}
     mask_store = DeploymentMaskStore(
         Path(str(plan["tick_store_root"])), create=False
+    )
+    prefix_mask_store = DeploymentMaskStore(
+        Path(str(plan["inputs"]["audit_prefix_store_root"])), create=False
     )
     compiled_array_names = (
         "sequence_offsets", "play_now", "kind_label_mask", "action_kind",
         "card_label_mask", "position_label_mask", "card_slot", "position",
         "hand_tokens", "card_mask", "ability_label_mask", "ability_slot",
         "ability_tokens", "ability_mask", "ability_position_label_mask",
+        "timing_label_mask", "replay_extent",
     )
     current_compiled_path: Path | None = None
     current_compiled_arrays: dict[str, np.ndarray] = {}
@@ -3505,11 +4384,6 @@ def _final_compiled_token_coverage(
     try:
         for tag in ordered_tags:
             result = by_tag[tag]
-            raw_actors = result.get("token_coverage_actor_evidence")
-            if not isinstance(raw_actors, list) or len(raw_actors) != 2:
-                raise NativeBcCompileError(
-                    f"full-success result lacks actor token evidence: {tag}"
-                )
             source = json.loads(source_paths[tag].read_bytes())
             native_plan = compile_battle(
                 source, native_ingest_contract=loaded_contract
@@ -3524,14 +4398,305 @@ def _final_compiled_token_coverage(
                 reader = ShardReader(Path(reader_key[0]), Path(reader_key[1]))
                 readers[reader_key] = reader
             episode = reader.episode(tag)
-            states = tuple(episode.iter_ticks())
+            stored_states = tuple(episode.iter_ticks())
+            is_prefix = episode_input["replay_extent"] == VALID_PREFIX_EXTENT
+            states = (
+                tuple(
+                    state
+                    for state in stored_states
+                    if state.tick
+                    < int(episode_input["timing_censor_tick_exclusive"])
+                )
+                if is_prefix
+                else stored_states
+            )
             states_by_tick = {state.tick: state for state in states}
             if len(states_by_tick) != len(states):
                 raise NativeBcCompileError(
                     f"token evidence Tick Store has duplicate Ticks: {tag}"
                 )
-            mask_metadata = mask_store.verify_episode_metadata(episode.metadata)
+            active_mask_store = prefix_mask_store if is_prefix else mask_store
+            mask_metadata = active_mask_store.verify_episode_metadata(
+                episode.metadata, require_complete=not is_prefix
+            )
             mask_entries = list(mask_metadata["entries"])
+            if is_prefix:
+                raw_prefix_actors = result.get(
+                    "prefix_token_coverage_actor_evidence"
+                )
+                if (
+                    not isinstance(raw_prefix_actors, list)
+                    or len(raw_prefix_actors) != 2
+                ):
+                    raise NativeBcCompileError(
+                        f"compiled prefix lacks generator actor evidence: {tag}"
+                    )
+                prefix_actors = {
+                    int(row.get("actor_side", -1)): row
+                    for row in raw_prefix_actors
+                    if isinstance(row, Mapping)
+                }
+                if set(prefix_actors) != {0, 1}:
+                    raise NativeBcCompileError(
+                        f"compiled prefix actor evidence sides changed: {tag}"
+                    )
+                for actor in prefix_actors.values():
+                    if (
+                        actor.get("action_label_tick_stop_exclusive")
+                        != episode_input["action_label_tick_stop_exclusive"]
+                        or actor.get("timing_target") != PREFIX_TIMING_TARGET
+                        or actor.get("replay_extent_sha256")
+                        != episode_input["extent_sha256"]
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled prefix actor extent binding changed: {tag}"
+                        )
+                    prefix_generator_actor_records.append(dict(actor))
+                if len(states) != int(episode_input["compiled_tick_count"]):
+                    raise NativeBcCompileError(
+                        f"compiled prefix sequence crosses censor boundary: {tag}"
+                    )
+                offset = int(episode.metadata[ACTION_EXECUTION_OFFSET_METADATA])
+                action_stop = int(
+                    episode_input["action_label_tick_stop_exclusive"]
+                )
+                for side in (0, 1):
+                    planned_prefix_abilities = {
+                        int(value["source_event_index"]): value
+                        for value in episode_input["prefix_ability_evidence"]
+                        if int(value["actor_side"]) == side
+                    }
+                    prefix_actor = prefix_actors[side]
+                    if prefix_actor.get("deck_tokens") != [
+                        card.source_token for card in native_plan.sides[side].deck
+                    ] or {
+                        int(label.get("source_event_index", -1))
+                        for label in prefix_actor.get("ability_labels") or []
+                        if isinstance(label, Mapping)
+                    } != set(planned_prefix_abilities):
+                        raise NativeBcCompileError(
+                            f"compiled prefix ability/deck evidence changed: {tag}/{side}"
+                        )
+                    shard_path, sequence_index = sequence_locations[(tag, side)]
+                    arrays = compiled_arrays(shard_path)
+                    offsets = arrays["sequence_offsets"]
+                    sequence_start = int(offsets[sequence_index])
+                    sequence_stop = int(offsets[sequence_index + 1])
+                    if (
+                        sequence_stop - sequence_start != len(states)
+                        or np.any(
+                            np.asarray(
+                                arrays["replay_extent"][
+                                    sequence_start:sequence_stop
+                                ]
+                            ) != 1
+                        )
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled prefix provenance differs from final shard: "
+                            f"{tag}/{side}"
+                        )
+                    state_start_tick = states[0].tick
+                    safe_deploys = [
+                        action
+                        for action in native_plan.actions
+                        if int(action.side) == side
+                        and int(action.tick) + offset < action_stop
+                    ]
+                    safe_abilities = [
+                        event
+                        for event in native_plan.ability_events
+                        if int(event.side) == side
+                        and int(event.tick) + offset < action_stop
+                    ]
+                    deploy_labels: list[dict[str, Any]] = []
+                    expected_deploy_rows: set[int] = set()
+                    expected_play_rows: set[int] = set()
+                    for action in safe_deploys:
+                        execution_tick = int(action.tick) + offset
+                        row = sequence_start + execution_tick - state_start_tick
+                        card = native_plan.sides[side].deck[
+                            int(action.logical_card_index)
+                        ]
+                        matches = [
+                            entry
+                            for entry in mask_entries
+                            if int(entry["side"]) == side
+                            and int(entry["deck_index"])
+                            == int(action.logical_card_index)
+                            and int(entry["card_id"]) == int(card.card_id)
+                            and int(entry["form_flags"]) == int(card.form_flags)
+                        ]
+                        if len(matches) != 1:
+                            raise NativeBcCompileError(
+                                f"compiled prefix mask identity is ambiguous: "
+                                f"{tag}/{side}/{execution_tick}"
+                            )
+                        reference = resolve_deployment_reference(
+                            matches[0],
+                            tick=execution_tick,
+                            require_dynamic_exact=True,
+                        )
+                        if reference is None:
+                            raise NativeBcCompileError(
+                                f"compiled prefix deploy lacks exact mask: "
+                                f"{tag}/{side}/{execution_tick}"
+                            )
+                        payload = active_mask_store.load(
+                            str(reference["content_sha256"])
+                        )
+                        state = states_by_tick.get(execution_tick)
+                        if state is None:
+                            raise NativeBcCompileError(
+                                f"compiled prefix deploy Tick is absent: "
+                                f"{tag}/{side}/{execution_tick}"
+                            )
+                        hand = list(state.players[side].hand)
+                        try:
+                            expected_slot = hand.index(
+                                int(action.logical_card_index)
+                            )
+                        except ValueError as error:
+                            raise NativeBcCompileError(
+                                f"compiled prefix deploy selects empty hand: "
+                                f"{tag}/{side}/{execution_tick}"
+                            ) from error
+                        expected_token = int(
+                            plan["source_card_to_token"][str(card.source_token)]
+                        )
+                        expected_position = _cell(
+                            int(action.x) if side == 0 else 17_999 - int(action.x),
+                            int(action.y) if side == 0 else 31_999 - int(action.y),
+                        )
+                        if (
+                            int(arrays["play_now"][row]) != 1
+                            or int(arrays["kind_label_mask"][row]) != 1
+                            or int(arrays["action_kind"][row]) != 0
+                            or int(arrays["card_label_mask"][row]) != 1
+                            or int(arrays["position_label_mask"][row]) != 1
+                            or int(arrays["card_slot"][row]) != expected_slot
+                            or int(arrays["position"][row]) != expected_position
+                            or int(arrays["hand_tokens"][row, expected_slot])
+                            != expected_token
+                            or int(arrays["card_mask"][row, expected_slot]) != 1
+                        ):
+                            raise NativeBcCompileError(
+                                f"compiled prefix deploy differs from final shard: "
+                                f"{tag}/{side}/{execution_tick}"
+                            )
+                        expected_deploy_rows.add(row)
+                        expected_play_rows.add(row)
+                        deploy_labels.append({
+                            "source_event_index": int(action.source_event_index),
+                            "source_token": str(card.source_token),
+                            "resolved_native_form_id": int(
+                                payload["resolved_data_id"]
+                            ),
+                            "accepted": True,
+                            "mask_legal": True,
+                            "compiled": True,
+                        })
+                    for event in safe_abilities:
+                        ability_row = (
+                            sequence_start
+                            + int(event.tick)
+                            + offset
+                            - state_start_tick
+                        )
+                        expected_play_rows.add(ability_row)
+                    expected_ability_rows = {
+                        sequence_start
+                        + int(event.tick)
+                        + offset
+                        - state_start_tick
+                        for event in safe_abilities
+                        if int(event.source_event_index)
+                        in planned_prefix_abilities
+                    }
+                    row_slice = slice(sequence_start, sequence_stop)
+                    actual = lambda name: {
+                        sequence_start + int(value)
+                        for value in np.flatnonzero(
+                            np.asarray(arrays[name][row_slice])
+                        )
+                    }
+                    if (
+                        actual("card_label_mask") != expected_deploy_rows
+                        or actual("position_label_mask") != expected_deploy_rows
+                        or actual("kind_label_mask")
+                        != expected_deploy_rows | expected_ability_rows
+                        or actual("ability_label_mask")
+                        != expected_ability_rows
+                        or actual("ability_position_label_mask")
+                        or actual("play_now") != expected_play_rows
+                    ):
+                        raise NativeBcCompileError(
+                            f"compiled prefix label rows differ from censor-safe events: "
+                            f"{tag}/{side}"
+                        )
+                    ability_labels = []
+                    for event in safe_abilities:
+                        evidence = planned_prefix_abilities.get(
+                            int(event.source_event_index)
+                        )
+                        if evidence is None:
+                            continue
+                        row = (
+                            sequence_start + int(event.tick) + offset
+                            - state_start_tick
+                        )
+                        slot = int(arrays["ability_slot"][row])
+                        expected_token = int(
+                            plan["native_ability_id_to_token"][
+                                str(int(evidence["selected_native_form_id"]))
+                            ]
+                        )
+                        if (
+                            int(arrays["kind_label_mask"][row]) != 1
+                            or int(arrays["action_kind"][row]) != 1
+                            or not 0 <= slot < arrays["ability_tokens"].shape[1]
+                            or int(arrays["ability_tokens"][row, slot])
+                            != expected_token
+                            or int(arrays["ability_mask"][row, slot]) != 1
+                        ):
+                            raise NativeBcCompileError(
+                                f"compiled prefix ability differs from final shard: "
+                                f"{tag}/{side}/{int(event.tick) + offset}"
+                            )
+                        ability_labels.append({
+                            "source_event_index": int(event.source_event_index),
+                            "resolved_token": str(evidence["resolved_token"]),
+                            "resolved_native_form_id": int(
+                                evidence["selected_native_form_id"]
+                            ),
+                            "selected_entity_id": int(
+                                evidence["selected_entity_id"]
+                            ),
+                            "resolution_transcript_sha256": str(
+                                evidence["transcript_sha256"]
+                            ),
+                            "accepted": True,
+                            "legal": True,
+                            "compiled": True,
+                        })
+                    prefix_actor_records.append({
+                        "battle_tag": tag,
+                        "actor_side": side,
+                        "full_success": False,
+                        "censored_prefix": True,
+                        "deck_tokens": [
+                            card.source_token
+                            for card in native_plan.sides[side].deck
+                        ],
+                        "deploy_labels": deploy_labels,
+                        "ability_labels": ability_labels,
+                    })
+                continue
+            raw_actors = result.get("token_coverage_actor_evidence")
+            if not isinstance(raw_actors, list) or len(raw_actors) != 2:
+                raise NativeBcCompileError(
+                    f"full-success result lacks actor token evidence: {tag}"
+                )
             actors = {
                 int(row.get("actor_side", -1)): row
                 for row in raw_actors if isinstance(row, Mapping)
@@ -3796,7 +4961,7 @@ def _final_compiled_token_coverage(
 
     try:
         authenticated = authenticate_generator_ability_evidence(
-            actor_records,
+            [*actor_records, *prefix_generator_actor_records],
             contract,
             source_coverage,
             expected_source_events_sha256=source_events_sha,
@@ -3828,6 +4993,7 @@ def _final_compiled_token_coverage(
                 label["compiled"] = True
                 label["resolution_transcript_sha256"] = digest
             compiled_records.append(actor)
+        compiled_records.extend(prefix_actor_records)
         success = summarize_success_token_coverage(
             compiled_records,
             contract,
@@ -3887,6 +5053,18 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             / "manifest.json",
             str(plan["inputs"]["deployment_mask_manifest_sha256"]),
             "deployment-mask manifest",
+        ),
+        (
+            Path(str(plan["inputs"]["audit_prefix_store_manifest_path"])),
+            str(plan["inputs"]["audit_prefix_store_manifest_sha256"]),
+            "audit-prefix Tick Store manifest",
+        ),
+        (
+            Path(str(plan["inputs"]["audit_prefix_store_root"]))
+            / "deployment-masks-v1"
+            / "manifest.json",
+            str(plan["inputs"]["audit_prefix_deployment_mask_manifest_sha256"]),
+            "audit-prefix deployment-mask manifest",
         ),
     )
     if plan["inputs"].get("source_token_coverage_receipt_path") is not None:
@@ -3974,6 +5152,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
                     "source_sha256": source_sha,
                     "source_group": source_group,
                     "player_tags": episode["player_tags"],
+                    "replay_extent": episode["replay_extent"],
                 }
             )
     assignment_raw = b"".join(
@@ -3982,6 +5161,30 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     _atomic_bytes(output / "split-assignments.jsonl", assignment_raw)
     total_rows = sum(value["rows"] for value in split_stats.values())
     total_sequences = sum(value["sequences"] for value in split_stats.values())
+    planned_episodes = [
+        episode for shard in plan["shards"] for episode in shard["episodes"]
+    ]
+    full_episodes = [
+        episode
+        for episode in planned_episodes
+        if episode["replay_extent"] == FULL_SUCCESS_EXTENT
+    ]
+    prefix_episodes = [
+        episode
+        for episode in planned_episodes
+        if episode["replay_extent"] == VALID_PREFIX_EXTENT
+    ]
+    full_rows = sum(int(value["compiled_tick_count"]) * 2 for value in full_episodes)
+    prefix_rows = sum(
+        int(value["compiled_tick_count"]) * 2 for value in prefix_episodes
+    )
+    if (
+        full_rows + prefix_rows != total_rows
+        or len(full_episodes) + len(prefix_episodes) != len(seen_tags)
+        or {str(value["battle_tag"]) for value in full_episodes}
+        & {str(value["battle_tag"]) for value in prefix_episodes}
+    ):
+        raise NativeBcCompileError("compiled full/prefix training union is not exact")
     native_generation_coverage = _authenticate_native_generation_receipt(
         Path(str(plan["inputs"]["native_generation_receipt_path"])),
         schema5_manifest=source,
@@ -3990,7 +5193,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         contract_file_sha256=str(
             plan["inputs"]["native_contract_file_sha256"]
         ),
-        expected_episodes=len(seen_tags),
+        expected_episodes=len(full_episodes),
     )
     token_coverage_manifest: dict[str, Any]
     if plan["inputs"].get("source_token_coverage_receipt_path") is None:
@@ -4049,7 +5252,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "native_replay_validated": True,
         "observation_mode": OBSERVATION_MODE,
-        "timing_target": "native_tick_hazard_v1",
+        "timing_target": "native_tick_hazard_with_right_censored_prefix_v1",
         "actor_information": "public_only_v1",
         "storage_schema": {
             "grid": GRID_STORAGE,
@@ -4101,15 +5304,22 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             **plan["split_audit"],
         },
         "state_provenance": {
-            "mode": "native_teacher_forced_from_schema5_actions",
+            "mode": "native_full_plus_semantic_censored_prefix_v1",
             "authoritative_rows": 0,
             "native_generated_unanchored_rows": total_rows,
             "native_grid_rows": total_rows,
             "every_native_tick_present": True,
+            "full_success_rows": full_rows,
+            "censored_prefix_rows": prefix_rows,
+            "prefix_terminal_target": "unknown_censored",
         },
         "mask_provenance": {
-            "kind": "content_addressed_native_deployment_sidecar_v1",
-            "referenced_sidecar_sha256": plan["inputs"]["referenced_deployment_mask_sha256"],
+            "kind": "content_addressed_full_and_partial_native_sidecars_v1",
+            "full_referenced_sidecar_sha256": plan["inputs"]["referenced_deployment_mask_sha256"],
+            "prefix_referenced_sidecar_sha256": plan["inputs"][
+                "referenced_audit_prefix_deployment_mask_sha256"
+            ],
+            "prefix_policy": PREFIX_MASK_PROVENANCE,
             "missing_sidecars": 0,
             "expert_mask_violations": 0,
             "timing_independent_of_conditional_masks": True,
@@ -4131,6 +5341,21 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "battles": len(seen_tags),
             "actor_sequences": total_sequences,
             "rows": total_rows,
+            "full_success_episodes": len(full_episodes),
+            "full_success_actor_sequences": len(full_episodes) * 2,
+            "full_success_rows": full_rows,
+            "censored_prefix_episodes": len(prefix_episodes),
+            "censored_prefix_actor_sequences": len(prefix_episodes) * 2,
+            "censored_prefix_rows": prefix_rows,
+            "training_episode_union_exact": True,
+            "training_episode_union_sha256": _digest({
+                "full_success_tags": sorted(
+                    str(value["battle_tag"]) for value in full_episodes
+                ),
+                "censored_prefix_tags": sorted(
+                    str(value["battle_tag"]) for value in prefix_episodes
+                ),
+            }),
         },
         "compiler": {
             **plan["compiler"],
@@ -4172,6 +5397,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Compile content-addressed native Tick Store episodes into BC shards"
     )
     parser.add_argument("--tick-store-root", type=Path, required=True)
+    parser.add_argument("--audit-prefix-store-root", type=Path, required=True)
     parser.add_argument("--schema5-manifest", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--native-contract", type=Path, required=True)
@@ -4204,6 +5430,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.native_contract,
         args.native_generation_receipt,
         args.source_token_coverage_receipt,
+        audit_prefix_store_root=args.audit_prefix_store_root,
         seed=args.seed,
         validation_fraction=args.validation_fraction,
         test_fraction=args.test_fraction,

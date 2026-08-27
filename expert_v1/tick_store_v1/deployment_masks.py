@@ -553,22 +553,31 @@ class NativeDeploymentMaskCapture:
         }
 
 
-def validate_episode_mask_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
+def validate_episode_mask_metadata(
+    value: Mapping[str, Any], *, require_complete: bool = True
+) -> dict[str, Any]:
     if value.get("kind") != EPISODE_MASK_KIND:
         raise DeploymentMaskContractError("episode mask metadata kind changed")
     if _integer(
         value.get("schema_version"), "episode_mask.schema_version"
     ) != MASK_SCHEMA_VERSION:
         raise DeploymentMaskContractError("episode mask metadata schema changed")
-    if value.get("complete") is not True:
+    if not isinstance(value.get("complete"), bool):
+        raise DeploymentMaskContractError("episode mask complete flag is invalid")
+    if require_complete and value.get("complete") is not True:
         raise DeploymentMaskContractError("episode mask capture is incomplete")
+    captured_slots = _integer(value.get("captured_slots"), "captured_slots")
+    base_probe_count = _integer(
+        value.get("base_probe_rpc_count"), "base_probe_rpc_count"
+    )
     if (
         _integer(value.get("expected_slots"), "expected_slots")
         != EXPECTED_SLOT_COUNT
-        or _integer(value.get("captured_slots"), "captured_slots")
-        != EXPECTED_SLOT_COUNT
-        or _integer(value.get("base_probe_rpc_count"), "base_probe_rpc_count")
-        != EXPECTED_SLOT_COUNT
+        or not 1 <= captured_slots <= EXPECTED_SLOT_COUNT
+        or base_probe_count != captured_slots
+        or (require_complete and captured_slots != EXPECTED_SLOT_COUNT)
+        or bool(value.get("complete"))
+        != (captured_slots == EXPECTED_SLOT_COUNT)
     ):
         raise DeploymentMaskContractError("episode mask slot/RPC accounting is open")
     probe_rpc_count = _integer(value.get("probe_rpc_count"), "probe_rpc_count")
@@ -578,7 +587,7 @@ def validate_episode_mask_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     )
     if (
         dynamic_probe_count < 0
-        or probe_rpc_count != EXPECTED_SLOT_COUNT + dynamic_probe_count
+        or probe_rpc_count != captured_slots + dynamic_probe_count
     ):
         raise DeploymentMaskContractError(
             "episode dynamic mask probe accounting is open"
@@ -598,8 +607,10 @@ def validate_episode_mask_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
     if tuple(value.get("variant_encoding") or ()) != VARIANT_ENCODING:
         raise DeploymentMaskContractError("episode mask variant encoding changed")
     raw_entries = value.get("entries")
-    if not isinstance(raw_entries, list) or len(raw_entries) != EXPECTED_SLOT_COUNT:
-        raise DeploymentMaskContractError("episode mask metadata needs 16 entries")
+    if not isinstance(raw_entries, list) or len(raw_entries) != captured_slots:
+        raise DeploymentMaskContractError(
+            "episode mask metadata entry count disagrees with captured slots"
+        )
     entries: list[dict[str, Any]] = []
     keys: set[tuple[int, int]] = set()
     for raw in raw_entries:
@@ -715,7 +726,7 @@ def validate_episode_mask_metadata(value: Mapping[str, Any]) -> dict[str, Any]:
         for side in EXPECTED_SIDES
         for deck_index in EXPECTED_DECK_INDICES
     }
-    if keys != expected:
+    if not keys <= expected or (require_complete and keys != expected):
         raise DeploymentMaskContractError("episode mask deck slots are incomplete")
     observed_dynamic_probe_count = sum(
         int(variant["tick"]) != int(entry["capture_tick"])
@@ -900,13 +911,16 @@ class DeploymentMaskStore:
         metadata: Mapping[str, Any],
         *,
         allow_cached: bool = True,
+        require_complete: bool = True,
     ) -> dict[str, Any]:
         value = metadata.get(EPISODE_METADATA_KEY)
         if not isinstance(value, Mapping):
             raise DeploymentMaskContractError(
                 f"episode lacks {EPISODE_METADATA_KEY}"
             )
-        normalized = validate_episode_mask_metadata(value)
+        normalized = validate_episode_mask_metadata(
+            value, require_complete=require_complete
+        )
         seen: set[str] = set()
         for entry in normalized["entries"]:
             references = [entry, *entry["dynamic_label_variants"]]
@@ -1190,9 +1204,13 @@ def verify_deployment_labels(
     episode_metadata: Mapping[str, Any],
     store: DeploymentMaskStore,
     labels: Iterable[Mapping[str, Any]],
+    *,
+    require_complete: bool = True,
 ) -> dict[str, Any]:
     """Offline, fail-closed label legality audit with no native RPCs."""
-    metadata = store.verify_episode_metadata(episode_metadata)
+    metadata = store.verify_episode_metadata(
+        episode_metadata, require_complete=require_complete
+    )
     references = {
         (int(entry["side"]), int(entry["deck_index"])): entry
         for entry in metadata["entries"]

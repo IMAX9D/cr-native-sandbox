@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping
 
 
-STORE_SCHEMA_VERSION = 1
+STORE_SCHEMA_VERSION = 2
 NATIVE_TICK_HZ = 20
 ENTITY_FIELDS = (
     "side",
@@ -26,7 +26,10 @@ ENTITY_FIELDS = (
     "ability_mana_cost",
 )
 TOWER_FIELDS = ("side", "role", "lane", "x", "y", "hp", "max_hp")
-PLAYER_FIELDS = ("elixir_raw", "hand0", "hand1", "hand2", "hand3", "next_deck_index")
+PLAYER_FIELDS = (
+    "elixir_raw", "hand0", "hand1", "hand2", "hand3",
+    "next_deck_index", "refill_timer",
+)
 EPISODE_FIELDS = (
     "commands_allowed",
     "command_gate_code",
@@ -50,9 +53,13 @@ class PlayerPrivate:
     elixir_raw: int
     hand: tuple[int, int, int, int]
     next_deck_index: int
+    refill_timer: int = 0
 
     def values(self) -> tuple[int, ...]:
-        return (self.elixir_raw, *self.hand, self.next_deck_index)
+        return (
+            self.elixir_raw, *self.hand,
+            self.next_deck_index, self.refill_timer,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +211,25 @@ def _normalize_players(state: Mapping[str, Any]) -> tuple[PlayerPrivate, PlayerP
         )
         if len(hand) != 4 or any(value < -1 or value > 7 for value in hand):
             raise TickStoreContractError("hand_deck_indices must contain four values in -1..7")
+        visible = [value for value in hand if value >= 0]
+        empty_slots = 4 - len(visible)
+        next_deck_index = _integer(
+            raw.get("next_deck_index"), "next_deck_index", default=-1
+        )
+        refill_timer = _integer(
+            raw.get("refill_timer"), "refill_timer", default=0
+        )
+        if (
+            len(set(visible)) != len(visible)
+            or empty_slots not in (0, 1)
+            or next_deck_index not in range(8)
+            or next_deck_index in visible
+            or not 0 <= refill_timer <= 10_000
+            or (empty_slots == 1) != (refill_timer > 0)
+        ):
+            raise TickStoreContractError(
+                "hand/next/refill native cycle state is inconsistent"
+            )
         elixir_raw = raw.get("elixir_raw")
         if not isinstance(elixir_raw, int):
             elixir = _integer(raw.get("elixir"), "player.elixir")
@@ -215,9 +241,8 @@ def _normalize_players(state: Mapping[str, Any]) -> tuple[PlayerPrivate, PlayerP
                 side=side,
                 elixir_raw=int(elixir_raw),
                 hand=hand,  # type: ignore[arg-type]
-                next_deck_index=_integer(
-                    raw.get("next_deck_index"), "next_deck_index", default=-1
-                ),
+                next_deck_index=next_deck_index,
+                refill_timer=refill_timer,
             )
         )
     result.sort(key=lambda item: item.side)
@@ -400,6 +425,7 @@ def actor_projection(state: TickState, *, actor_side: int) -> ActorTick:
         elixir_raw=own.elixir_raw,
         hand=own.hand,
         next_deck_index=own.next_deck_index,
+        refill_timer=own.refill_timer,
     )
     return ActorTick(
         tick=state.tick,

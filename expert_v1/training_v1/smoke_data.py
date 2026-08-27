@@ -83,6 +83,7 @@ def _shard(path: Path, *, seed: int, sequences: int, steps: int, dimensions: dic
         "ability_label_mask": np.zeros(rows, dtype=np.uint8),
         "ability_position_label_mask": np.zeros(rows, dtype=np.uint8),
         "sample_weight": np.ones(rows, dtype=np.float32),
+        "replay_extent": np.zeros(rows, dtype=np.uint8),
     }
     selected_positions = np.zeros((rows, POSITION_COUNT), dtype=np.uint8)
     ability_positions = np.zeros((rows, POSITION_COUNT), dtype=np.uint8)

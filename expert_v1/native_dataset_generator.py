@@ -52,6 +52,7 @@ from .native_seed_search import (
 )
 from .tick_store_v1.codec import EpisodeReader, encode_episode
 from .tick_store_v1.deployment_masks import (
+    DYNAMIC_RULE,
     EPISODE_METADATA_KEY,
     MASK_STORE_DIRECTORY,
     DeploymentMaskStore,
@@ -80,7 +81,7 @@ TASK_KIND = "expert_authoritative_native_tick_task_v1"
 RESULT_KIND = "expert_authoritative_native_tick_result_v1"
 DIAGNOSTIC_KIND = "expert_authoritative_native_tick_failure_v1"
 COORDINATE_PROVENANCE = "royaleapi_raw_data_i_to_native_v1"
-RUN_CONTRACT_VERSION = 2
+RUN_CONTRACT_VERSION = 3
 NATIVE_PREFLIGHT_CONTRACT_VERSION = 3
 NATIVE_PREFLIGHT_MODE = (
     "bounded_semantic_seed_preflight_then_fixed_seed_trace_v3"
@@ -825,14 +826,31 @@ class StagedTickSink:
         self._deployment_mask_payloads: dict[str, dict[str, Any]] = {}
 
     def stage_deployment_masks(
-        self, capture: NativeDeploymentMaskCapture
+        self,
+        capture: NativeDeploymentMaskCapture | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        payloads: Mapping[str, Mapping[str, Any]] | None = None,
+        require_complete: bool = True,
     ) -> None:
         if self.episode is not None:
             raise RuntimeError("deployment masks must be staged before episode")
         if self._deployment_mask_metadata is not None:
             raise RuntimeError("deployment masks may be staged only once")
-        self._deployment_mask_metadata = capture.metadata(require_complete=True)
-        self._deployment_mask_payloads = capture.payloads
+        if capture is not None:
+            if metadata is not None or payloads is not None:
+                raise RuntimeError("mask capture and explicit payloads are exclusive")
+            metadata = capture.metadata(require_complete=require_complete)
+            payloads = capture.payloads
+        if not isinstance(metadata, Mapping) or not isinstance(payloads, Mapping):
+            raise RuntimeError("deployment mask metadata/payloads are required")
+        validate_episode_mask_metadata(
+            metadata, require_complete=require_complete
+        )
+        self._deployment_mask_metadata = dict(metadata)
+        self._deployment_mask_payloads = {
+            str(digest): dict(value) for digest, value in payloads.items()
+        }
 
     def append(
         self,
@@ -878,6 +896,8 @@ def build_full_success_token_evidence(
     plan: BattlePlan,
     result: NativeReplayResult,
     episode: StagedEpisode,
+    *,
+    prefix_extent: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Bind source markers to accepted libg actions for later BC coverage.
 
@@ -887,17 +907,37 @@ def build_full_success_token_evidence(
     labels before setting ``compiled=true``.
     """
 
+    censored_prefix = prefix_extent is not None
+    if censored_prefix:
+        extent = dict(prefix_extent or {})
+        cutoff = int(extent.get("action_label_tick_stop_exclusive", -1))
+        if (
+            result.teacher_forced_success
+            or cutoff <= 0
+            or extent.get("training_admission")
+            != "actor_bc_censored_prefix_v1"
+            or extent.get("failure_tick_has_labels") is not False
+            or episode.battle_tag != plan.battle_tag
+        ):
+            raise RuntimeError("prefix token evidence extent is invalid")
+    else:
+        extent = {}
+        cutoff = 2**63 - 1
     if (
-        not result.teacher_forced_success
-        or result.accepted_actions != result.source_actions
-        or result.tick_store_entry is None
+        (not censored_prefix and (
+            not result.teacher_forced_success
+            or result.accepted_actions != result.source_actions
+            or result.tick_store_entry is None
+        ))
         or episode.battle_tag != plan.battle_tag
     ):
         raise RuntimeError("token evidence requires one complete native replay")
     raw_masks = episode.metadata.get(EPISODE_METADATA_KEY)
     if not isinstance(raw_masks, Mapping):
         raise RuntimeError("token evidence requires deployment-mask metadata")
-    masks = validate_episode_mask_metadata(raw_masks)
+    masks = validate_episode_mask_metadata(
+        raw_masks, require_complete=not censored_prefix
+    )
     entries = list(masks["entries"])
     payloads = episode.deployment_mask_payloads
     state_by_tick = {state.tick: state for state in episode.states}
@@ -913,20 +953,51 @@ def build_full_success_token_evidence(
             int(row.get("source_event_index", -1)),
             int(row.get("source_tick", -1)),
         )
+        execution_tick = int(row.get("execution_tick", -1))
+        if execution_tick >= cutoff:
+            continue
         if key in acceptance or row.get("accepted") is not True:
             raise RuntimeError("token evidence action acceptance is open/duplicate")
         acceptance[key] = row
-    if len(acceptance) != result.source_actions:
+    expected_source_actions = sum(
+        int(action.tick) + int(result.action_execution_tick_offset) < cutoff
+        for action in plan.actions
+    ) + sum(
+        int(event.tick) + int(result.action_execution_tick_offset) < cutoff
+        for event in plan.ability_events
+    )
+    if len(acceptance) != expected_source_actions:
         raise RuntimeError("token evidence does not cover every native action")
 
     actor_rows = [
         {
             "schema_version": 1,
-            "kind": "cr_native_full_success_actor_token_evidence_v1",
+            "kind": (
+                "cr_native_censored_prefix_actor_token_evidence_v1"
+                if censored_prefix
+                else "cr_native_full_success_actor_token_evidence_v1"
+            ),
             "battle_tag": plan.battle_tag,
             "actor_side": side,
-            "full_success": True,
-            "prefix_admission": False,
+            "full_success": not censored_prefix,
+            "censored_prefix": censored_prefix,
+            "prefix_admission": censored_prefix,
+            "action_label_tick_stop_exclusive": (
+                cutoff if censored_prefix else None
+            ),
+            "timing_target": (
+                "right_censored_at_failure_tick_v1"
+                if censored_prefix else "complete_episode_v1"
+            ),
+            "replay_extent_sha256": (
+                hashlib.sha256(json.dumps(
+                    extent,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+                if censored_prefix else None
+            ),
             "deck_tokens": [card.source_token for card in plan.sides[side].deck],
             "deploy_labels": [],
             "ability_labels": [],
@@ -938,6 +1009,8 @@ def build_full_success_token_evidence(
         side = int(action.side)
         spec = plan.sides[side].deck[int(action.logical_card_index)]
         execution_tick = int(action.tick) + int(result.action_execution_tick_offset)
+        if execution_tick >= cutoff:
+            continue
         action_key = ("play", side, int(action.source_event_index), int(action.tick))
         accepted = acceptance.get(action_key)
         if (
@@ -997,6 +1070,8 @@ def build_full_success_token_evidence(
     for event in plan.ability_events:
         side = int(event.side)
         execution_tick = int(event.tick) + int(result.action_execution_tick_offset)
+        if execution_tick >= cutoff:
+            continue
         resolution = resolution_by_marker.get(int(event.source_marker_index))
         accepted = acceptance.get(
             ("ability", side, int(event.source_event_index), int(event.tick))
@@ -1086,7 +1161,12 @@ def build_full_success_token_evidence(
             ).encode("utf-8")
         ).hexdigest()
         actor_rows[side]["ability_labels"].append(label)
-    if len(resolution_by_marker) != len(plan.ability_events):
+    safe_ability_markers = {
+        int(event.source_marker_index)
+        for event in plan.ability_events
+        if int(event.tick) + int(result.action_execution_tick_offset) < cutoff
+    }
+    if not safe_ability_markers <= set(resolution_by_marker):
         raise RuntimeError("ability evidence has unexpected native resolutions")
 
     for row in actor_rows:
@@ -1115,6 +1195,8 @@ class StoredFrameRegistry:
         self,
         root: Path,
         deployment_mask_store: DeploymentMaskStore | None = None,
+        *,
+        require_complete_masks: bool = True,
     ) -> None:
         self.root = root.resolve()
         self.deployment_mask_store = (
@@ -1122,6 +1204,7 @@ class StoredFrameRegistry:
             if deployment_mask_store is not None
             else DeploymentMaskStore(self.root)
         )
+        self.require_complete_masks = bool(require_complete_masks)
         self._lock = threading.Lock()
         self._entries: dict[str, dict[str, Any]] = {}
         self._load_existing()
@@ -1160,7 +1243,9 @@ class StoredFrameRegistry:
                     episode.deployment_mask_payloads
                 )
                 self.deployment_mask_store.verify_episode_metadata(
-                    episode.metadata, allow_cached=True
+                    episode.metadata,
+                    allow_cached=True,
+                    require_complete=self.require_complete_masks,
                 )
             elif mask_metadata is not None:
                 raise RuntimeError(
@@ -1741,12 +1826,64 @@ def _prefix_extent_metadata(
         if row.get("accepted") is True
         and int(row["execution_tick"]) < failure_execution_tick
     ]
+    mask_metadata = prefix.deployment_mask_metadata
+    if not isinstance(mask_metadata, Mapping):
+        return None
+    try:
+        normalized_masks = validate_episode_mask_metadata(
+            mask_metadata, require_complete=False
+        )
+    except Exception:
+        return None
+    mask_keys = {
+        (int(row["side"]), int(row["deck_index"]))
+        for row in normalized_masks["entries"]
+    }
     label_stop = min(failure_execution_tick, last_tick + 1)
+    training_states = tuple(
+        state for state in states if int(state.tick) < label_stop
+    )
+    if not training_states:
+        return None
+    retained_actor_ticks = 0
+    visible_slot_references = 0
+    empty_slot_actor_ticks = 0
+    for state in training_states:
+        for player in state.players:
+            hand = tuple(int(value) for value in player.hand)
+            if (
+                len(hand) != 4
+                or any(value < -1 or value > 7 for value in hand)
+                or len({value for value in hand if value >= 0})
+                != sum(value >= 0 for value in hand)
+            ):
+                return None
+            visible = [value for value in hand if value >= 0]
+            if any((int(player.side), value) not in mask_keys for value in visible):
+                return None
+            if len(visible) < 4:
+                empty_slot_actor_ticks += 1
+                if player.refill_timer <= 0 or player.next_deck_index not in range(8):
+                    return None
+            retained_actor_ticks += 1
+            visible_slot_references += len(visible)
+    safe_deploy_labels = sum(
+        row.get("accepted") is True
+        and row.get("type") == "play"
+        and int(row["execution_tick"]) < failure_execution_tick
+        for row in prefix.action_acceptance_sequence
+    )
+    if (
+        prefix.deployment_mask_label_rejections != 0
+        or prefix.deployment_mask_label_checks < safe_deploy_labels
+        or not prefix.deployment_mask_payloads
+    ):
+        return None
     extent = {
         "schema_version": 1,
         "kind": REPLAY_EXTENT_KIND,
         "extent": "valid_prefix",
-        "training_admission": "audit_only",
+        "training_admission": "actor_bc_censored_prefix_v1",
         "source_episode_complete": False,
         "every_native_tick_present_within_extent": True,
         "fixed_seed_replay": True,
@@ -1772,10 +1909,24 @@ def _prefix_extent_metadata(
         "observation_tick_stop_exclusive": int(last_tick + 1),
         "action_label_tick_stop_exclusive": int(label_stop),
         "timing_censor_tick_exclusive": int(label_stop),
+        "timing_target": "right_censored_at_failure_tick_v1",
         "failure_tick_has_labels": False,
         "terminal_target": "unknown_censored",
         "terminal_validated": False,
-        "deployment_masks": "not_collected_audit_prefix",
+        "deployment_masks": "partial_native_visible_hand_complete_v1",
+        "mask_coverage": {
+            "all_retained_visible_hand_slots_covered": True,
+            "retained_ticks": len(training_states),
+            "actor_ticks": retained_actor_ticks,
+            "visible_slot_references": visible_slot_references,
+            "empty_slot_actor_ticks": empty_slot_actor_ticks,
+            "captured_slots": int(normalized_masks["captured_slots"]),
+            "safe_deploy_labels": safe_deploy_labels,
+            "checked_deploy_labels": int(
+                prefix.deployment_mask_label_checks
+            ),
+            "rejected_deploy_labels": 0,
+        },
         "trace_batches": int(prefix.tick_trace_batches),
         "trace_complete_frames": int(prefix.tick_trace_complete_frames),
         "trace_incomplete_terminal_frames": int(
@@ -1788,6 +1939,7 @@ def _prefix_extent_metadata(
     return {
         **dict(base),
         REPLAY_EXTENT_METADATA_KEY: extent,
+        EPISODE_METADATA_KEY: dict(mask_metadata),
         "every_native_tick_present": True,
     }
 
@@ -1871,7 +2023,7 @@ def execute_two_phase_plan(
                     ability_branch_choices=None,
                     tick_sink=None,
                     trace_batch_steps=trace_batch_steps,
-                    capture_deployment_masks=False,
+                    capture_deployment_masks=True,
                     collect_tick_states_on_failure=True,
                     action_execution_tick_offset=(
                         ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
@@ -1904,6 +2056,11 @@ def execute_two_phase_plan(
                 )
             )
             if extent_metadata is not None and prefix_staged is not None:
+                prefix_staged.stage_deployment_masks(
+                    metadata=prefix_result.deployment_mask_metadata,
+                    payloads=prefix_result.deployment_mask_payloads,
+                    require_complete=False,
+                )
                 prefix_staged.append(
                     plan.battle_tag,
                     prefix_result.collected_tick_states,
@@ -2070,6 +2227,7 @@ def execute_task(
     semantic_diff: dict[str, Any] | None = None
     semantic_seed_audit: dict[str, Any] | None = None
     token_coverage_actor_evidence: list[dict[str, Any]] = []
+    prefix_token_coverage_actor_evidence: list[dict[str, Any]] = []
     phase_state: dict[str, Any] = {}
     started = time.perf_counter()
     try:
@@ -2133,6 +2291,22 @@ def execute_task(
             if two_phase.failure_prefix_staged:
                 if prefix_staged.episode is None:
                     raise RuntimeError("failure prefix was reported staged but is absent")
+                prefix_result = two_phase.failure_prefix
+                if prefix_result is None:
+                    raise RuntimeError("failure prefix result is absent")
+                prefix_extent = prefix_staged.episode.metadata.get(
+                    REPLAY_EXTENT_METADATA_KEY
+                )
+                if not isinstance(prefix_extent, Mapping):
+                    raise RuntimeError("failure prefix extent is absent")
+                prefix_token_coverage_actor_evidence = (
+                    build_full_success_token_evidence(
+                        plan,
+                        prefix_result,
+                        prefix_staged.episode,
+                        prefix_extent=prefix_extent,
+                    )
+                )
                 if prefix_sink is None or prefix_registry is None:
                     # Unit callers may intentionally omit persistence.  The
                     # production worker always supplies the isolated store.
@@ -2289,6 +2463,10 @@ def execute_task(
         "teacher_forced_success": success,
         "token_coverage_actor_evidence": (
             token_coverage_actor_evidence if success else []
+        ),
+        "prefix_token_coverage_actor_evidence": (
+            prefix_token_coverage_actor_evidence
+            if audit_prefix_store_entry is not None else []
         ),
         "failure_class": failure_class,
         "failure_domain": failure_domain,
@@ -2981,15 +3159,29 @@ def summarize_results(
         isinstance(row.get("audit_prefix_extent"), Mapping)
         and row["audit_prefix_extent"].get("kind") == REPLAY_EXTENT_KIND
         and row["audit_prefix_extent"].get("extent") == "valid_prefix"
-        and row["audit_prefix_extent"].get("training_admission") == "audit_only"
+        and row["audit_prefix_extent"].get("training_admission")
+        == "actor_bc_censored_prefix_v1"
         and row["audit_prefix_extent"].get("terminal_target")
         == "unknown_censored"
         and row["audit_prefix_extent"].get("failure_tick_has_labels") is False
+        and row["audit_prefix_extent"].get("timing_target")
+        == "right_censored_at_failure_tick_v1"
+        and row["audit_prefix_extent"].get("deployment_masks")
+        == "partial_native_visible_hand_complete_v1"
+        and isinstance(row["audit_prefix_extent"].get("mask_coverage"), Mapping)
+        and row["audit_prefix_extent"]["mask_coverage"].get(
+            "all_retained_visible_hand_slots_covered"
+        ) is True
+        and int(row["audit_prefix_extent"]["mask_coverage"].get(
+            "rejected_deploy_labels", -1
+        )) == 0
         and row.get("failure_domain") == "semantic"
         and row.get("failure_prefix_semantic_match") is True
         and int(row.get("failure_prefix_tick_count") or 0) > 0
-        and int(row.get("deployment_mask_probe_rpc_count") or 0) == 0
-        and int(row.get("native_deployment_mask_probes_attempted") or 0) == 0
+        and int(row.get("deployment_mask_probe_rpc_count") or 0) > 0
+        and int(row.get("native_deployment_mask_probes_attempted") or 0)
+        == int(row.get("deployment_mask_probe_rpc_count") or 0)
+        and int(row.get("native_deployment_mask_probe_exceptions") or 0) == 0
         for row in prefixes
     )
     audit_tick_coverage_complete = bool(
@@ -3393,26 +3585,30 @@ def verify_published_tick_store(
     if mask_contract is not None:
         if not isinstance(mask_contract, Mapping):
             raise RuntimeError("published Tick Store mask contract is malformed")
-        if expected_kind == AUDIT_PREFIX_STORE_KIND:
-            if mask_contract != {"required": False}:
-                raise RuntimeError(
-                    "audit-prefix Tick Store must explicitly forbid masks"
-                )
-        else:
-            if mask_contract.get("required") is not True:
-                raise RuntimeError("published Tick Store mask contract is malformed")
-            expected_path = f"{MASK_STORE_DIRECTORY}/manifest.json"
-            if str(mask_contract.get("manifest") or "") != expected_path:
-                raise RuntimeError("published Tick Store mask manifest path changed")
-            mask_manifest_path = root / expected_path
-            if not mask_manifest_path.is_file():
-                raise RuntimeError("published Tick Store mask manifest is missing")
-            if sha256_file(mask_manifest_path) != str(
-                mask_contract.get("manifest_sha256") or ""
-            ):
-                raise RuntimeError("published Tick Store mask manifest hash changed")
-            mask_store = DeploymentMaskStore(root, create=False)
-            mask_store.verify_manifest()
+        if (
+            mask_contract.get("required") is not True
+            or (
+                expected_kind == AUDIT_PREFIX_STORE_KIND
+                and mask_contract.get("partial") is not True
+            )
+            or (
+                expected_kind != AUDIT_PREFIX_STORE_KIND
+                and mask_contract.get("partial") is True
+            )
+        ):
+            raise RuntimeError("published Tick Store mask contract is malformed")
+        expected_path = f"{MASK_STORE_DIRECTORY}/manifest.json"
+        if str(mask_contract.get("manifest") or "") != expected_path:
+            raise RuntimeError("published Tick Store mask manifest path changed")
+        mask_manifest_path = root / expected_path
+        if not mask_manifest_path.is_file():
+            raise RuntimeError("published Tick Store mask manifest is missing")
+        if sha256_file(mask_manifest_path) != str(
+            mask_contract.get("manifest_sha256") or ""
+        ):
+            raise RuntimeError("published Tick Store mask manifest hash changed")
+        mask_store = DeploymentMaskStore(root, create=False)
+        mask_store.verify_manifest()
     episodes = ticks = total_bytes = 0
     battle_tags: set[str] = set()
     shard_names: set[str] = set()
@@ -3463,7 +3659,11 @@ def verify_published_tick_store(
                     payload = handle.read(payload_size)
                     reader = EpisodeReader(payload)
                     metadata = mask_store.verify_episode_metadata(
-                        reader.metadata, allow_cached=True
+                        reader.metadata,
+                        allow_cached=True,
+                        require_complete=(
+                            expected_kind != AUDIT_PREFIX_STORE_KIND
+                        ),
                     )
                     referenced_masks.update(
                         str(item["content_sha256"])
@@ -3474,42 +3674,88 @@ def verify_published_tick_store(
                         for item in metadata["entries"]
                         for variant in item["dynamic_label_variants"]
                     )
-        elif expected_kind == AUDIT_PREFIX_STORE_KIND:
-            with data.open("rb") as handle:
-                for entry in entries:
-                    handle.seek(int(entry["offset"]))
-                    raw_header = handle.read(FRAME_HEADER.size)
-                    _, payload_size, _, _, _, _ = FRAME_HEADER.unpack(raw_header)
-                    reader = EpisodeReader(handle.read(payload_size))
-                    extent = reader.metadata.get(REPLAY_EXTENT_METADATA_KEY)
-                    states = tuple(reader.iter_ticks())
-                    if (
-                        not isinstance(extent, Mapping)
-                        or extent.get("kind") != REPLAY_EXTENT_KIND
-                        or extent.get("extent") != "valid_prefix"
-                        or extent.get("training_admission") != "audit_only"
-                        or extent.get("source_episode_complete") is not False
-                        or extent.get("semantic_match") is not True
-                        or extent.get("failure_domain") != "semantic"
-                        or extent.get("failure_tick_has_labels") is not False
-                        or extent.get("terminal_target") != "unknown_censored"
-                        or extent.get("terminal_validated") is not False
-                        or extent.get("deployment_masks")
-                        != "not_collected_audit_prefix"
-                        or int(extent.get("trace_complete_frames", -1))
-                        != len(states)
-                        or not states
-                        or len(states) != int(entry["ticks"])
-                        or int(extent.get("observation_tick_start", -1))
-                        != states[0].tick
-                        or int(extent.get("observation_tick_stop_exclusive", -1))
-                        != states[-1].tick + 1
-                        or int(extent.get("action_label_tick_stop_exclusive", -1))
-                        > states[-1].tick + 1
-                    ):
-                        raise RuntimeError(
-                            f"published audit prefix metadata changed: {entry.get('battle_tag')}"
+                    if expected_kind == AUDIT_PREFIX_STORE_KIND:
+                        states = tuple(reader.iter_ticks())
+                        extent = reader.metadata.get(REPLAY_EXTENT_METADATA_KEY)
+                        coverage = (
+                            extent.get("mask_coverage")
+                            if isinstance(extent, Mapping) else None
                         )
+                        keys = {
+                            (int(item["side"]), int(item["deck_index"]))
+                            for item in metadata["entries"]
+                        }
+                        censor_tick = (
+                            int(extent.get("timing_censor_tick_exclusive", -1))
+                            if isinstance(extent, Mapping) else -1
+                        )
+                        training_states = tuple(
+                            state for state in states
+                            if int(state.tick) < censor_tick
+                        )
+                        actor_ticks = visible_references = empty_actor_ticks = 0
+                        visible_complete = True
+                        for state in training_states:
+                            for player in state.players:
+                                visible = [
+                                    int(value) for value in player.hand
+                                    if int(value) >= 0
+                                ]
+                                visible_complete = visible_complete and all(
+                                    (int(player.side), value) in keys
+                                    for value in visible
+                                )
+                                actor_ticks += 1
+                                visible_references += len(visible)
+                                empty_actor_ticks += len(visible) < 4
+                        if (
+                            not isinstance(extent, Mapping)
+                            or extent.get("kind") != REPLAY_EXTENT_KIND
+                            or extent.get("extent") != "valid_prefix"
+                            or extent.get("training_admission")
+                            != "actor_bc_censored_prefix_v1"
+                            or extent.get("source_episode_complete") is not False
+                            or extent.get("semantic_match") is not True
+                            or extent.get("failure_domain") != "semantic"
+                            or extent.get("failure_tick_has_labels") is not False
+                            or extent.get("terminal_target") != "unknown_censored"
+                            or extent.get("terminal_validated") is not False
+                            or extent.get("timing_target")
+                            != "right_censored_at_failure_tick_v1"
+                            or extent.get("deployment_masks")
+                            != "partial_native_visible_hand_complete_v1"
+                            or not isinstance(coverage, Mapping)
+                            or coverage.get(
+                                "all_retained_visible_hand_slots_covered"
+                            ) is not True
+                            or not visible_complete
+                            or int(coverage.get("retained_ticks", -1))
+                            != len(training_states)
+                            or int(coverage.get("actor_ticks", -1)) != actor_ticks
+                            or int(coverage.get("visible_slot_references", -1))
+                            != visible_references
+                            or int(coverage.get("empty_slot_actor_ticks", -1))
+                            != empty_actor_ticks
+                            or int(coverage.get("captured_slots", -1))
+                            != int(metadata["captured_slots"])
+                            or int(coverage.get("rejected_deploy_labels", -1)) != 0
+                            or int(extent.get("trace_complete_frames", -1))
+                            != len(states)
+                            or not states
+                            or len(states) != int(entry["ticks"])
+                            or int(extent.get("observation_tick_start", -1))
+                            != states[0].tick
+                            or int(extent.get(
+                                "observation_tick_stop_exclusive", -1
+                            )) != states[-1].tick + 1
+                            or int(extent.get(
+                                "action_label_tick_stop_exclusive", -1
+                            )) > states[-1].tick + 1
+                        ):
+                            raise RuntimeError(
+                                "published training prefix metadata changed: "
+                                f"{entry.get('battle_tag')}"
+                            )
     if (
         episodes != int(manifest.get("episode_count", -1))
         or ticks != int(manifest.get("tick_count", -1))
@@ -3709,7 +3955,8 @@ def run_generation(
             return completed
         registry = StoredFrameRegistry(output_root / "shards")
         prefix_registry = StoredFrameRegistry(
-            output_root / AUDIT_PREFIX_DIRECTORY
+            output_root / AUDIT_PREFIX_DIRECTORY,
+            require_complete_masks=False,
         )
         started = time.perf_counter()
         from concurrent.futures import ThreadPoolExecutor
@@ -3780,9 +4027,7 @@ def run_generation(
                     "native_deployment_masks": {
                         "required": True,
                         "schema_version": 1,
-                        "dynamic_rule": (
-                            "native_base_and_tower_state_projection_v1"
-                        ),
+                        "dynamic_rule": DYNAMIC_RULE,
                         "manifest": (
                             f"{MASK_STORE_DIRECTORY}/manifest.json"
                         ),
@@ -3813,6 +4058,13 @@ def run_generation(
             summary["deployment_mask_sidecar_bytes"] = int(
                 mask_manifest["bytes"]
             )
+            prefix_mask_manifest = (
+                prefix_registry.deployment_mask_store.build_manifest()
+            )
+            prefix_mask_manifest_path = (
+                output_root / AUDIT_PREFIX_DIRECTORY
+                / MASK_STORE_DIRECTORY / "manifest.json"
+            )
             prefix_store = build_store_manifest(
                 output_root / AUDIT_PREFIX_DIRECTORY,
                 source_manifest=selection_path,
@@ -3822,9 +4074,20 @@ def run_generation(
                 store_metadata={
                     "generator_kind": GENERATOR_KIND,
                     "episode_extent": "valid_prefix",
-                    "training_admission": "audit_only",
+                    "training_admission": "actor_bc_censored_prefix_v1",
                     "terminal_target": "unknown_censored",
-                    "native_deployment_masks": {"required": False},
+                    "timing_target": "right_censored_at_failure_tick_v1",
+                    "native_deployment_masks": {
+                        "required": True,
+                        "partial": True,
+                        "schema_version": 1,
+                        "dynamic_rule": DYNAMIC_RULE,
+                        "manifest": f"{MASK_STORE_DIRECTORY}/manifest.json",
+                        "manifest_sha256": sha256_file(
+                            prefix_mask_manifest_path
+                        ),
+                        "sidecars": int(prefix_mask_manifest["sidecars"]),
+                    },
                 },
             )
             prefix_manifest_path = (
@@ -3838,6 +4101,15 @@ def run_generation(
             )
             summary["audit_prefix_tick_store_manifest_sha256"] = (
                 sha256_file(prefix_manifest_path)
+            )
+            summary["audit_prefix_deployment_mask_store_manifest"] = str(
+                prefix_mask_manifest_path.resolve()
+            )
+            summary["audit_prefix_deployment_mask_store_manifest_sha256"] = (
+                sha256_file(prefix_mask_manifest_path)
+            )
+            summary["audit_prefix_deployment_mask_unique_sidecars"] = int(
+                prefix_mask_manifest["sidecars"]
             )
         atomic_json(output_root / "summary.json", summary)
         if summary["publication_ready"]:
