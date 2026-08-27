@@ -401,6 +401,9 @@ def validate_manifest(value: Mapping[str, Any], *, root: Path) -> None:
             token_coverage = value.get("token_coverage") or {}
             if (
                 token_coverage.get("enforced") is not True
+                or token_coverage.get("receipt_kind")
+                != "cr_expert_token_coverage_receipt_v2"
+                or token_coverage.get("receipt_schema_version") != 2
                 or (token_coverage.get("gate") or {}).get("admitted") is not True
             ):
                 raise DatasetContractError(

@@ -21,4 +21,6 @@ audit_tick_coverage_rate = 1.0
 compiled_full_episode_tags ∪ compiled_prefix_episode_tags = frozen_100k_tags
 ```
 
-Full-success rate 继续记录为诊断指标，但不再要求至少 50%。训练覆盖由 Full + 安全 Prefix 的 100,000 场并集承担；卡牌、形态与 ability 的逐-token 门必须从最终编译数组的有效标签独立复算。RPC、source-integrity、seed-search、固定 seed 重放不一致、Mask 不完整或首帧前失败均不得伪造 Prefix；这些情况会令 one-click 停止并保留诊断现场。
+Full-success rate 和逐卡 `full_success_episodes` 继续记录为诊断指标，但不再要求至少 50%。训练 episode 准入使用独立的 `admitted_training_episodes`：只有经过最终数组、Mask 和 censor 复验的 Full 或 Prefix 才计数，Prefix 不会被伪装成 Full。训练覆盖由 Full + 安全 Prefix 的 100,000 场并集承担；卡牌、形态与 ability 的逐-token 门必须从最终编译数组的有效标签独立复算。RPC、source-integrity、seed-search、固定 seed 重放不一致、Mask 不完整或首帧前失败均不得伪造 Prefix；这些情况会令 one-click 停止并保留诊断现场。
+
+版本边界保持分离：冻结 source coverage 与 ability resolution transcript 继续使用 v1；引入 `admitted_training_episodes` 的 success summary、adaptive quota 和最终 token coverage receipt 独立升级为 v2。消费者必须同时校验对应 v2 kind 与 `schema_version=2`，不得把旧 v1 aggregate 解释为新准入语义。

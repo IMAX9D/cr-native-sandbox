@@ -61,9 +61,12 @@ from .native_ingest_contract import contract_payload_sha256
 
 COVERAGE_SCHEMA_VERSION = 1
 SOURCE_KIND = "cr_expert_source_token_coverage_v1"
-SUCCESS_KIND = "cr_expert_success_token_coverage_v1"
-QUOTA_KIND = "cr_expert_adaptive_token_quota_v1"
-RECEIPT_KIND = "cr_expert_token_coverage_receipt_v1"
+SUCCESS_SCHEMA_VERSION = 2
+QUOTA_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 2
+SUCCESS_KIND = "cr_expert_success_token_coverage_v2"
+QUOTA_KIND = "cr_expert_adaptive_token_quota_v2"
+RECEIPT_KIND = "cr_expert_token_coverage_receipt_v2"
 SOURCE_ABILITY_EVENTS_KIND = "cr_expert_source_ability_events_v1"
 ABILITY_TRANSCRIPT_KIND = "cr_expert_libg_ability_resolution_transcript_v1"
 AUTHENTICATED_ABILITY_TRANSCRIPTS_KIND = (
@@ -1246,6 +1249,7 @@ def summarize_success_token_coverage(
             ),
         )
     card_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    admitted_card_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
     card_label_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
     card_labels: Counter[str] = Counter()
     form_episodes: dict[str, set[tuple[str, int]]] = defaultdict(set)
@@ -1291,8 +1295,9 @@ def summarize_success_token_coverage(
         deck = set(_unique_strings(record.get("deck_tokens"), "actor deck_tokens"))
         if len(deck) != 8 or not deck <= index["allowed_set"]:
             raise TokenCoverageError("successful actor deck must contain eight tokens")
-        if full_success:
-            for token in deck:
+        for token in deck:
+            admitted_card_episodes[token].add(key)
+            if full_success:
                 card_episodes[token].add(key)
 
         seen_events: set[tuple[str, int]] = set()
@@ -1337,6 +1342,7 @@ def summarize_success_token_coverage(
     cards = {
         token: {
             "full_success_episodes": len(card_episodes[token]),
+            "admitted_training_episodes": len(admitted_card_episodes[token]),
             "deploy_label_episodes": len(card_label_episodes[token]),
             "deploy_labels": int(card_labels[token]),
             "resolved_native_id_counts": {
@@ -1369,7 +1375,7 @@ def summarize_success_token_coverage(
         for token in index["ability"]
     }
     return {
-        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "schema_version": SUCCESS_SCHEMA_VERSION,
         "kind": SUCCESS_KIND,
         "contract_sha256": index["contract_sha256"],
         "records": total_records,
@@ -1412,11 +1418,13 @@ def build_adaptive_token_quotas(source: Mapping[str, Any]) -> dict[str, Any]:
         source.get("observed_ability_tokens"), "observed_ability_tokens"
     )
     return {
-        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "schema_version": QUOTA_SCHEMA_VERSION,
         "kind": QUOTA_KIND,
         "contract_sha256": str(source.get("contract_sha256") or ""),
         "formula": {
-            "card_episodes": "max(1,min(16,floor(source_deck_sides/4)))",
+            "card_training_episodes": (
+                "max(1,min(16,floor(source_deck_sides/4)))"
+            ),
             "card_labels": "max(1,min(64,floor(source_play_labels/4)))",
             "form_episodes": "max(1,min(8,floor(source_deck_sides/4)))",
             "form_labels": "max(1,min(16,floor(source_play_labels/4)))",
@@ -1427,7 +1435,7 @@ def build_adaptive_token_quotas(source: Mapping[str, Any]) -> dict[str, Any]:
         },
         "card_tokens": {
             token: {
-                "full_success_episodes": _adaptive_requirement(
+                "admitted_training_episodes": _adaptive_requirement(
                     _integer(_mapping(cards[token], token).get("deck_sides"), "deck_sides"),
                     divisor=4,
                     cap=16,
@@ -1528,7 +1536,7 @@ def _validate_success_within_source(
         "card_tokens": (
             "deck_sides",
             "play_labels",
-            "full_success_episodes",
+            "admitted_training_episodes",
             "deploy_labels",
         ),
         "form_tokens": (
@@ -1582,6 +1590,21 @@ def _validate_success_within_source(
                 raise TokenCoverageError(
                     f"success coverage exceeds source opportunities: {token}"
                 )
+    success_cards = _mapping(success.get("card_tokens"), "success card_tokens")
+    for token, raw_success in success_cards.items():
+        success_row = _mapping(raw_success, f"success stats for {token}")
+        full = _integer(
+            success_row.get("full_success_episodes"),
+            f"success {token} full_success_episodes",
+        )
+        admitted = _integer(
+            success_row.get("admitted_training_episodes"),
+            f"success {token} admitted_training_episodes",
+        )
+        if full > admitted:
+            raise TokenCoverageError(
+                f"full-success episodes exceed admitted training episodes: {token}"
+            )
 
 
 def _deficits(
@@ -1639,6 +1662,9 @@ def evaluate_token_coverage(
         source.get("kind") != SOURCE_KIND
         or success.get("kind") != SUCCESS_KIND
         or quotas.get("kind") != QUOTA_KIND
+        or source.get("schema_version") != COVERAGE_SCHEMA_VERSION
+        or success.get("schema_version") != SUCCESS_SCHEMA_VERSION
+        or quotas.get("schema_version") != QUOTA_SCHEMA_VERSION
         or not _SHA256_RE.fullmatch(expected_sha)
         or success.get("contract_sha256") != expected_sha
         or quotas.get("contract_sha256") != expected_sha
@@ -1648,7 +1674,7 @@ def evaluate_token_coverage(
     token_groups = {
         "card_tokens": (
             _unique_strings(source.get("observed_card_tokens"), "observed cards"),
-            ("full_success_episodes", "deploy_labels"),
+            ("admitted_training_episodes", "deploy_labels"),
         ),
         "form_tokens": (
             _unique_strings(source.get("observed_form_tokens"), "observed forms"),
@@ -1705,7 +1731,7 @@ def build_token_coverage_receipt(
     actual_quotas = recomputed_quotas if quotas is None else dict(quotas)
     evaluation = evaluate_token_coverage(source, success, actual_quotas)
     return {
-        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "schema_version": RECEIPT_SCHEMA_VERSION,
         "kind": RECEIPT_KIND,
         "contract_sha256": str(source.get("contract_sha256") or ""),
         "source": dict(source),
@@ -1719,8 +1745,25 @@ def canonical_coverage_receipt_bytes(receipt: Mapping[str, Any]) -> bytes:
     """Serialize a receipt deterministically and reject NaN/Infinity."""
 
     receipt = _mapping(receipt, "token coverage receipt")
-    if receipt.get("kind") != RECEIPT_KIND or receipt.get("schema_version") != 1:
+    if (
+        receipt.get("kind") != RECEIPT_KIND
+        or receipt.get("schema_version") != RECEIPT_SCHEMA_VERSION
+    ):
         raise TokenCoverageError("token coverage receipt kind/schema is invalid")
+    source = _mapping(receipt.get("source"), "token coverage receipt source")
+    success = _mapping(receipt.get("success"), "token coverage receipt success")
+    quotas = _mapping(receipt.get("quotas"), "token coverage receipt quotas")
+    evaluation = _mapping(
+        receipt.get("evaluation"), "token coverage receipt evaluation"
+    )
+    recomputed = evaluate_token_coverage(source, success, quotas)
+    if (
+        receipt.get("contract_sha256") != source.get("contract_sha256")
+        or canonical_json_bytes(evaluation) != canonical_json_bytes(recomputed)
+    ):
+        raise TokenCoverageError(
+            "token coverage receipt aggregate semantics changed"
+        )
     return canonical_json_bytes(receipt)
 
 
@@ -1759,10 +1802,13 @@ __all__ = [
     "AUTHENTICATED_ABILITY_TRANSCRIPTS_KIND",
     "COVERAGE_SCHEMA_VERSION",
     "QUOTA_KIND",
+    "QUOTA_SCHEMA_VERSION",
     "RECEIPT_KIND",
+    "RECEIPT_SCHEMA_VERSION",
     "SOURCE_ABILITY_EVENTS_KIND",
     "SOURCE_KIND",
     "SUCCESS_KIND",
+    "SUCCESS_SCHEMA_VERSION",
     "TokenCoverageError",
     "ability_resolution_transcript_sha256",
     "authenticate_ability_resolution_transcripts",

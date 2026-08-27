@@ -23,6 +23,7 @@ from expert_v1.compile_native_bc_dataset import (
     _ability_vocab,
     _card_vocab,
     _compile_actor,
+    _episode_extent_contract,
     _release_capacity_reservation,
     _stratified_capacity_sample,
     _validate_tick_store,
@@ -588,8 +589,11 @@ class NativeBcCompilerTests(unittest.TestCase):
             source_row = json.loads(source_manifest.read_text().splitlines()[0])
             source = json.loads(Path(source_row["source_path"]).read_text())
             loaded = load_native_ingest_contract(contract_path)
+            action_plan = compile_battle(
+                source, native_ingest_contract=loaded
+            )
             native_plan = replace(
-                compile_battle(source, native_ingest_contract=loaded),
+                action_plan,
                 actions=(),
                 ability_events=(),
             )
@@ -601,6 +605,12 @@ class NativeBcCompilerTests(unittest.TestCase):
             ) as reader:
                 episode = reader.episode(str(source["battle_tag"]))
                 state = next(episode.iter_ticks())
+                source_action = next(
+                    action for action in action_plan.actions
+                    if int(action.side) == 0
+                )
+                source_action_tick = int(source_action.tick) + 1
+                source_action_state = episode.read_tick(source_action_tick)
                 metadata = dict(episode.metadata)
             contract = dict(loaded.value)
             _cards, native_cards, source_cards = _card_vocab(contract)
@@ -633,7 +643,7 @@ class NativeBcCompilerTests(unittest.TestCase):
             players[0] = replace(
                 own,
                 hand=(own.hand[0], own.hand[1], -1, own.hand[3]),
-                refill_timer=600,
+                refill_timer=0,
             )
             transient = replace(state, players=tuple(players))
             refill = _compile_actor(
@@ -645,6 +655,80 @@ class NativeBcCompilerTests(unittest.TestCase):
             self.assertEqual(int(refill["hand_tokens"][0, 2]), 0)
             self.assertEqual(int(refill["card_mask"][0, 2]), 0)
             self.assertEqual(int(refill["card_label_mask"][0]), 0)
+
+            action_players = list(source_action_state.players)
+            action_own = action_players[0]
+            action_hand = list(action_own.hand)
+            selected_slot = action_hand.index(
+                int(source_action.logical_card_index)
+            )
+            action_hand[selected_slot] = -1
+            action_players[0] = replace(
+                action_own,
+                hand=tuple(action_hand),
+                next_deck_index=int(source_action.logical_card_index),
+                refill_timer=0,
+            )
+            selects_empty = replace(
+                source_action_state, players=tuple(action_players)
+            )
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "expert deck index absent from exact hand"
+            ):
+                _compile_actor(
+                    [selects_empty], metadata, action_plan, **common,
+                    replay_extent="valid_prefix",
+                    action_label_tick_stop_exclusive=source_action_tick + 1,
+                    timing_censor_tick_exclusive=source_action_tick + 1,
+                )
+
+    def test_prefix_failure_tick_mask_check_does_not_inflate_safe_labels(self) -> None:
+        extent = {
+            "kind": "cr_native_replay_extent_v1",
+            "extent": "valid_prefix",
+            "training_admission": "actor_bc_censored_prefix_v1",
+            "source_episode_complete": False,
+            "every_native_tick_present_within_extent": True,
+            "semantic_match": True,
+            "failure_domain": "semantic",
+            "failure_tick_has_labels": False,
+            "terminal_target": "unknown_censored",
+            "terminal_validated": False,
+            "deployment_masks": "partial_native_visible_hand_complete_v1",
+            "observation_tick_start": 10,
+            "observation_tick_stop_exclusive": 21,
+            "action_label_tick_stop_exclusive": 20,
+            "timing_censor_tick_exclusive": 20,
+            "timing_target": "right_censored_at_failure_tick_v1",
+            "mask_coverage": {
+                "all_retained_visible_hand_slots_covered": True,
+                "retained_ticks": 10,
+                "actor_ticks": 20,
+                "visible_slot_references": 80,
+                "empty_slot_actor_ticks": 0,
+                "safe_deploy_labels": 1,
+                # The failure Tick deployment was mask-checked before libg
+                # rejected it.  It is diagnostic only, not a safe label.
+                "checked_deploy_labels": 2,
+                "rejected_deploy_labels": 0,
+            },
+        }
+        value = _episode_extent_contract(
+            {"native_replay_extent_v1": extent},
+            tick_count=11,
+            replay_extent="valid_prefix",
+        )
+        self.assertEqual(value["compiled_tick_count"], 10)
+        tampered = deepcopy(extent)
+        tampered["mask_coverage"]["checked_deploy_labels"] = 0
+        with self.assertRaisesRegex(
+            NativeBcCompileError, "mask coverage accounting"
+        ):
+            _episode_extent_contract(
+                {"native_replay_extent_v1": tampered},
+                tick_count=11,
+                replay_extent="valid_prefix",
+            )
 
     def test_missing_mask_sidecar_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -939,6 +1023,28 @@ class NativeBcCompilerTests(unittest.TestCase):
                 NativeBcCompileError, "native generation receipt changed"
             ):
                 load_compile_plan(output / "compile-plan.json")
+
+    def test_legacy_ability_coverage_receipt_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(root)
+            value = json.loads(receipt.read_text(encoding="utf-8"))
+            value["ability_coverage"]["schema_version"] = 1
+            value["ability_coverage"]["kind"] = (
+                "cr_expert_ability_native_coverage_v1"
+            )
+            receipt.write_text(json.dumps(value) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "ability coverage kind/schema"
+            ):
+                create_compile_plan(
+                    tick_root,
+                    source,
+                    root / "legacy-ability-coverage",
+                    contract,
+                    receipt,
+                    maximum_rows_per_shard=10_000,
+                )
 
     def test_ability_failures_require_explicit_waiver_at_compiler_admission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

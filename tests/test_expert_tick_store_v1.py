@@ -13,6 +13,8 @@ from expert_v1.tick_store_v1.schema import (
     PlayerPrivate,
     TickState,
     TowerState,
+    TickStoreContractError,
+    _normalize_players,
     actor_projection,
 )
 from expert_v1.tick_store_v1.shard import (
@@ -98,7 +100,7 @@ class TickStoreV1Test(unittest.TestCase):
         transient = replace(
             source[1],
             players=(
-                PlayerPrivate(0, 42_000, (0, 1, -1, 3), 4, 600),
+                PlayerPrivate(0, 42_000, (0, 1, -1, 3), 4, 0),
                 source[1].players[1],
             ),
         )
@@ -109,7 +111,41 @@ class TickStoreV1Test(unittest.TestCase):
         decoded = list(EpisodeReader(blob).iter_ticks())
         self.assertEqual(decoded, source)
         self.assertEqual(decoded[1].players[0].hand, (0, 1, -1, 3))
-        self.assertEqual(decoded[1].players[0].refill_timer, 600)
+        self.assertEqual(decoded[1].players[0].refill_timer, 0)
+
+    def test_native_empty_slot_allows_zero_timer_but_keeps_cycle_guards(self) -> None:
+        def raw(hand: list[int], *, timer: int = 0, next_index: int = 4) -> dict:
+            return {
+                "players": [
+                    {
+                        "side": 0,
+                        "elixir_raw": 50_000,
+                        "hand_deck_indices": hand,
+                        "next_deck_index": next_index,
+                        "refill_timer": timer,
+                    },
+                    {
+                        "side": 1,
+                        "elixir_raw": 50_000,
+                        "hand_deck_indices": [4, 5, 6, 7],
+                        "next_deck_index": 0,
+                        "refill_timer": 0,
+                    },
+                ]
+            }
+
+        players = _normalize_players(raw([0, 1, -1, 3], timer=0))
+        self.assertEqual(players[0].hand, (0, 1, -1, 3))
+        self.assertEqual(players[0].refill_timer, 0)
+        for hand in (
+            [0, 0, -1, 3],      # duplicate visible card
+            [0, 1, -2, 3],      # value below native sentinel
+            [-1, 1, -1, 3],     # more than one empty slot
+        ):
+            with self.assertRaises(TickStoreContractError):
+                _normalize_players(raw(hand))
+        with self.assertRaises(TickStoreContractError):
+            _normalize_players(raw([0, 1, -1, 3], next_index=1))
 
     def test_shard_recovers_truncated_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

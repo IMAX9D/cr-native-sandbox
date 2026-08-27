@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from pathlib import Path
@@ -324,12 +325,20 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
             failure="native_rejected_tick_21_source_tick_20_codes_[4]",
             action_sequence=action,
         )
+        prefix_states = tick_states(12)
+        transient_players = list(prefix_states[5].players)
+        transient_players[0] = replace(
+            transient_players[0], hand=(0, 1, -1, 3), refill_timer=0
+        )
+        prefix_states[5] = replace(
+            prefix_states[5], players=tuple(transient_players)
+        )
         prefix = replay_result_stub(
             success=False,
             chosen_seed=7,
             failure=preflight.failure,
             action_sequence=action,
-            collected_states=tuple(tick_states(12)),
+            collected_states=tuple(prefix_states),
             with_masks=True,
         )
         prefix.seeds_tested = 0
@@ -367,6 +376,7 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 "all_retained_visible_hand_slots_covered"
             ]
         )
+        self.assertEqual(extent["mask_coverage"]["empty_slot_actor_ticks"], 1)
         self.assertIn("native_deployment_masks_v1", staged.episode.metadata)
         self.assertEqual(staged.episode.states[-1].tick, 21)
 

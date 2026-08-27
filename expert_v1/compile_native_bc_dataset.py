@@ -64,6 +64,8 @@ from .training_v1.schema import (
     validate_shard,
 )
 from .token_coverage_v1 import (
+    RECEIPT_KIND as TOKEN_COVERAGE_RECEIPT_KIND,
+    RECEIPT_SCHEMA_VERSION as TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION,
     authenticate_generator_ability_evidence,
     build_adaptive_token_quotas,
     build_token_coverage_receipt,
@@ -479,7 +481,7 @@ def _episode_extent_contract(
         or _require_integer(
             coverage.get("checked_deploy_labels"), "prefix checked deploy labels"
         )
-        != _require_integer(
+        < _require_integer(
             coverage.get("safe_deploy_labels"), "prefix safe deploy labels"
         )
     ):
@@ -805,9 +807,20 @@ def _authenticate_native_generation_receipt(
     ability = receipt.get("ability_coverage")
     if not isinstance(ability, Mapping):
         raise NativeBcCompileError("native ability coverage is missing")
+    if (
+        ability.get("kind") != "cr_expert_ability_native_coverage_v2"
+        or int(ability.get("schema_version", -1)) != 2
+    ):
+        raise NativeBcCompileError("native ability coverage kind/schema changed")
     gate = ability.get("gate")
     if not isinstance(gate, Mapping):
         raise NativeBcCompileError("native ability coverage gate is missing")
+    if (
+        gate.get("authority")
+        != "final_compiled_array_token_coverage_v1"
+        or gate.get("final_array_gate_deferred") is not True
+    ):
+        raise NativeBcCompileError("native ability coverage authority changed")
     minimum_count = _require_integer(
         gate.get("minimum_success_count"), "ability minimum success count"
     )
@@ -3382,8 +3395,6 @@ def _compile_actor(
             or sum(value == -1 for value in hand_indices) not in (0, 1)
             or len({value for value in hand_indices if value >= 0})
             != sum(value >= 0 for value in hand_indices)
-            or (sum(value == -1 for value in hand_indices) == 1)
-            != (int(actor.own_player.refill_timer) > 0)
         ):
             raise NativeBcCompileError(
                 f"invalid exact native hand/refill transient: "
@@ -3927,11 +3938,11 @@ def _compile_output_shard(
                 )
             if episode.replay_extent == VALID_PREFIX_EXTENT and int(
                 metadata[REPLAY_EXTENT_METADATA_KEY]["mask_coverage"][
-                    "checked_deploy_labels"
+                    "safe_deploy_labels"
                 ]
             ) != int(label_audit["checked"]):
                 raise NativeBcCompileError(
-                    f"audit-prefix checked deployment count changed: "
+                    f"audit-prefix safe deployment count changed: "
                     f"{episode.battle_tag}"
                 )
             for actor_side in (0, 1):
@@ -5219,6 +5230,8 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         gate = (token_receipt.get("evaluation") or {}).get("gate") or {}
         token_coverage_manifest = {
             "enforced": True,
+            "receipt_kind": TOKEN_COVERAGE_RECEIPT_KIND,
+            "receipt_schema_version": TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION,
             "receipt": "token-coverage-receipt.json",
             "receipt_file_sha256": token_file_sha,
             "receipt_canonical_sha256": token_digest,

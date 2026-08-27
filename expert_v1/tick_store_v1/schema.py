@@ -225,7 +225,6 @@ def _normalize_players(state: Mapping[str, Any]) -> tuple[PlayerPrivate, PlayerP
             or next_deck_index not in range(8)
             or next_deck_index in visible
             or not 0 <= refill_timer <= 10_000
-            or (empty_slots == 1) != (refill_timer > 0)
         ):
             raise TickStoreContractError(
                 "hand/next/refill native cycle state is inconsistent"

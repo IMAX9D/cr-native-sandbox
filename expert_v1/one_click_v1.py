@@ -33,6 +33,8 @@ from expert_v1.native_ingest_contract import (
     CONTRACT_SCHEMA_VERSION as NATIVE_CONTRACT_SCHEMA_VERSION,
 )
 from expert_v1.token_coverage_v1 import (
+    RECEIPT_KIND as TOKEN_COVERAGE_RECEIPT_KIND,
+    RECEIPT_SCHEMA_VERSION as TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION,
     build_adaptive_token_quotas,
     canonical_json_bytes,
     freeze_source_token_coverage,
@@ -1829,6 +1831,7 @@ def validate_native_result_records(
             "candidates": sum(expected.values()),
             "attempted": 0,
             "successes": 0,
+            "admitted_training_evidence": 0,
             "failures": 0,
             "failure_class_counts": {},
         },
@@ -1836,6 +1839,7 @@ def validate_native_result_records(
             "candidates": len(expected) - sum(expected.values()),
             "attempted": 0,
             "successes": 0,
+            "admitted_training_evidence": 0,
             "failures": 0,
             "failure_class_counts": {},
         },
@@ -1908,6 +1912,7 @@ def validate_native_result_records(
                         token_evidence_actor_records += 1
                 success_tags.add(tag)
                 cohort["successes"] += 1
+                cohort["admitted_training_evidence"] += 1
             else:
                 if require_token_evidence and row.get(
                     "token_coverage_actor_evidence"
@@ -1949,6 +1954,7 @@ def validate_native_result_records(
                     prefix_evidence = row.get(
                         "prefix_token_coverage_actor_evidence"
                     )
+                    prefix_ability_labels = 0
                     if require_token_evidence:
                         if not isinstance(prefix_evidence, list) or len(
                             prefix_evidence
@@ -1973,6 +1979,8 @@ def validate_native_result_records(
                                 if key != "native_evidence_sha256"
                             }
                             side = int(actor.get("actor_side", -1))
+                            deploy_labels = actor.get("deploy_labels")
+                            ability_labels = actor.get("ability_labels")
                             if (
                                 actor.get("kind")
                                 != "cr_native_censored_prefix_actor_token_evidence_v1"
@@ -1989,6 +1997,12 @@ def validate_native_result_records(
                                 or side in evidence_sides
                                 or claimed
                                 != hashlib.sha256(_canonical(body)).hexdigest()
+                                or not isinstance(deploy_labels, list)
+                                or not isinstance(ability_labels, list)
+                                or any(
+                                    not isinstance(label, Mapping)
+                                    for label in deploy_labels + ability_labels
+                                )
                                 or any(
                                     label.get("compiled") is not False
                                     for field in ("deploy_labels", "ability_labels")
@@ -1999,8 +2013,28 @@ def validate_native_result_records(
                                 raise OneClickError(
                                     "audit-prefix actor token evidence identity/hash changed"
                                 )
+                            for label in ability_labels:
+                                label_claimed = str(
+                                    label.get("native_evidence_sha256") or ""
+                                )
+                                label_body = {
+                                    key: value for key, value in label.items()
+                                    if key != "native_evidence_sha256"
+                                }
+                                if label_claimed != hashlib.sha256(
+                                    _canonical(label_body)
+                                ).hexdigest():
+                                    raise OneClickError(
+                                        "audit-prefix ability evidence identity/hash changed"
+                                    )
+                            prefix_ability_labels += len(ability_labels)
                             evidence_sides.add(side)
                             token_evidence_actor_records += 1
+                    if (
+                        cohort_name == "ability_positive"
+                        and prefix_ability_labels > 0
+                    ):
+                        cohort["admitted_training_evidence"] += 1
                     prefix_tags.add(tag)
                 else:
                     if require_token_evidence and row.get(
@@ -2028,6 +2062,10 @@ def validate_native_result_records(
         attempted = int(cohort["attempted"])
         cohort["success_rate"] = (
             float(cohort["successes"]) / attempted if attempted else None
+        )
+        cohort["admitted_training_evidence_rate"] = (
+            float(cohort["admitted_training_evidence"]) / attempted
+            if attempted else None
         )
         cohort["failure_class_counts"] = dict(
             sorted(cohort["failure_class_counts"].items())
@@ -2059,7 +2097,7 @@ def evaluate_ability_positive_coverage(
     waived: bool,
     waiver_reason: str | None,
 ) -> dict[str, Any]:
-    """Build the immutable ability/non-ability admission classification."""
+    """Build the immutable Full+Prefix ability admission classification."""
 
     positive = dict(result_audit.get("ability_positive") or {})
     zero = dict(result_audit.get("ability_zero") or {})
@@ -2084,7 +2122,19 @@ def evaluate_ability_positive_coverage(
     positive_rate = (
         positive_successes / candidate_positive if applicable else None
     )
-    raw_passed = (
+    admitted_evidence = int(positive.get("admitted_training_evidence", -1))
+    zero_admitted_evidence = int(zero.get("admitted_training_evidence", -1))
+    if (
+        admitted_evidence < positive_successes
+        or admitted_evidence > candidate_positive
+        or zero_admitted_evidence < int(zero.get("successes", -1))
+        or zero_admitted_evidence > candidate_zero
+    ):
+        raise OneClickError("ability training-evidence classification is invalid")
+    admitted_evidence_rate = (
+        admitted_evidence / candidate_positive if applicable else None
+    )
+    full_success_diagnostic_passed = (
         not applicable
         or (
             positive_successes >= int(minimum_success_count)
@@ -2092,12 +2142,20 @@ def evaluate_ability_positive_coverage(
             and positive_rate >= float(minimum_success_rate)
         )
     )
+    raw_passed = (
+        not applicable
+        or (
+            admitted_evidence >= int(minimum_success_count)
+            and admitted_evidence_rate is not None
+            and admitted_evidence_rate >= float(minimum_success_rate)
+        )
+    )
     reason = str(waiver_reason or "").strip() or None
     if waived and reason is None:
         raise OneClickError("ability-positive coverage waiver requires a reason")
     return {
-        "schema_version": 1,
-        "kind": "cr_expert_ability_native_coverage_v1",
+        "schema_version": 2,
+        "kind": "cr_expert_ability_native_coverage_v2",
         "candidate_counts": {
             "ability_positive": candidate_positive,
             "ability_zero": candidate_zero,
@@ -2118,6 +2176,14 @@ def evaluate_ability_positive_coverage(
             "ability_positive": positive_rate,
             "ability_zero": zero.get("success_rate"),
         },
+        "admitted_training_evidence_counts": {
+            "ability_positive": admitted_evidence,
+            "ability_zero": zero_admitted_evidence,
+        },
+        "admitted_training_evidence_rates": {
+            "ability_positive": admitted_evidence_rate,
+            "ability_zero": zero.get("admitted_training_evidence_rate"),
+        },
         "failure_class_counts": {
             "ability_positive": positive.get("failure_class_counts") or {},
             "ability_zero": zero.get("failure_class_counts") or {},
@@ -2127,8 +2193,11 @@ def evaluate_ability_positive_coverage(
             "minimum_success_count": int(minimum_success_count),
             "minimum_success_rate": float(minimum_success_rate),
             "raw_passed": raw_passed,
+            "full_success_diagnostic_passed": full_success_diagnostic_passed,
             "waiver_applied": bool(waived),
             "waiver_reason": reason,
+            "authority": "final_compiled_array_token_coverage_v1",
+            "final_array_gate_deferred": True,
             "admitted": bool(raw_passed or waived),
         },
     }
@@ -2950,6 +3019,9 @@ class OneClickOrchestrator:
                 )
                 != coverage_receipt.get("ability_coverage")
                 or token_coverage.get("enforced") is not True
+                or token_receipt.get("kind") != TOKEN_COVERAGE_RECEIPT_KIND
+                or token_receipt.get("schema_version")
+                != TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION
                 or (token_coverage.get("gate") or {}).get("admitted") is not True
                 or token_coverage.get("receipt_file_sha256")
                 != sha256_file(token_receipt_path)

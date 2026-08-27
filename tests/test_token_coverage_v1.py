@@ -430,7 +430,7 @@ class TokenCoverageV1Test(unittest.TestCase):
         quotas = build_adaptive_token_quotas(source)
         self.assertEqual(
             quotas["card_tokens"]["electro-dragon"],
-            {"full_success_episodes": 1, "deploy_labels": 1},
+            {"admitted_training_episodes": 1, "deploy_labels": 1},
         )
         modified = deepcopy(source)
         modified["card_tokens"]["electro-dragon"].update({
@@ -448,7 +448,7 @@ class TokenCoverageV1Test(unittest.TestCase):
         quotas = build_adaptive_token_quotas(modified)
         self.assertEqual(
             quotas["card_tokens"]["electro-dragon"],
-            {"full_success_episodes": 16, "deploy_labels": 64},
+            {"admitted_training_episodes": 16, "deploy_labels": 64},
         )
         self.assertEqual(
             quotas["form_tokens"]["archers-ev1"],
@@ -458,6 +458,55 @@ class TokenCoverageV1Test(unittest.TestCase):
             quotas["ability_tokens"]["rune-giant"],
             {"resolved_ability_episodes": 8, "resolved_ability_labels": 32},
         )
+
+    def test_censored_prefix_is_admitted_but_never_counted_as_full(self) -> None:
+        source, bundle, _transcripts, records = self._valid_fixture()
+        records[0]["full_success"] = False
+        records[0]["censored_prefix"] = True
+        success = self._summarize(records, source, bundle)
+        electro = success["card_tokens"]["electro-dragon"]
+        self.assertEqual(electro["full_success_episodes"], 0)
+        self.assertEqual(electro["admitted_training_episodes"], 1)
+        receipt = build_token_coverage_receipt(source, success)
+        self.assertTrue(receipt["evaluation"]["gate"]["admitted"])
+
+    def test_legacy_v1_aggregate_artifacts_are_rejected(self) -> None:
+        source, bundle, _transcripts, records = self._valid_fixture()
+        success = self._summarize(records, source, bundle)
+        quotas = build_adaptive_token_quotas(source)
+        receipt = build_token_coverage_receipt(source, success, quotas)
+        self.assertEqual(success["schema_version"], 2)
+        self.assertEqual(quotas["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 2)
+
+        legacy_success = deepcopy(success)
+        legacy_success.update(
+            schema_version=1,
+            kind="cr_expert_success_token_coverage_v1",
+        )
+        with self.assertRaisesRegex(TokenCoverageError, "contract binding"):
+            evaluate_token_coverage(source, legacy_success, quotas)
+
+        legacy_quotas = deepcopy(quotas)
+        legacy_quotas.update(
+            schema_version=1,
+            kind="cr_expert_adaptive_token_quota_v1",
+        )
+        with self.assertRaisesRegex(TokenCoverageError, "quotas were changed"):
+            evaluate_token_coverage(source, success, legacy_quotas)
+
+        legacy_receipt = deepcopy(receipt)
+        legacy_receipt.update(
+            schema_version=1,
+            kind="cr_expert_token_coverage_receipt_v1",
+        )
+        with self.assertRaisesRegex(TokenCoverageError, "kind/schema"):
+            canonical_coverage_receipt_bytes(legacy_receipt)
+
+        repacked_legacy = deepcopy(receipt)
+        repacked_legacy["success"] = legacy_success
+        with self.assertRaisesRegex(TokenCoverageError, "contract binding"):
+            canonical_coverage_receipt_bytes(repacked_legacy)
 
     def test_multi_candidate_never_becomes_offline_identity(self) -> None:
         source, bundle, transcripts, records = self._valid_fixture()

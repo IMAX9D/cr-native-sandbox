@@ -421,17 +421,21 @@ class ExpertOneClickV1Test(unittest.TestCase):
                         "candidates": 1,
                         "attempted": 1,
                         "successes": 1,
+                        "admitted_training_evidence": 1,
                         "failures": 0,
                         "failure_class_counts": {},
                         "success_rate": 1.0,
+                        "admitted_training_evidence_rate": 1.0,
                     },
                     "ability_zero": {
                         "candidates": 1,
                         "attempted": 1,
                         "successes": 0,
+                        "admitted_training_evidence": 0,
                         "failures": 1,
                         "failure_class_counts": {"semantic": 1},
                         "success_rate": 0.0,
+                        "admitted_training_evidence_rate": 0.0,
                     },
                 },
             )
@@ -463,17 +467,21 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 "candidates": 2,
                 "attempted": 2,
                 "successes": 0,
+                "admitted_training_evidence": 0,
                 "failures": 2,
                 "failure_class_counts": {"semantic": 2},
                 "success_rate": 0.0,
+                "admitted_training_evidence_rate": 0.0,
             },
             "ability_zero": {
                 "candidates": 98,
                 "attempted": 98,
                 "successes": 98,
+                "admitted_training_evidence": 98,
                 "failures": 0,
                 "failure_class_counts": {},
                 "success_rate": 1.0,
+                "admitted_training_evidence_rate": 1.0,
             },
         }
         coverage = evaluate_ability_positive_coverage(
@@ -566,7 +574,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
             root = Path(temporary)
             queue = root / "queue.jsonl"
             queue.write_text(
-                json.dumps({"battle_tag": "PREFIX", "ability_events_observed": 0})
+                json.dumps({"battle_tag": "PREFIX", "ability_events_observed": 1})
                 + "\n",
                 encoding="utf-8",
             )
@@ -591,6 +599,20 @@ class ExpertOneClickV1Test(unittest.TestCase):
             ).hexdigest()
             actors = []
             for side in (0, 1):
+                ability_labels = []
+                if side == 0:
+                    ability_label = {
+                        "source_event_index": 3,
+                        "compiled": False,
+                        "accepted": True,
+                        "legal": True,
+                    }
+                    ability_label["native_evidence_sha256"] = hashlib.sha256(
+                        json.dumps(
+                            ability_label, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    ability_labels.append(ability_label)
                 actor = {
                     "kind": "cr_native_censored_prefix_actor_token_evidence_v1",
                     "battle_tag": "PREFIX",
@@ -603,7 +625,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                     "replay_extent_sha256": extent_sha,
                     "deck_tokens": [f"card-{index}" for index in range(8)],
                     "deploy_labels": [],
-                    "ability_labels": [],
+                    "ability_labels": ability_labels,
                 }
                 actor["native_evidence_sha256"] = hashlib.sha256(
                     json.dumps(
@@ -631,6 +653,24 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 results, queue, expected_rows=1, require_token_evidence=True
             )
             self.assertEqual(audit["token_coverage_actor_evidence_records"], 2)
+            self.assertEqual(
+                audit["ability_positive"]["admitted_training_evidence"], 1
+            )
+            coverage = evaluate_ability_positive_coverage(
+                {"ability_positive": 1, "ability_zero": 0},
+                audit,
+                minimum_success_count=1,
+                minimum_success_rate=0.10,
+                waived=False,
+                waiver_reason=None,
+            )
+            self.assertEqual(
+                coverage["kind"], "cr_expert_ability_native_coverage_v2"
+            )
+            self.assertFalse(coverage["gate"]["full_success_diagnostic_passed"])
+            self.assertTrue(coverage["gate"]["raw_passed"])
+            self.assertTrue(coverage["gate"]["admitted"])
+            self.assertTrue(coverage["gate"]["final_array_gate_deferred"])
             actors[0]["deck_tokens"][0] = "tampered"
             results.write_text(json.dumps(row) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(OneClickError, "identity/hash"):
@@ -644,6 +684,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 "candidates": 1,
                 "attempted": 1,
                 "successes": 0,
+                "admitted_training_evidence": 0,
                 "failures": 1,
                 "failure_class_counts": {"semantic": 1},
             },
@@ -651,6 +692,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 "candidates": 0,
                 "attempted": 0,
                 "successes": 0,
+                "admitted_training_evidence": 0,
                 "failures": 0,
                 "failure_class_counts": {},
             },

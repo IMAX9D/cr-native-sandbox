@@ -1863,7 +1863,7 @@ def _prefix_extent_metadata(
                 return None
             if len(visible) < 4:
                 empty_slot_actor_ticks += 1
-                if player.refill_timer <= 0 or player.next_deck_index not in range(8):
+                if player.next_deck_index not in range(8):
                     return None
             retained_actor_ticks += 1
             visible_slot_references += len(visible)
