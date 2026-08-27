@@ -18,6 +18,7 @@ from expert_v1.one_click_v1 import (
     STAGES,
     _crawler_active,
     _crawler_process_runtime_evidence,
+    _legacy_22_lane_collection_inputs,
     _supervisor_process_runtime_evidence,
     _patchright_browser_runtime_files,
     _default_config,
@@ -1190,6 +1191,72 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 crawler_process_evidence=evidence,
                 supervisor_process_evidence=evidence,
             ))
+
+    def test_collection_migration_accepts_only_reconstructed_22_lane_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "crawler.toml"
+            config_path.write_text(
+                '[proxy]\nproxies = [\n  "http://127.0.0.1:18100",\n]\n',
+                encoding="utf-8",
+            )
+            config = OneClickConfig(
+                project_root=root,
+                data_root=root / "run",
+                crawler_root=root,
+                crawler_python=root / "python.exe",
+                training_python=root / "python.exe",
+                crawler_config=config_path,
+                authoritative_db=root / "db.sqlite3",
+                authoritative_root=root / "authoritative-schema5-v3",
+                native_contract=root / "contract.json",
+                template=root / "template.json",
+            )
+            current = [file_fingerprint(config_path)]
+            predecessor = _legacy_22_lane_collection_inputs(config, current)
+            self.assertIsNotNone(predecessor)
+            self.assertNotEqual(predecessor, tuple(current))
+            current_bytes = config_path.read_bytes()
+            newline = b"\r\n" if b"\r\n" in current_bytes else b"\n"
+            old_config = current_bytes.replace(
+                b'  "http://127.0.0.1:18100",' + newline,
+                b'  "http://127.0.0.1:18100",'
+                + newline
+                + b'  "http://127.0.0.1:18101",'
+                + newline,
+            )
+            self.assertEqual(predecessor[0]["bytes"], len(old_config))
+            self.assertEqual(
+                predecessor[0]["sha256"], hashlib.sha256(old_config).hexdigest()
+            )
+
+            runtime_file = root / "runtime.py"
+            runtime_file.write_text("runtime=1\n", encoding="utf-8")
+            runtime = [*current, file_fingerprint(runtime_file)]
+            journal = StageJournal(root / "state.json")
+            journal.value["active_stage"] = "collect_schema5_v3"
+            journal.value["stages"] = {
+                "collect_schema5_v3": {
+                    "status": "running",
+                    "inputs": list(predecessor),
+                    "outputs": [],
+                }
+            }
+            journal.save()
+            evidence = {"runtime_files_predate_process": True}
+            self.assertTrue(
+                journal.migrate_legacy_running_collect_inputs(
+                    legacy_inputs=current,
+                    compatible_previous_inputs=(predecessor,),
+                    runtime_inputs=runtime,
+                    crawler_process_evidence=evidence,
+                    supervisor_process_evidence=evidence,
+                )
+            )
+            self.assertTrue(
+                journal.value["collect_runtime_fingerprint_migration"]
+                ["compatible_predecessor_used"]
+            )
 
     def test_static_config_migration_is_exact_and_collect_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -554,6 +554,7 @@ class StageJournal:
         self,
         *,
         legacy_inputs: Sequence[Mapping[str, Any]],
+        compatible_previous_inputs: Sequence[Sequence[Mapping[str, Any]]] = (),
         runtime_inputs: Sequence[Mapping[str, Any]],
         crawler_process_evidence: Mapping[str, Any],
         supervisor_process_evidence: Mapping[str, Any],
@@ -572,6 +573,10 @@ class StageJournal:
         runtime = [dict(item) for item in runtime_inputs]
         _verify_fingerprints(legacy)
         _verify_fingerprints(runtime)
+        compatible = [
+            [dict(item) for item in candidate]
+            for candidate in compatible_previous_inputs
+        ]
         stages = self.value.get("stages")
         collect = (
             stages.get("collect_schema5_v3", {})
@@ -586,12 +591,21 @@ class StageJournal:
                 "collect runtime-fingerprint migration is already recorded "
                 "but stage inputs disagree"
             )
+        previous_inputs = collect.get("inputs")
+        matched_previous = next(
+            (
+                candidate
+                for candidate in [legacy, *compatible]
+                if previous_inputs == candidate
+            ),
+            None,
+        )
         if (
             self.value.get("active_stage") != "collect_schema5_v3"
             or not isinstance(stages, Mapping)
             or set(stages) != {"collect_schema5_v3"}
             or collect.get("status") != "running"
-            or collect.get("inputs") != legacy
+            or matched_previous is None
             or collect.get("outputs") not in (None, [])
             or self.value.get("native_layout") is not None
             or self.value.get("configuration") is not None
@@ -631,7 +645,10 @@ class StageJournal:
             "migrated_utc": utc_now(),
             "legacy_state_archive": str(archive.resolve()),
             "legacy_state_sha256": old_state_sha,
-            "legacy_inputs_sha256": hashlib.sha256(_canonical(legacy)).hexdigest(),
+            "legacy_inputs_sha256": hashlib.sha256(
+                _canonical(matched_previous)
+            ).hexdigest(),
+            "compatible_predecessor_used": matched_previous != legacy,
             "runtime_inputs_sha256": hashlib.sha256(_canonical(runtime)).hexdigest(),
             "crawler_process_evidence": dict(crawler_process_evidence),
             "supervisor_process_evidence": dict(supervisor_process_evidence),
@@ -1416,6 +1433,53 @@ def _legacy_collection_inputs(
         file_fingerprint(config.crawler_root / "crawler" / "main.py"),
         value_fingerprint("authoritative-settings", settings),
     ])
+
+
+def _legacy_22_lane_collection_inputs(
+    config: OneClickConfig,
+    current: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...] | None:
+    """Reconstruct the exact 22→21 lane predecessor without trusting Git.
+
+    Only the final replay proxy line may differ.  This lets an already-running
+    collect journal adopt the maximum currently available 21 unique exits
+    after the crawler itself has restarted from the current file.
+    """
+
+    path = config.crawler_config.resolve(strict=True)
+    raw = path.read_bytes()
+    newline = b"\r\n" if b"\r\n" in raw else b"\n"
+    current_tail = b'  "http://127.0.0.1:18100",' + newline + b"]"
+    old_tail = (
+        b'  "http://127.0.0.1:18100",'
+        + newline
+        + b'  "http://127.0.0.1:18101",'
+        + newline
+        + b"]"
+    )
+    if raw.count(current_tail) != 1 or b"127.0.0.1:18101" in raw:
+        return None
+    predecessor = raw.replace(current_tail, old_tail, 1)
+    old_fingerprint = {
+        "kind": "file_sha256_v1",
+        "path": str(path),
+        "bytes": len(predecessor),
+        "sha256": hashlib.sha256(predecessor).hexdigest(),
+    }
+    result = [dict(item) for item in current]
+    replacements = 0
+    for index, item in enumerate(result):
+        if (
+            item.get("kind") == "file_sha256_v1"
+            and Path(str(item.get("path") or "")).resolve() == path
+        ):
+            result[index] = old_fingerprint
+            replacements += 1
+    if replacements != 1:
+        raise OneClickError(
+            "collection legacy input set lacks exactly one crawler config"
+        )
+    return tuple(result)
 
 
 def _collection_runtime_fence(
@@ -2670,6 +2734,15 @@ class OneClickOrchestrator:
             )
             migrated = self.journal.migrate_legacy_running_collect_inputs(
                 legacy_inputs=fence.legacy_inputs,
+                compatible_previous_inputs=tuple(
+                    candidate
+                    for candidate in (
+                        _legacy_22_lane_collection_inputs(
+                            config, fence.legacy_inputs
+                        ),
+                    )
+                    if candidate is not None
+                ),
                 runtime_inputs=fence.inputs,
                 crawler_process_evidence=evidence,
                 supervisor_process_evidence=(
