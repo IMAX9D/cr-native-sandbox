@@ -639,6 +639,72 @@ class StageJournal:
         self.save()
         return True
 
+    def migrate_legacy_collect_static_configuration(
+        self,
+        *,
+        expected_legacy: Mapping[str, Any],
+        current: Mapping[str, Any],
+    ) -> bool:
+        """Adopt the one known pre-token-gate static config during collection.
+
+        The removed ``minimum_native_success_rate`` was a diagnostic aggregate,
+        not a data or training semantic.  The replacement smoke flag is fixed
+        false in production.  Migration is therefore safe only before freeze,
+        with collection as the sole unfinished stage, and only when the stored
+        hash exactly equals the reconstructed legacy payload.
+        """
+
+        existing = self.value.get("static_configuration")
+        if existing == current:
+            return False
+        stages = self.value.get("stages")
+        collect = (
+            stages.get("collect_schema5_v3", {})
+            if isinstance(stages, Mapping)
+            else {}
+        )
+        if (
+            existing != expected_legacy
+            or self.value.get("active_stage") != "collect_schema5_v3"
+            or not isinstance(stages, Mapping)
+            or set(stages) != {"collect_schema5_v3"}
+            or collect.get("status") != "running"
+            or collect.get("outputs") not in (None, [])
+            or self.value.get("native_layout") is not None
+            or self.value.get("configuration") is not None
+            or self.value.get("static_configuration_migration") is not None
+        ):
+            return False
+
+        raw = self.path.resolve(strict=True).read_bytes()
+        old_state_sha = hashlib.sha256(raw).hexdigest()
+        archive = self.path.with_name(
+            f"{self.path.stem}.pre-static-config-v2.{old_state_sha[:16]}.json"
+        )
+        if archive.exists():
+            if archive.read_bytes() != raw:
+                raise OneClickError(
+                    f"static-config migration archive collision: {archive}"
+                )
+        else:
+            _atomic_bytes(archive, raw)
+        self.value["static_configuration"] = dict(current)
+        self.value["static_configuration_migration"] = {
+            "schema_version": 1,
+            "kind": "cr_expert_static_configuration_migration_v1",
+            "migrated_utc": utc_now(),
+            "legacy_state_archive": str(archive.resolve()),
+            "legacy_state_sha256": old_state_sha,
+            "legacy_static_configuration": dict(expected_legacy),
+            "current_static_configuration": dict(current),
+            "reason": (
+                "remove_diagnostic_minimum_native_success_rate_and_bind_"
+                "production_smoke_flag_false"
+            ),
+        }
+        self.save()
+        return True
+
     def begin(
         self, stage: str, inputs: Sequence[Mapping[str, Any]]
     ) -> bool:
@@ -3541,8 +3607,28 @@ class OneClickOrchestrator:
         )
         existing_static = self.journal.value.get("static_configuration")
         if existing_static is not None and existing_static != static_configuration:
-            raise OneClickError(
-                "one-click static configuration changed; use a new --data-root"
+            legacy_declared = self.config.declared(include_native_layout=False)
+            smoke_flag = legacy_declared.pop(
+                "allow_smoke_coverage_deficits", None
+            )
+            legacy_declared["minimum_native_success_rate"] = 0.50
+            expected_legacy = value_fingerprint(
+                "one-click-static-config", legacy_declared
+            )
+            migrated = bool(smoke_flag is False) and (
+                self.journal.migrate_legacy_collect_static_configuration(
+                    expected_legacy=expected_legacy,
+                    current=static_configuration,
+                )
+            )
+            if not migrated:
+                raise OneClickError(
+                    "one-click static configuration changed; use a new --data-root"
+                )
+            print(
+                "[migration] archived legacy collect static configuration "
+                "and bound current production defaults",
+                flush=True,
             )
         if existing_static is None:
             self.journal.value["static_configuration"] = static_configuration

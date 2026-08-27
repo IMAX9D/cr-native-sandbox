@@ -1191,6 +1191,49 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 supervisor_process_evidence=evidence,
             ))
 
+    def test_static_config_migration_is_exact_and_collect_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = StageJournal(root / "state.json")
+            journal.begin("collect_schema5_v3", [])
+            legacy = value_fingerprint("one-click-static-config", {
+                "minimum_native_success_rate": 0.50,
+            })
+            current = value_fingerprint("one-click-static-config", {
+                "allow_smoke_coverage_deficits": False,
+            })
+            journal.value["static_configuration"] = legacy
+            journal.save()
+            old_bytes = journal.path.read_bytes()
+            self.assertTrue(
+                journal.migrate_legacy_collect_static_configuration(
+                    expected_legacy=legacy, current=current
+                )
+            )
+            receipt = journal.value["static_configuration_migration"]
+            self.assertEqual(
+                Path(receipt["legacy_state_archive"]).read_bytes(), old_bytes
+            )
+            self.assertEqual(journal.value["static_configuration"], current)
+            self.assertFalse(
+                journal.migrate_legacy_collect_static_configuration(
+                    expected_legacy=legacy, current=current
+                )
+            )
+
+            rejected = StageJournal(root / "rejected.json")
+            rejected.begin("collect_schema5_v3", [])
+            rejected.value["static_configuration"] = legacy
+            rejected.value["stages"]["freeze_schema5_v3"] = {
+                "status": "pending", "inputs": [], "outputs": [],
+            }
+            rejected.save()
+            self.assertFalse(
+                rejected.migrate_legacy_collect_static_configuration(
+                    expected_legacy=legacy, current=current
+                )
+            )
+
     def test_running_collect_migration_rejects_any_downstream_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
