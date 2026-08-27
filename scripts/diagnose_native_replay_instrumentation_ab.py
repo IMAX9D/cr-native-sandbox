@@ -294,12 +294,28 @@ class InstrumentedEnv:
         return getattr(self.env, name)
 
     def _record_state(self, state: Mapping[str, Any], source: str) -> str:
-        digest = control_state_sha256(state)
+        control = _control_projection(state)
+        digest = _sha256_bytes(_canonical(control))
         self._latest_state = dict(state)
         self.state_observations.append({
             "tick": int(state.get("tick", -1)),
             "source": source,
             "control_sha256": digest,
+            "tower_hp": [
+                [
+                    int(tower["side"]), str(tower["type"]),
+                    int(tower["x"]), int(tower["y"]), int(tower["hp"]),
+                ]
+                for tower in control["episode"]["crown_towers"]
+            ],
+            "player_cycle": [
+                [
+                    int(player["side"]), int(player["elixir_raw"]),
+                    list(player["hand_deck_indices"]),
+                    int(player["next_deck_index"]), int(player["refill_timer"]),
+                ]
+                for player in control["players"]
+            ],
         })
         return digest
 
