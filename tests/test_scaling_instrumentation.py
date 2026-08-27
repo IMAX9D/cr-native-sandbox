@@ -42,6 +42,24 @@ class ScalingInstrumentationTests(unittest.TestCase):
             summary["worker_transition_barrier_wait_mean_ms"], 4.5
         )
 
+    def test_dense_two_avd_twenty_worker_layout(self):
+        pool = MultiAvdWorkerPool(
+            avds=2,
+            workers_per_avd=10,
+            cores_per_avd=10,
+            memory_mb_per_avd=7168,
+        )
+        self.assertEqual(pool.workers, 20)
+        self.assertEqual(
+            pool.environment_ports("direct"), list(range(38031, 38051))
+        )
+        self.assertEqual(
+            pool.environment_ports("adb"),
+            [*range(37031, 37041), *range(37131, 37141)],
+        )
+        self.assertTrue(all(item.config.cores == 10 for item in pool.pools))
+        self.assertTrue(all(item.config.memory_mb == 7168 for item in pool.pools))
+
 
 if __name__ == "__main__":
     unittest.main()

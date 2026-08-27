@@ -33,6 +33,7 @@ DEFAULT_AVD_NAMES = (
     "royale_worker_api31_c",
     "royale_worker_api31_d",
 )
+MAX_WORKERS_PER_AVD = 10
 
 
 class WorkerError(RuntimeError):
@@ -192,8 +193,8 @@ class HeadlessWorkerPool:
 
     def configure_direct_ports(self, workers: int) -> dict[str, Any]:
         """Map host TCP ports straight through Emulator NAT, bypassing ADB proxy."""
-        if workers < 1 or workers > 8:
-            raise ValueError("workers must be in 1..8")
+        if workers < 1 or workers > MAX_WORKERS_PER_AVD:
+            raise ValueError(f"workers must be in 1..{MAX_WORKERS_PER_AVD}")
         mappings = []
         for slot in range(workers):
             host_port = self.config.direct_base_port + slot
@@ -306,8 +307,8 @@ class HeadlessWorkerPool:
     def ensure_ready(
         self, workers: int, *, configure_direct: bool = True
     ) -> dict[str, Any]:
-        if workers < 1 or workers > 8:
-            raise ValueError("workers must be in 1..8")
+        if workers < 1 or workers > MAX_WORKERS_PER_AVD:
+            raise ValueError(f"workers must be in 1..{MAX_WORKERS_PER_AVD}")
         self.config.data_root.mkdir(parents=True, exist_ok=True)
         vm = self.start_vm()
         package = self.ensure_package()
@@ -355,7 +356,7 @@ class HeadlessWorkerPool:
 
 
 class MultiAvdWorkerPool:
-    """Horizontal AVD pool with four isolated libg Workers per VM."""
+    """Horizontal AVD pool with isolated libg Worker processes per VM."""
 
     def __init__(
         self,
@@ -372,8 +373,10 @@ class MultiAvdWorkerPool:
     ) -> None:
         if avds < 1 or avds > len(avd_names):
             raise ValueError(f"avds must be in 1..{len(avd_names)}")
-        if workers_per_avd < 1 or workers_per_avd > 4:
-            raise ValueError("workers_per_avd must be in 1..4")
+        if workers_per_avd < 1 or workers_per_avd > MAX_WORKERS_PER_AVD:
+            raise ValueError(
+                f"workers_per_avd must be in 1..{MAX_WORKERS_PER_AVD}"
+            )
         self.avds = avds
         self.workers_per_avd = workers_per_avd
         self.pools = [
@@ -480,9 +483,15 @@ def main() -> int:
     parser.add_argument("--avds", type=int)
     parser.add_argument("--workers-per-avd", type=int)
     parser.add_argument("--base-port", type=int, default=37031)
+    parser.add_argument("--cores-per-avd", type=int, default=4)
+    parser.add_argument("--memory-mb-per-avd", type=int, default=4096)
     parser.add_argument("--transport", choices=("direct", "adb"), default="direct")
     parser.add_argument("--stop-vm", action="store_true")
     args = parser.parse_args()
+    if args.cores_per_avd <= 0 or args.memory_mb_per_avd < 2048:
+        raise ValueError(
+            "--cores-per-avd must be positive and --memory-mb-per-avd >= 2048"
+        )
     if args.avds is not None or args.workers_per_avd is not None:
         if args.avds is None or args.workers_per_avd is None:
             raise ValueError("--avds and --workers-per-avd must be supplied together")
@@ -491,6 +500,8 @@ def main() -> int:
         multi = MultiAvdWorkerPool(
             avds=args.avds,
             workers_per_avd=args.workers_per_avd,
+            cores_per_avd=args.cores_per_avd,
+            memory_mb_per_avd=args.memory_mb_per_avd,
         )
         if args.workers != multi.workers:
             raise ValueError(
