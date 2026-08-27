@@ -120,6 +120,7 @@ class NativeReplayResult:
     collected_tick_states: tuple[TickState, ...]
     logic_freeze_diagnostic: dict[str, Any] | None
     tick_store_entry: dict[str, Any] | None
+    deployment_mask_label_rejection_sequence: tuple[dict[str, Any], ...] = ()
     # Runtime-only payloads are needed to publish a censored Prefix Store.
     # They are deliberately excluded from json()/semantic parity digests.
     deployment_mask_payloads: dict[str, dict[str, Any]] = field(
@@ -423,6 +424,7 @@ def execute_plan(
     deployment_mask_label_checks = 0
     deployment_mask_label_rejections = 0
     deployment_mask_first_label_rejection: dict[str, Any] | None = None
+    deployment_mask_label_rejection_sequence: list[dict[str, Any]] = []
     logic_freeze_diagnostic: dict[str, Any] | None = None
     tick_accumulator = (
         TickTraceAccumulator()
@@ -670,12 +672,15 @@ def execute_plan(
                     deployment_mask_label_checks += 1
                     if not label_audit["legal"]:
                         deployment_mask_label_rejections += 1
-                        deployment_mask_first_label_rejection = label_audit
-                        failure = (
-                            "derived_deployment_mask_rejected_source_event_"
-                            f"{event['source_event_index']}"
+                        deployment_mask_label_rejection_sequence.append(
+                            dict(label_audit)
                         )
-                        break
+                        if deployment_mask_first_label_rejection is None:
+                            deployment_mask_first_label_rejection = label_audit
+                            failure = (
+                                "derived_deployment_mask_rejected_source_event_"
+                                f"{event['source_event_index']}"
+                            )
                 deployment_mask_probe_seconds += time.perf_counter() - mask_started
             if failure is not None:
                 break
@@ -1145,6 +1150,9 @@ def execute_plan(
         deployment_mask_label_rejections=deployment_mask_label_rejections,
         deployment_mask_first_label_rejection=(
             deployment_mask_first_label_rejection
+        ),
+        deployment_mask_label_rejection_sequence=tuple(
+            deployment_mask_label_rejection_sequence
         ),
         wall_seconds=time.perf_counter() - started,
         terminal_validated=terminal_validated,

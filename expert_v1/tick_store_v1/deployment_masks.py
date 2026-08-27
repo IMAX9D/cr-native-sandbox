@@ -41,6 +41,13 @@ EXPECTED_SLOT_COUNT = len(EXPECTED_SIDES) * len(EXPECTED_DECK_INDICES)
 POCKET_DEPTH_CELLS = 5
 LANE_SPLIT_COLUMN = 9
 GLOBAL_DEPLOY_CARD_IDS = frozenset({26_000_032, 27_000_013})
+LOCKED_ENEMY_PRINCESS_POCKET_REASON = (
+    "live_enemy_princess_tower_locked_pocket_v1"
+)
+LOCKED_POCKET_PROOF_FIELDS = {
+    "reason", "tower_side", "tower_x", "tower_y", "tower_hp",
+    "lane", "row", "column",
+}
 DYNAMIC_RULE = "native_base_and_tower_state_projection_v2"
 CAPTURE_STRATEGY = (
     "probe_once_when_each_side_deck_index_first_enters_native_hand_plus_"
@@ -541,6 +548,18 @@ class NativeDeploymentMaskCapture:
             payload, state, side=side, card_id=int(entry["card_id"])
         )
         legal = deployment_label_is_legal(rows, x=x, y=y)
+        locked_pocket = (
+            None
+            if legal
+            else classify_locked_enemy_princess_pocket_rejection(
+                payload,
+                state,
+                side=side,
+                card_id=int(entry["card_id"]),
+                x=x,
+                y=y,
+            )
+        )
         return {
             "tick": tick,
             "side": side,
@@ -550,6 +569,16 @@ class NativeDeploymentMaskCapture:
             "y": y,
             "content_sha256": digest,
             "legal": legal,
+            "reasons": (
+                [] if legal else ["position_not_in_derived_native_mask"]
+            ),
+            "source_event_index": _integer(
+                label.get("source_event_index"), "label.source_event_index"
+            ),
+            "source_marker_index": _integer(
+                label.get("source_marker_index"), "label.source_marker_index"
+            ),
+            "locked_pocket": locked_pocket,
         }
 
 
@@ -1065,6 +1094,132 @@ def _tower_rows(state: TickState | Mapping[str, Any]) -> list[dict[str, int]]:
     return result
 
 
+def locked_enemy_princess_pocket_proof_valid(value: Any) -> bool:
+    """Validate the narrow, persisted live-Princess pocket identity."""
+
+    if not isinstance(value, Mapping) or set(value) != LOCKED_POCKET_PROOF_FIELDS:
+        return False
+    try:
+        lane = _integer(value.get("lane"), "locked_pocket.lane")
+        column = _integer(value.get("column"), "locked_pocket.column")
+        return bool(
+            value.get("reason") == LOCKED_ENEMY_PRINCESS_POCKET_REASON
+            and _integer(value.get("tower_side"), "locked_pocket.tower_side")
+            in EXPECTED_SIDES
+            and _integer(value.get("tower_hp"), "locked_pocket.tower_hp") > 0
+            and lane in EXPECTED_SIDES
+            and 0 <= _integer(value.get("row"), "locked_pocket.row")
+            < ARENA_ROWS
+            and 0 <= column < ARENA_COLUMNS
+            and lane == int(column >= LANE_SPLIT_COLUMN)
+            and isinstance(value.get("tower_x"), int)
+            and not isinstance(value.get("tower_x"), bool)
+            and isinstance(value.get("tower_y"), int)
+            and not isinstance(value.get("tower_y"), bool)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def classify_locked_enemy_princess_pocket_rejection(
+    sidecar: Mapping[str, Any],
+    state: TickState | Mapping[str, Any],
+    *,
+    side: int,
+    card_id: int,
+    x: int,
+    y: int,
+) -> dict[str, Any] | None:
+    """Return proof only for a structural-1 cell locked by a live enemy tower.
+
+    This is intentionally narrower than a generic derived-mask rejection.  It
+    excludes spells/global cards, the always-structural bridge boundary, raw
+    or symmetrized structural zeroes, and living-tower footprints.
+    """
+
+    if side not in EXPECTED_SIDES:
+        return None
+    payload = normalize_sidecar(sidecar)
+    resolved_data_id = int(payload["resolved_data_id"])
+    if resolved_data_id <= 0:
+        return None
+    if (
+        (int(card_id) // 1_000_000 == 28 and int(card_id) != MIRROR_CARD_ID)
+        or resolved_data_id // 1_000_000 == 28
+        or int(card_id) in GLOBAL_DEPLOY_CARD_IDS
+        or resolved_data_id in GLOBAL_DEPLOY_CARD_IDS
+        or not 0 <= int(x) < ARENA_COLUMNS * CELL_SIZE
+        or not 0 <= int(y) < ARENA_ROWS * CELL_SIZE
+    ):
+        return None
+    row = int(y) // CELL_SIZE
+    column = int(x) // CELL_SIZE
+    if row not in (range(17, 21) if side == 0 else range(11, 15)):
+        return None
+    lane = int(column >= LANE_SPLIT_COLUMN)
+    native_rows = payload["rows"]
+    if native_rows[row][column] != "1" or not all(
+        native_rows[source_row][source_column] == "1"
+        for source_row, source_column in (
+            (row, column),
+            (row, ARENA_COLUMNS - 1 - column),
+            (ARENA_ROWS - 1 - row, column),
+            (ARENA_ROWS - 1 - row, ARENA_COLUMNS - 1 - column),
+        )
+    ):
+        return None
+    towers = _tower_rows(state)
+    matching = [
+        tower for tower in towers
+        if tower["side"] == 1 - side
+        and tower["role"] == 1
+        and tower["hp"] > 0
+        and int(tower["x"] >= LANE_SPLIT_COLUMN * CELL_SIZE) == lane
+    ]
+    if len(matching) != 1:
+        return None
+    # A derived zero inside any tower footprint is not attributable solely to
+    # the locked pocket and therefore cannot use the special censor path.
+    for tower in towers:
+        if tower["hp"] <= 0:
+            continue
+        footprint = 4 if tower["role"] == 0 else 3
+        half_extent = footprint * CELL_SIZE // 2
+        if (
+            max(0, (tower["x"] - half_extent) // CELL_SIZE)
+            <= column
+            < min(
+                ARENA_COLUMNS,
+                (tower["x"] + half_extent + CELL_SIZE - 1) // CELL_SIZE,
+            )
+            and max(0, (tower["y"] - half_extent) // CELL_SIZE)
+            <= row
+            < min(
+                ARENA_ROWS,
+                (tower["y"] + half_extent + CELL_SIZE - 1) // CELL_SIZE,
+            )
+        ):
+            return None
+    derived = derive_deployment_rows(
+        payload, state, side=side, card_id=card_id
+    )
+    if derived[row][column] != "0":
+        return None
+    tower = matching[0]
+    proof = {
+        "reason": LOCKED_ENEMY_PRINCESS_POCKET_REASON,
+        "tower_side": int(tower["side"]),
+        "tower_x": int(tower["x"]),
+        "tower_y": int(tower["y"]),
+        "tower_hp": int(tower["hp"]),
+        "lane": lane,
+        "row": row,
+        "column": column,
+    }
+    assert locked_enemy_princess_pocket_proof_valid(proof)
+    return proof
+
+
 def derive_deployment_rows(
     sidecar: Mapping[str, Any],
     state: TickState | Mapping[str, Any],
@@ -1270,6 +1425,9 @@ def verify_deployment_labels(
             violations.append({
                 "tick": tick, "side": side, "deck_index": deck_index,
                 "card_id": int(reference["card_id"]), "x": x, "y": y,
+                "source_event_index": int(raw.get("source_event_index", -1)),
+                "source_marker_index": int(raw.get("source_marker_index", -1)),
+                "content_sha256": digest,
                 "reasons": reasons,
             })
     return {

@@ -11,6 +11,8 @@
 
 Prefix Store 保持独立 kind `cr_native_tick_prefix_audit_store_v1` 和独立 `deployment-masks-v1`。BC compiler 必须通过显式第二输入读取它，重新认证 extent、partial Mask、source action、native accepted transcript 和 prefix actor evidence；不得把 Prefix 文件混入 Full Store 或绕过 censor。
 
+另有一个严格收窄的 Mask-censor 分支：仅当源回放继续向“模拟状态中仍被一座存活敌方公主塔锁定”的非桥、非全局法术 pocket 部署单位/建筑时，才允许 `actor_bc_mask_invalid_censored_prefix_v1`。它不能接收任意 Mask 差异。生产端必须额外执行一次同 seed、无 Mask 的参考重放，证明 preflight 语义一致、censor 前完整 TickState 逐字节一致、边界源动作确已被接受、Mask lane 未执行该动作，并固化 `native_mask_invalid_safe_censor_v3`。One-click 从已发布 Prefix frame 重算 pocket/塔血/sidecar；compiler 再从冻结 source、存储 Tick 与 sidecar 独立重算。英雄法术形态、桥边界、已破塔 pocket 或普通投影差异均不得走此分支。
+
 One-click 的不可豁免覆盖门为：
 
 ```text

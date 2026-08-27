@@ -45,11 +45,16 @@ from .native_dataset_generator import (
     NATIVE_PREFLIGHT_MODE,
     SEMANTIC_SEED_AUDIT_KIND,
     SEMANTIC_SEED_AUDIT_SCHEMA_VERSION,
+    MASK_INVALID_FAILURE_CLASS,
+    MASK_INVALID_FAILURE_DOMAIN,
+    mask_invalid_censor_provenance_valid,
     native_episode_pipeline_contract_valid,
+    prefix_extent_common_contract_valid,
 )
 from .native_replay_plan import BattlePlan, compile_battle
 from .tick_store_v1.deployment_masks import (
     DeploymentMaskStore,
+    classify_locked_enemy_princess_pocket_rejection,
     resolve_deployment_reference,
     verify_deployment_labels,
 )
@@ -95,6 +100,9 @@ REPLAY_EXTENT_KIND = "cr_native_replay_extent_v1"
 FULL_SUCCESS_EXTENT = "full_success"
 VALID_PREFIX_EXTENT = "valid_prefix"
 PREFIX_TRAINING_ADMISSION = "actor_bc_censored_prefix_v1"
+MASK_INVALID_PREFIX_TRAINING_ADMISSION = (
+    "actor_bc_mask_invalid_censored_prefix_v1"
+)
 PREFIX_MASK_PROVENANCE = "partial_native_visible_hand_complete_v1"
 PREFIX_TIMING_TARGET = "right_censored_at_failure_tick_v1"
 ENTITY_NUMERIC_FIELDS = ("level_ratio", "hp_ratio", "log_max_hp")
@@ -175,6 +183,7 @@ class EpisodeInput:
     mask_metadata_sha256: str = "0" * 64
     native_pipeline_sha256: str = "0" * 64
     chosen_seed: int = 0
+    preflight_teacher_forced_success: bool = True
     prefix_ability_evidence: tuple[dict[str, Any], ...] = ()
 
 
@@ -449,14 +458,43 @@ def _episode_extent_contract(
     censor = _require_integer(
         raw.get("timing_censor_tick_exclusive"), "prefix timing censor"
     )
+    mask_invalid = (
+        raw.get("training_admission")
+        == MASK_INVALID_PREFIX_TRAINING_ADMISSION
+    )
+    if mask_invalid and not prefix_extent_common_contract_valid(
+        raw, tick_count=int(tick_count)
+    ):
+        raise NativeBcCompileError("audit-prefix common extent contract changed")
+    provenance = raw.get("censor_provenance")
+    extent_semantics_valid = (
+        (
+            not mask_invalid
+            and raw.get("training_admission") == PREFIX_TRAINING_ADMISSION
+            and raw.get("semantic_match") is True
+            and raw.get("failure_domain") == "semantic"
+        )
+        or (
+            mask_invalid
+            and raw.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+            and raw.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+            and raw.get("semantic_match") is False
+            and raw.get("maskless_reference_semantic_match") is True
+            and raw.get("pre_censor_tick_state_parity") is True
+            and mask_invalid_censor_provenance_valid(provenance)
+            and int(provenance["execution_tick"]) == censor == action_stop
+            and int(provenance["pre_censor_tick_start"]) == start
+            and int(provenance["pre_censor_tick_count"]) == censor - start
+            and int(provenance["rejected_source_event_index"])
+            == int(raw.get("first_invalid_source_event_index", -1))
+        )
+    )
     if (
         raw.get("kind") != REPLAY_EXTENT_KIND
         or raw.get("extent") != VALID_PREFIX_EXTENT
-        or raw.get("training_admission") != PREFIX_TRAINING_ADMISSION
+        or not extent_semantics_valid
         or raw.get("source_episode_complete") is not False
         or raw.get("every_native_tick_present_within_extent") is not True
-        or raw.get("semantic_match") is not True
-        or raw.get("failure_domain") != "semantic"
         or raw.get("failure_tick_has_labels") is not False
         or raw.get("terminal_target") != "unknown_censored"
         or raw.get("terminal_validated") is not False
@@ -510,6 +548,144 @@ def _episode_extent_contract(
             canonical_json_bytes(body)
         ).hexdigest(),
     }
+
+
+def _verify_mask_invalid_stored_tick_proof(
+    episode: Any,
+    plan: BattlePlan,
+    *,
+    action_execution_tick_offset: int,
+    provenance: Mapping[str, Any],
+) -> list[Any]:
+    """Recompute a mask-censor proof from immutable source and Tick rows."""
+
+    try:
+        boundary_tick = int(provenance["execution_tick"])
+        rejected_event = int(provenance["rejected_source_event_index"])
+        rejected = [
+            action for action in plan.actions
+            if int(action.source_event_index) == rejected_event
+        ]
+        if len(rejected) != 1:
+            raise NativeBcCompileError(
+                "mask-invalid proof does not identify one source action"
+            )
+        action = rejected[0]
+        card = plan.sides[int(action.side)].deck[
+            int(action.logical_card_index)
+        ]
+        boundary_actions = [
+            candidate for candidate in plan.actions
+            if int(candidate.tick) + action_execution_tick_offset
+            == boundary_tick
+        ]
+        censored_indices = sorted(
+            int(candidate.source_event_index)
+            for candidate in (*plan.actions, *plan.ability_events)
+            if int(candidate.tick) + action_execution_tick_offset
+            == boundary_tick
+        )
+        preflight_boundary = provenance[
+            "preflight_boundary_accepted_action"
+        ]
+        if (
+            int(action.tick) + action_execution_tick_offset != boundary_tick
+            or int(provenance["source_marker_index"])
+            != int(action.source_marker_index)
+            or int(provenance["source_tick"]) != int(action.tick)
+            or int(provenance["side"]) != int(action.side)
+            or int(provenance["deck_index"])
+            != int(action.logical_card_index)
+            or int(provenance["card_id"]) != int(card.card_id)
+            or int(provenance["x"]) != int(action.x)
+            or int(provenance["y"]) != int(action.y)
+            or provenance["censored_tick_event_indices"] != censored_indices
+            or int(provenance["boundary_deploy_labels_checked"])
+            != len(boundary_actions)
+            or not isinstance(preflight_boundary, Mapping)
+            or preflight_boundary.get("accepted") is not True
+            or preflight_boundary.get("type") != "play"
+            or int(preflight_boundary.get("source_event_index", -1))
+            != rejected_event
+            or int(preflight_boundary.get("source_tick", -1))
+            != int(action.tick)
+            or int(preflight_boundary.get("execution_tick", -1))
+            != boundary_tick
+            or int(preflight_boundary.get("side", -1)) != int(action.side)
+            or hashlib.sha256(json.dumps(
+                dict(preflight_boundary),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            != provenance["preflight_boundary_accepted_action_sha256"]
+        ):
+            raise NativeBcCompileError(
+                "mask-invalid proof differs from frozen source boundary"
+            )
+        pre_censor_states = tuple(
+            state for state in episode.iter_ticks()
+            if int(state.tick) < boundary_tick
+        )
+        start = int(provenance["pre_censor_tick_start"])
+        if (
+            tuple(int(state.tick) for state in pre_censor_states)
+            != tuple(range(start, boundary_tick))
+            or int(provenance["pre_censor_tick_stop_exclusive"])
+            != boundary_tick
+            or int(provenance["pre_censor_tick_count"])
+            != len(pre_censor_states)
+        ):
+            raise NativeBcCompileError(
+                "mask-invalid pre-censor Tick count/range differs from store"
+            )
+        tick_digest = hashlib.sha256(json.dumps(
+            [asdict(state) for state in pre_censor_states],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if (
+            provenance["mask_lane_tick_sha256"] != tick_digest
+            or provenance["maskless_tick_sha256"] != tick_digest
+        ):
+            raise NativeBcCompileError(
+                "mask-invalid pre-censor Tick SHA differs from store"
+            )
+    except NativeBcCompileError:
+        raise
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+        raise NativeBcCompileError(
+            "mask-invalid stored Tick/source proof is malformed"
+        ) from error
+    return boundary_actions
+
+
+def _verify_mask_invalid_pocket_sidecar_proof(
+    state: TickState,
+    store: DeploymentMaskStore,
+    provenance: Mapping[str, Any],
+) -> None:
+    """Recompute the narrow pocket reason from one stored Tick and sidecar."""
+
+    try:
+        payload = store.load(str(provenance["mask_content_sha256"]))
+        recomputed = classify_locked_enemy_princess_pocket_rejection(
+            payload,
+            state,
+            side=int(provenance["side"]),
+            card_id=int(provenance["card_id"]),
+            x=int(provenance["x"]),
+            y=int(provenance["y"]),
+        )
+    except Exception as error:
+        raise NativeBcCompileError(
+            "mask-invalid locked-pocket sidecar proof is malformed"
+        ) from error
+    if recomputed != provenance.get("locked_pocket"):
+        raise NativeBcCompileError(
+            "mask-invalid locked-pocket proof differs from stored Tick/sidecar"
+        )
 
 
 def _read_source_input(
@@ -1290,7 +1466,7 @@ def validate_compile_plan(
         "observation_tick_stop_exclusive", "action_label_tick_stop_exclusive",
         "timing_censor_tick_exclusive", "timing_target", "terminal_target",
         "extent_sha256", "mask_metadata_sha256", "native_pipeline_sha256",
-        "chosen_seed",
+        "chosen_seed", "preflight_teacher_forced_success",
         "prefix_ability_evidence",
     }
     shard_fields = {
@@ -1351,6 +1527,10 @@ def validate_compile_plan(
             ):
                 _require_sha(item.get(name), f"episode.{name}")
             _require_integer(item.get("chosen_seed"), "episode.chosen_seed", minimum=1)
+            if not isinstance(item.get("preflight_teacher_forced_success"), bool):
+                raise NativeBcCompileError(
+                    "episode.preflight_teacher_forced_success must be boolean"
+                )
             for name in (
                 "tick_store_root", "tick_data_path", "tick_index_path", "source_path"
             ):
@@ -2897,6 +3077,75 @@ def create_compile_plan(
                         raise NativeBcCompileError(
                             f"audit-prefix ability evidence crosses censor: {tag}"
                         )
+                raw_extent = metadata[REPLAY_EXTENT_METADATA_KEY]
+                if raw_extent.get("training_admission") == (
+                    MASK_INVALID_PREFIX_TRAINING_ADMISSION
+                ):
+                    provenance = raw_extent["censor_provenance"]
+                    boundary_tick = int(provenance["execution_tick"])
+                    boundary_actions = _verify_mask_invalid_stored_tick_proof(
+                        episode,
+                        prefix_plan,
+                        action_execution_tick_offset=int(
+                            metadata[ACTION_EXECUTION_OFFSET_METADATA]
+                        ),
+                        provenance=provenance,
+                    )
+                    boundary_state = episode.read_tick(boundary_tick)
+                    _verify_mask_invalid_pocket_sidecar_proof(
+                        boundary_state, active_mask_store, provenance
+                    )
+                    boundary_audit = verify_deployment_labels(
+                        [boundary_state],
+                        metadata,
+                        active_mask_store,
+                        (
+                            {
+                                "tick": boundary_tick,
+                                "side": int(action.side),
+                                "deck_index": int(action.logical_card_index),
+                                "x": int(action.x),
+                                "y": int(action.y),
+                                "source_event_index": int(
+                                    action.source_event_index
+                                ),
+                                "source_marker_index": int(
+                                    action.source_marker_index
+                                ),
+                            }
+                            for action in boundary_actions
+                        ),
+                        require_complete=False,
+                    )
+                    violations = boundary_audit.get("violations") or []
+                    if (
+                        int(boundary_audit.get("checked", -1))
+                        != int(provenance["boundary_deploy_labels_checked"])
+                        or len(violations) != 1
+                        or violations[0].get("source_event_index")
+                        != int(provenance["rejected_source_event_index"])
+                        or violations[0].get("source_marker_index")
+                        != int(provenance["source_marker_index"])
+                        or violations[0].get("content_sha256")
+                        != provenance["mask_content_sha256"]
+                        or int(violations[0].get("tick", -1))
+                        != int(provenance["execution_tick"])
+                        or int(violations[0].get("side", -1))
+                        != int(provenance["side"])
+                        or int(violations[0].get("deck_index", -1))
+                        != int(provenance["deck_index"])
+                        or int(violations[0].get("card_id", -1))
+                        != int(provenance["card_id"])
+                        or int(violations[0].get("x", -1))
+                        != int(provenance["x"])
+                        or int(violations[0].get("y", -1))
+                        != int(provenance["y"])
+                        or violations[0].get("reasons")
+                        != ["position_not_in_derived_native_mask"]
+                    ):
+                        raise NativeBcCompileError(
+                            f"mask-invalid boundary proof differs from source/sidecar: {tag}"
+                        )
             target_masks = (
                 referenced_masks
                 if replay_extent == FULL_SUCCESS_EXTENT
@@ -2961,6 +3210,9 @@ def create_compile_plan(
                 "mask_metadata_sha256": _digest(dict(masks)),
                 "native_pipeline_sha256": _digest(dict(native_pipeline)),
                 "chosen_seed": int(result_row["preflight_chosen_seed"]),
+                "preflight_teacher_forced_success": bool(
+                    result_row["preflight_teacher_forced_success"]
+                ),
                 "prefix_ability_evidence": prefix_ability_by_tag.get(tag, []),
             }
         )
@@ -3905,7 +4157,7 @@ def _compile_output_shard(
                 ),
                 "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
                 "preflight_teacher_forced_success": (
-                    episode.replay_extent == FULL_SUCCESS_EXTENT
+                    episode.preflight_teacher_forced_success
                 ),
                 "preflight_chosen_seed": episode.chosen_seed,
                 "chosen_seed": episode.chosen_seed,
@@ -4501,7 +4753,7 @@ def _final_compiled_token_coverage(
                 ),
                 "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
                 "preflight_teacher_forced_success": (
-                    episode_input["replay_extent"] == FULL_SUCCESS_EXTENT
+                    episode_input["preflight_teacher_forced_success"]
                 ),
                 "preflight_chosen_seed": episode_input["chosen_seed"],
                 "chosen_seed": episode_input["chosen_seed"],

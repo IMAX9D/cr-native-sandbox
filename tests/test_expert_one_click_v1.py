@@ -594,11 +594,24 @@ class ExpertOneClickV1Test(unittest.TestCase):
                     "kind": "cr_native_replay_extent_v1",
                     "extent": "valid_prefix",
                     "training_admission": "actor_bc_censored_prefix_v1",
+                    "source_episode_complete": False,
+                    "every_native_tick_present_within_extent": True,
+                    "semantic_match": True,
+                    "failure_domain": "semantic",
                     "terminal_target": "unknown_censored",
+                    "terminal_validated": False,
                     "timing_target": "right_censored_at_failure_tick_v1",
                     "deployment_masks": "partial_native_visible_hand_complete_v1",
+                    "observation_tick_start": 10,
+                    "observation_tick_stop_exclusive": 22,
+                    "action_label_tick_stop_exclusive": 20,
+                    "timing_censor_tick_exclusive": 20,
                     "mask_coverage": {
                         "all_retained_visible_hand_slots_covered": True,
+                        "retained_ticks": 10,
+                        "actor_ticks": 20,
+                        "safe_deploy_labels": 0,
+                        "checked_deploy_labels": 0,
                         "rejected_deploy_labels": 0,
                     },
                     "failure_tick_has_labels": False,
@@ -646,12 +659,24 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 "kind": "cr_native_replay_extent_v1",
                 "extent": "valid_prefix",
                 "training_admission": "actor_bc_censored_prefix_v1",
+                "source_episode_complete": False,
+                "every_native_tick_present_within_extent": True,
+                "semantic_match": True,
+                "failure_domain": "semantic",
                 "action_label_tick_stop_exclusive": 20,
+                "observation_tick_start": 10,
+                "observation_tick_stop_exclusive": 22,
+                "timing_censor_tick_exclusive": 20,
                 "timing_target": "right_censored_at_failure_tick_v1",
                 "terminal_target": "unknown_censored",
+                "terminal_validated": False,
                 "deployment_masks": "partial_native_visible_hand_complete_v1",
                 "mask_coverage": {
                     "all_retained_visible_hand_slots_covered": True,
+                    "retained_ticks": 10,
+                    "actor_ticks": 20,
+                    "safe_deploy_labels": 0,
+                    "checked_deploy_labels": 0,
                     "rejected_deploy_labels": 0,
                 },
                 "failure_tick_has_labels": False,
@@ -742,6 +767,189 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 validate_native_result_records(
                     results, queue, expected_rows=1, require_token_evidence=True
                 )
+
+    def test_mask_invalid_censor_proof_is_tamper_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            queue = root / "queue.jsonl"
+            queue.write_text(
+                json.dumps({"battle_tag": "MASK", "ability_events_observed": 0})
+                + "\n",
+                encoding="utf-8",
+            )
+            digest = "a" * 64
+            boundary_action = {
+                "accepted": True,
+                "execution_tick": 21,
+                "result_code": 0,
+                "side": 0,
+                "source_event_index": 7,
+                "source_tick": 20,
+                "type": "play",
+            }
+            proof = {
+                "schema_version": 3,
+                "kind": "native_mask_invalid_safe_censor_v3",
+                "rejected_source_event_index": 7,
+                "source_marker_index": 17,
+                "source_tick": 20,
+                "execution_tick": 21,
+                "side": 0, "deck_index": 2, "card_id": 26_000_010,
+                "x": 3_500, "y": 17_501,
+                "mask_content_sha256": digest,
+                "boundary_deploy_labels_checked": 1,
+                "mask_rejection_count": 1,
+                "failure_event_executed": False,
+                "failure_label_compiled": False,
+                "label_or_mask_repair_applied": False,
+                "censored_tick_event_indices": [7],
+                "safe_action_count": 0,
+                "safe_action_transcript_sha256": hashlib.sha256(
+                    b"[]"
+                ).hexdigest(),
+                "mask_lane_action_metrics": {
+                    "attempted": 0, "responded": 0, "accepted": 0,
+                    "rejected": 0, "no_response": 0, "exceptions": 0,
+                },
+                "maskless_reference_reset_count": 1,
+                "maskless_reference_layout_mode": "fixed_preflight_seed_replay",
+                "pre_censor_tick_start": 10,
+                "pre_censor_tick_stop_exclusive": 21,
+                "pre_censor_tick_count": 11,
+                "mask_lane_tick_sha256": digest,
+                "maskless_tick_sha256": digest,
+                "tick_state_parity": True,
+                "preflight_semantics_sha256": digest,
+                "maskless_reference_semantics_sha256": digest,
+                "preflight_boundary_accepted_action": boundary_action,
+                "preflight_boundary_accepted_action_sha256": hashlib.sha256(
+                    json.dumps(
+                        boundary_action, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "locked_pocket": {
+                    "reason": "live_enemy_princess_tower_locked_pocket_v1",
+                    "tower_side": 1, "tower_x": 3_500,
+                    "tower_y": 25_500, "tower_hp": 3_052,
+                    "lane": 0, "row": 17, "column": 3,
+                },
+            }
+            extent = {
+                "kind": "cr_native_replay_extent_v1",
+                "extent": "valid_prefix",
+                "training_admission": "actor_bc_mask_invalid_censored_prefix_v1",
+                "failure_class": "native_deployment_mask_invalid_censored",
+                "failure_domain": "semantic_mask_invalid",
+                "semantic_match": False,
+                "maskless_reference_semantic_match": True,
+                "pre_censor_tick_state_parity": True,
+                "source_episode_complete": False,
+                "every_native_tick_present_within_extent": True,
+                "terminal_target": "unknown_censored",
+                "terminal_validated": False,
+                "failure_tick_has_labels": False,
+                "timing_target": "right_censored_at_failure_tick_v1",
+                "deployment_masks": "partial_native_visible_hand_complete_v1",
+                "observation_tick_start": 10,
+                "observation_tick_stop_exclusive": 22,
+                "action_label_tick_stop_exclusive": 21,
+                "timing_censor_tick_exclusive": 21,
+                "mask_coverage": {
+                    "all_retained_visible_hand_slots_covered": True,
+                    "retained_ticks": 11,
+                    "actor_ticks": 22,
+                    "visible_slot_references": 88,
+                    "empty_slot_actor_ticks": 0,
+                    "safe_deploy_labels": 0,
+                    "checked_deploy_labels": 1,
+                    "rejected_deploy_labels": 0,
+                },
+                "censor_provenance": proof,
+            }
+            rejection = {
+                "source_event_index": 7,
+                "source_marker_index": 17,
+                "content_sha256": digest,
+                "reasons": ["position_not_in_derived_native_mask"],
+                "locked_pocket": proof["locked_pocket"],
+            }
+            row = {
+                **current_pipeline_fields(success=True),
+                "kind": "expert_authoritative_native_tick_result_v1",
+                "battle_tag": "MASK", "final_attempt": True,
+                "teacher_forced_success": False,
+                "failure": "derived_deployment_mask_rejected_source_event_7",
+                "failure_class": "native_deployment_mask_invalid_censored",
+                "failure_domain": "semantic_mask_invalid",
+                "audit_prefix_tick_store_entry": {"ticks": 12},
+                "audit_prefix_extent": extent,
+                "failure_prefix_tick_count": 12,
+                "failure_prefix_semantic_match": False,
+                "preflight_full_trace_semantic_match": None,
+                "preflight_full_trace_semantic_diff": None,
+                "mask_invalid_censor_validated": True,
+                "deployment_mask_label_rejections": 1,
+                "deployment_mask_first_label_rejection": rejection,
+                "deployment_mask_label_rejection_sequence": [rejection],
+                "deployment_mask_probe_rpc_count": 1,
+                "native_deployment_mask_probes_attempted": 1,
+                "preflight_action_acceptance_sequence": [boundary_action],
+                "full_trace_action_acceptance_sequence": [],
+                "full_trace_native_action_metrics": {
+                    "native_actions_attempted": 0,
+                    "native_actions_responded": 0,
+                    "native_actions_accepted": 0,
+                    "native_actions_rejected": 0,
+                    "native_actions_no_response": 0,
+                    "native_action_exceptions": 0,
+                },
+                "maskless_reference_executed": True,
+                "maskless_reference_seconds": 1.0,
+                "maskless_reference_semantics_sha256": digest,
+                "maskless_reference_action_acceptance_sequence": [
+                    boundary_action
+                ],
+                "maskless_reference_native_action_metrics": {
+                    "native_actions_attempted": 1,
+                    "native_actions_responded": 1,
+                    "native_actions_accepted": 1,
+                    "native_actions_rejected": 0,
+                    "native_actions_no_response": 0,
+                    "native_action_exceptions": 0,
+                },
+            }
+            results = root / "results.jsonl"
+            results.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            audit = validate_native_result_records(results, queue, expected_rows=1)
+            self.assertEqual(audit["audit_prefix_tags"], ["MASK"])
+            with mock.patch(
+                "expert_v1.one_click_v1._mask_invalid_physical_pocket_proof_valid",
+                return_value=True,
+            ) as physical:
+                validate_native_result_records(
+                    results,
+                    queue,
+                    expected_rows=1,
+                    verify_physical_mask_invalid_proof=True,
+                )
+                physical.assert_called_once()
+            with mock.patch(
+                "expert_v1.one_click_v1._mask_invalid_physical_pocket_proof_valid",
+                return_value=False,
+            ), self.assertRaisesRegex(OneClickError, "physical pocket"):
+                validate_native_result_records(
+                    results,
+                    queue,
+                    expected_rows=1,
+                    verify_physical_mask_invalid_proof=True,
+                )
+            changed = json.loads(json.dumps(row))
+            changed["audit_prefix_extent"]["censor_provenance"][
+                "rejected_source_event_index"
+            ] = 8
+            results.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(OneClickError, "contract|proof"):
+                validate_native_result_records(results, queue, expected_rows=1)
 
     def test_ability_positive_waiver_requires_a_reason(self) -> None:
         result = {

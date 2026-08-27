@@ -38,7 +38,17 @@ from expert_v1.native_dataset_generator import (
     NATIVE_PREFLIGHT_MODE,
     SEMANTIC_SEED_AUDIT_KIND,
     SEMANTIC_SEED_AUDIT_SCHEMA_VERSION,
+    MASK_INVALID_FAILURE_CLASS,
+    MASK_INVALID_FAILURE_DOMAIN,
+    _physical_frame_reader,
+    mask_invalid_censor_provenance_valid,
     native_result_pipeline_contract_valid,
+    prefix_extent_common_contract_valid,
+)
+from expert_v1.tick_store_v1.deployment_masks import (
+    DeploymentMaskStore,
+    classify_locked_enemy_princess_pocket_rejection,
+    resolve_deployment_reference,
 )
 from expert_v1.token_coverage_v1 import (
     RECEIPT_KIND as TOKEN_COVERAGE_RECEIPT_KIND,
@@ -1804,12 +1814,72 @@ def validate_schema5_candidate_queue(
     }
 
 
+def _mask_invalid_physical_pocket_proof_valid(
+    results_path: Path,
+    row: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> bool:
+    """Recompute the pocket classification from the published Prefix frame."""
+
+    try:
+        reader = _physical_frame_reader(
+            results_path.resolve(strict=True).parent, row, prefix=True
+        )
+        if reader is None:
+            return False
+        metadata = reader.metadata
+        if metadata.get("native_replay_extent_v1") != row.get(
+            "audit_prefix_extent"
+        ):
+            return False
+        boundary_tick = int(provenance["execution_tick"])
+        state = reader.read_tick(boundary_tick)
+        store = DeploymentMaskStore(
+            results_path.resolve(strict=True).parent / "audit-prefix-shards",
+            create=False,
+        )
+        masks = store.verify_episode_metadata(
+            metadata, require_complete=False
+        )
+        entries = [
+            entry for entry in masks["entries"]
+            if int(entry["side"]) == int(provenance["side"])
+            and int(entry["deck_index"]) == int(provenance["deck_index"])
+        ]
+        if len(entries) != 1:
+            return False
+        if int(entries[0]["card_id"]) != int(provenance["card_id"]):
+            return False
+        reference = resolve_deployment_reference(
+            entries[0], tick=boundary_tick, require_dynamic_exact=True
+        )
+        if (
+            not isinstance(reference, Mapping)
+            or reference.get("content_sha256")
+            != provenance["mask_content_sha256"]
+        ):
+            return False
+        payload = store.load(str(reference["content_sha256"]))
+        recomputed = classify_locked_enemy_princess_pocket_rejection(
+            payload,
+            state,
+            side=int(provenance["side"]),
+            card_id=int(provenance["card_id"]),
+            x=int(provenance["x"]),
+            y=int(provenance["y"]),
+        )
+        return recomputed == provenance.get("locked_pocket")
+    except Exception:
+        return False
+
+
 def validate_native_result_records(
     results_path: Path,
     candidate_queue: Path,
     *,
     expected_rows: int,
     require_token_evidence: bool = False,
+    verify_physical_mask_invalid_proof: bool = False,
 ) -> dict[str, Any]:
     """Prove every frozen candidate has exactly one final native attempt."""
 
@@ -1936,27 +2006,50 @@ def validate_native_result_records(
                 prefix_entry = row.get("audit_prefix_tick_store_entry")
                 extent = row.get("audit_prefix_extent")
                 if isinstance(prefix_entry, Mapping):
+                    coverage = (
+                        extent.get("mask_coverage")
+                        if isinstance(extent, Mapping) else None
+                    )
+                    normal_prefix = bool(
+                        isinstance(extent, Mapping)
+                        and extent.get("training_admission")
+                        == "actor_bc_censored_prefix_v1"
+                        and row.get("failure_domain") == "semantic"
+                        and row.get("failure_prefix_semantic_match") is True
+                        and int(row.get("deployment_mask_label_rejections") or 0)
+                        == 0
+                    )
+                    provenance = (
+                        extent.get("censor_provenance")
+                        if isinstance(extent, Mapping) else None
+                    )
+                    mask_invalid_prefix = bool(
+                        isinstance(extent, Mapping)
+                        and extent.get("training_admission")
+                        == "actor_bc_mask_invalid_censored_prefix_v1"
+                        and extent.get("failure_class")
+                        == MASK_INVALID_FAILURE_CLASS
+                        and extent.get("failure_domain")
+                        == MASK_INVALID_FAILURE_DOMAIN
+                        and extent.get("semantic_match") is False
+                        and extent.get("maskless_reference_semantic_match") is True
+                        and extent.get("pre_censor_tick_state_parity") is True
+                        and row.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+                        and row.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+                        and row.get("failure_prefix_semantic_match") is False
+                        and row.get("preflight_full_trace_semantic_match") is None
+                        and row.get("preflight_full_trace_semantic_diff") is None
+                        and row.get("mask_invalid_censor_validated") is True
+                        and int(row.get("deployment_mask_label_rejections") or 0)
+                        == 1
+                        and mask_invalid_censor_provenance_valid(provenance)
+                    )
                     if (
                         not isinstance(extent, Mapping)
-                        or extent.get("kind") != "cr_native_replay_extent_v1"
-                        or extent.get("extent") != "valid_prefix"
-                        or extent.get("training_admission")
-                        != "actor_bc_censored_prefix_v1"
-                        or extent.get("terminal_target") != "unknown_censored"
-                        or extent.get("timing_target")
-                        != "right_censored_at_failure_tick_v1"
-                        or extent.get("deployment_masks")
-                        != "partial_native_visible_hand_complete_v1"
-                        or not isinstance(extent.get("mask_coverage"), Mapping)
-                        or extent["mask_coverage"].get(
-                            "all_retained_visible_hand_slots_covered"
-                        ) is not True
-                        or int(extent["mask_coverage"].get(
-                            "rejected_deploy_labels", -1
-                        )) != 0
-                        or extent.get("failure_tick_has_labels") is not False
-                        or row.get("failure_domain") != "semantic"
-                        or row.get("failure_prefix_semantic_match") is not True
+                        or not prefix_extent_common_contract_valid(
+                            extent, tick_count=int(prefix_entry.get("ticks", -1))
+                        )
+                        or not (normal_prefix or mask_invalid_prefix)
                         or int(prefix_entry.get("ticks", 0)) <= 0
                         or int(
                             row.get("native_deployment_mask_probes_attempted")
@@ -1964,6 +2057,147 @@ def validate_native_result_records(
                         ) <= 0
                     ):
                         raise OneClickError("audit-prefix result contract changed")
+                    if mask_invalid_prefix:
+                        rejection = row.get(
+                            "deployment_mask_first_label_rejection"
+                        )
+                        rejection_sequence = row.get(
+                            "deployment_mask_label_rejection_sequence"
+                        )
+                        actions = row.get("full_trace_action_acceptance_sequence")
+                        preflight_actions = row.get(
+                            "preflight_action_acceptance_sequence"
+                        )
+                        reference_actions = row.get(
+                            "maskless_reference_action_acceptance_sequence"
+                        )
+                        metrics = row.get("full_trace_native_action_metrics")
+                        reference_metrics = row.get(
+                            "maskless_reference_native_action_metrics"
+                        )
+                        boundary_row = provenance.get(
+                            "preflight_boundary_accepted_action"
+                        )
+                        seed_audit = row.get("semantic_seed_preflight")
+                        seed_candidates = (
+                            seed_audit.get("candidates")
+                            if isinstance(seed_audit, Mapping) else None
+                        )
+                        selected_seed_evidence = (
+                            seed_candidates[0]
+                            if isinstance(seed_candidates, list)
+                            and len(seed_candidates) == 1
+                            and isinstance(seed_candidates[0], Mapping)
+                            else None
+                        )
+                        reference_rows_valid = bool(
+                            isinstance(reference_actions, list)
+                            and all(
+                                isinstance(action, Mapping)
+                                for action in reference_actions
+                            )
+                        )
+                        reference_accepted = (
+                            sum(
+                                action.get("accepted") is True
+                                for action in reference_actions
+                            )
+                            if reference_rows_valid else -1
+                        )
+                        reference_rejected = (
+                            sum(
+                                action.get("accepted") is False
+                                for action in reference_actions
+                            )
+                            if reference_rows_valid else -1
+                        )
+                        if (
+                            not isinstance(rejection, Mapping)
+                            or not isinstance(rejection_sequence, list)
+                            or rejection_sequence != [rejection]
+                            or rejection.get("source_event_index")
+                            != provenance["rejected_source_event_index"]
+                            or rejection.get("source_marker_index")
+                            != provenance["source_marker_index"]
+                            or rejection.get("content_sha256")
+                            != provenance["mask_content_sha256"]
+                            or rejection.get("reasons")
+                            != ["position_not_in_derived_native_mask"]
+                            or rejection.get("locked_pocket")
+                            != provenance["locked_pocket"]
+                            or row.get("failure")
+                            != "derived_deployment_mask_rejected_source_event_"
+                            + str(provenance["rejected_source_event_index"])
+                            or not isinstance(actions, list)
+                            or len(actions) != int(provenance["safe_action_count"])
+                            or hashlib.sha256(_canonical(actions)).hexdigest()
+                            != provenance["safe_action_transcript_sha256"]
+                            or not isinstance(metrics, Mapping)
+                            or int(metrics.get("native_actions_attempted", -1))
+                            != int(provenance["safe_action_count"])
+                            or int(metrics.get("native_actions_responded", -1))
+                            != int(provenance["safe_action_count"])
+                            or int(metrics.get("native_actions_accepted", -1))
+                            != int(provenance["safe_action_count"])
+                            or int(metrics.get("native_actions_rejected", -1)) != 0
+                            or int(metrics.get("native_actions_no_response", -1)) != 0
+                            or int(metrics.get("native_action_exceptions", -1)) != 0
+                            or not isinstance(selected_seed_evidence, Mapping)
+                            or selected_seed_evidence.get("semantics_sha256")
+                            != provenance["preflight_semantics_sha256"]
+                            or not isinstance(preflight_actions, list)
+                            or not isinstance(boundary_row, Mapping)
+                            or [
+                                action for action in preflight_actions
+                                if action.get("source_event_index")
+                                == provenance["rejected_source_event_index"]
+                            ] != [boundary_row]
+                            or hashlib.sha256(_canonical(boundary_row)).hexdigest()
+                            != provenance[
+                                "preflight_boundary_accepted_action_sha256"
+                            ]
+                            or row.get("maskless_reference_executed") is not True
+                            or float(row.get(
+                                "maskless_reference_seconds", -1.0
+                            )) < 0.0
+                            or not reference_rows_valid
+                            or reference_actions != preflight_actions
+                            or row.get("maskless_reference_semantics_sha256")
+                            != provenance[
+                                "maskless_reference_semantics_sha256"
+                            ]
+                            or not isinstance(reference_metrics, Mapping)
+                            or int(reference_metrics.get(
+                                "native_actions_attempted", -1
+                            )) != len(reference_actions)
+                            or int(reference_metrics.get(
+                                "native_actions_responded", -1
+                            )) != len(reference_actions)
+                            or int(reference_metrics.get(
+                                "native_actions_accepted", -1
+                            )) != reference_accepted
+                            or int(reference_metrics.get(
+                                "native_actions_rejected", -1
+                            )) != reference_rejected
+                            or int(reference_metrics.get(
+                                "native_actions_no_response", -1
+                            )) != 0
+                            or int(reference_metrics.get(
+                                "native_action_exceptions", -1
+                            )) != 0
+                        ):
+                            raise OneClickError(
+                                "mask-invalid censor proof changed"
+                            )
+                        if (
+                            verify_physical_mask_invalid_proof
+                            and not _mask_invalid_physical_pocket_proof_valid(
+                                results_path, row, provenance
+                            )
+                        ):
+                            raise OneClickError(
+                                "mask-invalid physical pocket proof changed"
+                            )
                     prefix_evidence = row.get(
                         "prefix_token_coverage_actor_evidence"
                     )
@@ -2021,6 +2255,11 @@ def validate_native_result_records(
                                     for field in ("deploy_labels", "ability_labels")
                                     for label in actor.get(field) or []
                                     if isinstance(label, Mapping)
+                                )
+                                or any(
+                                    int(label.get("execution_tick", -1))
+                                    >= int(extent["action_label_tick_stop_exclusive"])
+                                    for label in deploy_labels + ability_labels
                                 )
                             ):
                                 raise OneClickError(
@@ -2721,6 +2960,7 @@ class OneClickOrchestrator:
                 config.candidate_queue,
                 expected_rows=config.target,
                 require_token_evidence=True,
+                verify_physical_mask_invalid_proof=True,
             )
             selected = int(summary.get("selected_battles", -1))
             processed = int(summary.get("processed_battles", -1))

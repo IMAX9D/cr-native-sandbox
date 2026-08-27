@@ -17,6 +17,7 @@ from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    classify_locked_enemy_princess_pocket_rejection,
     deployment_label_is_legal,
     derive_deployment_rows,
     normalize_native_probe,
@@ -196,6 +197,73 @@ def tick_state(tick: int = 100) -> TickState:
 
 
 class ExpertDeploymentMaskTests(unittest.TestCase):
+    def test_special_censor_only_classifies_live_enemy_princess_pocket(self) -> None:
+        ordinary_sidecar = normalize_native_probe(probe())
+        expected = {
+            "reason": "live_enemy_princess_tower_locked_pocket_v1",
+            "tower_side": 1,
+            "tower_x": 3_500,
+            "tower_y": 25_500,
+            "tower_hp": 3_052,
+            "lane": 0,
+            "row": 17,
+            "column": 3,
+        }
+        self.assertEqual(
+            classify_locked_enemy_princess_pocket_rejection(
+                ordinary_sidecar,
+                tower_mapping(),
+                side=0,
+                card_id=26_000_010,
+                x=3_500,
+                y=17_501,
+            ),
+            expected,
+        )
+        self.assertIsNotNone(
+            classify_locked_enemy_princess_pocket_rejection(
+                ordinary_sidecar,
+                tower_mapping(),
+                side=1,
+                card_id=27_000_000,
+                x=14_500,
+                y=14_499,
+            )
+        )
+
+        barrel_probe = probe()
+        barrel_probe["resolved_data_id"] = 203_000_107
+        self.assertIsNone(
+            classify_locked_enemy_princess_pocket_rejection(
+                normalize_native_probe(barrel_probe),
+                tower_mapping(),
+                side=0,
+                card_id=28_000_015,
+                x=3_500,
+                y=17_501,
+            )
+        )
+        self.assertIsNone(
+            classify_locked_enemy_princess_pocket_rejection(
+                ordinary_sidecar,
+                tower_mapping(),
+                side=0,
+                card_id=26_000_010,
+                x=3_500,
+                y=16_501,
+            )
+        )
+        self.assertIsNone(
+            classify_locked_enemy_princess_pocket_rejection(
+                ordinary_sidecar,
+                tower_mapping(destroy_enemy_left=True),
+                side=0,
+                card_id=26_000_010,
+                x=3_500,
+                y=17_501,
+            )
+        )
+
     def test_each_side_deck_slot_is_probed_once_not_per_tick(self) -> None:
         capture = NativeDeploymentMaskCapture(deck_slots())
         env = ProbeEnv()

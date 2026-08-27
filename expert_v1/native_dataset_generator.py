@@ -57,6 +57,7 @@ from .tick_store_v1.deployment_masks import (
     MASK_STORE_DIRECTORY,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    locked_enemy_princess_pocket_proof_valid,
     resolve_deployment_reference,
     validate_episode_mask_metadata,
 )
@@ -68,6 +69,7 @@ from .tick_store_v1.shard import (
     SHARD_KIND,
     STORE_KIND,
     WorkerShardSink,
+    _tag_hash,
     _scan_frames,
     build_store_manifest,
     sha256_file,
@@ -92,6 +94,9 @@ SEMANTIC_SEED_SELECTION_RULE = "first_layout_compatible_seed_only"
 AUDIT_PREFIX_DIRECTORY = "audit-prefix-shards"
 REPLAY_EXTENT_METADATA_KEY = "native_replay_extent_v1"
 REPLAY_EXTENT_KIND = "cr_native_replay_extent_v1"
+MASK_INVALID_CENSOR_KIND = "native_mask_invalid_safe_censor_v3"
+MASK_INVALID_FAILURE_CLASS = "native_deployment_mask_invalid_censored"
+MASK_INVALID_FAILURE_DOMAIN = "semantic_mask_invalid"
 EXACT_ABILITY_TIERS = {
     "source_reports_zero",
     "observed_ticks_identity_runtime_resolved",
@@ -926,8 +931,17 @@ def build_full_success_token_evidence(
         if (
             result.teacher_forced_success
             or cutoff <= 0
-            or extent.get("training_admission")
-            != "actor_bc_censored_prefix_v1"
+            or extent.get("training_admission") not in {
+                "actor_bc_censored_prefix_v1",
+                "actor_bc_mask_invalid_censored_prefix_v1",
+            }
+            or (
+                extent.get("training_admission")
+                == "actor_bc_mask_invalid_censored_prefix_v1"
+                and not mask_invalid_censor_provenance_valid(
+                    extent.get("censor_provenance")
+                )
+            )
             or extent.get("failure_tick_has_labels") is not False
             or episode.battle_tag != plan.battle_tag
         ):
@@ -1383,6 +1397,8 @@ def _failure_class(
         return "ability_entity_missing"
     if "native_rejected" in failure:
         return "native_action_rejected"
+    if failure.startswith("derived_deployment_mask_rejected_source_event_"):
+        return MASK_INVALID_FAILURE_CLASS
     if failure.startswith("native_terminal_before_"):
         return "native_terminal_before_source_event"
     if failure.startswith("hand_mismatch_event_"):
@@ -1392,7 +1408,6 @@ def _failure_class(
         "source_tick_",
         "execution_tick_",
         "native_deployment_mask_capture_incomplete_slots_",
-        "derived_deployment_mask_rejected_source_event_",
     )):
         return "source_plan_contract_mismatch"
     if failure.startswith("native_seed_search_layout_revalidation_failed"):
@@ -1424,6 +1439,8 @@ def _failure_domain(failure_class: str | None) -> str | None:
         return "semantic"
     if failure_class == "source_sha_mismatch":
         return "infrastructure"
+    if failure_class == MASK_INVALID_FAILURE_CLASS:
+        return MASK_INVALID_FAILURE_DOMAIN
     if failure_class in {
         "source_contract_or_compile_error",
         "source_hand_sequence_mismatch",
@@ -1798,6 +1815,22 @@ def native_episode_pipeline_contract_valid(
     preflight_sha = selected.get("semantics_sha256")
     extent = metadata.get(REPLAY_EXTENT_METADATA_KEY)
     if isinstance(extent, Mapping):
+        provenance = extent.get("censor_provenance")
+        if extent.get("training_admission") == (
+            "actor_bc_mask_invalid_censored_prefix_v1"
+        ):
+            return bool(
+                extent.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+                and extent.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+                and extent.get("semantic_match") is False
+                and extent.get("maskless_reference_semantic_match") is True
+                and extent.get("pre_censor_tick_state_parity") is True
+                and extent.get("fixed_seed_replay") is True
+                and extent.get("chosen_seed") == chosen
+                and extent.get("preflight_semantics_sha256") == preflight_sha
+                and mask_invalid_censor_provenance_valid(provenance)
+                and provenance.get("preflight_semantics_sha256") == preflight_sha
+            )
         return bool(
             extent.get("fixed_seed_replay") is True
             and extent.get("chosen_seed") == chosen
@@ -1826,10 +1859,25 @@ class TwoPhaseNativeReplay:
     failure_prefix_seconds: float = 0.0
     failure_prefix_staged: bool = False
     semantic_seed_audit: dict[str, Any] = field(default_factory=dict)
+    mask_invalid_prefix: bool = False
+    mask_invalid_semantic_diff: dict[str, Any] | None = None
+    maskless_reference: NativeReplayResult | None = None
+    maskless_reference_recorder: RecordingCountingEnv | None = None
+    maskless_reference_seconds: float = 0.0
 
     @property
     def result(self) -> NativeReplayResult:
+        if self.mask_invalid_prefix and self.failure_prefix is not None:
+            return self.failure_prefix
         return self.preflight if self.full_trace is None else self.full_trace
+
+
+@dataclass(slots=True)
+class MasklessReferenceAttempt:
+    result: NativeReplayResult
+    recorder: RecordingCountingEnv
+    seconds: float
+    evidence: dict[str, Any] | None
 
 
 _FAILURE_TICK_PATTERNS = (
@@ -1838,6 +1886,396 @@ _FAILURE_TICK_PATTERNS = (
     re.compile(r"native_terminal_before_source_tick_(\d+)"),
     re.compile(r"native_logic_frozen_before_execution_tick_(\d+)_source_tick_(\d+)"),
 )
+_MASK_REJECTION_FAILURE_RE = re.compile(
+    r"^derived_deployment_mask_rejected_source_event_(\d+)$"
+)
+_MASK_REJECTION_FIELDS = {
+    "tick", "side", "deck_index", "card_id", "x", "y",
+    "content_sha256", "legal", "reasons", "source_event_index",
+    "source_marker_index", "locked_pocket",
+}
+_ACCEPTED_ACTION_ROW_FIELDS = {
+    "accepted", "execution_tick", "result_code", "side",
+    "source_event_index", "source_tick", "type",
+}
+
+
+def _canonical_rows_sha256(rows: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+def mask_invalid_censor_provenance_valid(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    required = {
+        "schema_version", "kind", "rejected_source_event_index", "source_marker_index",
+        "source_tick", "execution_tick", "side", "deck_index", "card_id",
+        "x", "y", "mask_content_sha256", "boundary_deploy_labels_checked",
+        "mask_rejection_count", "failure_event_executed",
+        "failure_label_compiled", "label_or_mask_repair_applied",
+        "censored_tick_event_indices", "safe_action_count",
+        "safe_action_transcript_sha256", "maskless_reference_reset_count",
+        "mask_lane_action_metrics",
+        "maskless_reference_layout_mode", "pre_censor_tick_start",
+        "pre_censor_tick_stop_exclusive", "pre_censor_tick_count",
+        "mask_lane_tick_sha256", "maskless_tick_sha256", "tick_state_parity",
+        "preflight_semantics_sha256", "maskless_reference_semantics_sha256",
+        "preflight_boundary_accepted_action",
+        "preflight_boundary_accepted_action_sha256",
+        "locked_pocket",
+    }
+    sha_fields = {
+        "mask_content_sha256", "safe_action_transcript_sha256",
+        "mask_lane_tick_sha256", "maskless_tick_sha256",
+        "preflight_semantics_sha256", "maskless_reference_semantics_sha256",
+        "preflight_boundary_accepted_action_sha256",
+    }
+    try:
+        return bool(
+            set(value) == required
+            and int(value["schema_version"]) == 3
+            and value.get("kind") == MASK_INVALID_CENSOR_KIND
+            and int(value["side"]) in (0, 1)
+            and 0 <= int(value["deck_index"]) < 8
+            and 0 <= int(value["x"]) < 18_000
+            and 0 <= int(value["y"]) < 32_000
+            and locked_enemy_princess_pocket_proof_valid(
+                value.get("locked_pocket")
+            )
+            and int(value["locked_pocket"]["tower_side"])
+            == 1 - int(value["side"])
+            and int(value["locked_pocket"]["row"]) == int(value["y"]) // 1000
+            and int(value["locked_pocket"]["column"])
+            == int(value["x"]) // 1000
+            and int(value["locked_pocket"]["lane"])
+            == int(int(value["x"]) // 1000 >= 9)
+            and int(value["locked_pocket"]["lane"])
+            == int(int(value["locked_pocket"]["tower_x"]) >= 9000)
+            and int(value["locked_pocket"]["row"])
+            in (range(17, 21) if int(value["side"]) == 0 else range(11, 15))
+            and int(value["mask_rejection_count"]) == 1
+            and int(value["boundary_deploy_labels_checked"]) >= 1
+            and value.get("failure_event_executed") is False
+            and value.get("failure_label_compiled") is False
+            and value.get("label_or_mask_repair_applied") is False
+            and value.get("tick_state_parity") is True
+            and int(value["maskless_reference_reset_count"]) == 1
+            and value.get("maskless_reference_layout_mode")
+            == "fixed_preflight_seed_replay"
+            and int(value["pre_censor_tick_stop_exclusive"])
+            == int(value["execution_tick"])
+            and int(value["pre_censor_tick_count"]) > 0
+            and int(value["safe_action_count"]) >= 0
+            and value["mask_lane_tick_sha256"]
+            == value["maskless_tick_sha256"]
+            and value["preflight_semantics_sha256"]
+            == value["maskless_reference_semantics_sha256"]
+            and isinstance(
+                value.get("preflight_boundary_accepted_action"), Mapping
+            )
+            and set(value["preflight_boundary_accepted_action"])
+            == _ACCEPTED_ACTION_ROW_FIELDS
+            and value["preflight_boundary_accepted_action"].get("accepted")
+            is True
+            and int(value["preflight_boundary_accepted_action"]["result_code"])
+            == 0
+            and _canonical_rows_sha256(
+                value["preflight_boundary_accepted_action"]
+            ) == value["preflight_boundary_accepted_action_sha256"]
+            and isinstance(value.get("censored_tick_event_indices"), list)
+            and isinstance(value.get("mask_lane_action_metrics"), Mapping)
+            and value["mask_lane_action_metrics"] == {
+                "attempted": int(value["safe_action_count"]),
+                "responded": int(value["safe_action_count"]),
+                "accepted": int(value["safe_action_count"]),
+                "rejected": 0,
+                "no_response": 0,
+                "exceptions": 0,
+            }
+            and int(value["rejected_source_event_index"])
+            in value["censored_tick_event_indices"]
+            and all(re.fullmatch(r"[0-9a-f]{64}", str(value[field]))
+                    for field in sha_fields)
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def prefix_extent_common_contract_valid(
+    value: Any, *, tick_count: int
+) -> bool:
+    """Shared extent/range/accounting receiver for every trainable Prefix."""
+
+    if not isinstance(value, Mapping):
+        return False
+    coverage = value.get("mask_coverage")
+    if not isinstance(coverage, Mapping):
+        return False
+    try:
+        start = int(value["observation_tick_start"])
+        stop = int(value["observation_tick_stop_exclusive"])
+        action_stop = int(value["action_label_tick_stop_exclusive"])
+        censor = int(value["timing_censor_tick_exclusive"])
+        compiled_ticks = censor - start
+        return bool(
+            value.get("kind") == REPLAY_EXTENT_KIND
+            and value.get("extent") == "valid_prefix"
+            and value.get("source_episode_complete") is False
+            and value.get("every_native_tick_present_within_extent") is True
+            and value.get("failure_tick_has_labels") is False
+            and value.get("terminal_target") == "unknown_censored"
+            and value.get("terminal_validated") is False
+            and value.get("deployment_masks")
+            == "partial_native_visible_hand_complete_v1"
+            and value.get("timing_target")
+            == "right_censored_at_failure_tick_v1"
+            and stop - start == int(tick_count)
+            and start < action_stop <= censor <= stop
+            and compiled_ticks > 0
+            and coverage.get("all_retained_visible_hand_slots_covered") is True
+            and int(coverage["retained_ticks"]) == compiled_ticks
+            and int(coverage["actor_ticks"]) == compiled_ticks * 2
+            and int(coverage["rejected_deploy_labels"]) == 0
+            and int(coverage["checked_deploy_labels"])
+            >= int(coverage["safe_deploy_labels"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _unique_mask_rejection_boundary(
+    masked: NativeReplayResult,
+    plan: BattlePlan,
+) -> dict[str, Any] | None:
+    """Parse the one complete mask-rejection identity before another reset."""
+
+    match = _MASK_REJECTION_FAILURE_RE.fullmatch(str(masked.failure or ""))
+    rejection = masked.deployment_mask_first_label_rejection
+    raw_sequence = getattr(
+        masked, "deployment_mask_label_rejection_sequence", ()
+    )
+    if (
+        match is None
+        or int(masked.deployment_mask_label_rejections) != 1
+        or not isinstance(raw_sequence, (list, tuple))
+        or len(raw_sequence) != 1
+        or not isinstance(raw_sequence[0], Mapping)
+        or not isinstance(rejection, Mapping)
+        or set(rejection) != _MASK_REJECTION_FIELDS
+        or dict(raw_sequence[0]) != dict(rejection)
+        or rejection.get("legal") is not False
+        or rejection.get("reasons")
+        != ["position_not_in_derived_native_mask"]
+        or not locked_enemy_princess_pocket_proof_valid(
+            rejection.get("locked_pocket")
+        )
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(rejection.get("content_sha256") or "")
+        ) is None
+    ):
+        return None
+    try:
+        event_index = int(match.group(1))
+        actions = [
+            action for action in plan.actions
+            if int(action.source_event_index) == event_index
+        ]
+        if len(actions) != 1:
+            return None
+        action = actions[0]
+        execution_tick = (
+            int(action.tick) + int(masked.action_execution_tick_offset)
+        )
+        card = plan.sides[int(action.side)].deck[
+            int(action.logical_card_index)
+        ]
+        if (
+            int(rejection["source_event_index"]) != event_index
+            or int(rejection["source_marker_index"])
+            != int(action.source_marker_index)
+            or int(rejection["tick"]) != execution_tick
+            or int(rejection["side"]) != int(action.side)
+            or int(rejection["deck_index"])
+            != int(action.logical_card_index)
+            or int(rejection["card_id"]) != int(card.card_id)
+            or int(rejection["x"]) != int(action.x)
+            or int(rejection["y"]) != int(action.y)
+        ):
+            return None
+        actual_actions = tuple(
+            dict(row) for row in masked.action_acceptance_sequence
+        )
+        if (
+            int(masked.accepted_actions) != len(actual_actions)
+            or any(row.get("accepted") is not True for row in actual_actions)
+            or any(
+                int(row.get("source_event_index", -1)) == event_index
+                or int(row.get("execution_tick", -1)) >= execution_tick
+                for row in actual_actions
+            )
+        ):
+            return None
+        safe_deploys = sum(
+            row.get("type") == "play" for row in actual_actions
+        )
+        boundary_deploys = sum(
+            int(candidate.tick) + int(masked.action_execution_tick_offset)
+            == execution_tick
+            for candidate in plan.actions
+        )
+        if (
+            boundary_deploys <= 0
+            or int(masked.deployment_mask_label_checks)
+            != safe_deploys + boundary_deploys
+        ):
+            return None
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+    return {
+        "event_index": event_index,
+        "action": action,
+        "card": card,
+        "execution_tick": execution_tick,
+        "rejection": dict(rejection),
+        "actual_actions": actual_actions,
+        "boundary_deploys": boundary_deploys,
+    }
+
+
+def _mask_invalid_censor_evidence(
+    preflight: NativeReplayResult,
+    masked: NativeReplayResult,
+    maskless_reference: NativeReplayResult,
+    plan: BattlePlan,
+) -> dict[str, Any] | None:
+    """Authenticate one mask-invalid boundary without legalizing its label."""
+
+    boundary = _unique_mask_rejection_boundary(masked, plan)
+    if boundary is None or diff_native_replay_semantics(
+        preflight, maskless_reference
+    ):
+        return None
+    event_index = int(boundary["event_index"])
+    action = boundary["action"]
+    execution_tick = int(boundary["execution_tick"])
+    card = boundary["card"]
+    rejection = boundary["rejection"]
+    preflight_boundary_rows = [
+        dict(row) for row in preflight.action_acceptance_sequence
+        if int(row.get("source_event_index", -1)) == event_index
+    ]
+    if (
+        len(preflight_boundary_rows) != 1
+        or set(preflight_boundary_rows[0]) != _ACCEPTED_ACTION_ROW_FIELDS
+        or preflight_boundary_rows[0].get("accepted") is not True
+        or int(preflight_boundary_rows[0].get("result_code", -1)) != 0
+        or preflight_boundary_rows[0].get("type") != "play"
+        or int(preflight_boundary_rows[0].get("source_tick", -1))
+        != int(action.tick)
+        or int(preflight_boundary_rows[0].get("execution_tick", -1))
+        != execution_tick
+        or int(preflight_boundary_rows[0].get("side", -1))
+        != int(action.side)
+    ):
+        return None
+    preflight_boundary_row = preflight_boundary_rows[0]
+    expected_actions = tuple(
+        dict(row) for row in preflight.action_acceptance_sequence
+        if int(row["execution_tick"]) < execution_tick
+    )
+    actual_actions = boundary["actual_actions"]
+    if actual_actions != expected_actions:
+        return None
+    boundary_deploys = int(boundary["boundary_deploys"])
+    masked_through_boundary = tuple(
+        state for state in masked.collected_tick_states
+        if int(state.tick) <= execution_tick
+    )
+    reference_through_boundary = tuple(
+        state for state in maskless_reference.collected_tick_states
+        if int(state.tick) <= execution_tick
+    )
+    if (
+        not masked_through_boundary
+        or masked_through_boundary[-1].tick != execution_tick
+        or masked_through_boundary != reference_through_boundary
+    ):
+        return None
+    masked_states = tuple(
+        state for state in masked.collected_tick_states
+        if int(state.tick) < execution_tick
+    )
+    reference_states = tuple(
+        state for state in maskless_reference.collected_tick_states
+        if int(state.tick) < execution_tick
+    )
+    if not masked_states or masked_states != reference_states:
+        return None
+    state_rows = [asdict(state) for state in masked_states]
+    action_rows = list(actual_actions)
+    return {
+        "schema_version": 3,
+        "kind": MASK_INVALID_CENSOR_KIND,
+        "rejected_source_event_index": event_index,
+        "source_marker_index": int(action.source_marker_index),
+        "source_tick": int(action.tick),
+        "execution_tick": execution_tick,
+        "side": int(action.side),
+        "deck_index": int(action.logical_card_index),
+        "card_id": int(card.card_id),
+        "x": int(action.x),
+        "y": int(action.y),
+        "mask_content_sha256": str(rejection["content_sha256"]),
+        "boundary_deploy_labels_checked": boundary_deploys,
+        "mask_rejection_count": 1,
+        "failure_event_executed": False,
+        "failure_label_compiled": False,
+        "label_or_mask_repair_applied": False,
+        "censored_tick_event_indices": sorted(
+            int(candidate.source_event_index)
+            for candidate in (*plan.actions, *plan.ability_events)
+            if int(candidate.tick) + int(masked.action_execution_tick_offset)
+            == execution_tick
+        ),
+        "safe_action_count": len(action_rows),
+        "safe_action_transcript_sha256": _canonical_rows_sha256(action_rows),
+        "mask_lane_action_metrics": {
+            "attempted": len(action_rows),
+            "responded": len(action_rows),
+            "accepted": int(masked.accepted_actions),
+            "rejected": 0,
+            "no_response": 0,
+            "exceptions": 0,
+        },
+        "maskless_reference_reset_count": int(
+            maskless_reference.seed_search_native_resets
+        ),
+        "maskless_reference_layout_mode": str(
+            maskless_reference.layout_resolution_mode
+        ),
+        "pre_censor_tick_start": int(masked_states[0].tick),
+        "pre_censor_tick_stop_exclusive": execution_tick,
+        "pre_censor_tick_count": len(state_rows),
+        "mask_lane_tick_sha256": _canonical_rows_sha256(state_rows),
+        "maskless_tick_sha256": _canonical_rows_sha256(
+            [asdict(state) for state in reference_states]
+        ),
+        "tick_state_parity": True,
+        "preflight_semantics_sha256": _semantic_digest(preflight),
+        "maskless_reference_semantics_sha256": _semantic_digest(
+            maskless_reference
+        ),
+        "preflight_boundary_accepted_action": preflight_boundary_row,
+        "preflight_boundary_accepted_action_sha256": _canonical_rows_sha256(
+            preflight_boundary_row
+        ),
+        "locked_pocket": dict(rejection["locked_pocket"]),
+    }
 
 
 def _failure_boundary(
@@ -1897,9 +2335,18 @@ def _prefix_extent_metadata(
     prefix: NativeReplayResult,
     *,
     base: Mapping[str, Any],
+    mask_invalid_censor: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     states = prefix.collected_tick_states
-    boundary = _failure_boundary(prefix)
+    boundary = (
+        (
+            int(mask_invalid_censor["execution_tick"]),
+            int(mask_invalid_censor["source_tick"]),
+            int(mask_invalid_censor["rejected_source_event_index"]),
+        )
+        if isinstance(mask_invalid_censor, Mapping)
+        else _failure_boundary(prefix)
+    )
     if not states or boundary is None:
         return None
     require_consecutive(states)
@@ -1907,10 +2354,20 @@ def _prefix_extent_metadata(
         return None
     failure_execution_tick, failure_source_tick, failure_event_index = boundary
     last_tick = states[-1].tick
-    if failure_execution_tick < states[0].tick or last_tick > failure_execution_tick:
+    if (
+        failure_execution_tick < states[0].tick
+        or last_tick > failure_execution_tick
+        or (mask_invalid_censor is not None and last_tick != failure_execution_tick)
+    ):
         return None
-    failure_class = _failure_class(
-        prefix, None, "preflight_first_native_difference"
+    failure_class = (
+        MASK_INVALID_FAILURE_CLASS
+        if mask_invalid_censor is not None
+        else _failure_class(prefix, None, "preflight_first_native_difference")
+    )
+    failure_domain = (
+        MASK_INVALID_FAILURE_DOMAIN
+        if mask_invalid_censor is not None else "semantic"
     )
     accepted_before_boundary = [
         dict(row)
@@ -1966,7 +2423,8 @@ def _prefix_extent_metadata(
         for row in prefix.action_acceptance_sequence
     )
     if (
-        prefix.deployment_mask_label_rejections != 0
+        prefix.deployment_mask_label_rejections
+        != (1 if mask_invalid_censor is not None else 0)
         or prefix.deployment_mask_label_checks < safe_deploy_labels
         or not prefix.deployment_mask_payloads
     ):
@@ -1975,16 +2433,26 @@ def _prefix_extent_metadata(
         "schema_version": 1,
         "kind": REPLAY_EXTENT_KIND,
         "extent": "valid_prefix",
-        "training_admission": "actor_bc_censored_prefix_v1",
+        "training_admission": (
+            "actor_bc_mask_invalid_censored_prefix_v1"
+            if mask_invalid_censor is not None
+            else "actor_bc_censored_prefix_v1"
+        ),
         "source_episode_complete": False,
         "every_native_tick_present_within_extent": True,
         "fixed_seed_replay": True,
         "chosen_seed": int(prefix.chosen_seed),
         "preflight_semantics_sha256": _semantic_digest(preflight),
         "prefix_replay_semantics_sha256": _semantic_digest(prefix),
-        "semantic_match": True,
+        "semantic_match": mask_invalid_censor is None,
+        "maskless_reference_semantic_match": (
+            None if mask_invalid_censor is None else True
+        ),
+        "pre_censor_tick_state_parity": (
+            None if mask_invalid_censor is None else True
+        ),
         "failure_class": failure_class,
-        "failure_domain": "semantic",
+        "failure_domain": failure_domain,
         "failure": prefix.failure,
         "failure_source_tick": failure_source_tick,
         "failure_execution_tick": failure_execution_tick,
@@ -2006,6 +2474,11 @@ def _prefix_extent_metadata(
         "terminal_target": "unknown_censored",
         "terminal_validated": False,
         "deployment_masks": "partial_native_visible_hand_complete_v1",
+        "censor_provenance": (
+            {"kind": "native_semantic_failure_censor_v1"}
+            if mask_invalid_censor is None
+            else dict(mask_invalid_censor)
+        ),
         "mask_coverage": {
             "all_retained_visible_hand_slots_covered": True,
             "retained_ticks": len(training_states),
@@ -2034,6 +2507,55 @@ def _prefix_extent_metadata(
         EPISODE_METADATA_KEY: dict(mask_metadata),
         "every_native_tick_present": True,
     }
+
+
+def _authenticate_mask_invalid_prefix(
+    env: Any,
+    plan: BattlePlan,
+    template: Mapping[str, Any],
+    preflight: NativeReplayResult,
+    masked: NativeReplayResult,
+    *,
+    seed: int,
+    maximum_seeds_to_test: int,
+    trace_batch_steps: int,
+    phase_state: dict[str, Any] | None = None,
+) -> MasklessReferenceAttempt | None:
+    """Replay maskless once and authenticate the mask-invalid safe prefix."""
+
+    if _unique_mask_rejection_boundary(masked, plan) is None:
+        return None
+    recorder = RecordingCountingEnv(env)
+    if phase_state is not None:
+        phase_state["maskless_reference_recorder"] = recorder
+    started = time.perf_counter()
+    try:
+        reference = execute_plan(
+            recorder,
+            plan,
+            template,
+            None,
+            seed=seed,
+            fixed_seed=preflight.chosen_seed,
+            maximum_seeds_to_test=maximum_seeds_to_test,
+            capture_decisions=False,
+            ability_branch_choices=None,
+            tick_sink=None,
+            trace_batch_steps=trace_batch_steps,
+            capture_deployment_masks=False,
+            collect_tick_states_on_failure=True,
+            action_execution_tick_offset=(
+                ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
+            ),
+        )
+    finally:
+        seconds = time.perf_counter() - started
+        if phase_state is not None:
+            phase_state["maskless_reference_seconds"] = seconds
+    evidence = _mask_invalid_censor_evidence(
+        preflight, masked, reference, plan
+    )
+    return MasklessReferenceAttempt(reference, recorder, seconds, evidence)
 
 
 def execute_two_phase_plan(
@@ -2123,15 +2645,44 @@ def execute_two_phase_plan(
             finally:
                 prefix_seconds = time.perf_counter() - phase_started
                 phase_state["failure_prefix_seconds"] = prefix_seconds
-            prefix_semantic_diff = diff_native_replay_semantics(
-                preflight, prefix_result
+            mask_invalid = _authenticate_mask_invalid_prefix(
+                env,
+                plan,
+                template,
+                preflight,
+                prefix_result,
+                seed=seed,
+                maximum_seeds_to_test=maximum_seeds_to_test,
+                trace_batch_steps=trace_batch_steps,
+                phase_state=phase_state,
             )
+            mask_invalid_evidence = None
+            if mask_invalid is None:
+                prefix_semantic_diff = diff_native_replay_semantics(
+                    preflight, prefix_result
+                )
+            else:
+                reference = mask_invalid.result
+                reference_recorder = mask_invalid.recorder
+                mask_invalid_evidence = mask_invalid.evidence
+                prefix_semantic_diff = (
+                    None
+                    if mask_invalid_evidence is not None
+                    else diff_native_replay_semantics(preflight, prefix_result)
+                )
+                phase_state["mask_invalid_reference_semantics_sha256"] = (
+                    _semantic_digest(reference)
+                )
+                phase_state["mask_invalid_reference_metrics"] = (
+                    reference_recorder.metrics()
+                )
             extent_metadata = (
                 None
                 if prefix_semantic_diff or prefix_result.teacher_forced_success
                 else _prefix_extent_metadata(
                     preflight,
                     prefix_result,
+                    mask_invalid_censor=mask_invalid_evidence,
                     base={
                         **dict(tick_store_metadata),
                         "native_execution_pipeline": {
@@ -2158,20 +2709,44 @@ def execute_two_phase_plan(
                     extent_metadata,
                 )
                 prefix_was_staged = True
-        return TwoPhaseNativeReplay(
-            preflight=preflight,
-            full_trace=None,
-            preflight_recorder=preflight_recorder,
-            full_trace_recorder=None,
-            preflight_seconds=preflight_seconds,
-            full_trace_seconds=0.0,
-            semantic_diff=prefix_semantic_diff,
-            failure_prefix=prefix_result,
-            failure_prefix_recorder=prefix_recorder,
-            failure_prefix_seconds=prefix_seconds,
-            failure_prefix_staged=prefix_was_staged,
-            semantic_seed_audit=semantic_seed_audit,
-        )
+            return TwoPhaseNativeReplay(
+                preflight=preflight,
+                full_trace=(
+                    prefix_result if mask_invalid_evidence is not None else None
+                ),
+                preflight_recorder=preflight_recorder,
+                full_trace_recorder=(
+                    prefix_recorder if mask_invalid_evidence is not None else None
+                ),
+                preflight_seconds=preflight_seconds,
+                full_trace_seconds=(
+                    prefix_seconds if mask_invalid_evidence is not None else 0.0
+                ),
+                semantic_diff=prefix_semantic_diff,
+                failure_prefix=prefix_result,
+                failure_prefix_recorder=(
+                    None if mask_invalid_evidence is not None else prefix_recorder
+                ),
+                failure_prefix_seconds=(
+                    0.0 if mask_invalid_evidence is not None else prefix_seconds
+                ),
+                failure_prefix_staged=prefix_was_staged,
+                semantic_seed_audit=semantic_seed_audit,
+                mask_invalid_prefix=mask_invalid_evidence is not None,
+                mask_invalid_semantic_diff=(
+                    diff_native_replay_semantics(preflight, prefix_result)
+                    if mask_invalid_evidence is not None else None
+                ),
+                maskless_reference=(
+                    None if mask_invalid is None else mask_invalid.result
+                ),
+                maskless_reference_recorder=(
+                    None if mask_invalid is None else mask_invalid.recorder
+                ),
+                maskless_reference_seconds=(
+                    0.0 if mask_invalid is None else mask_invalid.seconds
+                ),
+            )
 
     full_trace_recorder = RecordingCountingEnv(env)
     phase_state["full_trace_recorder"] = full_trace_recorder
@@ -2203,6 +2778,7 @@ def execute_two_phase_plan(
             tick_store_metadata=full_metadata,
             trace_batch_steps=trace_batch_steps,
             capture_deployment_masks=True,
+            collect_tick_states_on_failure=True,
             action_execution_tick_offset=(
                 ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
             ),
@@ -2210,6 +2786,74 @@ def execute_two_phase_plan(
     finally:
         full_trace_seconds = time.perf_counter() - phase_started
         phase_state["full_trace_seconds"] = full_trace_seconds
+    mask_invalid = _authenticate_mask_invalid_prefix(
+        env,
+        plan,
+        template,
+        preflight,
+        full_trace,
+        seed=seed,
+        maximum_seeds_to_test=maximum_seeds_to_test,
+        trace_batch_steps=trace_batch_steps,
+        phase_state=phase_state,
+    )
+    if mask_invalid is not None and mask_invalid.evidence is not None:
+        reference = mask_invalid.result
+        reference_recorder = mask_invalid.recorder
+        mask_invalid_evidence = mask_invalid.evidence
+        phase_state["mask_invalid_reference_semantics_sha256"] = (
+            _semantic_digest(reference)
+        )
+        phase_state["mask_invalid_reference_metrics"] = (
+            reference_recorder.metrics()
+        )
+        extent_metadata = _prefix_extent_metadata(
+            preflight,
+            full_trace,
+            mask_invalid_censor=mask_invalid_evidence,
+            base={
+                **dict(tick_store_metadata),
+                "native_execution_pipeline": {
+                    "contract_version": NATIVE_PREFLIGHT_CONTRACT_VERSION,
+                    "mode": NATIVE_PREFLIGHT_MODE,
+                    "preflight_chosen_seed": preflight.chosen_seed,
+                    "preflight_semantics_sha256": _semantic_digest(preflight),
+                    "semantic_seed_selection": semantic_seed_audit,
+                },
+            },
+        )
+        if extent_metadata is not None and prefix_staged is not None:
+            prefix_staged.stage_deployment_masks(
+                metadata=full_trace.deployment_mask_metadata,
+                payloads=full_trace.deployment_mask_payloads,
+                require_complete=False,
+            )
+            prefix_staged.append(
+                plan.battle_tag,
+                full_trace.collected_tick_states,
+                extent_metadata,
+            )
+            return TwoPhaseNativeReplay(
+                preflight=preflight,
+                full_trace=full_trace,
+                preflight_recorder=preflight_recorder,
+                full_trace_recorder=full_trace_recorder,
+                preflight_seconds=preflight_seconds,
+                full_trace_seconds=full_trace_seconds,
+                semantic_diff=None,
+                failure_prefix=full_trace,
+                failure_prefix_recorder=None,
+                failure_prefix_seconds=0.0,
+                failure_prefix_staged=True,
+                semantic_seed_audit=semantic_seed_audit,
+                mask_invalid_prefix=True,
+                mask_invalid_semantic_diff=diff_native_replay_semantics(
+                    preflight, full_trace
+                ),
+                maskless_reference=mask_invalid.result,
+                maskless_reference_recorder=mask_invalid.recorder,
+                maskless_reference_seconds=mask_invalid.seconds,
+            )
     semantic_diff = diff_native_replay_semantics(preflight, full_trace)
     if not semantic_diff and staged.episode is not None:
         staged.episode.metadata["native_execution_pipeline"].update({
@@ -2226,6 +2870,15 @@ def execute_two_phase_plan(
         full_trace_seconds=full_trace_seconds,
         semantic_diff=semantic_diff,
         semantic_seed_audit=semantic_seed_audit,
+        maskless_reference=(
+            None if mask_invalid is None else mask_invalid.result
+        ),
+        maskless_reference_recorder=(
+            None if mask_invalid is None else mask_invalid.recorder
+        ),
+        maskless_reference_seconds=(
+            0.0 if mask_invalid is None else mask_invalid.seconds
+        ),
     )
 
 
@@ -2250,12 +2903,15 @@ def _combined_phase_metrics(
     preflight: RecordingCountingEnv,
     full_trace: RecordingCountingEnv | None,
     failure_prefix: RecordingCountingEnv | None = None,
+    maskless_reference: RecordingCountingEnv | None = None,
 ) -> dict[str, Any]:
     rows = [preflight.metrics()]
     if full_trace is not None:
         rows.append(full_trace.metrics())
     if failure_prefix is not None:
         rows.append(failure_prefix.metrics())
+    if maskless_reference is not None:
+        rows.append(maskless_reference.metrics())
     combined = {
         key: sum(int(row[key]) for row in rows)
         for key in _COUNTING_METRIC_KEYS
@@ -2300,6 +2956,7 @@ def execute_task(
     preflight_recorder = RecordingCountingEnv(env)
     full_trace_recorder: RecordingCountingEnv | None = None
     failure_prefix_recorder: RecordingCountingEnv | None = None
+    maskless_reference_recorder: RecordingCountingEnv | None = None
     plan: BattlePlan | None = None
     preflight_result: NativeReplayResult | None = None
     result: NativeReplayResult | None = None
@@ -2315,6 +2972,7 @@ def execute_task(
     preflight_seconds = 0.0
     full_trace_seconds = 0.0
     failure_prefix_seconds = 0.0
+    maskless_reference_seconds = 0.0
     semantic_diff: dict[str, Any] | None = None
     semantic_seed_audit: dict[str, Any] | None = None
     token_coverage_actor_evidence: list[dict[str, Any]] = []
@@ -2369,49 +3027,55 @@ def execute_task(
         preflight_recorder = two_phase.preflight_recorder
         full_trace_recorder = two_phase.full_trace_recorder
         failure_prefix_recorder = two_phase.failure_prefix_recorder
+        maskless_reference_recorder = two_phase.maskless_reference_recorder
         preflight_seconds = two_phase.preflight_seconds
         full_trace_seconds = two_phase.full_trace_seconds
         failure_prefix_seconds = two_phase.failure_prefix_seconds
+        maskless_reference_seconds = two_phase.maskless_reference_seconds
         semantic_diff = two_phase.semantic_diff
         semantic_seed_audit = two_phase.semantic_seed_audit
-        if not preflight_result.teacher_forced_success:
+        if two_phase.failure_prefix_staged:
             stage = "preflight_first_native_difference"
             if semantic_diff:
                 stage = "preflight_failure_prefix_semantic_diff"
                 raise PreflightFullTraceDivergence(semantic_diff)
-            if two_phase.failure_prefix_staged:
-                if prefix_staged.episode is None:
-                    raise RuntimeError("failure prefix was reported staged but is absent")
-                prefix_result = two_phase.failure_prefix
-                if prefix_result is None:
-                    raise RuntimeError("failure prefix result is absent")
-                prefix_extent = prefix_staged.episode.metadata.get(
-                    REPLAY_EXTENT_METADATA_KEY
+            if prefix_staged.episode is None:
+                raise RuntimeError("failure prefix was reported staged but is absent")
+            prefix_result = two_phase.failure_prefix
+            if prefix_result is None:
+                raise RuntimeError("failure prefix result is absent")
+            prefix_extent = prefix_staged.episode.metadata.get(
+                REPLAY_EXTENT_METADATA_KEY
+            )
+            if not isinstance(prefix_extent, Mapping):
+                raise RuntimeError("failure prefix extent is absent")
+            prefix_token_coverage_actor_evidence = (
+                build_full_success_token_evidence(
+                    plan,
+                    prefix_result,
+                    prefix_staged.episode,
+                    prefix_extent=prefix_extent,
                 )
-                if not isinstance(prefix_extent, Mapping):
-                    raise RuntimeError("failure prefix extent is absent")
-                prefix_token_coverage_actor_evidence = (
-                    build_full_success_token_evidence(
-                        plan,
-                        prefix_result,
-                        prefix_staged.episode,
-                        prefix_extent=prefix_extent,
+            )
+            if prefix_sink is None or prefix_registry is None:
+                # Unit callers may intentionally omit persistence.  The
+                # production worker always supplies the isolated store.
+                pass
+            else:
+                stage = "immutable_prefix_tick_store_commit"
+                if commit_guard is not None and not commit_guard():
+                    raise RuntimeError(
+                        "native task lease ownership was lost before prefix commit"
                     )
+                audit_prefix_store_entry = prefix_registry.commit_or_reuse(
+                    prefix_sink, prefix_staged.episode
                 )
-                if prefix_sink is None or prefix_registry is None:
-                    # Unit callers may intentionally omit persistence.  The
-                    # production worker always supplies the isolated store.
-                    pass
-                else:
-                    stage = "immutable_prefix_tick_store_commit"
-                    if commit_guard is not None and not commit_guard():
-                        raise RuntimeError(
-                            "native task lease ownership was lost before prefix commit"
-                        )
-                    audit_prefix_store_entry = prefix_registry.commit_or_reuse(
-                        prefix_sink, prefix_staged.episode
-                    )
-                    stage = "preflight_first_native_difference"
+                stage = "preflight_first_native_difference"
+        elif not preflight_result.teacher_forced_success:
+            stage = "preflight_first_native_difference"
+            if semantic_diff:
+                stage = "preflight_failure_prefix_semantic_diff"
+                raise PreflightFullTraceDivergence(semantic_diff)
         elif semantic_diff:
             stage = "preflight_full_trace_semantic_diff"
             raise PreflightFullTraceDivergence(semantic_diff)
@@ -2475,6 +3139,9 @@ def execute_task(
         )
         full_trace_recorder = phase_state.get("full_trace_recorder")
         failure_prefix_recorder = phase_state.get("failure_prefix_recorder")
+        maskless_reference_recorder = phase_state.get(
+            "maskless_reference_recorder"
+        )
         preflight_seconds = float(
             phase_state.get("preflight_seconds", preflight_seconds)
         )
@@ -2483,6 +3150,11 @@ def execute_task(
         )
         failure_prefix_seconds = float(
             phase_state.get("failure_prefix_seconds", failure_prefix_seconds)
+        )
+        maskless_reference_seconds = float(
+            phase_state.get(
+                "maskless_reference_seconds", maskless_reference_seconds
+            )
         )
         semantic_seed_audit = phase_state.get(
             "semantic_seed_audit", semantic_seed_audit
@@ -2495,7 +3167,10 @@ def execute_task(
         and store_entry is not None
     )
     metrics = _combined_phase_metrics(
-        preflight_recorder, full_trace_recorder, failure_prefix_recorder
+        preflight_recorder,
+        full_trace_recorder,
+        failure_prefix_recorder,
+        maskless_reference_recorder,
     )
     active_recorder = (
         full_trace_recorder or failure_prefix_recorder or preflight_recorder
@@ -2520,6 +3195,15 @@ def execute_task(
             ),
         }
     failure_domain = _failure_domain(failure_class)
+    capture_result = (
+        two_phase.failure_prefix
+        if (
+            two_phase is not None
+            and two_phase.failure_prefix is not None
+            and audit_prefix_store_entry is not None
+        )
+        else result
+    )
     coordinate_provenance = (
         None if plan is None else plan.coordinate_provenance
     )
@@ -2578,10 +3262,35 @@ def execute_task(
         "full_trace_seconds": full_trace_seconds,
         "failure_prefix_executed": failure_prefix_recorder is not None,
         "failure_prefix_seconds": failure_prefix_seconds,
+        "maskless_reference_executed": maskless_reference_recorder is not None,
+        "maskless_reference_seconds": maskless_reference_seconds,
+        "maskless_reference_native_ticks_advanced": (
+            0
+            if two_phase is None or two_phase.maskless_reference is None
+            else two_phase.maskless_reference.native_ticks_advanced
+        ),
+        "maskless_reference_semantics_sha256": (
+            None
+            if two_phase is None or two_phase.maskless_reference is None
+            else _semantic_digest(two_phase.maskless_reference)
+        ),
         "failure_prefix_semantic_match": (
             None
             if two_phase is None or two_phase.failure_prefix is None
-            else not bool(two_phase.semantic_diff)
+            else (
+                False
+                if two_phase.mask_invalid_prefix
+                else not bool(two_phase.semantic_diff)
+            )
+        ),
+        "mask_invalid_censor_validated": bool(
+            two_phase is not None
+            and two_phase.mask_invalid_prefix
+            and two_phase.failure_prefix_staged
+            and not two_phase.semantic_diff
+        ),
+        "mask_invalid_full_semantic_diff": (
+            None if two_phase is None else two_phase.mask_invalid_semantic_diff
         ),
         "failure_prefix_tick_count": (
             0
@@ -2619,6 +3328,19 @@ def execute_task(
             if failure_prefix_recorder is None
             else failure_prefix_recorder.metrics()
         ),
+        "maskless_reference_native_action_metrics": (
+            None
+            if maskless_reference_recorder is None
+            else maskless_reference_recorder.metrics()
+        ),
+        "maskless_reference_action_acceptance_sequence": (
+            []
+            if two_phase is None or two_phase.maskless_reference is None
+            else [
+                dict(row)
+                for row in two_phase.maskless_reference.action_acceptance_sequence
+            ]
+        ),
         "preflight_action_acceptance_sequence": (
             []
             if preflight_result is None
@@ -2633,9 +3355,20 @@ def execute_task(
             ]
         ),
         "preflight_full_trace_semantic_match": (
-            None if not full_trace_executed else not bool(semantic_diff)
+            None
+            if (
+                not full_trace_executed
+                or (two_phase is not None and two_phase.mask_invalid_prefix)
+            )
+            else (
+                not bool(semantic_diff)
+            )
         ),
-        "preflight_full_trace_semantic_diff": semantic_diff,
+        "preflight_full_trace_semantic_diff": (
+            None
+            if two_phase is not None and two_phase.mask_invalid_prefix
+            else semantic_diff
+        ),
         **metrics,
         "native_teacher_forced_profile": native_teacher_forced_profile(
             ROYALEAPI_NATIVE_TEACHER_FORCED_ACTION_EXECUTION_TICK_OFFSET
@@ -2706,50 +3439,68 @@ def execute_task(
             0 if result is None else len(result.collected_tick_states)
         ),
         "tick_trace_complete_frames": (
-            0 if result is None else result.tick_trace_complete_frames
+            0 if capture_result is None else capture_result.tick_trace_complete_frames
         ),
         "tick_trace_incomplete_terminal_frames": (
-            0 if result is None else result.tick_trace_incomplete_terminal_frames
+            0 if capture_result is None
+            else capture_result.tick_trace_incomplete_terminal_frames
         ),
         "tick_trace_incomplete_nonterminal_freeze_frames": (
-            0 if result is None
-            else result.tick_trace_incomplete_nonterminal_freeze_frames
+            0 if capture_result is None
+            else capture_result.tick_trace_incomplete_nonterminal_freeze_frames
         ),
         "deployment_mask_probe_seconds": (
-            0.0 if result is None else result.deployment_mask_probe_seconds
+            0.0 if capture_result is None
+            else capture_result.deployment_mask_probe_seconds
         ),
         "deployment_mask_probe_rpc_count": (
-            0 if result is None else result.deployment_mask_probe_rpc_count
+            0 if capture_result is None
+            else capture_result.deployment_mask_probe_rpc_count
         ),
         "deployment_mask_slots_captured": (
-            0 if result is None else result.deployment_mask_slots_captured
+            0 if capture_result is None
+            else capture_result.deployment_mask_slots_captured
         ),
         "deployment_mask_base_probe_rpc_count": (
             0
-            if result is None
-            else result.deployment_mask_base_probe_rpc_count
+            if capture_result is None
+            else capture_result.deployment_mask_base_probe_rpc_count
         ),
         "deployment_mask_dynamic_label_probe_rpc_count": (
             0
-            if result is None
-            else result.deployment_mask_dynamic_label_probe_rpc_count
+            if capture_result is None
+            else capture_result.deployment_mask_dynamic_label_probe_rpc_count
         ),
         "deployment_mask_capture_complete": (
-            False if result is None else result.deployment_mask_capture_complete
+            False if capture_result is None
+            else capture_result.deployment_mask_capture_complete
         ),
         "deployment_mask_metadata": (
-            None if result is None else result.deployment_mask_metadata
+            None if capture_result is None else capture_result.deployment_mask_metadata
         ),
         "deployment_mask_label_checks": (
-            0 if result is None else result.deployment_mask_label_checks
+            0 if capture_result is None else capture_result.deployment_mask_label_checks
         ),
         "deployment_mask_label_rejections": (
-            0 if result is None else result.deployment_mask_label_rejections
+            0 if capture_result is None
+            else capture_result.deployment_mask_label_rejections
         ),
         "deployment_mask_first_label_rejection": (
             None
-            if result is None
-            else result.deployment_mask_first_label_rejection
+            if capture_result is None
+            else capture_result.deployment_mask_first_label_rejection
+        ),
+        "deployment_mask_label_rejection_sequence": (
+            []
+            if capture_result is None
+            else [
+                dict(row)
+                for row in getattr(
+                    capture_result,
+                    "deployment_mask_label_rejection_sequence",
+                    (),
+                )
+            ]
         ),
         "logic_freeze_diagnostic": (
             None if result is None else result.logic_freeze_diagnostic
@@ -2823,6 +3574,11 @@ def execute_task(
             if two_phase is None or two_phase.failure_prefix is None
             else two_phase.failure_prefix.json()
         ),
+        "maskless_reference_native_result": (
+            None
+            if two_phase is None or two_phase.maskless_reference is None
+            else two_phase.maskless_reference.json()
+        ),
         "preflight_full_trace_semantic_diff": semantic_diff,
         "native_boundary_snapshot": active_recorder.snapshot(),
         "preflight_native_boundary_snapshot": preflight_recorder.snapshot(),
@@ -2835,6 +3591,11 @@ def execute_task(
             None
             if failure_prefix_recorder is None
             else failure_prefix_recorder.snapshot()
+        ),
+        "maskless_reference_native_boundary_snapshot": (
+            None
+            if maskless_reference_recorder is None
+            else maskless_reference_recorder.snapshot()
         ),
         "exception_traceback": error_traceback,
     }
@@ -3178,6 +3939,151 @@ def _ratio(numerator: int | float, denominator: int | float) -> float | None:
     return float(numerator) / float(denominator) if denominator else None
 
 
+def _result_prefix_integrity(row: Mapping[str, Any]) -> bool:
+    extent = row.get("audit_prefix_extent")
+    if not isinstance(extent, Mapping):
+        return False
+    prefix_entry = row.get("audit_prefix_tick_store_entry")
+    common = bool(
+        isinstance(prefix_entry, Mapping)
+        and prefix_extent_common_contract_valid(
+            extent, tick_count=int(prefix_entry.get("ticks", -1))
+        )
+        and int(row.get("failure_prefix_tick_count") or 0) > 0
+        and int(row.get("deployment_mask_probe_rpc_count") or 0) > 0
+        and int(row.get("native_deployment_mask_probes_attempted") or 0)
+        == int(row.get("deployment_mask_probe_rpc_count") or 0)
+        and int(row.get("native_deployment_mask_probe_exceptions") or 0) == 0
+    )
+    if not common:
+        return False
+    if extent.get("training_admission") == "actor_bc_censored_prefix_v1":
+        return bool(
+            extent.get("failure_domain") == "semantic"
+            and extent.get("semantic_match") is True
+            and row.get("failure_domain") == "semantic"
+            and row.get("failure_prefix_semantic_match") is True
+            and int(row.get("deployment_mask_label_rejections") or 0) == 0
+        )
+    if extent.get("training_admission") != (
+        "actor_bc_mask_invalid_censored_prefix_v1"
+    ):
+        return False
+    provenance = extent.get("censor_provenance")
+    actions = row.get("full_trace_action_acceptance_sequence")
+    preflight_actions = row.get("preflight_action_acceptance_sequence")
+    reference_actions = row.get(
+        "maskless_reference_action_acceptance_sequence"
+    )
+    metrics = row.get("full_trace_native_action_metrics")
+    reference_metrics = row.get("maskless_reference_native_action_metrics")
+    rejection = row.get("deployment_mask_first_label_rejection")
+    rejection_sequence = row.get("deployment_mask_label_rejection_sequence")
+    if not mask_invalid_censor_provenance_valid(provenance):
+        return False
+    boundary_row = (
+        provenance.get("preflight_boundary_accepted_action")
+        if isinstance(provenance, Mapping) else None
+    )
+    seed_audit = row.get("semantic_seed_preflight")
+    candidates = (
+        seed_audit.get("candidates")
+        if isinstance(seed_audit, Mapping) else None
+    )
+    selected = (
+        candidates[0]
+        if isinstance(candidates, list)
+        and len(candidates) == 1
+        and isinstance(candidates[0], Mapping)
+        else None
+    )
+    if not isinstance(reference_actions, list):
+        return False
+    reference_accepted = sum(
+        action.get("accepted") is True
+        for action in reference_actions
+        if isinstance(action, Mapping)
+    )
+    reference_rejected = sum(
+        action.get("accepted") is False
+        for action in reference_actions
+        if isinstance(action, Mapping)
+    )
+    if reference_accepted + reference_rejected != len(reference_actions):
+        return False
+    try:
+        return bool(
+            extent.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+        and extent.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+        and extent.get("semantic_match") is False
+        and extent.get("maskless_reference_semantic_match") is True
+        and extent.get("pre_censor_tick_state_parity") is True
+        and row.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+        and row.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+        and row.get("failure_prefix_semantic_match") is False
+        and row.get("preflight_full_trace_semantic_match") is None
+        and row.get("preflight_full_trace_semantic_diff") is None
+        and row.get("mask_invalid_censor_validated") is True
+        and row.get("maskless_reference_executed") is True
+        and float(row.get("maskless_reference_seconds", -1.0)) >= 0.0
+        and int(row.get("deployment_mask_label_rejections") or 0) == 1
+        and isinstance(rejection, Mapping)
+        and rejection_sequence == [rejection]
+        and rejection.get("source_event_index")
+        == provenance["rejected_source_event_index"]
+        and rejection.get("content_sha256") == provenance["mask_content_sha256"]
+        and rejection.get("reasons")
+        == ["position_not_in_derived_native_mask"]
+        and rejection.get("locked_pocket") == provenance["locked_pocket"]
+        and isinstance(selected, Mapping)
+        and selected.get("semantics_sha256")
+        == provenance["preflight_semantics_sha256"]
+        and isinstance(preflight_actions, list)
+        and isinstance(boundary_row, Mapping)
+        and [
+            action for action in preflight_actions
+            if action.get("source_event_index")
+            == provenance["rejected_source_event_index"]
+        ] == [boundary_row]
+        and _canonical_rows_sha256(boundary_row)
+        == provenance["preflight_boundary_accepted_action_sha256"]
+        and isinstance(actions, list)
+        and len(actions) == int(provenance["safe_action_count"])
+        and _canonical_rows_sha256(actions)
+        == provenance["safe_action_transcript_sha256"]
+        and isinstance(metrics, Mapping)
+        and int(metrics.get("native_actions_attempted", -1))
+        == int(provenance["safe_action_count"])
+        and int(metrics.get("native_actions_responded", -1))
+        == int(provenance["safe_action_count"])
+        and int(metrics.get("native_actions_accepted", -1))
+        == int(provenance["safe_action_count"])
+        and int(metrics.get("native_actions_rejected", -1)) == 0
+        and int(metrics.get("native_actions_no_response", -1)) == 0
+        and int(metrics.get("native_action_exceptions", -1)) == 0
+        and isinstance(reference_actions, list)
+        and reference_actions == preflight_actions
+        and row.get("maskless_reference_semantics_sha256")
+        == provenance["maskless_reference_semantics_sha256"]
+        and isinstance(reference_metrics, Mapping)
+        and int(reference_metrics.get("native_actions_attempted", -1))
+        == len(reference_actions)
+        and int(reference_metrics.get("native_actions_responded", -1))
+        == len(reference_actions)
+        and int(reference_metrics.get("native_actions_accepted", -1))
+        == reference_accepted
+        and int(reference_metrics.get("native_actions_rejected", -1))
+        == reference_rejected
+        and int(reference_metrics.get("native_actions_no_response", -1)) == 0
+        and int(reference_metrics.get("native_action_exceptions", -1)) == 0
+        and str(row.get("failure") or "")
+        == "derived_deployment_mask_rejected_source_event_"
+        + str(provenance["rejected_source_event_index"])
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def summarize_results(
     tasks: Sequence[NativeDatasetTask],
     results: Sequence[Mapping[str, Any]],
@@ -3214,6 +4120,10 @@ def summarize_results(
     full_trace_seconds = sum(
         float(row.get("full_trace_seconds") or 0.0) for row in results
     )
+    maskless_reference_seconds = sum(
+        float(row.get("maskless_reference_seconds") or 0.0)
+        for row in results
+    )
     avoided_trace_ticks = sum(
         int(row.get("avoided_trace_ticks") or 0) for row in results
     )
@@ -3222,6 +4132,16 @@ def summarize_results(
     )
     full_trace_executions = sum(
         row.get("full_trace_executed") is True for row in results
+    )
+    maskless_reference_executions = sum(
+        row.get("maskless_reference_executed") is True for row in results
+    )
+    maskless_reference_ticks = sum(
+        int(row.get("maskless_reference_native_ticks_advanced") or 0)
+        for row in results
+    )
+    mask_invalid_censored_prefixes = sum(
+        row.get("mask_invalid_censor_validated") is True for row in results
     )
     semantic_divergences = sum(
         bool(row.get("preflight_full_trace_semantic_diff")) for row in results
@@ -3246,35 +4166,7 @@ def summarize_results(
         int(row["audit_prefix_tick_store_entry"].get("ticks", 0))
         for row in prefixes
     )
-    prefix_integrity = all(
-        isinstance(row.get("audit_prefix_extent"), Mapping)
-        and row["audit_prefix_extent"].get("kind") == REPLAY_EXTENT_KIND
-        and row["audit_prefix_extent"].get("extent") == "valid_prefix"
-        and row["audit_prefix_extent"].get("training_admission")
-        == "actor_bc_censored_prefix_v1"
-        and row["audit_prefix_extent"].get("terminal_target")
-        == "unknown_censored"
-        and row["audit_prefix_extent"].get("failure_tick_has_labels") is False
-        and row["audit_prefix_extent"].get("timing_target")
-        == "right_censored_at_failure_tick_v1"
-        and row["audit_prefix_extent"].get("deployment_masks")
-        == "partial_native_visible_hand_complete_v1"
-        and isinstance(row["audit_prefix_extent"].get("mask_coverage"), Mapping)
-        and row["audit_prefix_extent"]["mask_coverage"].get(
-            "all_retained_visible_hand_slots_covered"
-        ) is True
-        and int(row["audit_prefix_extent"]["mask_coverage"].get(
-            "rejected_deploy_labels", -1
-        )) == 0
-        and row.get("failure_domain") == "semantic"
-        and row.get("failure_prefix_semantic_match") is True
-        and int(row.get("failure_prefix_tick_count") or 0) > 0
-        and int(row.get("deployment_mask_probe_rpc_count") or 0) > 0
-        and int(row.get("native_deployment_mask_probes_attempted") or 0)
-        == int(row.get("deployment_mask_probe_rpc_count") or 0)
-        and int(row.get("native_deployment_mask_probe_exceptions") or 0) == 0
-        for row in prefixes
-    )
+    prefix_integrity = all(_result_prefix_integrity(row) for row in prefixes)
     audit_tick_coverage_complete = bool(
         len(successes) + len(prefixes) == len(tasks)
         and not unframed
@@ -3396,6 +4288,32 @@ def summarize_results(
                 and row.get("full_trace_layout_resolution_mode")
                 == "fixed_preflight_seed_replay"
             )
+            or (
+                row.get("preflight_teacher_forced_success") is True
+                and row.get("full_trace_executed") is True
+                and row.get("preflight_full_trace_semantic_match") is None
+                and row.get("preflight_full_trace_semantic_diff") is None
+                and row.get("mask_invalid_censor_validated") is True
+                and isinstance(
+                    row.get("mask_invalid_full_semantic_diff"), Mapping
+                )
+                and row.get("full_trace_layout_resolution_mode")
+                == "fixed_preflight_seed_replay"
+                and _result_prefix_integrity(row)
+            )
+            or (
+                row.get("preflight_teacher_forced_success") is False
+                and row.get("full_trace_executed") is True
+                and row.get("preflight_full_trace_semantic_match") is None
+                and row.get("preflight_full_trace_semantic_diff") is None
+                and row.get("mask_invalid_censor_validated") is True
+                and isinstance(
+                    row.get("mask_invalid_full_semantic_diff"), Mapping
+                )
+                and row.get("full_trace_layout_resolution_mode")
+                == "fixed_preflight_seed_replay"
+                and _result_prefix_integrity(row)
+            )
             or row.get("preflight_teacher_forced_success") is None
         )
         for row in results
@@ -3425,8 +4343,12 @@ def summarize_results(
         "native_execution_pipeline_mode": NATIVE_PREFLIGHT_MODE,
         "preflight_seconds": preflight_seconds,
         "full_trace_seconds": full_trace_seconds,
+        "maskless_reference_seconds": maskless_reference_seconds,
         "preflight_rejections": preflight_rejections,
         "full_trace_executions": full_trace_executions,
+        "maskless_reference_executions": maskless_reference_executions,
+        "maskless_reference_native_ticks_advanced": maskless_reference_ticks,
+        "mask_invalid_censored_prefixes": mask_invalid_censored_prefixes,
         "avoided_trace_ticks": avoided_trace_ticks,
         "preflight_full_trace_semantic_divergences": semantic_divergences,
         "two_phase_preflight_integrity": two_phase_integrity,
@@ -3503,17 +4425,17 @@ def summarize_results(
     }
 
 
-def _physical_frame_valid(
+def _physical_frame_reader(
     output_root: Path,
     record: Mapping[str, Any],
     *,
     prefix: bool = False,
-) -> bool:
+) -> EpisodeReader | None:
     entry = record.get(
         "audit_prefix_tick_store_entry" if prefix else "tick_store_entry"
     )
     if not isinstance(entry, Mapping):
-        return False
+        return None
     stem = str(entry.get("shard") or "")
     paths = [
         output_root
@@ -3525,25 +4447,47 @@ def _physical_frame_valid(
     ]
     path = next((item for item in paths if item.exists()), None)
     if path is None:
-        return False
+        return None
     offset = int(entry["offset"])
     with path.open("rb") as source:
         source.seek(offset)
         header = source.read(FRAME_HEADER.size)
         if len(header) != FRAME_HEADER.size:
-            return False
-        magic, payload_size, payload_crc, _tag_hash, ticks, _reserved = (
+            return None
+        magic, payload_size, payload_crc, tag_hash, ticks, _reserved = (
             FRAME_HEADER.unpack(header)
         )
         payload = source.read(payload_size)
     import zlib
-    return bool(
+    tag = str(record.get("battle_tag") or "")
+    try:
+        reader = EpisodeReader(payload)
+    except Exception:
+        return None
+    if not (
         magic == FRAME_MAGIC
+        and payload_size > 0
         and len(payload) == payload_size
         and zlib.crc32(payload) == payload_crc
+        and tag_hash == _tag_hash(tag)
         and hashlib.sha256(payload).hexdigest() == entry["payload_sha256"]
-        and int(ticks) == int(entry["ticks"])
-    )
+        and int(payload_size) == int(entry.get("payload_size", -1))
+        and int(entry.get("frame_size", -1))
+        == FRAME_HEADER.size + payload_size
+        and int(ticks) == int(entry["ticks"]) == reader.tick_count
+        and str(reader.metadata.get("battle_tag") or "") == tag
+    ):
+        return None
+    return reader
+
+
+def _physical_frame_valid(
+    output_root: Path,
+    record: Mapping[str, Any],
+    *,
+    prefix: bool = False,
+) -> bool:
+    return _physical_frame_reader(output_root, record, prefix=prefix) is not None
 
 
 def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
@@ -3558,6 +4502,12 @@ def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
             if not native_result_pipeline_contract_valid(record):
                 raise RuntimeError(
                     f"native result pipeline contract is stale/invalid: {tag}"
+                )
+            if isinstance(
+                record.get("audit_prefix_tick_store_entry"), Mapping
+            ) and not _result_prefix_integrity(record):
+                raise RuntimeError(
+                    f"native prefix result proof is stale/invalid: {tag}"
                 )
             row = queue.connection.execute(
                 "SELECT status FROM tasks WHERE battle_tag=?", (tag,)
@@ -3591,10 +4541,29 @@ def reconcile_result_files(output_root: Path, queue_path: Path) -> int:
                     continue
                 if isinstance(
                     record.get("audit_prefix_tick_store_entry"), Mapping
-                ) and not _physical_frame_valid(
-                    output_root, record, prefix=True
                 ):
-                    continue
+                    prefix_reader = _physical_frame_reader(
+                        output_root, record, prefix=True
+                    )
+                    if prefix_reader is None:
+                        continue
+                    metadata = prefix_reader.metadata
+                    if (
+                        metadata.get(REPLAY_EXTENT_METADATA_KEY)
+                        != record.get("audit_prefix_extent")
+                        or not native_episode_pipeline_contract_valid(
+                            metadata, record
+                        )
+                        or str(metadata.get("source_sha256") or "")
+                        != str(record.get("source_sha256") or "")
+                        or int(metadata.get("selection_index", -1))
+                        != int(record.get("selection_index", -2))
+                        or str(metadata.get("selection_digest") or "")
+                        != str(record.get("selection_digest") or "")
+                    ):
+                        raise RuntimeError(
+                            f"native prefix frame/result proof changed: {tag}"
+                        )
                 with queue.connection:
                     queue.connection.execute(
                         """
@@ -3803,15 +4772,35 @@ def verify_published_tick_store(
                                 actor_ticks += 1
                                 visible_references += len(visible)
                                 empty_actor_ticks += len(visible) < 4
+                        normal_extent = bool(
+                            isinstance(extent, Mapping)
+                            and extent.get("training_admission")
+                            == "actor_bc_censored_prefix_v1"
+                            and extent.get("semantic_match") is True
+                            and extent.get("failure_domain") == "semantic"
+                        )
+                        special_extent = bool(
+                            isinstance(extent, Mapping)
+                            and extent.get("training_admission")
+                            == "actor_bc_mask_invalid_censored_prefix_v1"
+                            and extent.get("failure_class")
+                            == MASK_INVALID_FAILURE_CLASS
+                            and extent.get("failure_domain")
+                            == MASK_INVALID_FAILURE_DOMAIN
+                            and extent.get("semantic_match") is False
+                            and extent.get("maskless_reference_semantic_match")
+                            is True
+                            and extent.get("pre_censor_tick_state_parity") is True
+                            and mask_invalid_censor_provenance_valid(
+                                extent.get("censor_provenance")
+                            )
+                        )
                         if (
                             not isinstance(extent, Mapping)
                             or extent.get("kind") != REPLAY_EXTENT_KIND
                             or extent.get("extent") != "valid_prefix"
-                            or extent.get("training_admission")
-                            != "actor_bc_censored_prefix_v1"
+                            or not (normal_extent or special_extent)
                             or extent.get("source_episode_complete") is not False
-                            or extent.get("semantic_match") is not True
-                            or extent.get("failure_domain") != "semantic"
                             or extent.get("failure_tick_has_labels") is not False
                             or extent.get("terminal_target") != "unknown_censored"
                             or extent.get("terminal_validated") is not False

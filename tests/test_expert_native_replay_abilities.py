@@ -180,6 +180,41 @@ def template() -> dict:
 
 
 class ExpertNativeReplayAbilityTests(unittest.TestCase):
+    def test_unique_mask_rejection_audits_boundary_batch_before_joint_act(self) -> None:
+        class OneInvalidMaskEnv(FakeNativeEnv):
+            def probe_grid(self, *, side: int, deck_index: int) -> dict:
+                value = super().probe_grid(side=side, deck_index=deck_index)
+                if (side, deck_index) == (0, 0):
+                    value["rows"] = ["0" * 18 for _ in range(32)]
+                    value["valid_cells"] = 0
+                return value
+
+        env = OneInvalidMaskEnv()
+        result = execute_plan(
+            env,
+            compile_battle(ability_battle()),
+            template(),
+            calibration(),
+            capture_deployment_masks=True,
+        )
+        self.assertEqual(
+            result.failure,
+            "derived_deployment_mask_rejected_source_event_0",
+        )
+        self.assertEqual(result.deployment_mask_label_checks, 2)
+        self.assertEqual(result.deployment_mask_label_rejections, 1)
+        self.assertEqual(
+            len(result.deployment_mask_label_rejection_sequence), 1
+        )
+        self.assertEqual(
+            result.deployment_mask_first_label_rejection[
+                "source_event_index"
+            ],
+            0,
+        )
+        self.assertEqual(env.submitted, [])
+        self.assertEqual(result.action_acceptance_sequence, ())
+
     def test_premature_native_terminal_is_semantic_not_protocol_mismatch(self) -> None:
         class PrematureTerminalEnv(FakeNativeEnv):
             def step(self, steps: int) -> dict:

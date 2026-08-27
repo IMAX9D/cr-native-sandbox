@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
@@ -24,6 +24,8 @@ from expert_v1.compile_native_bc_dataset import (
     _card_vocab,
     _compile_actor,
     _episode_extent_contract,
+    _verify_mask_invalid_pocket_sidecar_proof,
+    _verify_mask_invalid_stored_tick_proof,
     _release_capacity_reservation,
     _stratified_capacity_sample,
     _validate_tick_store,
@@ -48,6 +50,7 @@ from expert_v1.tick_store_v1.deployment_masks import (
     DeploymentMaskContractError,
     DeploymentMaskStore,
     NativeDeploymentMaskCapture,
+    normalize_native_probe,
     resolve_deployment_reference,
 )
 from expert_v1.tick_store_v1.schema import (
@@ -822,6 +825,289 @@ class NativeBcCompilerTests(unittest.TestCase):
                 replay_extent="valid_prefix",
             )
 
+    def test_mask_invalid_censor_extent_is_exact_and_tamper_closed(self) -> None:
+        digest = "a" * 64
+        boundary_action = {
+            "accepted": True,
+            "execution_tick": 21,
+            "result_code": 0,
+            "side": 0,
+            "source_event_index": 7,
+            "source_tick": 20,
+            "type": "play",
+        }
+        provenance = {
+            "schema_version": 3,
+            "kind": "native_mask_invalid_safe_censor_v3",
+            "rejected_source_event_index": 7,
+            "source_marker_index": 17,
+            "source_tick": 20,
+            "execution_tick": 21,
+            "side": 0,
+            "deck_index": 2,
+            "card_id": 26_000_010,
+            "x": 3_500,
+            "y": 17_501,
+            "mask_content_sha256": digest,
+            "boundary_deploy_labels_checked": 1,
+            "mask_rejection_count": 1,
+            "failure_event_executed": False,
+            "failure_label_compiled": False,
+            "label_or_mask_repair_applied": False,
+            "censored_tick_event_indices": [7],
+            "safe_action_count": 0,
+            "safe_action_transcript_sha256": digest,
+            "mask_lane_action_metrics": {
+                "attempted": 0, "responded": 0, "accepted": 0,
+                "rejected": 0, "no_response": 0, "exceptions": 0,
+            },
+            "maskless_reference_reset_count": 1,
+            "maskless_reference_layout_mode": "fixed_preflight_seed_replay",
+            "pre_censor_tick_start": 10,
+            "pre_censor_tick_stop_exclusive": 21,
+            "pre_censor_tick_count": 11,
+            "mask_lane_tick_sha256": digest,
+            "maskless_tick_sha256": digest,
+            "tick_state_parity": True,
+            "preflight_semantics_sha256": digest,
+            "maskless_reference_semantics_sha256": digest,
+            "preflight_boundary_accepted_action": boundary_action,
+            "preflight_boundary_accepted_action_sha256": hashlib.sha256(
+                json.dumps(
+                    boundary_action, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest(),
+            "locked_pocket": {
+                "reason": "live_enemy_princess_tower_locked_pocket_v1",
+                "tower_side": 1, "tower_x": 3_500,
+                "tower_y": 25_500, "tower_hp": 3_052,
+                "lane": 0, "row": 17, "column": 3,
+            },
+        }
+        extent = {
+            "kind": "cr_native_replay_extent_v1",
+            "extent": "valid_prefix",
+            "training_admission": "actor_bc_mask_invalid_censored_prefix_v1",
+            "source_episode_complete": False,
+            "every_native_tick_present_within_extent": True,
+            "semantic_match": False,
+            "maskless_reference_semantic_match": True,
+            "pre_censor_tick_state_parity": True,
+            "failure_class": "native_deployment_mask_invalid_censored",
+            "failure_domain": "semantic_mask_invalid",
+            "failure_tick_has_labels": False,
+            "terminal_target": "unknown_censored",
+            "terminal_validated": False,
+            "deployment_masks": "partial_native_visible_hand_complete_v1",
+            "observation_tick_start": 10,
+            "observation_tick_stop_exclusive": 22,
+            "action_label_tick_stop_exclusive": 21,
+            "timing_censor_tick_exclusive": 21,
+            "timing_target": "right_censored_at_failure_tick_v1",
+            "first_invalid_source_event_index": 7,
+            "censor_provenance": provenance,
+            "mask_coverage": {
+                "all_retained_visible_hand_slots_covered": True,
+                "retained_ticks": 11,
+                "actor_ticks": 22,
+                "visible_slot_references": 88,
+                "empty_slot_actor_ticks": 0,
+                "safe_deploy_labels": 0,
+                "checked_deploy_labels": 1,
+                "rejected_deploy_labels": 0,
+            },
+        }
+        value = _episode_extent_contract(
+            {"native_replay_extent_v1": extent},
+            tick_count=12,
+            replay_extent="valid_prefix",
+        )
+        self.assertEqual(value["compiled_tick_count"], 11)
+        for field, replacement in (
+            ("rejected_source_event_index", 8),
+            ("mask_rejection_count", 2),
+            ("mask_lane_tick_sha256", "b" * 64),
+        ):
+            changed = deepcopy(extent)
+            changed["censor_provenance"][field] = replacement
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "replay extent contract"
+            ):
+                _episode_extent_contract(
+                    {"native_replay_extent_v1": changed},
+                    tick_count=12,
+                    replay_extent="valid_prefix",
+                )
+
+    def test_mask_invalid_proof_is_recomputed_from_stored_ticks_and_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contract_path = root / "contract.json"
+            published = write_native_ingest_contract(contract_path)
+            contract_value = json.loads(contract_path.read_text())
+            contract = load_native_ingest_contract(contract_path)
+            source = json.loads(FIXTURE.read_text())
+            source["authoritative_native_contract"] = {
+                "game_version": contract_value["game_version"],
+                "contract_sha256": contract_value["contract_sha256"],
+                "contract_file_sha256": published["file_sha256"],
+            }
+            plan = compile_battle(source, native_ingest_contract=contract)
+            states = _states(source, contract)
+            action = plan.actions[0]
+            boundary_tick = int(action.tick) + 1
+            pre_censor = tuple(
+                state for state in states if int(state.tick) < boundary_tick
+            )
+            tick_sha = hashlib.sha256(json.dumps(
+                [asdict(state) for state in pre_censor],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            boundary_actions = [
+                candidate for candidate in plan.actions
+                if int(candidate.tick) + 1 == boundary_tick
+            ]
+            censored_indices = sorted(
+                int(candidate.source_event_index)
+                for candidate in (*plan.actions, *plan.ability_events)
+                if int(candidate.tick) + 1 == boundary_tick
+            )
+            card = plan.sides[int(action.side)].deck[
+                int(action.logical_card_index)
+            ]
+            provenance = {
+                "execution_tick": boundary_tick,
+                "rejected_source_event_index": int(action.source_event_index),
+                "source_marker_index": int(action.source_marker_index),
+                "source_tick": int(action.tick),
+                "side": int(action.side),
+                "deck_index": int(action.logical_card_index),
+                "card_id": int(card.card_id),
+                "x": int(action.x),
+                "y": int(action.y),
+                "censored_tick_event_indices": censored_indices,
+                "boundary_deploy_labels_checked": len(boundary_actions),
+                "pre_censor_tick_start": int(pre_censor[0].tick),
+                "pre_censor_tick_stop_exclusive": boundary_tick,
+                "pre_censor_tick_count": len(pre_censor),
+                "mask_lane_tick_sha256": tick_sha,
+                "maskless_tick_sha256": tick_sha,
+                "preflight_boundary_accepted_action": {
+                    "accepted": True,
+                    "execution_tick": boundary_tick,
+                    "result_code": 0,
+                    "side": int(action.side),
+                    "source_event_index": int(action.source_event_index),
+                    "source_tick": int(action.tick),
+                    "type": "play",
+                },
+            }
+            provenance["preflight_boundary_accepted_action_sha256"] = (
+                hashlib.sha256(json.dumps(
+                    provenance["preflight_boundary_accepted_action"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest()
+            )
+            episode = SimpleNamespace(iter_ticks=lambda: iter(states))
+            verified = _verify_mask_invalid_stored_tick_proof(
+                episode,
+                plan,
+                action_execution_tick_offset=1,
+                provenance=provenance,
+            )
+            self.assertEqual(len(verified), len(boundary_actions))
+
+            mutations = {
+                "side": 1 - int(action.side),
+                "deck_index": (int(action.logical_card_index) + 1) % 8,
+                "card_id": int(card.card_id) + 1,
+                "x": int(action.x) + 1,
+                "y": int(action.y) + 1,
+                "source_tick": int(action.tick) + 1,
+                "censored_tick_event_indices": censored_indices[:-1],
+                "pre_censor_tick_count": len(pre_censor) - 1,
+            }
+            for field, replacement in mutations.items():
+                with self.subTest(field=field):
+                    changed = deepcopy(provenance)
+                    changed[field] = replacement
+                    with self.assertRaises(NativeBcCompileError):
+                        _verify_mask_invalid_stored_tick_proof(
+                            episode,
+                            plan,
+                            action_execution_tick_offset=1,
+                            provenance=changed,
+                        )
+
+            resigned = deepcopy(provenance)
+            resigned["mask_lane_tick_sha256"] = "b" * 64
+            resigned["maskless_tick_sha256"] = "b" * 64
+            with self.assertRaisesRegex(
+                NativeBcCompileError, "Tick SHA differs from store"
+            ):
+                _verify_mask_invalid_stored_tick_proof(
+                    episode,
+                    plan,
+                    action_execution_tick_offset=1,
+                    provenance=resigned,
+                )
+
+    def test_mask_invalid_pocket_reason_is_recomputed_from_tick_and_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = DeploymentMaskStore(Path(directory))
+            payload = normalize_native_probe(
+                _Probe({(0, 0): 3}, {(0, 0): 26_000_010}).probe_grid(
+                    side=0, deck_index=0
+                )
+            )
+            published = store.publish(payload)
+            state = TickState(
+                tick=21,
+                players=(
+                    PlayerPrivate(0, 50_000, (0, 1, 2, 3), 4),
+                    PlayerPrivate(1, 50_000, (0, 1, 2, 3), 4),
+                ),
+                towers=_tower_states(),
+                entities=(),
+                episode=EpisodeState(1, 0, 1, 0, 0, 0, 0, 0, 0),
+            )
+            provenance = {
+                "mask_content_sha256": published["content_sha256"],
+                "side": 0,
+                "card_id": 26_000_010,
+                "x": 3_500,
+                "y": 17_501,
+                "locked_pocket": {
+                    "reason": "live_enemy_princess_tower_locked_pocket_v1",
+                    "tower_side": 1,
+                    "tower_x": 3_500,
+                    "tower_y": 25_500,
+                    "tower_hp": 4_858,
+                    "lane": 0,
+                    "row": 17,
+                    "column": 3,
+                },
+            }
+            _verify_mask_invalid_pocket_sidecar_proof(
+                state, store, provenance
+            )
+            for field, replacement in (
+                ("card_id", 28_000_015),
+                ("y", 16_501),
+            ):
+                with self.subTest(field=field):
+                    changed = deepcopy(provenance)
+                    changed[field] = replacement
+                    with self.assertRaisesRegex(
+                        NativeBcCompileError, "locked-pocket proof"
+                    ):
+                        _verify_mask_invalid_pocket_sidecar_proof(
+                            state, store, changed
+                        )
+
     def test_missing_mask_sidecar_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1235,13 +1521,26 @@ class NativeBcCompilerTests(unittest.TestCase):
                         "kind": "cr_native_replay_extent_v1",
                         "extent": "valid_prefix",
                         "training_admission": "actor_bc_censored_prefix_v1",
+                        "source_episode_complete": False,
+                        "every_native_tick_present_within_extent": True,
+                        "semantic_match": True,
+                        "failure_domain": "semantic",
                         "terminal_target": "unknown_censored",
+                        "terminal_validated": False,
                         "timing_target": "right_censored_at_failure_tick_v1",
                         "deployment_masks": (
                             "partial_native_visible_hand_complete_v1"
                         ),
+                        "observation_tick_start": 10,
+                        "observation_tick_stop_exclusive": 11,
+                        "action_label_tick_stop_exclusive": 11,
+                        "timing_censor_tick_exclusive": 11,
                         "mask_coverage": {
                             "all_retained_visible_hand_slots_covered": True,
+                            "retained_ticks": 1,
+                            "actor_ticks": 2,
+                            "safe_deploy_labels": 0,
+                            "checked_deploy_labels": 0,
                             "rejected_deploy_labels": 0,
                         },
                         "failure_tick_has_labels": False,

@@ -13,6 +13,8 @@ from expert_v1.native_dataset_generator import (
     COORDINATE_PROVENANCE,
     _failure_class,
     _failure_domain,
+    _combined_phase_metrics,
+    _mask_invalid_censor_evidence,
     NativeDatasetTask,
     PreflightFullTraceDivergence,
     RecordingCountingEnv,
@@ -187,6 +189,9 @@ def replay_result_stub(
         deployment_mask_payloads=mask_payloads,
         deployment_mask_label_checks=0,
         deployment_mask_label_rejections=0,
+        deployment_mask_first_label_rejection=None,
+        deployment_mask_label_rejection_sequence=(),
+        action_execution_tick_offset=1,
     )
 
 
@@ -351,6 +356,225 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
         self.assertTrue(second.kwargs["capture_deployment_masks"])
         self.assertIsNotNone(second.kwargs["tick_sink"])
         self.assertEqual(outcome.semantic_diff, {})
+
+    def test_unique_mask_rejection_builds_strict_fixed_seed_censor(self) -> None:
+        failure_event = {
+            "source_tick": 20, "execution_tick": 21,
+            "source_event_index": 0, "type": "play", "side": 0,
+            "accepted": True, "result_code": 0,
+        }
+        states = tuple(tick_states(12))
+        preflight = replay_result_stub(
+            success=True, chosen_seed=7, action_sequence=(failure_event,)
+        )
+        masked = replay_result_stub(
+            success=False,
+            chosen_seed=7,
+            failure="derived_deployment_mask_rejected_source_event_0",
+            action_sequence=(),
+            collected_states=states,
+            with_masks=True,
+        )
+        masked.final_tick = 21
+        masked.seeds_tested = 0
+        masked.seed_search_native_resets = 1
+        masked.layout_resolution_mode = "fixed_preflight_seed_replay"
+        digest = next(iter(masked.deployment_mask_payloads))
+        rejection = {
+            "tick": 21, "side": 0, "deck_index": 0,
+            "card_id": 26_000_000, "x": 3_500, "y": 17_501,
+            "content_sha256": digest, "legal": False,
+            "reasons": ["position_not_in_derived_native_mask"],
+            "source_event_index": 0, "source_marker_index": 9,
+            "locked_pocket": {
+                "reason": "live_enemy_princess_tower_locked_pocket_v1",
+                "tower_side": 1, "tower_x": 3_500,
+                "tower_y": 25_500, "tower_hp": 3_052,
+                "lane": 0, "row": 17, "column": 3,
+            },
+        }
+        masked.deployment_mask_label_checks = 1
+        masked.deployment_mask_label_rejections = 1
+        masked.deployment_mask_first_label_rejection = rejection
+        masked.deployment_mask_label_rejection_sequence = (rejection,)
+        reference = replay_result_stub(
+            success=True,
+            chosen_seed=7,
+            action_sequence=(failure_event,),
+            collected_states=states,
+        )
+        reference.seeds_tested = 0
+        reference.seed_search_native_resets = 1
+        reference.layout_resolution_mode = "fixed_preflight_seed_replay"
+        action = SimpleNamespace(
+            source_event_index=0, source_marker_index=9, tick=20,
+            side=0, logical_card_index=0, x=3_500, y=17_501,
+        )
+        plan = SimpleNamespace(
+            battle_tag="MASK-CENSOR",
+            actions=(action,),
+            ability_events=(),
+            sides=(
+                SimpleNamespace(deck=(SimpleNamespace(card_id=26_000_000),)),
+                SimpleNamespace(deck=()),
+            ),
+        )
+        evidence = _mask_invalid_censor_evidence(
+            preflight, masked, reference, plan
+        )
+        self.assertIsNotNone(evidence)
+        self.assertFalse(evidence["failure_event_executed"])
+        self.assertEqual(
+            evidence["preflight_boundary_accepted_action"], failure_event
+        )
+        self.assertEqual(
+            evidence["preflight_boundary_accepted_action_sha256"],
+            hashlib.sha256(json.dumps(
+                failure_event, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest(),
+        )
+
+        rejected_preflight = replay_result_stub(
+            success=False,
+            chosen_seed=7,
+            failure="native_rejected_tick_21_source_tick_20",
+            action_sequence=({**failure_event, "accepted": False},),
+        )
+        self.assertIsNone(_mask_invalid_censor_evidence(
+            rejected_preflight, masked, reference, plan
+        ))
+
+        tampered_n = SimpleNamespace(**vars(masked))
+        tampered_n.failure = "derived_deployment_mask_rejected_source_event_1"
+        self.assertIsNone(
+            _mask_invalid_censor_evidence(preflight, tampered_n, reference, plan)
+        )
+        tampered_count = SimpleNamespace(**vars(masked))
+        tampered_count.deployment_mask_label_rejections = 2
+        self.assertIsNone(
+            _mask_invalid_censor_evidence(
+                preflight, tampered_count, reference, plan
+            )
+        )
+        changed_states = list(states)
+        changed_states[2] = replace(
+            changed_states[2],
+            episode=replace(changed_states[2].episode, battle_flag=9),
+        )
+        tampered_state = SimpleNamespace(**vars(masked))
+        tampered_state.collected_tick_states = tuple(changed_states)
+        self.assertIsNone(
+            _mask_invalid_censor_evidence(
+                preflight, tampered_state, reference, plan
+            )
+        )
+
+        staged = StagedTickSink()
+        with patch(
+            "expert_v1.native_dataset_generator.execute_plan",
+            side_effect=[preflight, masked, reference],
+        ) as mocked, patch(
+            "expert_v1.native_dataset_generator.compatible_native_seed_search",
+            return_value=FakeCompatibleSeedSearch(),
+        ):
+            outcome = execute_two_phase_plan(
+                object(), plan, {}, StagedTickSink(), prefix_staged=staged,
+                seed=1, maximum_seeds_to_test=16, trace_batch_steps=8,
+                tick_store_metadata={"source_sha256": "a" * 64},
+            )
+        self.assertEqual(mocked.call_count, 3)
+        self.assertTrue(outcome.mask_invalid_prefix)
+        self.assertTrue(outcome.failure_prefix_staged)
+        self.assertIsNone(outcome.semantic_diff)
+        self.assertIs(outcome.maskless_reference, reference)
+        self.assertIsNotNone(outcome.maskless_reference_recorder)
+        self.assertGreaterEqual(outcome.maskless_reference_seconds, 0.0)
+        extent = staged.episode.metadata["native_replay_extent_v1"]
+        self.assertEqual(
+            extent["training_admission"],
+            "actor_bc_mask_invalid_censored_prefix_v1",
+        )
+        self.assertEqual(extent["timing_censor_tick_exclusive"], 21)
+        self.assertFalse(extent["semantic_match"])
+        self.assertTrue(extent["pre_censor_tick_state_parity"])
+        outcome.maskless_reference_recorder.native_actions_attempted = 3
+        outcome.maskless_reference_recorder.native_actions_responded = 3
+        outcome.maskless_reference_recorder.native_actions_accepted = 3
+        combined = _combined_phase_metrics(
+            outcome.preflight_recorder,
+            outcome.full_trace_recorder,
+            outcome.failure_prefix_recorder,
+            outcome.maskless_reference_recorder,
+        )
+        self.assertEqual(
+            combined["native_actions_attempted"],
+            sum(
+                recorder.native_actions_attempted
+                for recorder in (
+                    outcome.preflight_recorder,
+                    outcome.full_trace_recorder,
+                    outcome.maskless_reference_recorder,
+                )
+                if recorder is not None
+            ),
+        )
+
+        for name, changed in (
+            (
+                "zero_rejections",
+                {
+                    "deployment_mask_label_rejections": 0,
+                    "deployment_mask_first_label_rejection": None,
+                    "deployment_mask_label_rejection_sequence": (),
+                },
+            ),
+            (
+                "multiple_rejections",
+                {
+                    "deployment_mask_label_rejections": 2,
+                    "deployment_mask_first_label_rejection": rejection,
+                    "deployment_mask_label_rejection_sequence": (
+                        rejection,
+                        {**rejection, "source_event_index": 1},
+                    ),
+                },
+            ),
+            (
+                "generic_derived_false_not_locked_pocket",
+                {
+                    "deployment_mask_label_rejections": 1,
+                    "deployment_mask_first_label_rejection": {
+                        **rejection, "locked_pocket": None,
+                    },
+                    "deployment_mask_label_rejection_sequence": ({
+                        **rejection, "locked_pocket": None,
+                    },),
+                },
+            ),
+        ):
+            with self.subTest(name=name):
+                invalid = SimpleNamespace(**vars(masked))
+                for field, value in changed.items():
+                    setattr(invalid, field, value)
+                invalid_prefix = StagedTickSink()
+                with patch(
+                    "expert_v1.native_dataset_generator.execute_plan",
+                    side_effect=[preflight, invalid],
+                ) as rejected_mock, patch(
+                    "expert_v1.native_dataset_generator.compatible_native_seed_search",
+                    return_value=FakeCompatibleSeedSearch(),
+                ):
+                    rejected = execute_two_phase_plan(
+                        object(), plan, {}, StagedTickSink(),
+                        prefix_staged=invalid_prefix,
+                        seed=1, maximum_seeds_to_test=16,
+                        trace_batch_steps=8,
+                        tick_store_metadata={"source_sha256": "a" * 64},
+                    )
+                self.assertEqual(rejected_mock.call_count, 2)
+                self.assertFalse(rejected.mask_invalid_prefix)
+                self.assertFalse(rejected.failure_prefix_staged)
+                self.assertIsNone(invalid_prefix.episode)
 
     def test_semantic_failure_prefix_is_consecutive_censored_and_audit_only(self) -> None:
         action = ({
@@ -732,17 +956,73 @@ class NativeDatasetGeneratorTest(unittest.TestCase):
                 )
             prefix_root = root / "audit-prefix-shards"
             sink = WorkerShardSink(prefix_root, "prefix", episodes_per_shard=1)
-            entry = sink.append("PREFIX-CRASH", tick_states(), {"audit": True})
+            extent = {
+                "kind": "cr_native_replay_extent_v1",
+                "extent": "valid_prefix",
+                "training_admission": "actor_bc_censored_prefix_v1",
+                "source_episode_complete": False,
+                "every_native_tick_present_within_extent": True,
+                "fixed_seed_replay": True,
+                "chosen_seed": 7,
+                "preflight_semantics_sha256": "a" * 64,
+                "prefix_replay_semantics_sha256": "a" * 64,
+                "semantic_match": True,
+                "failure_domain": "semantic",
+                "failure_tick_has_labels": False,
+                "terminal_target": "unknown_censored",
+                "terminal_validated": False,
+                "deployment_masks": "partial_native_visible_hand_complete_v1",
+                "observation_tick_start": 10,
+                "observation_tick_stop_exclusive": 14,
+                "action_label_tick_stop_exclusive": 13,
+                "timing_censor_tick_exclusive": 13,
+                "timing_target": "right_censored_at_failure_tick_v1",
+                "mask_coverage": {
+                    "all_retained_visible_hand_slots_covered": True,
+                    "retained_ticks": 3,
+                    "actor_ticks": 6,
+                    "visible_slot_references": 24,
+                    "empty_slot_actor_ticks": 0,
+                    "safe_deploy_labels": 0,
+                    "checked_deploy_labels": 0,
+                    "rejected_deploy_labels": 0,
+                },
+            }
+            audit = semantic_audit(seed=7, success=False, prefix=0)
+            entry = sink.append("PREFIX-CRASH", tick_states(), {
+                "source_sha256": "a" * 64,
+                "selection_index": 0,
+                "selection_digest": "b" * 64,
+                "native_replay_extent_v1": extent,
+                "native_execution_pipeline": {
+                    "contract_version": 4,
+                    "mode": "single_semantic_seed_preflight_then_fixed_seed_trace_v4",
+                    "preflight_chosen_seed": 7,
+                    "preflight_semantics_sha256": "a" * 64,
+                    "semantic_seed_selection": audit,
+                },
+            })
             sink.finalize()
             atomic_json(root / "results" / "PREFIX_CRASH.json", {
                 **current_result_pipeline_fields(success=False),
                 "schema_version": 1,
                 "kind": "expert_authoritative_native_tick_result_v1",
                 "battle_tag": "PREFIX-CRASH",
+                "selection_index": 0,
+                "selection_digest": "b" * 64,
+                "source_sha256": "a" * 64,
                 "teacher_forced_success": False,
                 "failure": "native_rejected_tick_13_codes_[4]",
+                "failure_domain": "semantic",
                 "retry_scheduled": False,
                 "audit_prefix_tick_store_entry": entry,
+                "audit_prefix_extent": extent,
+                "failure_prefix_tick_count": 4,
+                "failure_prefix_semantic_match": True,
+                "deployment_mask_label_rejections": 0,
+                "deployment_mask_probe_rpc_count": 1,
+                "native_deployment_mask_probes_attempted": 1,
+                "native_deployment_mask_probe_exceptions": 0,
             })
             self.assertEqual(reconcile_result_files(root, queue_path), 1)
             with TickStoreWorkQueue(queue_path) as queue:
