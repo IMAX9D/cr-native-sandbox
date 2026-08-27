@@ -754,6 +754,9 @@ class OneClickConfig:
     audit_workers: int = max(8, os.cpu_count() or 8)
     compile_io_workers: int = min(32, max(4, (os.cpu_count() or 4) * 2))
     compile_process_workers: int = max(1, (os.cpu_count() or 2) // 2)
+    # Only isolated current-chain smoke runs may preserve exact token deficits.
+    # Production one-click configurations must leave this false.
+    allow_smoke_coverage_deficits: bool = False
 
     @property
     def state_path(self) -> Path:
@@ -1196,7 +1199,7 @@ def native_generation_command(config: OneClickConfig) -> tuple[str, ...]:
 
 
 def compile_command(config: OneClickConfig) -> tuple[str, ...]:
-    return (
+    command = (
         str(config.training_python),
         "-m",
         "expert_v1.compile_native_bc_dataset",
@@ -1219,11 +1222,14 @@ def compile_command(config: OneClickConfig) -> tuple[str, ...]:
         "--process-workers",
         str(config.compile_process_workers),
     )
+    if config.allow_smoke_coverage_deficits:
+        command += ("--allow-smoke-coverage-deficits",)
+    return command
 
 
 def training_smoke_command(config: OneClickConfig) -> tuple[str, ...]:
     dataset_sha = sha256_file(config.compiled_root / "manifest.json")
-    return (
+    command = (
         str(config.training_python),
         "-m",
         "expert_v1.training_v1.train",
@@ -1259,6 +1265,9 @@ def training_smoke_command(config: OneClickConfig) -> tuple[str, ...]:
         "auto",
         "--allow-unanchored-native-states",
     )
+    if config.allow_smoke_coverage_deficits:
+        command += ("--allow-nonproduction-smoke",)
+    return command
 
 
 def formal_training_command(config: OneClickConfig) -> tuple[str, ...]:
@@ -3252,8 +3261,32 @@ class OneClickOrchestrator:
             gates = manifest.get("quality_gates") or {}
             token_coverage = manifest.get("token_coverage") or {}
             token_receipt = _read_json(token_receipt_path)
+            smoke_coverage_mode = config.allow_smoke_coverage_deficits
+            coverage_evaluation = token_receipt.get("evaluation") or {}
+            coverage_deficits_present = any(
+                rows
+                for name in ("hard_floor_deficits", "adaptive_quota_deficits")
+                for rows in ((coverage_evaluation.get(name) or {}).values())
+            )
+            admission_invalid = (
+                (
+                    manifest.get("production_ready") is not False
+                    or manifest.get("smoke_only") is not True
+                    or manifest.get("smoke_reason")
+                    != "smoke_deficits_preserved_v1"
+                    or (token_coverage.get("gate") or {}).get("admitted") is not False
+                    or not coverage_deficits_present
+                )
+                if smoke_coverage_mode
+                else (
+                    manifest.get("production_ready") is not True
+                    or manifest.get("smoke_only") is True
+                    or (token_coverage.get("gate") or {}).get("admitted") is not True
+                    or coverage_deficits_present
+                )
+            )
             if (
-                manifest.get("production_ready") is not True
+                admission_invalid
                 or manifest.get("native_replay_validated") is not True
                 or Path(str(source.get("path") or "")).resolve()
                 != config.frozen_manifest.resolve()
@@ -3286,28 +3319,17 @@ class OneClickOrchestrator:
                 or token_receipt.get("kind") != TOKEN_COVERAGE_RECEIPT_KIND
                 or token_receipt.get("schema_version")
                 != TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION
-                or (token_coverage.get("gate") or {}).get("admitted") is not True
                 or token_coverage.get("receipt_file_sha256")
                 != sha256_file(token_receipt_path)
                 or token_coverage.get("receipt_canonical_sha256")
                 != hashlib.sha256(
                     canonical_json_bytes(token_receipt)
                 ).hexdigest()
-                or any(
-                    rows
-                    for name in (
-                        "hard_floor_deficits",
-                        "adaptive_quota_deficits",
-                    )
-                    for rows in (
-                        (
-                            (token_receipt.get("evaluation") or {}).get(name)
-                            or {}
-                        ).values()
-                    )
-                )
             ):
-                raise OneClickError("compiled dataset failed production admission")
+                raise OneClickError(
+                    "compiled dataset failed "
+                    + ("isolated smoke admission" if smoke_coverage_mode else "production admission")
+                )
             required_zero = (
                 "split_collisions",
                 "forbidden_actor_features",

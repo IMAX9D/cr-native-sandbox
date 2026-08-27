@@ -1342,6 +1342,39 @@ class NativeBcCompilerTests(unittest.TestCase):
             ):
                 _validate_tick_store(prefix_root, workers=1)
 
+    def test_smoke_coverage_admission_is_explicitly_bound_into_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tick_root, source, contract, receipt = self._inputs(root)
+            production = create_compile_plan(
+                tick_root,
+                source,
+                root / "production",
+                contract,
+                receipt,
+                maximum_rows_per_shard=10_000,
+            )
+            smoke = create_compile_plan(
+                tick_root,
+                source,
+                root / "smoke",
+                contract,
+                receipt,
+                maximum_rows_per_shard=10_000,
+                allow_smoke_coverage_deficits=True,
+            )
+            self.assertEqual(
+                production["compiler"]["token_coverage_admission"],
+                "production_strict_v1",
+            )
+            self.assertEqual(
+                smoke["compiler"]["token_coverage_admission"],
+                "smoke_deficits_preserved_v1",
+            )
+            self.assertNotEqual(
+                production["input_content_sha256"], smoke["input_content_sha256"]
+            )
+
     def test_capacity_preflight_is_bound_and_low_disk_fails_before_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

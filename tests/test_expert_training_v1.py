@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -12,6 +13,7 @@ from expert_v1.training_v1.losses import behaviour_cloning_loss
 from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy
 from expert_v1.training_v1.schema import DatasetContractError, read_manifest, validate_shard
 from expert_v1.training_v1.smoke_data import create_smoke_dataset
+from expert_v1.training_v1.train import _validate_training_admission
 
 
 class ExpertTrainingV1Tests(unittest.TestCase):
@@ -22,6 +24,35 @@ class ExpertTrainingV1Tests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_nonproduction_smoke_requires_exact_explicit_admission(self) -> None:
+        manifest = {
+            "production_ready": False,
+            "smoke_only": True,
+            "smoke_reason": "smoke_deficits_preserved_v1",
+            "token_coverage": {"gate": {"admitted": False}},
+        }
+        with self.assertRaisesRegex(RuntimeError, "requires --allow"):
+            _validate_training_admission(
+                SimpleNamespace(smoke=True, allow_nonproduction_smoke=False),
+                self.root,
+                manifest,
+                "native_state_v1",
+            )
+        _validate_training_admission(
+            SimpleNamespace(smoke=True, allow_nonproduction_smoke=True),
+            self.root,
+            manifest,
+            "native_state_v1",
+        )
+        manifest["smoke_reason"] = "forged"
+        with self.assertRaisesRegex(RuntimeError, "authenticated"):
+            _validate_training_admission(
+                SimpleNamespace(smoke=True, allow_nonproduction_smoke=True),
+                self.root,
+                manifest,
+                "native_state_v1",
+            )
 
     def test_contract_and_recurrent_loss(self) -> None:
         shard = self.root / self.manifest["splits"]["train"][0]

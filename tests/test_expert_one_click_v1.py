@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -1395,6 +1396,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
             )
 
             compile_args = compile_command(config)
+            self.assertNotIn("--allow-smoke-coverage-deficits", compile_args)
             self.assertEqual(
                 compile_args[compile_args.index("--schema5-manifest") + 1],
                 str(config.frozen_manifest),
@@ -1406,6 +1408,7 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 str(config.native_generation_receipt),
             )
             smoke = training_smoke_command(config)
+            self.assertNotIn("--allow-nonproduction-smoke", smoke)
             self.assertIn("--smoke", smoke)
             self.assertIn("--resume", smoke)
             self.assertEqual(
@@ -1416,6 +1419,17 @@ class ExpertOneClickV1Test(unittest.TestCase):
                 str(config.frozen_manifest),
             )
             self.assertIn("--allow-unanchored-native-states", smoke)
+            isolated_smoke = replace(
+                config, allow_smoke_coverage_deficits=True
+            )
+            self.assertIn(
+                "--allow-smoke-coverage-deficits",
+                compile_command(isolated_smoke),
+            )
+            self.assertIn(
+                "--allow-nonproduction-smoke",
+                training_smoke_command(isolated_smoke),
+            )
             formal = formal_training_command(config)
             self.assertIn("--resume", formal)
             self.assertNotIn("--smoke", formal)

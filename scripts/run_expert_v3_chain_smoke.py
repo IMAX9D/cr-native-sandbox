@@ -511,6 +511,7 @@ def build_config(args: argparse.Namespace) -> SmokeConfig:
         audit_workers=max(8, args.audit_workers),
         compile_io_workers=max(1, args.compile_io_workers),
         compile_process_workers=max(1, args.compile_process_workers),
+        allow_smoke_coverage_deficits=True,
     )
 
 

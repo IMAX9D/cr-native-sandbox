@@ -382,6 +382,25 @@ def _validate_training_admission(
     observation_mode: str,
 ) -> None:
     if args.smoke:
+        if getattr(args, "allow_nonproduction_smoke", False):
+            if (
+                manifest.get("production_ready") is not False
+                or manifest.get("smoke_only") is not True
+                or manifest.get("smoke_reason")
+                != "smoke_deficits_preserved_v1"
+                or ((manifest.get("token_coverage") or {}).get("gate") or {}).get(
+                    "admitted"
+                )
+                is not False
+            ):
+                raise RuntimeError(
+                    "non-production smoke requires an authenticated "
+                    "smoke_deficits_preserved_v1 dataset"
+                )
+        elif manifest.get("production_ready") is False and manifest.get("smoke_only") is True:
+            raise RuntimeError(
+                "smoke-only compiled dataset requires --allow-nonproduction-smoke"
+            )
         return
     if manifest.get("production_ready") is not True:
         raise RuntimeError("dataset is not marked production_ready")
@@ -1175,6 +1194,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-eval-batches", type=int, default=0)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument(
+        "--allow-nonproduction-smoke",
+        action="store_true",
+        help=(
+            "allow only a compiler-authenticated smoke_deficits_preserved_v1 "
+            "dataset during --smoke; formal training remains forbidden"
+        ),
+    )
+    parser.add_argument(
         "--allow-unanchored-native-states",
         action="store_true",
         help="explicitly accept scene/label drift risk when source replays lack state anchors",
@@ -1188,6 +1215,8 @@ def main() -> int:
         raise ValueError("epochs, batch size and early stopping patience must be positive")
     if args.workers < 0 or args.integrity_workers < 0:
         raise ValueError("workers and integrity workers must be non-negative")
+    if args.allow_nonproduction_smoke and not args.smoke:
+        raise ValueError("--allow-nonproduction-smoke requires --smoke")
     run(args)
     return 0
 

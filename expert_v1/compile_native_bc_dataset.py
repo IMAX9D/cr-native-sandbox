@@ -105,6 +105,8 @@ MASK_INVALID_PREFIX_TRAINING_ADMISSION = (
 )
 PREFIX_MASK_PROVENANCE = "partial_native_visible_hand_complete_v1"
 PREFIX_TIMING_TARGET = "right_censored_at_failure_tick_v1"
+PRODUCTION_TOKEN_COVERAGE_ADMISSION = "production_strict_v1"
+SMOKE_TOKEN_COVERAGE_ADMISSION = "smoke_deficits_preserved_v1"
 ENTITY_NUMERIC_FIELDS = ("level_ratio", "hp_ratio", "log_max_hp")
 MAX_ABILITY_SLOTS = 16
 CAPACITY_PREFLIGHT_KIND = "cr_native_bc_capacity_preflight_v2"
@@ -1263,6 +1265,7 @@ def validate_compile_plan(
             "kind", "schema_version", "seed", "validation_fraction",
             "test_fraction", "maximum_rows_per_shard", "actor_information",
             "action_alignment", "entity_identity", "mask_policy", "storage_schema",
+            "token_coverage_admission",
             "components",
         },
         "compile-plan compiler",
@@ -1278,6 +1281,10 @@ def validate_compile_plan(
         or compiler.get("entity_identity") != "discrete_native_card_token_v1"
         or compiler.get("mask_policy")
         != "full_complete_prefix_visible_hand_partial_fail_closed_v1"
+        or compiler.get("token_coverage_admission") not in {
+            PRODUCTION_TOKEN_COVERAGE_ADMISSION,
+            SMOKE_TOKEN_COVERAGE_ADMISSION,
+        }
         or compiler.get("storage_schema") != {
             "grid": GRID_STORAGE,
             "selected_position_mask": POSITION_MASK_STORAGE,
@@ -2853,6 +2860,7 @@ def create_compile_plan(
     test_fraction: float = 0.05,
     maximum_rows_per_shard: int = 524_288,
     io_workers: int = 16,
+    allow_smoke_coverage_deficits: bool = False,
 ) -> dict[str, Any]:
     """Verify all immutable inputs and atomically publish a deterministic plan."""
     tick_store_root = tick_store_root.resolve(strict=True)
@@ -3374,6 +3382,11 @@ def create_compile_plan(
         "action_alignment": "source_tick_plus_episode_metadata_offset",
         "entity_identity": "discrete_native_card_token_v1",
         "mask_policy": "full_complete_prefix_visible_hand_partial_fail_closed_v1",
+        "token_coverage_admission": (
+            SMOKE_TOKEN_COVERAGE_ADMISSION
+            if allow_smoke_coverage_deficits
+            else PRODUCTION_TOKEN_COVERAGE_ADMISSION
+        ),
         "components": {
             "compiler_sha256": sha256_file(Path(__file__).resolve()),
             "training_schema_sha256": sha256_file(
@@ -4982,6 +4995,15 @@ def _final_compiled_token_coverage(
                             "resolved_native_form_id": int(
                                 payload["resolved_data_id"]
                             ),
+                            "identity_provenance": (
+                                "libg_dynamic_choice_exact_v1"
+                                if (
+                                    str(card.source_token) == "mirror"
+                                    or str(payload.get("selection_strategy") or "")
+                                    == "native_dynamic_choice"
+                                )
+                                else "libg_deployment_mask_exact_v1"
+                            ),
                             "accepted": True,
                             "mask_legal": True,
                             "compiled": True,
@@ -5633,7 +5655,11 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "source_receipt_sha256": source_receipt_sha,
             "gate": gate,
         }
-        if gate.get("admitted") is not True:
+        smoke_coverage_mode = (
+            plan["compiler"].get("token_coverage_admission")
+            == SMOKE_TOKEN_COVERAGE_ADMISSION
+        )
+        if gate.get("admitted") is not True and not smoke_coverage_mode:
             deficits = token_receipt.get("evaluation") or {}
             raise NativeBcCompileError(
                 "FAILED_COVERAGE: per-token deficits remain; evidence="
@@ -5648,15 +5674,25 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
                     separators=(",", ":"),
                 )
             )
+    smoke_coverage_mode = (
+        plan["compiler"].get("token_coverage_admission")
+        == SMOKE_TOKEN_COVERAGE_ADMISSION
+    )
+    token_gate_admitted = bool(
+        token_coverage_manifest.get("enforced") is True
+        and (token_coverage_manifest.get("gate") or {}).get("admitted") is True
+    )
     manifest: dict[str, Any] = {
         "kind": DATASET_KIND,
         "schema_version": SCHEMA_VERSION,
         # Stable across repeated finalization of the same authenticated plan.
         "created_utc": str(plan["created_utc"]),
-        "production_ready": bool(
-            token_coverage_manifest.get("enforced") is True
-            and (token_coverage_manifest.get("gate") or {}).get("admitted")
-            is True
+        "production_ready": token_gate_admitted,
+        "smoke_only": bool(smoke_coverage_mode and not token_gate_admitted),
+        "smoke_reason": (
+            SMOKE_TOKEN_COVERAGE_ADMISSION
+            if smoke_coverage_mode and not token_gate_admitted
+            else None
         ),
         "native_replay_validated": True,
         "observation_mode": OBSERVATION_MODE,
@@ -5823,6 +5859,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--finalize-only", action="store_true")
+    parser.add_argument(
+        "--allow-smoke-coverage-deficits",
+        action="store_true",
+        help=(
+            "publish a non-production smoke-only dataset while preserving exact "
+            "per-token deficits; never valid for formal training"
+        ),
+    )
     return parser
 
 
@@ -5844,6 +5888,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         test_fraction=args.test_fraction,
         maximum_rows_per_shard=args.maximum_rows_per_shard,
         io_workers=args.io_workers,
+        allow_smoke_coverage_deficits=args.allow_smoke_coverage_deficits,
     )
     if args.plan_only:
         return {
