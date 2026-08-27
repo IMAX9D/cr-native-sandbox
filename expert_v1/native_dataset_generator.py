@@ -4277,8 +4277,19 @@ def summarize_results(
             (
                 row.get("preflight_teacher_forced_success") is False
                 and row.get("full_trace_executed") is False
+                and row.get("failure_prefix_executed") is not True
                 and int(row.get("tick_trace_complete_frames") or 0) == 0
                 and int(row.get("deployment_mask_probe_rpc_count") or 0) == 0
+            )
+            or (
+                row.get("preflight_teacher_forced_success") is False
+                and row.get("full_trace_executed") is False
+                and row.get("failure_prefix_executed") is True
+                and row.get("failure_prefix_semantic_match") is True
+                and isinstance(
+                    row.get("audit_prefix_tick_store_entry"), Mapping
+                )
+                and _result_prefix_integrity(row)
             )
             or (
                 row.get("preflight_teacher_forced_success") is True
