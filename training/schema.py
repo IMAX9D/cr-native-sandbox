@@ -122,6 +122,9 @@ def deployment_mask(
     own_rows = range(0, 15) if side == 0 else range(17, 32)
     for row in own_rows:
         allowed[row] = [True] * ARENA_COLUMNS
+    # River-edge boundary geometry is structural: admit the mirrored boundary
+    # row and keep only native terrain-mask 1s in the final intersection.
+    allowed[16 if side == 0 else 15] = [True] * ARENA_COLUMNS
     pocket_rows = (
         range(16, 16 + POCKET_DEPTH_CELLS)
         if side == 0
@@ -207,6 +210,7 @@ class ActionMaskCache:
         allowed = np.zeros((ARENA_ROWS, ARENA_COLUMNS), dtype=np.bool_)
         own_rows = slice(0, 15) if side == 0 else slice(17, 32)
         allowed[own_rows, :] = True
+        allowed[16 if side == 0 else 15, :] = True
         living_enemy_princesses = [
             entity
             for entity in state.get("entities", [])

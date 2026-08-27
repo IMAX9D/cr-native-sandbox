@@ -506,7 +506,7 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             "destroyed-left-tower pocket includes native river-edge row",
         )
         self.assertFalse(
-            deployment_label_is_legal(skeletons, x=13_500, y=16_501),
+            deployment_label_is_legal(skeletons, x=13_500, y=17_501),
             "destroying the left tower does not unlock the right pocket",
         )
         mirrored = derive_deployment_rows(
@@ -516,8 +516,51 @@ class ExpertDeploymentMaskTests(unittest.TestCase):
             card_id=26_000_010,
         )
         self.assertFalse(
-            deployment_label_is_legal(mirrored, x=3_500, y=15_499),
+            deployment_label_is_legal(mirrored, x=3_500, y=14_499),
             "side-1 cannot use a pocket opened by destruction on its own side",
+        )
+
+    def test_live_tower_bridge_boundary_uses_only_native_structural_ones(self) -> None:
+        bridge_pattern = ["0"] * 18
+        bridge_pattern[3] = "1"
+        bridge_pattern[14] = "1"
+        structural_rows = ["1" * 18 for _ in range(32)]
+        structural_rows[15] = "".join(bridge_pattern)
+        structural_rows[16] = "".join(bridge_pattern)
+        structural = normalize_native_probe(probe(structural_rows))
+
+        skeletons = derive_deployment_rows(
+            structural, tower_mapping(), side=0, card_id=26_000_010
+        )
+        guards = derive_deployment_rows(
+            structural, tower_mapping(), side=1, card_id=26_000_025
+        )
+        for x in (3_500, 14_500):
+            self.assertTrue(
+                deployment_label_is_legal(skeletons, x=x, y=16_501)
+            )
+            self.assertTrue(
+                deployment_label_is_legal(guards, x=x, y=15_499)
+            )
+        self.assertFalse(
+            deployment_label_is_legal(skeletons, x=8_500, y=16_501)
+        )
+        self.assertFalse(
+            deployment_label_is_legal(guards, x=8_500, y=15_499)
+        )
+
+        raw_zero_rows = list(structural_rows)
+        raw_zero_rows[15] = "0" * 18
+        raw_zero_rows[16] = "0" * 18
+        building = derive_deployment_rows(
+            normalize_native_probe(probe(raw_zero_rows)),
+            tower_mapping(),
+            side=0,
+            card_id=27_000_000,
+        )
+        self.assertFalse(
+            deployment_label_is_legal(building, x=3_500, y=16_501),
+            "allowed bridge geometry must not turn a structural raw 0 into 1",
         )
 
     def test_sidecar_is_content_addressed_and_offline_labels_are_auditable(self) -> None:

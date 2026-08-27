@@ -1120,6 +1120,13 @@ def derive_deployment_rows(
     own_rows = range(0, 15) if side == 0 else range(17, ARENA_ROWS)
     for row in own_rows:
         allowed[row] = [True] * ARENA_COLUMNS
+    # The native structural mask, not ownership geometry, identifies the two
+    # bridge openings on the river-edge half-cell row.  Admit the whole
+    # boundary row here and let the final ``result & allowed`` intersection
+    # retain only structural 1s: sidecar 0s and building restrictions remain
+    # closed.  The rows are exact 180-degree mirrors.
+    bridge_boundary_row = 16 if side == 0 else 15
+    allowed[bridge_boundary_row] = [True] * ARENA_COLUMNS
     living_enemy_princesses = [
         tower for tower in towers
         if tower["side"] != side and tower["role"] == 1 and tower["hp"] > 0
