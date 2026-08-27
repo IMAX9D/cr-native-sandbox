@@ -61,7 +61,7 @@ from expert_v1.token_coverage_v1 import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_ROOT = Path(
-    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v3"
+    r"D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v4"
 )
 DEFAULT_CRAWLER_ROOT = Path(r"D:\皇室战争数据集")
 DEFAULT_CRAWLER_PYTHON = Path(
