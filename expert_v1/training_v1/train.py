@@ -851,18 +851,25 @@ def run(args: argparse.Namespace) -> Path:
     output_root = args.output_root.resolve()
     run_root = output_root / run_id
     with TrainingInstanceLock(output_root / ".expert-training-v1.lock", run_id=run_id):
+        trusted_manifest_text = os.environ.get(
+            "CR_EXPERT_TRUST_INTEGRITY_MANIFEST", ""
+        ).strip()
         trust_existing_integrity = (
             os.environ.get("CR_EXPERT_TRUST_EXISTING_INTEGRITY") == "1"
+            or bool(trusted_manifest_text)
         )
         if trust_existing_integrity:
-            if not args.resume:
-                raise RuntimeError(
-                    "existing integrity may only be trusted while resuming"
-                )
-            existing_manifest_path = run_root / "manifest.json"
+            if trusted_manifest_text:
+                existing_manifest_path = Path(trusted_manifest_text).resolve()
+            else:
+                if not args.resume:
+                    raise RuntimeError(
+                        "existing integrity may only be trusted while resuming"
+                    )
+                existing_manifest_path = run_root / "manifest.json"
             if not existing_manifest_path.is_file():
                 raise RuntimeError(
-                    "trusted resume integrity requires an existing run manifest"
+                    "trusted integrity requires an existing authenticated run manifest"
                 )
             existing_run_manifest = json.loads(
                 existing_manifest_path.read_text(encoding="utf-8-sig")
