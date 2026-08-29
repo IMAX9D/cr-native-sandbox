@@ -7,9 +7,11 @@ from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import random
+import shutil
 import time
 from typing import Any, Mapping
 
@@ -32,7 +34,7 @@ from .smoke_data import create_smoke_dataset
 
 
 CHECKPOINT_KIND = "cr_native_expert_bc_checkpoint_v1"
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 RUN_KIND = "cr_native_expert_bc_run_v1"
 RUN_SCHEMA_VERSION = 3
 CHECKPOINT_REQUIRED_FIELDS = {
@@ -52,6 +54,10 @@ CHECKPOINT_REQUIRED_FIELDS = {
     "run_id",
     "optimizer_identity_sha256",
     "checkpoint_role",
+    "epoch_complete",
+    "batch_in_epoch",
+    "batches_in_epoch",
+    "epoch_start_train_generator_state",
 }
 
 
@@ -156,6 +162,29 @@ def _atomic_torch(path: Path, value: Mapping[str, Any]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    temporary = destination.with_name(
+        destination.name + f".{os.getpid()}.tmp"
+    )
+    shutil.copy2(source, temporary)
+    os.replace(temporary, destination)
+
+
+def _save_rolling_latest(
+    checkpoints: Path, checkpoint: Mapping[str, Any]
+) -> None:
+    latest = checkpoints / "latest.pt"
+    previous_1 = checkpoints / "previous-1.pt"
+    previous_2 = checkpoints / "previous-2.pt"
+    if previous_1.is_file():
+        _atomic_copy(previous_1, previous_2)
+    if latest.is_file():
+        _atomic_copy(latest, previous_1)
+    _atomic_torch(
+        latest, {**dict(checkpoint), "checkpoint_role": "latest"}
+    )
 
 
 def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
@@ -490,6 +519,10 @@ def _checkpoint_payload(
     is_best: bool,
     training_metrics: Mapping[str, float],
     validation_metrics: Mapping[str, float],
+    epoch_complete: bool,
+    batch_in_epoch: int,
+    batches_in_epoch: int,
+    epoch_start_train_generator_state: torch.Tensor,
 ) -> dict[str, Any]:
     return {
         "kind": CHECKPOINT_KIND,
@@ -513,6 +546,12 @@ def _checkpoint_payload(
         "training_metrics": dict(training_metrics),
         "validation_metrics": dict(validation_metrics),
         "rng": _capture_rng(train_generator),
+        "epoch_complete": bool(epoch_complete),
+        "batch_in_epoch": int(batch_in_epoch),
+        "batches_in_epoch": int(batches_in_epoch),
+        "epoch_start_train_generator_state": (
+            epoch_start_train_generator_state.detach().cpu().clone()
+        ),
     }
 
 
@@ -550,7 +589,7 @@ def _certify_checkpoint(
             raise RuntimeError(f"checkpoint {field} mismatch: {path}")
     if model_config is not None and value.get("model_config") != dict(model_config):
         raise RuntimeError(f"checkpoint model configuration mismatch: {path}")
-    expected_role = "latest" if path.name == "latest.pt" else "best"
+    expected_role = "best" if path.name == "best.pt" else "latest"
     if value.get("checkpoint_role") != expected_role:
         raise RuntimeError(f"checkpoint role mismatch: {path}")
     if not isinstance(value.get("model_state"), Mapping):
@@ -568,6 +607,16 @@ def _certify_checkpoint(
     global_step = int(value.get("global_step", -1))
     if epoch < 0 or step < 0 or global_step < 0 or step != global_step:
         raise RuntimeError(f"checkpoint progress counters are invalid: {path}")
+    batch_in_epoch = int(value.get("batch_in_epoch", -1))
+    batches_in_epoch = int(value.get("batches_in_epoch", -1))
+    if (
+        not isinstance(value.get("epoch_complete"), bool)
+        or batch_in_epoch < 0
+        or batches_in_epoch <= 0
+        or batch_in_epoch > batches_in_epoch
+        or not isinstance(value.get("epoch_start_train_generator_state"), torch.Tensor)
+    ):
+        raise RuntimeError(f"checkpoint intra-epoch state is invalid: {path}")
     return value
 
 
@@ -660,7 +709,7 @@ def _restore_checkpoint(
     run_signature_sha256: str,
     run_id: str,
     optimizer_identity_sha256: str,
-) -> tuple[int, int, float, int]:
+) -> tuple[int, int, float, int, int, torch.Tensor | None]:
     missing = sorted(CHECKPOINT_REQUIRED_FIELDS - set(checkpoint))
     if missing:
         raise RuntimeError(f"checkpoint is incomplete: {missing}")
@@ -687,7 +736,24 @@ def _restore_checkpoint(
     epochs_without_improvement = int(checkpoint["epochs_without_improvement"])
     if epoch < 0 or global_step < 0 or epochs_without_improvement < 0:
         raise RuntimeError("checkpoint progress counters are invalid")
-    return epoch, global_step, best_validation_loss, epochs_without_improvement
+    epoch_complete = bool(checkpoint["epoch_complete"])
+    resume_batch = 0 if epoch_complete else int(checkpoint["batch_in_epoch"])
+    completed_epoch = epoch if epoch_complete else epoch - 1
+    epoch_start_state = (
+        None
+        if epoch_complete
+        else checkpoint["epoch_start_train_generator_state"].cpu().clone()
+    )
+    if completed_epoch < 0:
+        completed_epoch = 0
+    return (
+        completed_epoch,
+        global_step,
+        best_validation_loss,
+        epochs_without_improvement,
+        resume_batch,
+        epoch_start_state,
+    )
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -931,6 +997,8 @@ def run(args: argparse.Namespace) -> Path:
         epochs_without_improvement = 0
         updates = 0
         completed_epoch = 0
+        resume_batch_in_epoch = 0
+        resume_epoch_start_generator_state: torch.Tensor | None = None
         latest_exists = (run_root / "checkpoints" / "latest.pt").is_file()
         if continuing and latest_exists:
             checkpoint_path, checkpoint = _load_resume_checkpoint(
@@ -947,6 +1015,8 @@ def run(args: argparse.Namespace) -> Path:
                 updates,
                 best_validation,
                 epochs_without_improvement,
+                resume_batch_in_epoch,
+                resume_epoch_start_generator_state,
             ) = _restore_checkpoint(
                 checkpoint,
                 model=model,
@@ -996,9 +1066,22 @@ def run(args: argparse.Namespace) -> Path:
             train_batches_total = min(
                 train_batches_total, int(args.max_train_batches)
             )
+        total_training_steps = train_batches_total * args.epochs
+        last_saved_percent = min(
+            100, (updates * 100) // max(total_training_steps, 1)
+        )
         should_train = epochs_without_improvement < args.early_stopping_patience
         if should_train:
             for epoch in range(completed_epoch + 1, args.epochs + 1):
+                if (
+                    resume_batch_in_epoch > 0
+                    and resume_epoch_start_generator_state is not None
+                    and epoch == completed_epoch + 1
+                ):
+                    train_generator.set_state(
+                        resume_epoch_start_generator_state.cpu()
+                    )
+                epoch_start_generator_state = train_generator.get_state().cpu().clone()
                 model.train()
                 accumulator = MetricAccumulator()
                 epoch_started = time.perf_counter()
@@ -1016,6 +1099,12 @@ def run(args: argparse.Namespace) -> Path:
                 for batch_index, batch in enumerate(train_loader):
                     if args.max_train_batches and batch_index >= args.max_train_batches:
                         break
+                    if (
+                        resume_batch_in_epoch > 0
+                        and epoch == completed_epoch + 1
+                        and batch_index < resume_batch_in_epoch
+                    ):
+                        continue
                     batch = _move(batch, device, normalizer)
                     optimizer.zero_grad(set_to_none=True)
                     output = model.forward_batch(batch)
@@ -1034,6 +1123,39 @@ def run(args: argparse.Namespace) -> Path:
                     examples += int(batch["loss_mask"].sum().item())
                     updates += 1
                     completed_batch = batch_index + 1
+                    completed_percent = min(
+                        100,
+                        (updates * 100) // max(total_training_steps, 1),
+                    )
+                    if completed_percent > last_saved_percent:
+                        rolling_checkpoint = _checkpoint_payload(
+                            epoch=epoch,
+                            global_step=updates,
+                            model=model,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            normalizer=normalizer,
+                            train_generator=train_generator,
+                            dataset_manifest_sha256=integrity["manifest_sha256"],
+                            run_signature_sha256=run_signature_sha256,
+                            run_id=run_id,
+                            optimizer_identity_sha256=optimizer_identity_sha256,
+                            best_validation_loss=best_validation,
+                            epochs_without_improvement=epochs_without_improvement,
+                            is_best=False,
+                            training_metrics=accumulator.result(),
+                            validation_metrics={},
+                            epoch_complete=False,
+                            batch_in_epoch=completed_batch,
+                            batches_in_epoch=train_batches_total,
+                            epoch_start_train_generator_state=(
+                                epoch_start_generator_state
+                            ),
+                        )
+                        _save_rolling_latest(
+                            run_root / "checkpoints", rolling_checkpoint
+                        )
+                        last_saved_percent = completed_percent
                     if (
                         completed_batch % 100 == 0
                         or completed_batch == train_batches_total
@@ -1049,6 +1171,8 @@ def run(args: argparse.Namespace) -> Path:
                             "loss": float(loss.detach().item()),
                             "updated_utc": datetime.now(timezone.utc).isoformat(),
                         })
+                resume_batch_in_epoch = 0
+                resume_epoch_start_generator_state = None
                 _atomic_json(progress_path, {
                     "kind": "cr_expert_training_progress_v1",
                     "status": "validation",
@@ -1103,6 +1227,12 @@ def run(args: argparse.Namespace) -> Path:
                     is_best=improved,
                     training_metrics=training_metrics,
                     validation_metrics=validation_metrics,
+                    epoch_complete=True,
+                    batch_in_epoch=train_batches_total,
+                    batches_in_epoch=train_batches_total,
+                    epoch_start_train_generator_state=(
+                        epoch_start_generator_state
+                    ),
                 )
                 if improved:
                     _atomic_torch(
