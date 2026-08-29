@@ -3,6 +3,7 @@ param(
     [int]$BattleSeed = 20260824,
     [int]$PolicySeed = 20260824,
     [string]$Python = "D:\AI_data\runtime\venv\Scripts\python.exe",
+    [string]$ExpertDatasetRoot = "D:\AI_data\cr-native-core\expert-v1\one-click-schema5-v3-current-frontier-v5\compiled\native-bc-v1",
     [switch]$Smoke
 )
 
@@ -27,6 +28,7 @@ if ($LASTEXITCODE -ne 0) { throw "Native Worker startup failed: $LASTEXITCODE" }
 $Arguments = @(
     "-m", "native_core.human_vs_ai",
     "--checkpoint", $Checkpoint,
+    "--expert-dataset-root", $ExpertDatasetRoot,
     "--battle-seed", "$BattleSeed",
     "--policy-seed", "$PolicySeed",
     "--port", "37031"
