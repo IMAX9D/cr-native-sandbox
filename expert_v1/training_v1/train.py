@@ -231,7 +231,16 @@ def _restore_rng(state: Mapping[str, Any], train_generator: torch.Generator) -> 
     if cuda_state is not None:
         if not torch.cuda.is_available():
             raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is unavailable")
-        torch.cuda.set_rng_state_all(cuda_state)
+        # ``torch.load(..., map_location=device)`` also relocates the saved
+        # CUDA RNG byte tensors.  Linux requires CPU ByteTensors here, while
+        # the original Windows runtime accepted the relocated values.  Moving
+        # the exact bytes back to CPU preserves the RNG stream across hosts.
+        torch.cuda.set_rng_state_all(
+            [
+                item.detach().cpu().to(dtype=torch.uint8).contiguous()
+                for item in cuda_state
+            ]
+        )
     train_generator.set_state(state["train_loader_generator"].cpu())
 
 
@@ -274,6 +283,20 @@ def _run_signature(
         "max_eval_batches": args.max_eval_batches,
         "allow_unanchored_native_states": bool(args.allow_unanchored_native_states),
     }
+    # Keep the legacy/default signature byte-for-byte compatible while binding
+    # cloud-only topology and numerical changes when they are requested.
+    spatial_size = int(getattr(args, "spatial_size", 64))
+    precision = str(getattr(args, "precision", "fp32"))
+    prefetch_factor = int(getattr(args, "prefetch_factor", 2))
+    fused_adamw = bool(getattr(args, "fused_adamw", False))
+    if spatial_size != 64:
+        payload["spatial_size"] = spatial_size
+    if precision != "fp32":
+        payload["precision"] = precision
+    if prefetch_factor != 2:
+        payload["prefetch_factor"] = prefetch_factor
+    if fused_adamw:
+        payload["fused_adamw"] = True
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), payload
 
@@ -306,7 +329,7 @@ def _optimizer_identity(
         "capturable": False,
         "differentiable": False,
         "foreach": None,
-        "fused": None,
+        "fused": True if bool(getattr(args, "fused_adamw", False)) else None,
         "scheduler": "constant_lr_v1",
         "model_config": dict(model_config),
     }
@@ -372,6 +395,11 @@ def _loader(
     worker_generator = torch.Generator().manual_seed(
         args.seed + {"train": 101, "validation": 202, "test": 303}[split]
     )
+    loader_options: dict[str, Any] = {}
+    if args.workers > 0:
+        loader_options["prefetch_factor"] = int(
+            getattr(args, "prefetch_factor", 2)
+        )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -383,6 +411,7 @@ def _loader(
         persistent_workers=args.workers > 0,
         drop_last=False,
         generator=worker_generator,
+        **loader_options,
     )
 
 
@@ -393,6 +422,7 @@ def _evaluate(
     *,
     maximum_batches: int,
     normalizer: DatasetPrecomputedNormalizer,
+    precision: str = "fp32",
 ) -> dict[str, float]:
     model.eval()
     accumulator = MetricAccumulator()
@@ -401,8 +431,13 @@ def _evaluate(
             if maximum_batches and index >= maximum_batches:
                 break
             batch = _move(batch, device, normalizer)
-            output = model.forward_batch(batch)
-            _loss, metrics = behaviour_cloning_loss(output, batch, model.config)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=precision == "bf16",
+            ):
+                output = model.forward_batch(batch)
+                _loss, metrics = behaviour_cloning_loss(output, batch, model.config)
             accumulator.add(metrics)
     return accumulator.result()
 
@@ -552,6 +587,37 @@ def _checkpoint_payload(
         "epoch_start_train_generator_state": (
             epoch_start_train_generator_state.detach().cpu().clone()
         ),
+    }
+
+
+def _inference_weights_payload(
+    *,
+    epoch: int,
+    global_step: int,
+    model: RecurrentExpertPolicy,
+    dataset_manifest_sha256: str,
+    run_signature_sha256: str,
+    run_id: str,
+) -> dict[str, Any]:
+    model_state = {
+        name: (
+            value.detach().cpu().to(dtype=torch.float16).contiguous()
+            if value.is_floating_point()
+            else value.detach().cpu().contiguous()
+        )
+        for name, value in model.state_dict().items()
+    }
+    return {
+        "kind": "cr_native_expert_inference_weights_v1",
+        "schema_version": 1,
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "run_id": run_id,
+        "dataset_manifest_sha256": dataset_manifest_sha256,
+        "run_signature_sha256": run_signature_sha256,
+        "model_config": model.config.to_dict(),
+        "storage_dtype": "float16",
+        "model_state": model_state,
     }
 
 
@@ -764,6 +830,9 @@ def run(args: argparse.Namespace) -> Path:
     preliminary_digest = sha256_file(dataset_root / "manifest.json")
     observation_mode = str(preliminary_manifest.get("observation_mode") or OBSERVATION_NATIVE)
     device = _device(args.device)
+    precision = str(getattr(args, "precision", "fp32"))
+    if precision == "bf16" and device.type != "cuda":
+        raise RuntimeError("BF16 expert training requires CUDA")
     run_signature_sha256, signature_payload = _run_signature(
         args,
         dataset_manifest_sha256=preliminary_digest,
@@ -782,9 +851,48 @@ def run(args: argparse.Namespace) -> Path:
     output_root = args.output_root.resolve()
     run_root = output_root / run_id
     with TrainingInstanceLock(output_root / ".expert-training-v1.lock", run_id=run_id):
-        manifest, integrity = verify_dataset_integrity(
-            dataset_root, workers=args.integrity_workers
+        trust_existing_integrity = (
+            os.environ.get("CR_EXPERT_TRUST_EXISTING_INTEGRITY") == "1"
         )
+        if trust_existing_integrity:
+            if not args.resume:
+                raise RuntimeError(
+                    "existing integrity may only be trusted while resuming"
+                )
+            existing_manifest_path = run_root / "manifest.json"
+            if not existing_manifest_path.is_file():
+                raise RuntimeError(
+                    "trusted resume integrity requires an existing run manifest"
+                )
+            existing_run_manifest = json.loads(
+                existing_manifest_path.read_text(encoding="utf-8-sig")
+            )
+            integrity = dict(existing_run_manifest.get("dataset_integrity") or {})
+            shard_files = preliminary_manifest.get("shard_file_sha256") or {}
+            if (
+                integrity.get("manifest_sha256") != preliminary_digest
+                or int(integrity.get("shard_files", -1)) != len(shard_files)
+            ):
+                raise RuntimeError(
+                    "existing integrity receipt does not match the active dataset"
+                )
+            missing_file = next(
+                (
+                    relative
+                    for relative in shard_files
+                    if not (dataset_root / relative).is_file()
+                ),
+                None,
+            )
+            if missing_file is not None:
+                raise RuntimeError(
+                    f"trusted resume dataset file is missing: {missing_file}"
+                )
+            manifest = preliminary_manifest
+        else:
+            manifest, integrity = verify_dataset_integrity(
+                dataset_root, workers=args.integrity_workers
+            )
         actual_observation_mode = str(manifest.get("observation_mode") or OBSERVATION_NATIVE)
         actual_signature, actual_signature_payload = _run_signature(
             args,
@@ -800,12 +908,31 @@ def run(args: argparse.Namespace) -> Path:
         signature_payload = actual_signature_payload
         _validate_training_admission(args, dataset_root, manifest, observation_mode)
 
-        shard_summary: dict[str, dict[str, int]] = {}
-        for split, shards in manifest["splits"].items():
-            for relative in shards:
-                shard_summary[f"{split}:{relative}"] = validate_shard(
-                    dataset_root / relative, manifest
+        if trust_existing_integrity:
+            cached_shards = existing_run_manifest.get("dataset_shards") or {}
+            expected_shard_keys = {
+                f"{split}:{relative}"
+                for split, shards in manifest["splits"].items()
+                for relative in shards
+            }
+            if set(cached_shards) != expected_shard_keys:
+                raise RuntimeError(
+                    "existing shard validation receipt does not cover the active dataset"
                 )
+            shard_summary = {
+                str(key): {
+                    "sequences": int(value["sequences"]),
+                    "rows": int(value["rows"]),
+                }
+                for key, value in cached_shards.items()
+            }
+        else:
+            shard_summary: dict[str, dict[str, int]] = {}
+            for split, shards in manifest["splits"].items():
+                for relative in shards:
+                    shard_summary[f"{split}:{relative}"] = validate_shard(
+                        dataset_root / relative, manifest
+                    )
         dimensions = manifest["dimensions"]
         config = ExpertPolicyConfig(
             grid_channels=int(dimensions["grid_channels"]),
@@ -815,6 +942,7 @@ def run(args: argparse.Namespace) -> Path:
             max_ability_slots=int(dimensions["max_ability_slots"]),
             entity_numeric_size=int(dimensions.get("entity_numeric_size", 3)),
             card_embedding_size=args.card_embedding_size,
+            spatial_size=int(getattr(args, "spatial_size", 64)),
             hidden_size=args.hidden_size,
             lambda_max=args.lambda_max,
             lambda_initial=args.lambda_initial,
@@ -967,7 +1095,7 @@ def run(args: argparse.Namespace) -> Path:
             maximize=False,
             capturable=False,
             differentiable=False,
-            fused=None,
+            fused=True if bool(getattr(args, "fused_adamw", False)) else None,
         )
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _epoch: 1.0)
         normalizer = DatasetPrecomputedNormalizer(config.public_scalar_size)
@@ -1082,6 +1210,43 @@ def run(args: argparse.Namespace) -> Path:
                         resume_epoch_start_generator_state.cpu()
                     )
                 epoch_start_generator_state = train_generator.get_state().cpu().clone()
+                epoch_loader = train_loader
+                batch_offset = 0
+                if (
+                    resume_batch_in_epoch > 0
+                    and epoch == completed_epoch + 1
+                ):
+                    # Recreate the exact epoch permutation from its checkpointed
+                    # start state, then hand only the unseen suffix to workers.
+                    # Iterating and discarding already-trained batches performs
+                    # all dataset I/O again and can leave the GPU idle for hours.
+                    permutation = torch.randperm(
+                        len(train_loader.dataset), generator=train_generator
+                    )
+                    sample_offset = min(
+                        resume_batch_in_epoch * args.batch_size,
+                        len(permutation),
+                    )
+                    remaining_indices = permutation[sample_offset:].tolist()
+                    resume_loader_options: dict[str, Any] = {}
+                    if args.workers > 0:
+                        resume_loader_options["prefetch_factor"] = int(
+                            getattr(args, "prefetch_factor", 2)
+                        )
+                    epoch_loader = DataLoader(
+                        train_loader.dataset,
+                        batch_size=args.batch_size,
+                        shuffle=False,
+                        sampler=remaining_indices,
+                        num_workers=args.workers,
+                        collate_fn=collate_sequences,
+                        pin_memory=torch.cuda.is_available(),
+                        persistent_workers=args.workers > 0,
+                        drop_last=False,
+                        generator=torch.Generator().manual_seed(args.seed + 101),
+                        **resume_loader_options,
+                    )
+                    batch_offset = resume_batch_in_epoch
                 model.train()
                 accumulator = MetricAccumulator()
                 epoch_started = time.perf_counter()
@@ -1091,24 +1256,24 @@ def run(args: argparse.Namespace) -> Path:
                     "status": "training",
                     "epoch": epoch,
                     "epochs": args.epochs,
-                    "batch": 0,
+                    "batch": batch_offset,
                     "batches": train_batches_total,
                     "global_step": updates,
                     "updated_utc": datetime.now(timezone.utc).isoformat(),
                 })
-                for batch_index, batch in enumerate(train_loader):
+                for local_batch_index, batch in enumerate(epoch_loader):
+                    batch_index = batch_offset + local_batch_index
                     if args.max_train_batches and batch_index >= args.max_train_batches:
                         break
-                    if (
-                        resume_batch_in_epoch > 0
-                        and epoch == completed_epoch + 1
-                        and batch_index < resume_batch_in_epoch
-                    ):
-                        continue
                     batch = _move(batch, device, normalizer)
                     optimizer.zero_grad(set_to_none=True)
-                    output = model.forward_batch(batch)
-                    loss, metrics = behaviour_cloning_loss(output, batch, config)
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=torch.bfloat16,
+                        enabled=precision == "bf16",
+                    ):
+                        output = model.forward_batch(batch)
+                        loss, metrics = behaviour_cloning_loss(output, batch, config)
                     if not bool(torch.isfinite(loss)):
                         raise FloatingPointError("expert BC loss became non-finite")
                     loss.backward()
@@ -1190,6 +1355,7 @@ def run(args: argparse.Namespace) -> Path:
                     device,
                     maximum_batches=args.max_eval_batches,
                     normalizer=normalizer,
+                    precision=precision,
                 )
                 validation_loss = float(validation_metrics.get("loss", float("inf")))
                 improved = validation_loss < best_validation - args.minimum_delta
@@ -1243,6 +1409,25 @@ def run(args: argparse.Namespace) -> Path:
                     run_root / "checkpoints" / "latest.pt",
                     {**checkpoint, "checkpoint_role": "latest"},
                 )
+                epoch_checkpoint_dir = run_root / "checkpoints" / "epochs"
+                epoch_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_torch(
+                    epoch_checkpoint_dir / f"epoch-{epoch:03d}.pt",
+                    {**checkpoint, "checkpoint_role": "epoch"},
+                )
+                inference_export_dir = run_root / "exports" / "epochs"
+                inference_export_dir.mkdir(parents=True, exist_ok=True)
+                _atomic_torch(
+                    inference_export_dir / f"epoch-{epoch:03d}-fp16.pt",
+                    _inference_weights_payload(
+                        epoch=epoch,
+                        global_step=updates,
+                        model=model,
+                        dataset_manifest_sha256=integrity["manifest_sha256"],
+                        run_signature_sha256=run_signature_sha256,
+                        run_id=run_id,
+                    ),
+                )
                 _append_jsonl(events, epoch_event)
                 print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
                 if epochs_without_improvement >= args.early_stopping_patience:
@@ -1278,6 +1463,7 @@ def run(args: argparse.Namespace) -> Path:
             device,
             maximum_batches=args.max_eval_batches,
             normalizer=normalizer,
+            precision=precision,
         )
         session_wall_seconds = time.perf_counter() - started
         final = {
@@ -1362,6 +1548,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--burn-in", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--validation-split", default="validation")
     parser.add_argument("--test-split", default="test")
@@ -1376,6 +1563,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip", type=float, default=1.0)
     parser.add_argument("--hidden-size", type=int, default=256)
     parser.add_argument("--card-embedding-size", type=int, default=64)
+    parser.add_argument("--spatial-size", type=int, default=64)
+    parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--fused-adamw", action="store_true")
     parser.add_argument("--lambda-max", type=float, default=20.0)
     parser.add_argument("--lambda-initial", type=float, default=0.30)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
@@ -1407,6 +1597,8 @@ def main() -> int:
         raise ValueError("epochs, batch size and early stopping patience must be positive")
     if args.workers < 0 or args.integrity_workers < 0:
         raise ValueError("workers and integrity workers must be non-negative")
+    if args.prefetch_factor <= 0 or args.spatial_size <= 0:
+        raise ValueError("prefetch factor and spatial size must be positive")
     split_names = (args.train_split, args.validation_split, args.test_split)
     if set(split_names) != {"train", "validation", "test"}:
         raise ValueError(
