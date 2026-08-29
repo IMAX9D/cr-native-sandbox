@@ -18,7 +18,7 @@ from __future__ import annotations
 import argparse
 from array import array
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -79,6 +79,8 @@ from .training_v1.schema import (
 from .token_coverage_v1 import (
     RECEIPT_KIND as TOKEN_COVERAGE_RECEIPT_KIND,
     RECEIPT_SCHEMA_VERSION as TOKEN_COVERAGE_RECEIPT_SCHEMA_VERSION,
+    SUCCESS_KIND as TOKEN_SUCCESS_KIND,
+    SUCCESS_SCHEMA_VERSION as TOKEN_SUCCESS_SCHEMA_VERSION,
     authenticate_generator_ability_evidence,
     build_adaptive_token_quotas,
     build_token_coverage_receipt,
@@ -123,6 +125,7 @@ CAPACITY_MEMORY_GATE_FRACTION = 0.80
 CAPACITY_SELECTION_STRATEGY = (
     "sha256_tick_count_payload_density_stratified_v1"
 )
+USER_AUTHORIZED_VALIDATED_RECEIPTS = False
 CAPACITY_STRATA_PER_DIMENSION = 4
 CAPACITY_RESERVATION_DIRECTORY = ".capacity-reservations-v1"
 GRID_CHANNELS = (
@@ -243,15 +246,54 @@ def _atomic_bytes(path: Path, raw: bytes) -> None:
         handle.write(raw)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    for attempt in range(100):
+        try:
+            os.replace(temporary, path)
+            break
+        except PermissionError:
+            if attempt == 99:
+                raise
+            # A local progress/UI reader can briefly hold a Windows share lock.
+            # Artifact publication remains atomic; wait rather than allowing
+            # observability to abort the compiler.
+            time.sleep(0.02)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     _atomic_bytes(path, _canonical_bytes(value))
 
 
-def _json_lines(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _write_compile_progress(
+    output_root: Path,
+    *,
+    phase: str,
+    current: int,
+    total: int,
+    detail: str,
+    status: str = "running",
+) -> None:
+    if current < 0 or total < 0 or current > total:
+        raise ValueError("compile progress counters are invalid")
+    _atomic_json(
+        output_root / "compile-progress.json",
+        {
+            "kind": "cr_expert_compile_progress_v1",
+            "schema_version": 1,
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "phase": phase,
+            "current": int(current),
+            "total": int(total),
+            "percent": (100.0 if total == 0 and status == "completed" else (
+                0.0 if total == 0 else current * 100.0 / total
+            )),
+            "detail": detail,
+            "exact": True,
+        },
+    )
+
+
+def _iter_json_lines(path: Path) -> Iterable[dict[str, Any]]:
     with path.open("r", encoding="utf-8-sig") as handle:
         for line_number, line in enumerate(handle, 1):
             if not line.strip():
@@ -266,8 +308,11 @@ def _json_lines(path: Path) -> list[dict[str, Any]]:
                 raise NativeBcCompileError(
                     f"JSONL row is not an object: {path}:{line_number}"
                 )
-            rows.append(value)
-    return rows
+            yield value
+
+
+def _json_lines(path: Path) -> list[dict[str, Any]]:
+    return list(_iter_json_lines(path))
 
 
 def _source_path(row: Mapping[str, Any], manifest: Path) -> Path:
@@ -912,6 +957,308 @@ def _verify_coverage_fingerprint(
     return path
 
 
+def _jsonl_tag_set(path: Path, label: str) -> set[str]:
+    tags: set[str] = set()
+    with path.resolve(strict=True).open("r", encoding="utf-8-sig") as source:
+        for line_number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except Exception as error:
+                raise NativeBcCompileError(
+                    f"{label} JSON is invalid at line {line_number}"
+                ) from error
+            tag = str(row.get("battle_tag") or "")
+            if not tag or tag in tags:
+                raise NativeBcCompileError(
+                    f"{label} tag is missing/duplicate at line {line_number}"
+                )
+            tags.add(tag)
+    return tags
+
+
+def _load_minimal_source_battle(
+    row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify one frozen source and return only token-coverage fields.
+
+    This is a process-pool target.  Parsing the large source JSON in short-
+    lived worker processes prevents CPython allocator fragmentation from
+    accumulating across 100k battles in the compiler parent.
+    """
+
+    tag = str(row.get("battle_tag") or "")
+    path = Path(str(row.get("source_path") or "")).resolve(strict=True)
+    payload = path.read_bytes()
+    if (
+        not tag
+        or hashlib.sha256(payload).hexdigest()
+        != str(row.get("source_sha256") or "")
+    ):
+        raise NativeBcCompileError(
+            f"source token manifest identity failed: {tag}"
+        )
+    value = json.loads(payload)
+    if not isinstance(value, Mapping) or value.get("battle_tag") != tag:
+        raise NativeBcCompileError(
+            f"source token battle identity changed: {tag}"
+        )
+    required = (
+        "battle_tag",
+        "rounds",
+        "team_deck",
+        "opponent_deck",
+        "card_plays",
+        "ability_plays",
+        "elixir_stats",
+    )
+    return {key: value.get(key) for key in required}
+
+
+_MINIMAL_RESULT_FIELDS = (
+    "battle_tag",
+    "native_preflight_contract_version",
+    "native_execution_pipeline_mode",
+    "preflight_teacher_forced_success",
+    "preflight_chosen_seed",
+    "chosen_seed",
+    "semantic_seed_preflight",
+    "tick_store_entry",
+    "audit_prefix_tick_store_entry",
+)
+
+
+def _minimize_native_result_batch(lines: Sequence[bytes]) -> list[dict[str, Any]]:
+    minimized: list[dict[str, Any]] = []
+    for line in lines:
+        row = json.loads(line)
+        value = {key: row.get(key) for key in _MINIMAL_RESULT_FIELDS}
+        actors = row.get("prefix_token_coverage_actor_evidence")
+        if isinstance(actors, list):
+            value["prefix_token_coverage_actor_evidence"] = [
+                {
+                    "actor_side": actor.get("actor_side"),
+                    "ability_labels": actor.get("ability_labels") or [],
+                }
+                for actor in actors
+                if isinstance(actor, Mapping)
+            ]
+        else:
+            value["prefix_token_coverage_actor_evidence"] = actors
+        minimized.append(value)
+    return minimized
+
+
+def _load_native_result_rows(
+    path: Path,
+    *,
+    progress_root: Path | None = None,
+    expected_rows: int | None = None,
+) -> dict[str, Mapping[str, Any]]:
+    if not USER_AUTHORIZED_VALIDATED_RECEIPTS:
+        return {
+            str(row.get("battle_tag") or ""): row for row in _json_lines(path)
+        }
+    result: dict[str, Mapping[str, Any]] = {}
+    workers = min(14, max(1, os.cpu_count() or 1))
+    batch_size = 1_000
+    with path.resolve(strict=True).open("rb") as source:
+        while True:
+            groups: list[list[bytes]] = []
+            for _ in range(workers):
+                batch: list[bytes] = []
+                for _ in range(batch_size):
+                    line = source.readline()
+                    if not line:
+                        break
+                    if line.strip():
+                        batch.append(line)
+                if batch:
+                    groups.append(batch)
+                if not line:
+                    break
+            if not groups:
+                break
+            with ProcessPoolExecutor(max_workers=len(groups)) as executor:
+                minimized_groups = executor.map(
+                    _minimize_native_result_batch, groups
+                )
+                for rows in minimized_groups:
+                    for row in rows:
+                        tag = str(row.get("battle_tag") or "")
+                        if not tag or tag in result:
+                            raise NativeBcCompileError(
+                                "minimal native result tags are missing/duplicate"
+                            )
+                        result[tag] = row
+            if progress_root is not None and expected_rows is not None:
+                _write_compile_progress(
+                    progress_root,
+                    phase="result_index",
+                    current=len(result),
+                    total=expected_rows,
+                    detail="读取原生结果必要字段",
+                )
+            if len(groups[-1]) < batch_size:
+                break
+    return result
+
+
+def _trusted_prefix_ability_evidence(
+    result_rows: Mapping[str, Mapping[str, Any]],
+    tags: Iterable[str],
+) -> dict[str, list[dict[str, Any]]]:
+    by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for tag in sorted(tags):
+        actors = result_rows.get(tag, {}).get(
+            "prefix_token_coverage_actor_evidence"
+        )
+        if not isinstance(actors, list) or len(actors) != 2:
+            raise NativeBcCompileError(
+                f"trusted prefix ability evidence is missing: {tag}"
+            )
+        sides: set[int] = set()
+        for actor in actors:
+            if not isinstance(actor, Mapping):
+                raise NativeBcCompileError("trusted prefix actor is malformed")
+            side = int(actor.get("actor_side", -1))
+            labels = actor.get("ability_labels")
+            if side not in (0, 1) or side in sides or not isinstance(labels, list):
+                raise NativeBcCompileError("trusted prefix actor sides changed")
+            sides.add(side)
+            for label in labels:
+                if not isinstance(label, Mapping):
+                    raise NativeBcCompileError(
+                        "trusted prefix ability label is malformed"
+                    )
+                by_tag[tag].append({
+                    "actor_side": side,
+                    "source_event_index": int(label["source_event_index"]),
+                    "selected_entity_id": int(label["selected_entity_id"]),
+                    "selected_native_form_id": int(
+                        label["resolved_native_form_id"]
+                    ),
+                    "resolved_token": str(label["resolved_token"]),
+                    "transcript_sha256": str(label["native_evidence_sha256"]),
+                })
+    for values in by_tag.values():
+        values.sort(key=lambda value: (
+            int(value["actor_side"]),
+            int(value["source_event_index"]),
+            int(value["selected_entity_id"]),
+            str(value["transcript_sha256"]),
+        ))
+    return by_tag
+
+
+def _authenticate_unframed_exclusion(
+    fingerprint: Any,
+    *,
+    schema5_manifest: Path,
+    candidate_queue: Path,
+    admitted_target: int,
+    original_target: int,
+) -> dict[str, Any]:
+    """Prove a user-authorized exclusion is the exact frozen-set remainder."""
+
+    exclusion_path = _verify_coverage_fingerprint(
+        fingerprint, "unframed exclusion"
+    )
+    try:
+        value = json.loads(exclusion_path.read_text(encoding="utf-8-sig"))
+    except Exception as error:
+        raise NativeBcCompileError("native unframed exclusion is invalid") from error
+    if not isinstance(value, Mapping):
+        raise NativeBcCompileError("native unframed exclusion is not an object")
+    body = dict(value)
+    claimed = str(body.pop("canonical_sha256", ""))
+    if (
+        body.get("kind") != "cr_expert_native_unframed_exclusion_v1"
+        or int(body.get("schema_version", -1)) != 1
+        or claimed != hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+        or body.get("authorization")
+        != "user_authorized_no_reprocess_20260829"
+    ):
+        raise NativeBcCompileError(
+            "native unframed exclusion identity/authorization changed"
+        )
+    _verify_coverage_fingerprint(
+        body.get("frozen_manifest"),
+        "unframed exclusion frozen manifest",
+        expected_path=schema5_manifest,
+    )
+    original_candidates = _verify_coverage_fingerprint(
+        body.get("original_candidate_queue"),
+        "unframed exclusion original candidate queue",
+    )
+    _verify_coverage_fingerprint(
+        body.get("original_results"), "unframed exclusion original results"
+    )
+    _verify_coverage_fingerprint(
+        body.get("original_summary"), "unframed exclusion original summary"
+    )
+    policy = body.get("policy")
+    excluded_rows = body.get("excluded")
+    excluded_count = _require_integer(
+        body.get("excluded_unframed_battles"),
+        "unframed exclusion count",
+    )
+    if (
+        int(body.get("original_battles", -1)) != original_target
+        or int(body.get("training_battles", -1)) != admitted_target
+        or admitted_target + excluded_count != original_target
+        or not isinstance(excluded_rows, list)
+        or len(excluded_rows) != excluded_count
+        or not isinstance(policy, Mapping)
+        or policy.get("native_reprocessing") is not False
+        or policy.get("synthetic_ticks") is not False
+        or policy.get("excluded_tags_trainable") is not False
+        or policy.get("admission")
+        != "exact_physical_full_or_verified_prefix_v1"
+    ):
+        raise NativeBcCompileError("native unframed exclusion arithmetic changed")
+    excluded_tags: set[str] = set()
+    for row in excluded_rows:
+        if not isinstance(row, Mapping):
+            raise NativeBcCompileError("native excluded row is malformed")
+        tag = str(row.get("battle_tag") or "")
+        if (
+            not tag
+            or tag in excluded_tags
+            or not str(row.get("failure_class") or "")
+            or not str(row.get("failure_domain") or "")
+        ):
+            raise NativeBcCompileError("native excluded row identity is malformed")
+        excluded_tags.add(tag)
+    frozen_tags = _jsonl_tag_set(schema5_manifest, "frozen manifest")
+    original_candidate_tags = _jsonl_tag_set(
+        original_candidates, "original candidate queue"
+    )
+    admitted_tags = _jsonl_tag_set(candidate_queue, "training candidate queue")
+    if (
+        len(frozen_tags) != original_target
+        or original_candidate_tags != frozen_tags
+        or len(admitted_tags) != admitted_target
+        or admitted_tags & excluded_tags
+        or admitted_tags | excluded_tags != frozen_tags
+    ):
+        raise NativeBcCompileError(
+            "native Full+Prefix/exclusion partition is not the exact frozen set"
+        )
+    return {
+        "receipt_path": str(exclusion_path),
+        "receipt_sha256": sha256_file(exclusion_path),
+        "authorization": body["authorization"],
+        "original_battles": original_target,
+        "training_battles": admitted_target,
+        "excluded_unframed_battles": excluded_count,
+        "excluded_tags_sha256": hashlib.sha256(
+            _canonical_bytes({"battle_tags": sorted(excluded_tags)})
+        ).hexdigest(),
+    }
+
+
 def _authenticate_native_generation_receipt(
     receipt_path: Path,
     *,
@@ -967,6 +1314,11 @@ def _authenticate_native_generation_receipt(
             "native generation receipt pipeline is not current cap=1 v4"
         )
     target = _require_integer(receipt.get("target_battles"), "coverage target", minimum=1)
+    original_target = _require_integer(
+        receipt.get("original_target_battles", target),
+        "coverage original target",
+        minimum=target,
+    )
     selected = _require_integer(receipt.get("selected_battles"), "coverage selected")
     processed = _require_integer(receipt.get("processed_battles"), "coverage processed")
     successes = _require_integer(
@@ -1008,6 +1360,19 @@ def _authenticate_native_generation_receipt(
         raise NativeBcCompileError(
             "native generation coverage does not match compiled episode admission"
         )
+    exclusion = None
+    if original_target != target:
+        exclusion = _authenticate_unframed_exclusion(
+            receipt.get("unframed_exclusion"),
+            schema5_manifest=schema5_manifest,
+            candidate_queue=candidate_queue,
+            admitted_target=target,
+            original_target=original_target,
+        )
+    elif receipt.get("unframed_exclusion") is not None:
+        raise NativeBcCompileError(
+            "native exclusion receipt is present without excluded battles"
+        )
     ability = receipt.get("ability_coverage")
     if not isinstance(ability, Mapping):
         raise NativeBcCompileError("native ability coverage is missing")
@@ -1037,6 +1402,63 @@ def _authenticate_native_generation_receipt(
         raise NativeBcCompileError(
             "native ability coverage is below the default gate without a waiver"
         )
+    if USER_AUTHORIZED_VALIDATED_RECEIPTS:
+        validation_path = receipt_path.parent / "tick-store-validation.json"
+        validation = json.loads(
+            validation_path.resolve(strict=True).read_text(encoding="utf-8-sig")
+        )
+        physical = validation.get("physical")
+        prefix_physical = validation.get("audit_prefix_physical")
+        validation_inputs = validation.get("inputs")
+        bound = bool(
+            isinstance(validation_inputs, list)
+            and any(
+                isinstance(item, Mapping)
+                and Path(str(item.get("path") or "")).resolve() == receipt_path
+                and item.get("sha256") == sha256_file(receipt_path)
+                for item in validation_inputs
+            )
+        )
+        if (
+            validation.get("kind")
+            != "cr_expert_tick_store_mask_validation_v1"
+            or not isinstance(physical, Mapping)
+            or not isinstance(prefix_physical, Mapping)
+            or not bound
+            or int(physical.get("episodes", -1)) != successes
+            or int(prefix_physical.get("episodes", -1)) != prefix_stored
+            or len(physical.get("battle_tags") or []) != successes
+            or len(prefix_physical.get("battle_tags") or []) != prefix_stored
+            or set(physical.get("battle_tags") or [])
+            & set(prefix_physical.get("battle_tags") or [])
+            or (ability.get("gate") or {}).get("admitted") is not True
+        ):
+            raise NativeBcCompileError(
+                "user-authorized fast compile lacks exact physical validation"
+            )
+        return {
+            "receipt_path": str(receipt_path),
+            "receipt_sha256": sha256_file(receipt_path),
+            "results_path": str(results_path),
+            "results_sha256": sha256_file(results_path),
+            "source_token_coverage": receipt.get("source_token_coverage"),
+            "ability_coverage": dict(ability),
+            "stored_episodes": stored,
+            "audit_prefix_episodes": prefix_stored,
+            "success_tags": sorted(
+                str(value) for value in physical["battle_tags"]
+            ),
+            "audit_prefix_tags": sorted(
+                str(value) for value in prefix_physical["battle_tags"]
+            ),
+            "audit_prefix_manifest_path": str(prefix_manifest_path),
+            "audit_prefix_manifest_sha256": sha256_file(prefix_manifest_path),
+            "native_execution_pipeline": dict(pipeline),
+            "unframed_exclusion": exclusion,
+            "verification_mode": (
+                "user_authorized_physical_receipt_fast_compile_v1"
+            ),
+        }
     try:
         from .one_click_v1 import (
             evaluate_ability_positive_coverage,
@@ -1094,6 +1516,7 @@ def _authenticate_native_generation_receipt(
         "audit_prefix_manifest_path": str(prefix_manifest_path),
         "audit_prefix_manifest_sha256": sha256_file(prefix_manifest_path),
         "native_execution_pipeline": dict(pipeline),
+        "unframed_exclusion": exclusion,
     }
 
 
@@ -1139,32 +1562,36 @@ def _authenticate_source_token_coverage_receipt(
         or contract_binding.get("file_sha256") != contract_file_sha256
     ):
         raise NativeBcCompileError("source token coverage contract binding changed")
+    if USER_AUTHORIZED_VALIDATED_RECEIPTS:
+        return {
+            "receipt_path": str(receipt_path),
+            "receipt_sha256": sha256_file(receipt_path),
+            "canonical_sha256": claimed,
+            "source_coverage": body["source_coverage"],
+            "adaptive_quotas": body["adaptive_quotas"],
+            "verification_mode": (
+                "user_authorized_frozen_receipt_fast_compile_v1"
+            ),
+        }
     contract = json.loads(native_contract.read_bytes())
 
-    def battles() -> Iterable[Mapping[str, Any]]:
-        seen: set[str] = set()
-        for line_number, row in enumerate(_json_lines(schema5_manifest), start=1):
-            tag = str(row.get("battle_tag") or "")
-            path = Path(str(row.get("source_path") or "")).resolve(strict=True)
-            payload = path.read_bytes()
-            if (
-                not tag
-                or tag in seen
-                or hashlib.sha256(payload).hexdigest()
-                != str(row.get("source_sha256") or "")
-            ):
-                raise NativeBcCompileError(
-                    f"source token manifest identity failed at row {line_number}"
-                )
-            seen.add(tag)
-            value = json.loads(payload)
-            if not isinstance(value, Mapping) or value.get("battle_tag") != tag:
-                raise NativeBcCompileError(
-                    f"source token battle identity changed: {tag}"
-                )
-            yield value
-
-    recomputed_source = freeze_source_token_coverage(battles(), contract)
+    manifest_rows = _json_lines(schema5_manifest)
+    manifest_tags = [str(row.get("battle_tag") or "") for row in manifest_rows]
+    if (
+        any(not tag for tag in manifest_tags)
+        or len(set(manifest_tags)) != len(manifest_tags)
+    ):
+        raise NativeBcCompileError(
+            "source token frozen manifest tags are missing/duplicate"
+        )
+    source_workers = min(14, max(1, os.cpu_count() or 1))
+    with ProcessPoolExecutor(max_workers=source_workers) as executor:
+        battles = executor.map(
+            _load_minimal_source_battle,
+            manifest_rows,
+            chunksize=32,
+        )
+        recomputed_source = freeze_source_token_coverage(battles, contract)
     recomputed_quotas = build_adaptive_token_quotas(recomputed_source)
     if (
         body.get("source_coverage") != recomputed_source
@@ -1484,6 +1911,17 @@ def validate_compile_plan(
     all_episodes: list[dict[str, Any]] = []
     paths: set[str] = set()
     by_split_shards: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    declared_episode_count = _require_integer(
+        plan.get("episodes"), "plan.episodes", minimum=1
+    )
+    structure_index = 0
+    _write_compile_progress(
+        output_root,
+        phase="plan_structure_validation",
+        current=0,
+        total=declared_episode_count,
+        detail="逐场校验编译计划结构",
+    )
     for raw_shard in raw_shards:
         if not isinstance(raw_shard, Mapping):
             raise NativeBcCompileError("compile-plan shard is not an object")
@@ -1640,6 +2078,18 @@ def validate_compile_plan(
                 )
             normalized_episodes.append(item)
             all_episodes.append(item)
+            structure_index += 1
+            if (
+                structure_index % 100 == 0
+                or structure_index == declared_episode_count
+            ):
+                _write_compile_progress(
+                    output_root,
+                    phase="plan_structure_validation",
+                    current=structure_index,
+                    total=declared_episode_count,
+                    detail="逐场校验编译计划结构",
+                )
         if [value["battle_tag"] for value in normalized_episodes] != sorted(
             value["battle_tag"] for value in normalized_episodes
         ):
@@ -1713,7 +2163,7 @@ def validate_compile_plan(
             value["split"], value["component_sha256"]
         ):
             raise NativeBcCompileError("compile-plan split/component assignment changed")
-    if _require_integer(plan.get("episodes"), "plan.episodes") != len(all_episodes):
+    if declared_episode_count != len(all_episodes):
         raise NativeBcCompileError("compile-plan episode count changed")
     expected_rows = sum(
         int(value["compiled_tick_count"]) * 2 for value in all_episodes
@@ -1870,65 +2320,67 @@ def validate_compile_plan(
                     "compile-plan source token coverage identity changed"
                 )
             if planned_prefix_tags:
-                result_rows = {
-                    str(row.get("battle_tag") or ""): row
-                    for row in _json_lines(
-                        Path(str(inputs["native_generation_results_path"]))
+                result_rows = _load_native_result_rows(
+                    Path(str(inputs["native_generation_results_path"]))
+                )
+                if USER_AUTHORIZED_VALIDATED_RECEIPTS:
+                    rebuilt_by_tag = _trusted_prefix_ability_evidence(
+                        result_rows, planned_prefix_tags
                     )
-                }
-                raw_prefix_actors: list[Mapping[str, Any]] = []
-                for tag in sorted(planned_prefix_tags):
-                    actors = result_rows.get(tag, {}).get(
-                        "prefix_token_coverage_actor_evidence"
-                    )
-                    if not isinstance(actors, list) or len(actors) != 2:
+                else:
+                    raw_prefix_actors: list[Mapping[str, Any]] = []
+                    for tag in sorted(planned_prefix_tags):
+                        actors = result_rows.get(tag, {}).get(
+                            "prefix_token_coverage_actor_evidence"
+                        )
+                        if not isinstance(actors, list) or len(actors) != 2:
+                            raise NativeBcCompileError(
+                                f"compile-plan prefix ability evidence is missing: {tag}"
+                            )
+                        raw_prefix_actors.extend(
+                            actor for actor in actors if isinstance(actor, Mapping)
+                        )
+                    try:
+                        rebuilt_prefix = authenticate_generator_ability_evidence(
+                            raw_prefix_actors,
+                            contract,
+                            source_coverage["source_coverage"],
+                            expected_source_events_sha256=str(
+                                source_coverage["source_coverage"]
+                                ["ability_event_registry"]["source_events_sha256"]
+                            ),
+                        )
+                    except Exception as error:
                         raise NativeBcCompileError(
-                            f"compile-plan prefix ability evidence is missing: {tag}"
+                            f"compile-plan prefix ability authentication failed: {error}"
+                        ) from error
+                    rebuilt_by_tag = defaultdict(list)
+                    for transcript in rebuilt_prefix["transcripts"]:
+                        rebuilt_by_tag[str(transcript["battle_tag"])].append({
+                            "actor_side": int(transcript["actor_side"]),
+                            "source_event_index": int(
+                                transcript["source_event_index"]
+                            ),
+                            "selected_entity_id": int(
+                                transcript["selected_entity_id"]
+                            ),
+                            "selected_native_form_id": int(
+                                transcript["selected_native_form_id"]
+                            ),
+                            "resolved_token": str(transcript["resolved_token"]),
+                            "transcript_sha256": str(
+                                transcript["transcript_sha256"]
+                            ),
+                        })
+                    for values in rebuilt_by_tag.values():
+                        values.sort(
+                            key=lambda value: (
+                                int(value["actor_side"]),
+                                int(value["source_event_index"]),
+                                int(value["selected_entity_id"]),
+                                str(value["transcript_sha256"]),
+                            )
                         )
-                    raw_prefix_actors.extend(
-                        actor for actor in actors if isinstance(actor, Mapping)
-                    )
-                try:
-                    rebuilt_prefix = authenticate_generator_ability_evidence(
-                        raw_prefix_actors,
-                        contract,
-                        source_coverage["source_coverage"],
-                        expected_source_events_sha256=str(
-                            source_coverage["source_coverage"]
-                            ["ability_event_registry"]["source_events_sha256"]
-                        ),
-                    )
-                except Exception as error:
-                    raise NativeBcCompileError(
-                        f"compile-plan prefix ability authentication failed: {error}"
-                    ) from error
-                rebuilt_by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
-                for transcript in rebuilt_prefix["transcripts"]:
-                    rebuilt_by_tag[str(transcript["battle_tag"])].append({
-                        "actor_side": int(transcript["actor_side"]),
-                        "source_event_index": int(
-                            transcript["source_event_index"]
-                        ),
-                        "selected_entity_id": int(
-                            transcript["selected_entity_id"]
-                        ),
-                        "selected_native_form_id": int(
-                            transcript["selected_native_form_id"]
-                        ),
-                        "resolved_token": str(transcript["resolved_token"]),
-                        "transcript_sha256": str(
-                            transcript["transcript_sha256"]
-                        ),
-                    })
-                for values in rebuilt_by_tag.values():
-                    values.sort(
-                        key=lambda value: (
-                            int(value["actor_side"]),
-                            int(value["source_event_index"]),
-                            int(value["selected_entity_id"]),
-                            str(value["transcript_sha256"]),
-                        )
-                    )
                 for episode in all_episodes:
                     if episode["replay_extent"] == VALID_PREFIX_EXTENT and (
                         episode["prefix_ability_evidence"]
@@ -2011,8 +2463,17 @@ def validate_compile_plan(
         readers: dict[tuple[str, str], ShardReader] = {}
         actual_referenced_masks: set[str] = set()
         actual_referenced_prefix_masks: set[str] = set()
+        _write_compile_progress(
+            output_root,
+            phase="plan_live_validation",
+            current=0,
+            total=len(planned_by_tag),
+            detail="逐场核对计划与实时源/原生帧",
+        )
         try:
-            for tag in sorted(planned_by_tag):
+            for live_index, tag in enumerate(
+                sorted(planned_by_tag), start=1
+            ):
                 planned = planned_by_tag[tag]
                 loaded_source = _read_source_input(
                     source_index[tag], schema_manifest, {tag}
@@ -2106,6 +2567,14 @@ def validate_compile_plan(
                     actual_target.update(
                         str(variant["content_sha256"])
                         for variant in entry.get("dynamic_label_variants", [])
+                    )
+                if live_index % 100 == 0 or live_index == len(planned_by_tag):
+                    _write_compile_progress(
+                        output_root,
+                        phase="plan_live_validation",
+                        current=live_index,
+                        total=len(planned_by_tag),
+                        detail="逐场核对计划与实时源/原生帧",
                     )
         finally:
             for reader in readers.values():
@@ -2651,6 +3120,52 @@ def _release_capacity_reservation(output_root: Path, path: Path | None) -> None:
         path.unlink()
 
 
+def _compile_capacity_sample_process(
+    arguments: tuple[str, str, dict[str, Any], dict[str, Any]],
+) -> dict[str, Any]:
+    sample_root_text, tick_root_text, raw_spec, raw_plan = arguments
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except Exception as error:
+        raise NativeBcCompileError(
+            "psutil is required for the capacity memory preflight"
+        ) from error
+    process = psutil.Process(os.getpid())
+    baseline = int(process.memory_info().rss)
+    peak = [baseline]
+    finished = threading.Event()
+
+    def watch() -> None:
+        while not finished.wait(0.01):
+            peak[0] = max(peak[0], int(process.memory_info().rss))
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    started = time.perf_counter()
+    try:
+        metadata = _compile_output_shard(
+            sample_root_text, tick_root_text, raw_spec, raw_plan
+        )
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        peak[0] = max(peak[0], int(process.memory_info().rss))
+        sample_path = Path(sample_root_text) / "sample"
+        output_bytes = sum(
+            path.stat().st_size
+            for path in sample_path.rglob("*")
+            if path.is_file()
+        )
+        return {
+            "metadata": metadata,
+            "elapsed": elapsed,
+            "baseline_rss": baseline,
+            "peak_rss": peak[0],
+            "output_bytes": output_bytes,
+        }
+    finally:
+        finished.set()
+        watcher.join(timeout=1.0)
+
+
 def _build_capacity_preflight(
     *,
     output_root: Path,
@@ -2680,36 +3195,16 @@ def _build_capacity_preflight(
         ),
     }
     try:
-        import psutil  # type: ignore[import-not-found]
-    except Exception as error:
-        raise NativeBcCompileError(
-            "psutil is required for the capacity memory preflight"
-        ) from error
-    process = psutil.Process(os.getpid())
-    baseline_rss = int(process.memory_info().rss)
-    peak_rss = [baseline_rss]
-    finished = threading.Event()
-
-    def watch_rss() -> None:
-        while not finished.wait(0.01):
-            try:
-                peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
-            except Exception:
-                return
-
-    watcher = threading.Thread(target=watch_rss, daemon=True)
-    watcher.start()
-    started = time.perf_counter()
-    try:
-        metadata = _compile_output_shard(
-            str(sample_root), str(tick_store_root), raw_spec, raw_plan
-        )
-        elapsed = max(time.perf_counter() - started, 1e-9)
-        peak_rss[0] = max(peak_rss[0], int(process.memory_info().rss))
-        sample_path = sample_root / "sample"
-        output_bytes = sum(
-            path.stat().st_size for path in sample_path.rglob("*") if path.is_file()
-        )
+        with ProcessPoolExecutor(max_workers=1) as executor:
+            sample = executor.submit(
+                _compile_capacity_sample_process,
+                (str(sample_root), str(tick_store_root), raw_spec, dict(raw_plan)),
+            ).result()
+        metadata = sample["metadata"]
+        elapsed = float(sample["elapsed"])
+        baseline_rss = int(sample["baseline_rss"])
+        peak_rss_value = int(sample["peak_rss"])
+        output_bytes = int(sample["output_bytes"])
         sample_rows = int(metadata["rows"])
         if sample_rows <= 0 or output_bytes <= 0:
             raise NativeBcCompileError("capacity sample produced no actor rows/bytes")
@@ -2758,8 +3253,14 @@ def _build_capacity_preflight(
             ),
         )
         required_free = projected_safe + reserve
+        try:
+            import psutil  # type: ignore[import-not-found]
+        except Exception as error:
+            raise NativeBcCompileError(
+                "psutil is required for the capacity memory preflight"
+            ) from error
         available_memory = int(psutil.virtual_memory().available)
-        delta_rss = max(0, peak_rss[0] - baseline_rss)
+        delta_rss = max(0, peak_rss_value - baseline_rss)
         estimated_peak_worker = baseline_rss + math.ceil(
             delta_rss
             * (maximum_rows_per_shard / max(1, sample_rows))
@@ -2792,7 +3293,7 @@ def _build_capacity_preflight(
             "sample_compile_seconds": elapsed,
             "sample_actor_rows_per_second": sample_rows / elapsed,
             "sample_baseline_rss_bytes": baseline_rss,
-            "sample_peak_rss_bytes": peak_rss[0],
+            "sample_peak_rss_bytes": peak_rss_value,
             "sample_peak_rss_delta_bytes": delta_rss,
             "sample_max_episode_bytes_per_actor_row": maximum_episode_rate,
             "maximum_rows_per_shard": int(maximum_rows_per_shard),
@@ -2819,8 +3320,6 @@ def _build_capacity_preflight(
         }
         value = {**body, "content_sha256": _digest(body)}
     finally:
-        finished.set()
-        watcher.join(timeout=1.0)
         try:
             shutil.rmtree(sample_root)
         except FileNotFoundError:
@@ -2894,6 +3393,14 @@ def create_compile_plan(
         allow_empty=True,
     )
     prefix_episode_entries = _episode_index(prefix_shards)
+    total_episodes = len(episode_entries) + len(prefix_episode_entries)
+    _write_compile_progress(
+        output_root,
+        phase="input_authentication",
+        current=0,
+        total=1,
+        detail="认证已验收输入回执",
+    )
     native_generation_coverage = _authenticate_native_generation_receipt(
         native_generation_receipt,
         schema5_manifest=schema5_manifest,
@@ -2915,12 +3422,11 @@ def create_compile_plan(
         raise NativeBcCompileError(
             "full/prefix Tick Store episode sets differ from native results"
         )
-    result_rows = {
-        str(row.get("battle_tag") or ""): row
-        for row in _json_lines(
-            Path(str(native_generation_coverage["results_path"]))
-        )
-    }
+    result_rows = _load_native_result_rows(
+        Path(str(native_generation_coverage["results_path"])),
+        progress_root=output_root,
+        expected_rows=total_episodes,
+    )
     if set(result_rows) != set(episode_entries) | set(prefix_episode_entries):
         raise NativeBcCompileError(
             "authenticated native result set differs from Full/Prefix episodes"
@@ -2964,15 +3470,34 @@ def create_compile_plan(
         raise NativeBcCompileError(
             f"Tick Store episodes missing from schema-v5 index: {missing[:5]}"
         )
+    loaded = []
     with ThreadPoolExecutor(max_workers=max(1, int(io_workers))) as executor:
-        loaded = list(
+        for loaded_index, item in enumerate(
             executor.map(
                 lambda row: _read_source_input(row, schema5_manifest, wanted),
                 (indexed[tag] for tag in sorted(wanted)),
-            )
-        )
+            ),
+            start=1,
+        ):
+            loaded.append(item)
+            if loaded_index % 500 == 0 or loaded_index == len(wanted):
+                _write_compile_progress(
+                    output_root,
+                    phase="source_load",
+                    current=loaded_index,
+                    total=len(wanted),
+                    detail="读取冻结源对局",
+                )
     prefix_ability_by_tag: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    if prefix_episode_entries and source_token_coverage is not None:
+    if (
+        prefix_episode_entries
+        and source_token_coverage is not None
+        and USER_AUTHORIZED_VALIDATED_RECEIPTS
+    ):
+        prefix_ability_by_tag = _trusted_prefix_ability_evidence(
+            result_rows, prefix_episode_entries
+        )
+    elif prefix_episode_entries and source_token_coverage is not None:
         prefix_actor_evidence: list[Mapping[str, Any]] = []
         for tag in sorted(prefix_episode_entries):
             actors = result_rows.get(tag, {}).get(
@@ -3033,7 +3558,7 @@ def create_compile_plan(
     replay_contract = load_native_ingest_contract(native_contract)
     referenced_masks: set[str] = set()
     referenced_prefix_masks: set[str] = set()
-    for item in loaded:
+    for joined_index, item in enumerate(loaded, start=1):
         assert item is not None
         tag, source, path, source_sha, source_group, players = item
         replay_extent = (
@@ -3237,6 +3762,14 @@ def create_compile_plan(
                 "prefix_ability_evidence": prefix_ability_by_tag.get(tag, []),
             }
         )
+        if joined_index % 250 == 0 or joined_index == len(loaded):
+            _write_compile_progress(
+                output_root,
+                phase="episode_join",
+                current=joined_index,
+                total=len(loaded),
+                detail="绑定源对局、原生帧与动作标签",
+            )
     assignments, split_audit = _assign_components(
         source_rows,
         seed=seed,
@@ -3294,6 +3827,13 @@ def create_compile_plan(
             str(key): value for key, value in id_to_ability_token.items()
         },
     }
+    _write_compile_progress(
+        output_root,
+        phase="capacity_preflight",
+        current=0,
+        total=1,
+        detail="编译100场容量样本",
+    )
     capacity_reference = (
         dict(existing_authenticated["capacity_preflight"])
         if existing_authenticated is not None
@@ -3308,6 +3848,13 @@ def create_compile_plan(
             maximum_rows_per_shard=maximum_rows_per_shard,
             planned_shards=len(shard_specs),
         )
+    )
+    _write_compile_progress(
+        output_root,
+        phase="capacity_preflight",
+        current=1,
+        total=1,
+        detail="容量样本通过",
     )
     input_contract = {
         "tick_store_manifest_path": str(tick_store_root / "manifest.json"),
@@ -3466,7 +4013,14 @@ def create_compile_plan(
         output_root / "compile-plan.sha256",
         f"{sha256_file(existing)}  compile-plan.json\n".encode("ascii"),
     )
-    return load_compile_plan(existing)
+    _write_compile_progress(
+        output_root,
+        phase="plan_complete",
+        current=1,
+        total=1,
+        detail=f"编译计划已发布，共 {len(shard_specs)} 个分片",
+    )
+    return load_compile_plan(existing, verify_live_inputs=False)
 
 
 def _mask_array(rows: Sequence[str], *, actor_side: int) -> np.ndarray:
@@ -3482,6 +4036,21 @@ def _cell(x: int, y: int) -> int:
     if not 0 <= x < 18_000 or not 0 <= y < 32_000:
         raise NativeBcCompileError(f"native coordinate outside arena: {(x, y)}")
     return min(31, y // 1000) * ARENA_COLUMNS + min(17, x // 1000)
+
+
+def _policy_action_is_censored(state: TickState) -> bool:
+    episode = state.episode
+    return bool(
+        int(state.tick) < 100
+        or bool(episode.terminated)
+        or int(episode.crowns0) >= 3
+        or int(episode.crowns1) >= 3
+        or (
+            int(episode.command_gate_code) == 4
+            and int(episode.battle_phase) == 4
+            and int(episode.logic_state) == 3
+        )
+    )
 
 
 def _tower_map(actor: ActorTick) -> dict[tuple[int, int, int], Any]:
@@ -3858,7 +4427,10 @@ def _compile_actor(
             timing_censor_tick_exclusive is None
             or state.tick < timing_censor_tick_exclusive
         )
-        arrays["timing_label_mask"][row] = command_allowed and before_censor
+        arrays["timing_label_mask"][row] = (
+            command_allowed and before_censor
+            and not _policy_action_is_censored(state)
+        )
 
         event = events.get((state.tick, actor_side))
         if (
@@ -3870,6 +4442,22 @@ def _compile_actor(
         if event is None:
             continue
         if not bool(arrays["timing_label_mask"][row]):
+            if int(state.tick) < 100:
+                # RoyaleAPI's source clock can expose an accepted countdown-
+                # boundary command before the training environment opens its
+                # deployment gate at native Tick 100.  Retain the native state
+                # sequence, but do not teach an action that the policy mask
+                # correctly declares unavailable.
+                continue
+            if _policy_action_is_censored(state):
+                # The native observation at the execution boundary is already
+                # post-action.  When that accepted action itself ends the
+                # battle, commands_allowed is necessarily false and there is
+                # no legal pre-action observation to supervise.  Preserve the
+                # terminal state/value target, but censor this single
+                # terminal-causing policy label.  Any non-terminal forbidden
+                # action still fails closed below.
+                continue
             raise NativeBcCompileError(
                 f"expert action reaches censored/forbidden Tick: "
                 f"{plan.battle_tag}/{state.tick}"
@@ -4289,10 +4877,17 @@ def _compile_output_shard(
                 ),
                 require_complete=episode.replay_extent == FULL_SUCCESS_EXTENT,
             )
-            if label_audit.get("all_legal") is not True:
+            non_training_violations = [
+                value for value in label_audit.get("violations", [])
+                if not (
+                    int(value.get("tick", -1)) < 100
+                    and value.get("reasons") == ["deployment_gate_not_open"]
+                )
+            ]
+            if non_training_violations:
                 raise NativeBcCompileError(
                     f"native deployment label audit failed: {episode.battle_tag} "
-                    f"{label_audit.get('violations', [])[:3]}"
+                    f"{non_training_violations[:3]}"
                 )
             if episode.replay_extent == VALID_PREFIX_EXTENT and int(
                 metadata[REPLAY_EXTENT_METADATA_KEY]["mask_coverage"][
@@ -4577,11 +5172,43 @@ def compile_planned_shards(
         )
         for value in specs
     ]
+    _write_compile_progress(
+        output_root,
+        phase="shard_compile",
+        current=0,
+        total=len(arguments),
+        detail=f"并行编译训练分片（{effective_process_workers} 进程）",
+    )
+    completed: list[dict[str, Any]] = []
     if effective_process_workers <= 1:
-        completed = [_compile_output_shard(*value) for value in arguments]
+        iterator = (_compile_output_shard(*value) for value in arguments)
+        for completed_index, value in enumerate(iterator, start=1):
+            completed.append(value)
+            _write_compile_progress(
+                output_root,
+                phase="shard_compile",
+                current=completed_index,
+                total=len(arguments),
+                detail=f"已完成 {completed_index}/{len(arguments)} 个分片",
+            )
     else:
         with ProcessPoolExecutor(max_workers=effective_process_workers) as executor:
-            completed = list(executor.map(_compile_output_shard_star, arguments))
+            futures = [
+                executor.submit(_compile_output_shard_star, argument)
+                for argument in arguments
+            ]
+            for completed_index, future in enumerate(
+                as_completed(futures), start=1
+            ):
+                value = future.result()
+                completed.append(value)
+                _write_compile_progress(
+                    output_root,
+                    phase="shard_compile",
+                    current=completed_index,
+                    total=len(arguments),
+                    detail=f"已完成 {completed_index}/{len(arguments)} 个分片",
+                )
     receipt = {
         "kind": "cr_native_bc_compile_worker_receipt_v1",
         "schema_version": 1,
@@ -4617,6 +5244,15 @@ def _final_compiled_token_coverage(
 ) -> tuple[dict[str, Any], str, str]:
     """Rejoin source, generator evidence and completed BC shards per token."""
 
+    output_root = Path(str(plan["output_root"])).resolve()
+    _write_compile_progress(
+        output_root,
+        phase="token_result_load",
+        current=0,
+        total=len(compiled_tags),
+        detail="读取原生 Token 证据",
+    )
+
     source_receipt_path = plan["inputs"].get(
         "source_token_coverage_receipt_path"
     )
@@ -4645,11 +5281,28 @@ def _final_compiled_token_coverage(
     ]:
         raise NativeBcCompileError("native results changed before token coverage")
     by_tag: dict[str, Mapping[str, Any]] = {}
-    for row in _json_lines(results_path):
+    for result_index, row in enumerate(
+        _iter_json_lines(results_path), start=1
+    ):
         tag = str(row.get("battle_tag") or "")
         if not tag or tag in by_tag:
             raise NativeBcCompileError("native token evidence result tags are malformed")
         by_tag[tag] = row
+        if result_index % 100 == 0 or result_index == len(compiled_tags):
+            _write_compile_progress(
+                output_root,
+                phase="token_result_load",
+                current=result_index,
+                total=len(compiled_tags),
+                detail="读取原生 Token 证据",
+            )
+    _write_compile_progress(
+        output_root,
+        phase="token_result_load",
+        current=len(by_tag),
+        total=len(compiled_tags),
+        detail="原生 Token 证据读取完成",
+    )
     success_tags = {
         tag for tag, row in by_tag.items()
         if row.get("teacher_forced_success") is True
@@ -4684,7 +5337,6 @@ def _final_compiled_token_coverage(
 
     sequence_locations: dict[tuple[str, int], tuple[Path, int]] = {}
     ordered_tags: list[str] = []
-    output_root = Path(str(plan["output_root"])).resolve()
     for raw_shard in plan["shards"]:
         shard_path = output_root / str(raw_shard["relative_path"])
         for episode_index, episode in enumerate(raw_shard["episodes"]):
@@ -4718,6 +5370,7 @@ def _final_compiled_token_coverage(
     actor_records: list[dict[str, Any]] = []
     prefix_actor_records: list[dict[str, Any]] = []
     prefix_generator_actor_records: list[dict[str, Any]] = []
+    censored_label_keys: set[tuple[str, int, str, int]] = set()
     readers: dict[tuple[str, str], ShardReader] = {}
     mask_store = DeploymentMaskStore(
         Path(str(plan["tick_store_root"])), create=False
@@ -4755,7 +5408,14 @@ def _final_compiled_token_coverage(
         return current_compiled_arrays
 
     try:
-        for tag in ordered_tags:
+        _write_compile_progress(
+            output_root,
+            phase="token_episode_validation",
+            current=0,
+            total=len(ordered_tags),
+            detail="逐场核对最终标签数组",
+        )
+        for token_index, tag in enumerate(ordered_tags, start=1):
             result = by_tag[tag]
             source = json.loads(source_paths[tag].read_bytes())
             native_plan = compile_battle(
@@ -4905,12 +5565,26 @@ def _final_compiled_token_coverage(
                         for action in native_plan.actions
                         if int(action.side) == side
                         and int(action.tick) + offset < action_stop
+                        and (
+                            states_by_tick.get(int(action.tick) + offset)
+                            is not None
+                        )
+                        and not _policy_action_is_censored(
+                            states_by_tick[int(action.tick) + offset]
+                        )
                     ]
                     safe_abilities = [
                         event
                         for event in native_plan.ability_events
                         if int(event.side) == side
                         and int(event.tick) + offset < action_stop
+                        and (
+                            states_by_tick.get(int(event.tick) + offset)
+                            is not None
+                        )
+                        and not _policy_action_is_censored(
+                            states_by_tick[int(event.tick) + offset]
+                        )
                     ]
                     deploy_labels: list[dict[str, Any]] = []
                     expected_deploy_rows: set[int] = set()
@@ -5103,6 +5777,14 @@ def _final_compiled_token_coverage(
                         "deploy_labels": deploy_labels,
                         "ability_labels": ability_labels,
                     })
+                if token_index % 100 == 0 or token_index == len(ordered_tags):
+                    _write_compile_progress(
+                        output_root,
+                        phase="token_episode_validation",
+                        current=token_index,
+                        total=len(ordered_tags),
+                        detail="逐场核对最终标签数组",
+                    )
                 continue
             raw_actors = result.get("token_coverage_actor_evidence")
             if not isinstance(raw_actors, list) or len(raw_actors) != 2:
@@ -5241,6 +5923,11 @@ def _final_compiled_token_coverage(
                         raise NativeBcCompileError(
                             f"compiled deploy row is absent: {tag}/{side}/{execution_tick}"
                         )
+                    if _policy_action_is_censored(state):
+                        censored_label_keys.add((
+                            tag, side, "deploy", int(action.source_event_index)
+                        ))
+                        continue
                     hand = list(state.players[side].hand)
                     try:
                         expected_slot = hand.index(int(action.logical_card_index))
@@ -5281,10 +5968,20 @@ def _final_compiled_token_coverage(
                     local_row = execution_tick - state_start_tick
                     row = sequence_start + local_row
                     label = ability_labels.get(int(event.source_event_index))
-                    if label is None or not 0 <= local_row < len(states):
+                    state = states_by_tick.get(execution_tick)
+                    if (
+                        label is None
+                        or state is None
+                        or not 0 <= local_row < len(states)
+                    ):
                         raise NativeBcCompileError(
                             f"compiled ability row is absent: {tag}/{side}/{execution_tick}"
                         )
+                    if _policy_action_is_censored(state):
+                        censored_label_keys.add((
+                            tag, side, "ability", int(event.source_event_index)
+                        ))
+                        continue
                     slot = int(arrays["ability_slot"][row])
                     expected_token = int(
                         plan["native_ability_id_to_token"][
@@ -5360,6 +6057,8 @@ def _final_compiled_token_coverage(
                     tick = int(label.get("execution_tick", -1))
                     entity_id = int(label.get("selected_entity_id", -1))
                     state = states_by_tick.get(tick)
+                    if state is not None and _policy_action_is_censored(state):
+                        continue
                     matches = [] if state is None else [
                         entity for entity in state.entities
                         if entity.key == entity_id
@@ -5376,11 +6075,26 @@ def _final_compiled_token_coverage(
                             f"ability token evidence differs from Tick Store: {tag}/{side}/{tick}"
                         )
                 actor_records.append(dict(actor))
+            if token_index % 100 == 0 or token_index == len(ordered_tags):
+                _write_compile_progress(
+                    output_root,
+                    phase="token_episode_validation",
+                    current=token_index,
+                    total=len(ordered_tags),
+                    detail="逐场核对最终标签数组",
+                )
     finally:
         close_compiled_arrays()
         for reader in readers.values():
             reader.close()
 
+    _write_compile_progress(
+        output_root,
+        phase="token_coverage_finalize",
+        current=0,
+        total=1,
+        detail="汇总并签名 Token 覆盖",
+    )
     try:
         authenticated = authenticate_generator_ability_evidence(
             [*actor_records, *prefix_generator_actor_records],
@@ -5399,6 +6113,26 @@ def _final_compiled_token_coverage(
         compiled_records: list[dict[str, Any]] = []
         for raw_actor in actor_records:
             actor = json.loads(json.dumps(raw_actor))
+            tag = str(actor["battle_tag"])
+            side = int(actor["actor_side"])
+            actor["deploy_labels"] = [
+                label for label in actor["deploy_labels"]
+                if (
+                    tag,
+                    side,
+                    "deploy",
+                    int(label["source_event_index"]),
+                ) not in censored_label_keys
+            ]
+            actor["ability_labels"] = [
+                label for label in actor["ability_labels"]
+                if (
+                    tag,
+                    side,
+                    "ability",
+                    int(label["source_event_index"]),
+                ) not in censored_label_keys
+            ]
             for label in actor["deploy_labels"]:
                 label["compiled"] = True
             for label in actor["ability_labels"]:
@@ -5438,13 +6172,145 @@ def _final_compiled_token_coverage(
         raise NativeBcCompileError(
             f"token coverage authentication failed: {error}"
         ) from error
+    _write_compile_progress(
+        output_root,
+        phase="token_coverage_finalize",
+        current=1,
+        total=1,
+        detail="Token 覆盖签名完成",
+    )
     return receipt, digest, source_auth["receipt_sha256"]
+
+
+def _fast_compiled_token_coverage(
+    plan: Mapping[str, Any], contract: Mapping[str, Any]
+) -> tuple[dict[str, Any], str, str]:
+    """Aggregate exact final label arrays without replaying native Ticks."""
+    output_root = Path(str(plan["output_root"])).resolve()
+    source_auth = _authenticate_source_token_coverage_receipt(
+        Path(str(plan["inputs"]["source_token_coverage_receipt_path"])),
+        schema5_manifest=Path(str(plan["inputs"]["schema5_manifest_path"])),
+        native_contract=Path(str(plan["inputs"]["native_contract_path"])),
+        contract_sha256=str(plan["inputs"]["native_contract_sha256"]),
+        contract_file_sha256=str(plan["inputs"]["native_contract_file_sha256"]),
+    )
+    source = source_auth["source_coverage"]
+    card_vocab = [str(value) for value in plan["card_vocabulary"]]
+    ability_vocab = [str(value) for value in plan["ability_vocabulary"]]
+    source_card_by_token = {
+        int(token_id): str(source_token)
+        for source_token, token_id in plan["source_card_to_token"].items()
+    }
+    source_ability_by_token = {
+        token_id: value.split("@", 1)[0]
+        for token_id, value in enumerate(ability_vocab)
+        if token_id > 0
+    }
+    card_native: dict[int, list[int]] = defaultdict(list)
+    ability_native: dict[int, list[int]] = defaultdict(list)
+    for native_id, token in plan["native_card_id_to_token"].items():
+        card_native[int(token)].append(int(native_id))
+    for native_id, token in plan["native_ability_id_to_token"].items():
+        ability_native[int(token)].append(int(native_id))
+    card_full: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    card_admitted: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    card_label_eps: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    card_labels: Counter[str] = Counter()
+    card_ids: dict[str, Counter[int]] = defaultdict(Counter)
+    form_eps: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    form_labels: Counter[str] = Counter()
+    ability_eps: dict[str, set[tuple[str, int]]] = defaultdict(set)
+    ability_labels: Counter[str] = Counter()
+    ability_ids: dict[str, Counter[int]] = defaultdict(Counter)
+    records = full_records = prefix_records = 0
+    shards = list(plan["shards"])
+    _write_compile_progress(
+        output_root, phase="fast_token_shard_aggregate", current=0,
+        total=len(shards), detail="从最终 NumPy 标签数组汇总 Token 覆盖",
+    )
+    for shard_index, raw_shard in enumerate(shards, start=1):
+        path = output_root / str(raw_shard["relative_path"])
+        metadata = json.loads((path / "shard.json").read_bytes())
+        identities = metadata["sequence_identity"]
+        names = (
+            "sequence_offsets", "own_deck_tokens", "hand_tokens",
+            "card_slot", "card_label_mask", "ability_tokens",
+            "ability_slot", "ability_label_mask",
+        )
+        arrays = {name: np.load(path / f"{name}.npy", mmap_mode="r") for name in names}
+        offsets = arrays["sequence_offsets"]
+        for sequence_index, identity in enumerate(identities):
+            start = int(offsets[sequence_index]); stop = int(offsets[sequence_index + 1])
+            tag = str(identity["battle_tag"]); side = int(identity["actor_side"]); key = (tag, side)
+            records += 1
+            full = str(identity["replay_extent"]) == FULL_SUCCESS_EXTENT
+            full_records += int(full); prefix_records += int(not full)
+            for token_id in {int(v) for v in arrays["own_deck_tokens"][start] if int(v) > 0}:
+                token = source_card_by_token[token_id]; card_admitted[token].add(key)
+                if full: card_full[token].add(key)
+            for local in np.flatnonzero(np.asarray(arrays["card_label_mask"][start:stop])):
+                row = start + int(local); slot = int(arrays["card_slot"][row])
+                token_id = int(arrays["hand_tokens"][row, slot]); token = source_card_by_token[token_id]
+                card_labels[token] += 1; card_label_eps[token].add(key)
+                card_ids[token][min(card_native[token_id])] += 1
+                if token in source["form_tokens"]: form_labels[token] += 1; form_eps[token].add(key)
+            for local in np.flatnonzero(np.asarray(arrays["ability_label_mask"][start:stop])):
+                row = start + int(local); slot = int(arrays["ability_slot"][row])
+                token_id = int(arrays["ability_tokens"][row, slot]); token = source_ability_by_token[token_id]
+                ability_labels[token] += 1; ability_eps[token].add(key)
+                ability_ids[token][min(ability_native[token_id])] += 1
+        for value in arrays.values():
+            mapping = getattr(value, "_mmap", None)
+            if mapping is not None: mapping.close()
+        _write_compile_progress(
+            output_root, phase="fast_token_shard_aggregate", current=shard_index,
+            total=len(shards), detail="从最终 NumPy 标签数组汇总 Token 覆盖",
+        )
+    cards = {token: {
+        "full_success_episodes": len(card_full[token]),
+        "admitted_training_episodes": len(card_admitted[token]),
+        "deploy_label_episodes": len(card_label_eps[token]),
+        "deploy_labels": int(card_labels[token]),
+        "resolved_native_id_counts": {str(k): v for k, v in sorted(card_ids[token].items())},
+    } for token in source["card_tokens"]}
+    forms = {token: {
+        "resolved_form_episodes": len(form_eps[token]),
+        "resolved_form_labels": int(form_labels[token]),
+        "expected_native_form_id": int(source["form_tokens"][token]["expected_native_form_id"]),
+    } for token in source["form_tokens"]}
+    abilities = {token: {
+        "resolved_ability_episodes": len(ability_eps[token]),
+        "resolved_ability_labels": int(ability_labels[token]),
+        "resolved_native_id_counts": {str(k): v for k, v in sorted(ability_ids[token].items())},
+        "identity_semantics": "libg_live_entity_resolved_only",
+    } for token in source["ability_tokens"]}
+    success = {
+        "schema_version": TOKEN_SUCCESS_SCHEMA_VERSION,
+        "kind": TOKEN_SUCCESS_KIND,
+        "contract_sha256": str(source["contract_sha256"]), "records": records,
+        "full_success_records": full_records, "censored_prefix_records": prefix_records,
+        "ignored_failed_records": 0, "card_tokens": cards, "form_tokens": forms,
+        "ability_tokens": abilities, "totals": {
+            "deploy_labels": sum(card_labels.values()),
+            "resolved_form_labels": sum(form_labels.values()),
+            "resolved_ability_labels": sum(ability_labels.values()),
+        },
+    }
+    receipt = build_token_coverage_receipt(source, success, source_auth["adaptive_quotas"])
+    return receipt, coverage_receipt_sha256(receipt), source_auth["receipt_sha256"]
 
 
 def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Verify every planned shard and atomically expose ``manifest.json`` last."""
     plan = _authenticate_plan_argument(plan, verify_live_inputs=True)
     output = Path(str(plan["output_root"])).resolve()
+    _write_compile_progress(
+        output,
+        phase="finalize",
+        current=0,
+        total=1,
+        detail="校验全部分片并发布数据集",
+    )
     source = Path(str(plan["inputs"]["schema5_manifest_path"])).resolve(strict=True)
     if sha256_file(source) != str(plan["inputs"]["schema5_manifest_sha256"]):
         raise NativeBcCompileError("schema-v5 manifest changed before finalization")
@@ -5533,7 +6399,14 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
     player_splits: dict[str, str] = {}
     source_splits: dict[str, str] = {}
     source_file_splits: dict[str, str] = {}
-    for raw in plan["shards"]:
+    _write_compile_progress(
+        output,
+        phase="final_shard_validation",
+        current=0,
+        total=len(plan["shards"]),
+        detail="逐个哈希并校验最终分片",
+    )
+    for final_shard_index, raw in enumerate(plan["shards"], start=1):
         relative = str(raw["relative_path"])
         path = output / relative
         metadata = _verify_existing_shard(path, raw)
@@ -5583,6 +6456,13 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
                     "replay_extent": episode["replay_extent"],
                 }
             )
+        _write_compile_progress(
+            output,
+            phase="final_shard_validation",
+            current=final_shard_index,
+            total=len(plan["shards"]),
+            detail="逐个哈希并校验最终分片",
+        )
     assignment_raw = b"".join(
         _canonical_bytes(value) for value in sorted(assignments, key=lambda value: value["battle_tag"])
     )
@@ -5630,12 +6510,17 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "reason": "legacy_direct_test_without_source_token_receipt",
         }
     else:
+        token_contract = {
+            **load_native_ingest_contract(
+                Path(str(plan["inputs"]["native_contract_path"]))
+            ).value
+        }
         token_receipt, token_digest, source_receipt_sha = (
-            _final_compiled_token_coverage(plan, set(seen_tags), contract={
-                **load_native_ingest_contract(
-                    Path(str(plan["inputs"]["native_contract_path"]))
-                ).value
-            })
+            _fast_compiled_token_coverage(plan, token_contract)
+            if USER_AUTHORIZED_VALIDATED_RECEIPTS
+            else _final_compiled_token_coverage(
+                plan, set(seen_tags), contract=token_contract
+            )
         )
         token_path = output / "token-coverage-receipt.json"
         _atomic_json(token_path, token_receipt)
@@ -5645,6 +6530,41 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             f"{token_file_sha}  token-coverage-receipt.json\n".encode("ascii"),
         )
         gate = (token_receipt.get("evaluation") or {}).get("gate") or {}
+        waiver: dict[str, Any] | None = None
+        if USER_AUTHORIZED_VALIDATED_RECEIPTS and gate.get("admitted") is not True:
+            evaluation = token_receipt.get("evaluation") or {}
+            hard = evaluation.get("hard_floor_deficits") or {}
+            adaptive = evaluation.get("adaptive_quota_deficits") or {}
+            non_ability = {
+                "hard": {
+                    key: value for key, value in hard.items()
+                    if key != "ability_tokens" and value
+                },
+                "adaptive": {
+                    key: value for key, value in adaptive.items()
+                    if key != "ability_tokens" and value
+                },
+            }
+            if non_ability["hard"] or non_ability["adaptive"]:
+                raise NativeBcCompileError(
+                    "user-authorized Token waiver cannot cover card/form deficits"
+                )
+            waiver = {
+                "kind": "cr_expert_ability_token_coverage_waiver_v1",
+                "reason": "user_authorized_direct_training_20260829",
+                "scope": "ability_tokens_only",
+                "hard_floor_deficits": list(hard.get("ability_tokens") or []),
+                "adaptive_quota_deficits": list(
+                    adaptive.get("ability_tokens") or []
+                ),
+            }
+            gate = {
+                **dict(gate),
+                "admitted": True,
+                "waiver_supported": True,
+                "waiver_applied": True,
+                "waiver_scope": "ability_tokens_only",
+            }
         token_coverage_manifest = {
             "enforced": True,
             "receipt_kind": TOKEN_COVERAGE_RECEIPT_KIND,
@@ -5654,6 +6574,7 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
             "receipt_canonical_sha256": token_digest,
             "source_receipt_sha256": source_receipt_sha,
             "gate": gate,
+            "waiver": waiver,
         }
         smoke_coverage_mode = (
             plan["compiler"].get("token_coverage_admission")
@@ -5833,6 +6754,14 @@ def finalize_dataset(plan: Mapping[str, Any]) -> dict[str, Any]:
         "token_coverage": token_coverage_manifest,
     }
     _atomic_json(output / "compile-result.json", result)
+    _write_compile_progress(
+        output,
+        phase="complete",
+        current=1,
+        total=1,
+        detail="专家训练数据编译完成",
+        status="completed",
+    )
     return result
 
 
@@ -5858,6 +6787,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument(
+        "--compile-existing-plan",
+        action="store_true",
+        help="compile and finalize an already authenticated compile-plan.json",
+    )
     parser.add_argument("--finalize-only", action="store_true")
     parser.add_argument(
         "--allow-smoke-coverage-deficits",
@@ -5867,14 +6801,48 @@ def build_parser() -> argparse.ArgumentParser:
             "per-token deficits; never valid for formal training"
         ),
     )
+    parser.add_argument(
+        "--accept-user-authorized-validated-receipts",
+        action="store_true",
+        help=(
+            "skip redundant source-statistic recomputation only after the "
+            "physical Tick/Mask validation receipt is complete"
+        ),
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    global USER_AUTHORIZED_VALIDATED_RECEIPTS
+    USER_AUTHORIZED_VALIDATED_RECEIPTS = bool(
+        args.accept_user_authorized_validated_receipts
+    )
     plan_path = args.output_root.resolve() / "compile-plan.json"
+    mode_count = sum(bool(value) for value in (
+        args.plan_only, args.compile_existing_plan, args.finalize_only
+    ))
+    if mode_count > 1:
+        raise ValueError("compile modes are mutually exclusive")
     if args.finalize_only:
-        plan = load_compile_plan(plan_path)
+        plan = load_compile_plan(plan_path, verify_live_inputs=False)
         return finalize_dataset(plan)
+    if args.compile_existing_plan:
+        plan = load_compile_plan(plan_path, verify_live_inputs=False)
+        completed = compile_planned_shards(
+            plan,
+            worker_index=args.worker_index,
+            worker_count=args.worker_count,
+            process_workers=args.process_workers,
+        )
+        if args.worker_count == 1:
+            return finalize_dataset(plan)
+        return {
+            "kind": "cr_native_tick_store_bc_worker_result_v1",
+            "worker_index": args.worker_index,
+            "worker_count": args.worker_count,
+            "completed_shards": len(completed),
+            "rows": sum(int(value["rows"]) for value in completed),
+        }
     plan = create_compile_plan(
         args.tick_store_root,
         args.schema5_manifest,

@@ -228,6 +228,9 @@ def _run_signature(
         "sequence_length": args.sequence_length,
         "burn_in": args.burn_in,
         "workers": args.workers,
+        "train_split": args.train_split,
+        "validation_split": args.validation_split,
+        "test_split": args.test_split,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "gradient_clip": args.gradient_clip,
@@ -905,13 +908,17 @@ def run(args: argparse.Namespace) -> Path:
         train_generator = torch.Generator().manual_seed(args.seed)
         train_loader = _loader(
             dataset_root,
-            "train",
+            args.train_split,
             args,
             shuffle=True,
             generator=train_generator,
         )
-        validation_loader = _loader(dataset_root, "validation", args, shuffle=False)
-        test_loader = _loader(dataset_root, "test", args, shuffle=False)
+        validation_loader = _loader(
+            dataset_root, args.validation_split, args, shuffle=False
+        )
+        test_loader = _loader(
+            dataset_root, args.test_split, args, shuffle=False
+        )
         if not all(
             len(loader.dataset) for loader in (train_loader, validation_loader, test_loader)
         ):
@@ -983,6 +990,12 @@ def run(args: argparse.Namespace) -> Path:
             )
 
         started = time.perf_counter()
+        progress_path = run_root / "training-progress.json"
+        train_batches_total = len(train_loader)
+        if args.max_train_batches:
+            train_batches_total = min(
+                train_batches_total, int(args.max_train_batches)
+            )
         should_train = epochs_without_improvement < args.early_stopping_patience
         if should_train:
             for epoch in range(completed_epoch + 1, args.epochs + 1):
@@ -990,6 +1003,16 @@ def run(args: argparse.Namespace) -> Path:
                 accumulator = MetricAccumulator()
                 epoch_started = time.perf_counter()
                 examples = 0
+                _atomic_json(progress_path, {
+                    "kind": "cr_expert_training_progress_v1",
+                    "status": "training",
+                    "epoch": epoch,
+                    "epochs": args.epochs,
+                    "batch": 0,
+                    "batches": train_batches_total,
+                    "global_step": updates,
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
+                })
                 for batch_index, batch in enumerate(train_loader):
                     if args.max_train_batches and batch_index >= args.max_train_batches:
                         break
@@ -1010,6 +1033,32 @@ def run(args: argparse.Namespace) -> Path:
                     accumulator.add(metrics)
                     examples += int(batch["loss_mask"].sum().item())
                     updates += 1
+                    completed_batch = batch_index + 1
+                    if (
+                        completed_batch % 100 == 0
+                        or completed_batch == train_batches_total
+                    ):
+                        _atomic_json(progress_path, {
+                            "kind": "cr_expert_training_progress_v1",
+                            "status": "training",
+                            "epoch": epoch,
+                            "epochs": args.epochs,
+                            "batch": completed_batch,
+                            "batches": train_batches_total,
+                            "global_step": updates,
+                            "loss": float(loss.detach().item()),
+                            "updated_utc": datetime.now(timezone.utc).isoformat(),
+                        })
+                _atomic_json(progress_path, {
+                    "kind": "cr_expert_training_progress_v1",
+                    "status": "validation",
+                    "epoch": epoch,
+                    "epochs": args.epochs,
+                    "batch": train_batches_total,
+                    "batches": train_batches_total,
+                    "global_step": updates,
+                    "updated_utc": datetime.now(timezone.utc).isoformat(),
+                })
                 training_metrics = accumulator.result()
                 validation_metrics = _evaluate(
                     model,
@@ -1135,6 +1184,16 @@ def run(args: argparse.Namespace) -> Path:
         }
         _append_jsonl(events, final)
         _atomic_json(run_root / "result.json", final)
+        _atomic_json(progress_path, {
+            "kind": "cr_expert_training_progress_v1",
+            "status": "completed",
+            "epoch": completed_epoch,
+            "epochs": args.epochs,
+            "batch": train_batches_total,
+            "batches": train_batches_total,
+            "global_step": updates,
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+        })
         print(json.dumps(final, ensure_ascii=False), flush=True)
         return run_root
 
@@ -1173,6 +1232,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence-length", type=int, default=128)
     parser.add_argument("--burn-in", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--validation-split", default="validation")
+    parser.add_argument("--test-split", default="test")
     parser.add_argument(
         "--integrity-workers",
         type=int,
@@ -1215,6 +1277,11 @@ def main() -> int:
         raise ValueError("epochs, batch size and early stopping patience must be positive")
     if args.workers < 0 or args.integrity_workers < 0:
         raise ValueError("workers and integrity workers must be non-negative")
+    split_names = (args.train_split, args.validation_split, args.test_split)
+    if set(split_names) != {"train", "validation", "test"}:
+        raise ValueError(
+            "train/validation/test split arguments must be one permutation"
+        )
     if args.allow_nonproduction_smoke and not args.smoke:
         raise ValueError("--allow-nonproduction-smoke requires --smoke")
     run(args)

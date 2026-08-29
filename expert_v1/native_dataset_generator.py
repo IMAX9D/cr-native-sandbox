@@ -4686,10 +4686,186 @@ def requeue_failed_infrastructure(
     return requeued
 
 
+_VERIFY_MASK_STORES: dict[str, DeploymentMaskStore] = {}
+
+
+def _verify_published_shard_process(
+    arguments: tuple[str, dict[str, Any], str, bool],
+) -> dict[str, Any]:
+    """Validate one immutable shard; safe as a Windows process-pool target."""
+
+    root_text, shard, expected_kind, masks_required = arguments
+    root = Path(root_text)
+    name = str(shard["name"])
+    data = root / str(shard["data_file"])
+    index = root / str(shard["index_file"])
+    if not data.is_file() or not index.is_file():
+        raise RuntimeError(f"published Tick Store shard is missing: {name}")
+    if sha256_file(data) != str(shard["data_sha256"]):
+        raise RuntimeError(f"published Tick Store data hash changed: {name}")
+    if sha256_file(index) != str(shard["index_sha256"]):
+        raise RuntimeError(f"published Tick Store index hash changed: {name}")
+    entries = _scan_frames(data, truncate_invalid_tail=False)
+    indexed = [
+        json.loads(line)
+        for line in index.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip()
+    ]
+    if entries != indexed:
+        raise RuntimeError(f"published Tick Store index content changed: {name}")
+    if len(entries) != int(shard["episode_count"]):
+        raise RuntimeError(f"published Tick Store episode count changed: {name}")
+    shard_ticks = sum(int(entry["ticks"]) for entry in entries)
+    if shard_ticks != int(shard["tick_count"]):
+        raise RuntimeError(f"published Tick Store Tick count changed: {name}")
+    local_tags: set[str] = set()
+    for entry in entries:
+        tag = str(entry.get("battle_tag") or "")
+        if not tag or tag in local_tags:
+            raise RuntimeError(
+                "published Tick Store shard battle tags are not unique"
+            )
+        local_tags.add(tag)
+    local_referenced_masks: set[str] = set()
+    if masks_required:
+        cache_key = str(root.resolve())
+        mask_store = _VERIFY_MASK_STORES.get(cache_key)
+        if mask_store is None:
+            mask_store = DeploymentMaskStore(root, create=False)
+            _VERIFY_MASK_STORES[cache_key] = mask_store
+        with data.open("rb") as handle:
+            for entry in entries:
+                handle.seek(int(entry["offset"]))
+                raw_header = handle.read(FRAME_HEADER.size)
+                if len(raw_header) != FRAME_HEADER.size:
+                    raise RuntimeError("Tick Store frame header disappeared")
+                _, payload_size, _, _, _, _ = FRAME_HEADER.unpack(raw_header)
+                payload = handle.read(payload_size)
+                reader = EpisodeReader(payload)
+                metadata = mask_store.verify_episode_metadata(
+                    reader.metadata,
+                    allow_cached=True,
+                    require_complete=(
+                        expected_kind != AUDIT_PREFIX_STORE_KIND
+                    ),
+                )
+                local_referenced_masks.update(
+                    str(item["content_sha256"])
+                    for item in metadata["entries"]
+                )
+                local_referenced_masks.update(
+                    str(variant["content_sha256"])
+                    for item in metadata["entries"]
+                    for variant in item["dynamic_label_variants"]
+                )
+                if expected_kind != AUDIT_PREFIX_STORE_KIND:
+                    continue
+                states = tuple(reader.iter_ticks())
+                extent = reader.metadata.get(REPLAY_EXTENT_METADATA_KEY)
+                coverage = (
+                    extent.get("mask_coverage")
+                    if isinstance(extent, Mapping) else None
+                )
+                keys = {
+                    (int(item["side"]), int(item["deck_index"]))
+                    for item in metadata["entries"]
+                }
+                censor_tick = (
+                    int(extent.get("timing_censor_tick_exclusive", -1))
+                    if isinstance(extent, Mapping) else -1
+                )
+                training_states = tuple(
+                    state for state in states if int(state.tick) < censor_tick
+                )
+                actor_ticks = visible_references = empty_actor_ticks = 0
+                visible_complete = True
+                for state in training_states:
+                    for player in state.players:
+                        visible = [
+                            int(value) for value in player.hand
+                            if int(value) >= 0
+                        ]
+                        visible_complete = visible_complete and all(
+                            (int(player.side), value) in keys for value in visible
+                        )
+                        actor_ticks += 1
+                        visible_references += len(visible)
+                        empty_actor_ticks += len(visible) < 4
+                normal_extent = bool(
+                    isinstance(extent, Mapping)
+                    and extent.get("training_admission")
+                    == "actor_bc_censored_prefix_v1"
+                    and extent.get("semantic_match") is True
+                    and extent.get("failure_domain") == "semantic"
+                )
+                special_extent = bool(
+                    isinstance(extent, Mapping)
+                    and extent.get("training_admission")
+                    == "actor_bc_mask_invalid_censored_prefix_v1"
+                    and extent.get("failure_class") == MASK_INVALID_FAILURE_CLASS
+                    and extent.get("failure_domain") == MASK_INVALID_FAILURE_DOMAIN
+                    and extent.get("semantic_match") is False
+                    and extent.get("maskless_reference_semantic_match") is True
+                    and extent.get("pre_censor_tick_state_parity") is True
+                    and mask_invalid_censor_provenance_valid(
+                        extent.get("censor_provenance")
+                    )
+                )
+                if (
+                    not isinstance(extent, Mapping)
+                    or extent.get("kind") != REPLAY_EXTENT_KIND
+                    or extent.get("extent") != "valid_prefix"
+                    or not (normal_extent or special_extent)
+                    or extent.get("source_episode_complete") is not False
+                    or extent.get("failure_tick_has_labels") is not False
+                    or extent.get("terminal_target") != "unknown_censored"
+                    or extent.get("terminal_validated") is not False
+                    or extent.get("timing_target")
+                    != "right_censored_at_failure_tick_v1"
+                    or extent.get("deployment_masks")
+                    != "partial_native_visible_hand_complete_v1"
+                    or not isinstance(coverage, Mapping)
+                    or coverage.get("all_retained_visible_hand_slots_covered")
+                    is not True
+                    or not visible_complete
+                    or int(coverage.get("retained_ticks", -1))
+                    != len(training_states)
+                    or int(coverage.get("actor_ticks", -1)) != actor_ticks
+                    or int(coverage.get("visible_slot_references", -1))
+                    != visible_references
+                    or int(coverage.get("empty_slot_actor_ticks", -1))
+                    != empty_actor_ticks
+                    or int(coverage.get("captured_slots", -1))
+                    != int(metadata["captured_slots"])
+                    or int(coverage.get("rejected_deploy_labels", -1)) != 0
+                    or int(extent.get("trace_complete_frames", -1)) != len(states)
+                    or not states
+                    or len(states) != int(entry["ticks"])
+                    or int(extent.get("observation_tick_start", -1))
+                    != states[0].tick
+                    or int(extent.get("observation_tick_stop_exclusive", -1))
+                    != states[-1].tick + 1
+                    or int(extent.get("action_label_tick_stop_exclusive", -1))
+                    > states[-1].tick + 1
+                ):
+                    raise RuntimeError(
+                        "published training prefix metadata changed: "
+                        f"{entry.get('battle_tag')}"
+                    )
+    return {
+        "episodes": len(entries),
+        "ticks": shard_ticks,
+        "bytes": data.stat().st_size,
+        "battle_tags": sorted(local_tags),
+        "referenced_masks": sorted(local_referenced_masks),
+    }
+
+
 def verify_published_tick_store(
     root: Path,
     *,
     expected_kind: str = STORE_KIND,
+    workers: int = 1,
 ) -> dict[str, Any]:
     """Read-only validation of every data/index hash behind the store manifest."""
     manifest_path = root / "manifest.json"
@@ -4728,16 +4904,20 @@ def verify_published_tick_store(
             raise RuntimeError("published Tick Store mask manifest hash changed")
         mask_store = DeploymentMaskStore(root, create=False)
         mask_store.verify_manifest()
-    episodes = ticks = total_bytes = 0
-    battle_tags: set[str] = set()
+    if int(workers) <= 0:
+        raise ValueError("Tick Store verification workers must be positive")
+    shards = manifest.get("shards") or []
     shard_names: set[str] = set()
-    for shard in manifest.get("shards") or []:
+    for shard in shards:
         if not isinstance(shard, Mapping):
             raise RuntimeError("published Tick Store has malformed shard entry")
         name = str(shard.get("name") or "")
         if not name or name in shard_names:
             raise RuntimeError("published Tick Store has duplicate/empty shard name")
         shard_names.add(name)
+
+    def verify_shard(shard: Mapping[str, Any]) -> dict[str, Any]:
+        name = str(shard["name"])
         data = root / str(shard["data_file"])
         index = root / str(shard["index_file"])
         if not data.is_file() or not index.is_file():
@@ -4759,14 +4939,15 @@ def verify_published_tick_store(
         shard_ticks = sum(int(entry["ticks"]) for entry in entries)
         if shard_ticks != int(shard["tick_count"]):
             raise RuntimeError(f"published Tick Store Tick count changed: {name}")
-        episodes += len(entries)
+        local_tags: set[str] = set()
         for entry in entries:
             tag = str(entry.get("battle_tag") or "")
-            if not tag or tag in battle_tags:
-                raise RuntimeError("published Tick Store battle tags are not unique")
-            battle_tags.add(tag)
-        ticks += shard_ticks
-        total_bytes += data.stat().st_size
+            if not tag or tag in local_tags:
+                raise RuntimeError(
+                    "published Tick Store shard battle tags are not unique"
+                )
+            local_tags.add(tag)
+        local_referenced_masks: set[str] = set()
         if mask_store is not None:
             with data.open("rb") as handle:
                 for entry in entries:
@@ -4784,11 +4965,11 @@ def verify_published_tick_store(
                             expected_kind != AUDIT_PREFIX_STORE_KIND
                         ),
                     )
-                    referenced_masks.update(
+                    local_referenced_masks.update(
                         str(item["content_sha256"])
                         for item in metadata["entries"]
                     )
-                    referenced_masks.update(
+                    local_referenced_masks.update(
                         str(variant["content_sha256"])
                         for item in metadata["entries"]
                         for variant in item["dynamic_label_variants"]
@@ -4895,6 +5076,45 @@ def verify_published_tick_store(
                                 "published training prefix metadata changed: "
                                 f"{entry.get('battle_tag')}"
                             )
+        return {
+            "episodes": len(entries),
+            "ticks": shard_ticks,
+            "bytes": data.stat().st_size,
+            "battle_tags": local_tags,
+            "referenced_masks": local_referenced_masks,
+        }
+
+    if int(workers) == 1 or len(shards) <= 1:
+        verified = [verify_shard(shard) for shard in shards]
+    else:
+        from concurrent.futures import ProcessPoolExecutor
+
+        arguments = [
+            (
+                str(root.resolve()),
+                dict(shard),
+                expected_kind,
+                mask_store is not None,
+            )
+            for shard in shards
+        ]
+        with ProcessPoolExecutor(
+            max_workers=min(int(workers), len(shards)),
+        ) as executor:
+            verified = list(
+                executor.map(_verify_published_shard_process, arguments)
+            )
+    episodes = ticks = total_bytes = 0
+    battle_tags: set[str] = set()
+    for shard in verified:
+        local_tags = set(shard["battle_tags"])
+        if battle_tags & local_tags:
+            raise RuntimeError("published Tick Store battle tags are not unique")
+        battle_tags.update(local_tags)
+        referenced_masks.update(shard["referenced_masks"])
+        episodes += int(shard["episodes"])
+        ticks += int(shard["ticks"])
+        total_bytes += int(shard["bytes"])
     if (
         episodes != int(manifest.get("episode_count", -1))
         or ticks != int(manifest.get("tick_count", -1))
@@ -4910,9 +5130,11 @@ def verify_published_tick_store(
     }
 
 
-def verify_published_audit_prefix_store(root: Path) -> dict[str, Any]:
+def verify_published_audit_prefix_store(
+    root: Path, *, workers: int = 1
+) -> dict[str, Any]:
     return verify_published_tick_store(
-        root, expected_kind=AUDIT_PREFIX_STORE_KIND
+        root, expected_kind=AUDIT_PREFIX_STORE_KIND, workers=workers
     )
 
 

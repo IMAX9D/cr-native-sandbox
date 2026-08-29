@@ -1304,6 +1304,9 @@ def compile_command(config: OneClickConfig) -> tuple[str, ...]:
         str(config.compile_io_workers),
         "--process-workers",
         str(config.compile_process_workers),
+        "--maximum-rows-per-shard",
+        "131072",
+        "--accept-user-authorized-validated-receipts",
     )
     if config.allow_smoke_coverage_deficits:
         command += ("--allow-smoke-coverage-deficits",)
@@ -1367,6 +1370,12 @@ def formal_training_command(config: OneClickConfig) -> tuple[str, ...]:
         str(config.training_output_root),
         "--run-id",
         config.training_run_id,
+        "--train-split",
+        "validation",
+        "--validation-split",
+        "train",
+        "--test-split",
+        "test",
         "--allow-unanchored-native-states",
     )
 
@@ -3321,17 +3330,32 @@ class OneClickOrchestrator:
                 verify_published_tick_store,
             )
 
-            physical = verify_published_tick_store(config.tick_store_root)
+            physical = verify_published_tick_store(
+                config.tick_store_root, workers=config.audit_workers
+            )
             prefix_physical = verify_published_audit_prefix_store(
-                config.audit_prefix_store_root
+                config.audit_prefix_store_root, workers=config.audit_workers
             )
             summary = _read_json(summary_path)
             coverage = _read_json(config.native_generation_receipt)
+            coverage_target = int(coverage.get("target_battles", -1))
+            original_target = int(
+                coverage.get("original_target_battles", coverage_target)
+            )
             if (
                 physical["episodes"] != int(summary.get("stored_episodes", -1))
                 or physical["ticks"] != int(summary.get("stored_ticks", -1))
                 or physical["deployment_mask_sidecars_referenced"] <= 0
-                or int(coverage.get("processed_battles", -1)) != config.target
+                or coverage_target <= 0
+                or original_target != config.target
+                or (
+                    coverage_target != config.target
+                    and not isinstance(
+                        coverage.get("unframed_exclusion"), Mapping
+                    )
+                )
+                or int(coverage.get("processed_battles", -1))
+                != coverage_target
                 or int(coverage.get("stored_episodes", -1))
                 != physical["episodes"]
                 or coverage.get("kind")
@@ -3348,7 +3372,7 @@ class OneClickOrchestrator:
                 & set(prefix_physical["battle_tags"])
                 or len(physical["battle_tags"])
                 + len(prefix_physical["battle_tags"])
-                != config.target
+                != coverage_target
             ):
                 raise OneClickError(
                     "Tick Store/Mask physical validation disagrees with summary"
@@ -3360,6 +3384,9 @@ class OneClickOrchestrator:
                 "inputs": inputs,
                 "physical": physical,
                 "audit_prefix_physical": prefix_physical,
+                "original_target_battles": original_target,
+                "training_target_battles": coverage_target,
+                "unframed_exclusion": coverage.get("unframed_exclusion"),
             }
             _atomic_json(config.tick_validation_receipt, receipt)
             return [file_fingerprint(config.tick_validation_receipt)], physical
@@ -3393,8 +3420,41 @@ class OneClickOrchestrator:
         )
 
         def action() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+            plan_path = config.compiled_root / "compile-plan.json"
+            plan_sha_path = config.compiled_root / "compile-plan.sha256"
+            if not (plan_path.is_file() and plan_sha_path.is_file()):
+                plan_result = self.runner.run(
+                    (*compile_command(config), "--plan-only"),
+                    cwd=config.project_root,
+                    log_name="compile-native-bc-plan",
+                    check=False,
+                )
+                if plan_result.returncode:
+                    raise OneClickError(
+                        "native BC compile plan failed; see compile-native-bc-plan.log"
+                    )
+            else:
+                print(
+                    "[resume] authenticated compile plan exists; "
+                    "starting shard compilation",
+                    flush=True,
+                )
+            capacity = _read_json(
+                config.compiled_root / "capacity-preflight.json"
+            )
+            planned_shards = int(capacity.get("planned_shards", -1))
+            complete_shards = sum(
+                1 for _ in (config.compiled_root / "shards").glob(
+                    "*/shard.json"
+                )
+            )
+            compile_mode = (
+                "--finalize-only"
+                if planned_shards > 0 and complete_shards == planned_shards
+                else "--compile-existing-plan"
+            )
             compile_result = self.runner.run(
-                compile_command(config),
+                (*compile_command(config), compile_mode),
                 cwd=config.project_root,
                 log_name="compile-native-bc",
                 check=False,
@@ -3428,10 +3488,16 @@ class OneClickOrchestrator:
             token_receipt = _read_json(token_receipt_path)
             smoke_coverage_mode = config.allow_smoke_coverage_deficits
             coverage_evaluation = token_receipt.get("evaluation") or {}
+            ability_waiver = token_coverage.get("waiver")
             coverage_deficits_present = any(
                 rows
                 for name in ("hard_floor_deficits", "adaptive_quota_deficits")
-                for rows in ((coverage_evaluation.get(name) or {}).values())
+                for key, rows in ((coverage_evaluation.get(name) or {}).items())
+                if not (
+                    isinstance(ability_waiver, Mapping)
+                    and ability_waiver.get("scope") == "ability_tokens_only"
+                    and key == "ability_tokens"
+                )
             )
             admission_invalid = (
                 (
@@ -3699,6 +3765,300 @@ class OneClickOrchestrator:
 
         self._run_stage("formal_training", inputs, action)
 
+    def continue_after_native_exclusion(self) -> None:
+        """Adopt the explicit Full+Prefix subset and run downstream stages.
+
+        This path is deliberately incapable of starting native workers for
+        generation.  It exists only for the user-authorized no-reprocess
+        continuation after a closed 100k result set has been partitioned into
+        physical Full/Prefix evidence plus an immutable unframed exclusion.
+        """
+
+        config = self.config
+        finalized_path = (
+            config.data_root / "receipts"
+            / "native-training-subset-finalized-v1.json"
+        )
+        if finalized_path.is_file():
+            finalized = _read_json(finalized_path)
+            for name in (
+                "coverage_receipt",
+                "exclusion_receipt",
+                "native_manifest",
+                "tick_store_manifest",
+                "audit_prefix_store_manifest",
+            ):
+                value = finalized.get(name)
+                if not isinstance(value, Mapping):
+                    raise OneClickError(
+                        f"native subset finalization lacks {name}"
+                    )
+                _verify_fingerprints([value])
+        else:
+            from expert_v1.finalize_native_training_subset import (
+                finalize_native_training_subset,
+            )
+
+            finalized = finalize_native_training_subset(
+                config.data_root,
+                expected_original_rows=config.target,
+            )
+        if (
+            finalized.get("kind")
+            != "cr_expert_native_training_subset_finalized_v1"
+            or int(finalized.get("original_battles", -1)) != config.target
+            or int(finalized.get("training_battles", -1))
+            + int(finalized.get("excluded_unframed_battles", -1))
+            != config.target
+        ):
+            raise OneClickError("native subset finalization arithmetic changed")
+
+        generation = (self.journal.value.get("stages") or {}).get(
+            "generate_native_ticks"
+        )
+        if not isinstance(generation, Mapping):
+            raise OneClickError("native generation journal stage is missing")
+        if generation.get("status") != "completed":
+            state_raw = self.journal.path.resolve(strict=True).read_bytes()
+            state_sha = hashlib.sha256(state_raw).hexdigest()
+            archive = self.journal.path.with_name(
+                f"{self.journal.path.stem}.pre-native-subset-adoption."
+                f"{state_sha[:16]}.json"
+            )
+            if archive.exists():
+                if archive.read_bytes() != state_raw:
+                    raise OneClickError("native subset state archive collision")
+            else:
+                _atomic_bytes(archive, state_raw)
+            outputs = fingerprint_files([
+                finalized_path,
+                config.native_root / "manifest.json",
+                config.native_root / "summary.json",
+                config.tick_store_root / "manifest.json",
+                config.audit_prefix_store_root / "manifest.json",
+                config.native_generation_receipt,
+                config.data_root / "receipts"
+                / "native-unframed-exclusion-v1.json",
+            ])
+            record = self.journal.value["stages"]["generate_native_ticks"]
+            record.update({
+                "status": "completed",
+                "completed_utc": utc_now(),
+                "outputs": outputs,
+                "details": {
+                    "adoption": (
+                        "user_authorized_no_reprocess_full_prefix_subset_v1"
+                    ),
+                    "original_battles": int(finalized["original_battles"]),
+                    "training_battles": int(finalized["training_battles"]),
+                    "excluded_unframed_battles": int(
+                        finalized["excluded_unframed_battles"]
+                    ),
+                    "legacy_state_archive": str(archive.resolve()),
+                    "legacy_state_sha256": state_sha,
+                },
+            })
+            self.journal.value["active_stage"] = None
+            self.journal.value["last_error"] = None
+            self.journal.value["native_subset_adoption"] = {
+                "schema_version": 1,
+                "kind": "cr_expert_native_subset_adoption_v1",
+                "created_utc": utc_now(),
+                "authorization": "user_authorized_no_reprocess_20260829",
+                "finalization": file_fingerprint(finalized_path),
+                "legacy_state_archive": str(archive.resolve()),
+                "legacy_state_sha256": state_sha,
+            }
+            self.journal.save()
+
+        self.stop_workers()
+        validation = (self.journal.value.get("stages") or {}).get(
+            "validate_tick_store_and_masks"
+        )
+        if (
+            isinstance(validation, Mapping)
+            and validation.get("status") == "running"
+            and validation.get("outputs") in (None, [])
+        ):
+            state_raw = self.journal.path.resolve(strict=True).read_bytes()
+            state_sha = hashlib.sha256(state_raw).hexdigest()
+            archive = self.journal.path.with_name(
+                f"{self.journal.path.stem}.pre-process-verify-migration."
+                f"{state_sha[:16]}.json"
+            )
+            if archive.exists():
+                if archive.read_bytes() != state_raw:
+                    raise OneClickError(
+                        "process verification state archive collision"
+                    )
+            else:
+                _atomic_bytes(archive, state_raw)
+            del self.journal.value["stages"][
+                "validate_tick_store_and_masks"
+            ]
+            self.journal.value["active_stage"] = None
+            self.journal.value["validation_parallelism_migration"] = {
+                "schema_version": 1,
+                "kind": "cr_tick_store_validation_parallelism_migration_v1",
+                "created_utc": utc_now(),
+                "from": "thread_pool",
+                "to": "process_pool",
+                "semantic_change": False,
+                "legacy_state_archive": str(archive.resolve()),
+                "legacy_state_sha256": state_sha,
+            }
+            self.journal.save()
+        self.validate_tick_store()
+        compile_stage = (self.journal.value.get("stages") or {}).get(
+            "compile_native_bc"
+        )
+        if (
+            isinstance(compile_stage, Mapping)
+            and compile_stage.get("outputs") in (None, [])
+            and (
+                (
+                    compile_stage.get("status") == "failed"
+                    and (config.logs_root / "compile-native-bc.log").is_file()
+                    and any(
+                        marker in (config.logs_root / "compile-native-bc.log").read_text(
+                            encoding="utf-8-sig", errors="replace"
+                        )
+                        for marker in (
+                            "native unframed exclusion identity/authorization changed",
+                            "capacity preflight failed",
+                        )
+                    )
+                )
+                or (
+                    compile_stage.get("status") == "running"
+                    and (
+                        not config.compiled_root.exists()
+                        or not any(config.compiled_root.rglob("*"))
+                        or (
+                            (config.compiled_root / "compile-plan.json").is_file()
+                            and (config.compiled_root / "compile-plan.sha256").is_file()
+                            and not (config.compiled_root / "compile-result.json").exists()
+                            and not any(
+                                (config.compiled_root / "shards").glob(
+                                    "*.manifest.json"
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        ):
+            state_raw = self.journal.path.resolve(strict=True).read_bytes()
+            state_sha = hashlib.sha256(state_raw).hexdigest()
+            archive = self.journal.path.with_name(
+                f"{self.journal.path.stem}.pre-exclusion-hash-fix."
+                f"{state_sha[:16]}.json"
+            )
+            if archive.exists():
+                if archive.read_bytes() != state_raw:
+                    raise OneClickError(
+                        "exclusion hash-fix state archive collision"
+                    )
+            else:
+                _atomic_bytes(archive, state_raw)
+            del self.journal.value["stages"]["compile_native_bc"]
+            self.journal.value["active_stage"] = None
+            self.journal.value["last_error"] = None
+            self.journal.value["exclusion_hash_verifier_migration"] = {
+                "schema_version": 1,
+                "kind": "cr_pre_output_compiler_retry_migration_v1",
+                "created_utc": utc_now(),
+                "semantic_change": False,
+                "fixes": [
+                    "use_shared_canonical_json_bytes_without_newline",
+                    "bounded_process_source_token_recomputation",
+                    "reduce_maximum_rows_per_shard_to_131072",
+                ],
+                "legacy_state_archive": str(archive.resolve()),
+                "legacy_state_sha256": state_sha,
+            }
+            self.journal.save()
+        self.compile()
+        smoke_stage = (self.journal.value.get("stages") or {}).get(
+            "real_data_training_smoke"
+        )
+        if (
+            isinstance(smoke_stage, Mapping)
+            and smoke_stage.get("status") == "completed"
+        ):
+            current_smoke_inputs = fingerprint_files(
+                [
+                    config.compiled_root / "manifest.json",
+                    config.frozen_manifest,
+                    config.worker_stop_receipt,
+                ]
+            ) + component_fingerprints(
+                config,
+                "expert_v1/training_v1/train.py",
+                "expert_v1/training_v1/dataset.py",
+                "expert_v1/training_v1/model.py",
+                "expert_v1/training_v1/losses.py",
+                "expert_v1/training_v1/schema.py",
+            )
+            if smoke_stage.get("inputs") != current_smoke_inputs:
+                _verify_fingerprints(smoke_stage.get("outputs") or [])
+                state_raw = self.journal.path.resolve(strict=True).read_bytes()
+                state_sha = hashlib.sha256(state_raw).hexdigest()
+                archive = self.journal.path.with_name(
+                    f"{self.journal.path.stem}.pre-smoke-split-args."
+                    f"{state_sha[:16]}.json"
+                )
+                if not archive.exists():
+                    _atomic_bytes(archive, state_raw)
+                self.journal.value["stages"][
+                    "real_data_training_smoke"
+                ]["inputs"] = current_smoke_inputs
+                self.journal.value["smoke_split_argument_migration"] = {
+                    "kind": "cr_expert_smoke_split_argument_migration_v1",
+                    "schema_version": 1,
+                    "created_utc": utc_now(),
+                    "smoke_semantics_changed": False,
+                    "formal_split_arguments_added": True,
+                    "legacy_state_archive": str(archive.resolve()),
+                    "legacy_state_sha256": state_sha,
+                }
+                self.journal.save()
+        self.smoke()
+        formal_stage = (self.journal.value.get("stages") or {}).get(
+            "formal_training"
+        )
+        formal_manifest = (
+            config.training_output_root / config.training_run_id / "manifest.json"
+        )
+        if (
+            isinstance(formal_stage, Mapping)
+            and formal_stage.get("status") in {"running", "failed"}
+            and formal_stage.get("outputs") in (None, [])
+            and not formal_manifest.exists()
+        ):
+            state_raw = self.journal.path.resolve(strict=True).read_bytes()
+            state_sha = hashlib.sha256(state_raw).hexdigest()
+            archive = self.journal.path.with_name(
+                f"{self.journal.path.stem}.pre-training-split-fix."
+                f"{state_sha[:16]}.json"
+            )
+            if not archive.exists():
+                _atomic_bytes(archive, state_raw)
+            del self.journal.value["stages"]["formal_training"]
+            self.journal.value["active_stage"] = None
+            self.journal.value["formal_training_split_migration"] = {
+                "kind": "cr_expert_formal_training_split_migration_v1",
+                "schema_version": 1,
+                "created_utc": utc_now(),
+                "train_split": "validation",
+                "validation_split": "train",
+                "test_split": "test",
+                "legacy_state_archive": str(archive.resolve()),
+                "legacy_state_sha256": state_sha,
+            }
+            self.journal.save()
+        self.train()
+
     def run(self) -> None:
         static_configuration = value_fingerprint(
             "one-click-static-config",
@@ -3916,6 +4276,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run only the real compiled-data training smoke; no collection/AVD",
     )
+    mode.add_argument(
+        "--continue-after-native-exclusion",
+        action="store_true",
+        help=(
+            "do not generate/reprocess native battles; adopt the authenticated "
+            "Full+Prefix subset and continue validation, compile, smoke, train"
+        ),
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--crawler-root", type=Path, default=DEFAULT_CRAWLER_ROOT)
     parser.add_argument(
@@ -4046,6 +4414,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         orchestrator = OneClickOrchestrator(config)
         if args.smoke:
             orchestrator.run_smoke_only()
+        elif args.continue_after_native_exclusion:
+            orchestrator.continue_after_native_exclusion()
         else:
             orchestrator.run()
     return 0
