@@ -1,21 +1,24 @@
 param(
     [ValidateSet("probe-baseline", "probe-detach-surface", "probe-null-surface", "probe-no-surface", "probe-create-only", "probe-minimal", "probe-direct")]
     [string]$Profile = "probe-baseline",
-    [string]$Adb = "D:\Codex\toolchains\android-sdk\platform-tools\adb.exe",
+    [string]$Adb = $(if ($env:CR_SANDBOX_ADB) { $env:CR_SANDBOX_ADB } else { throw "Missing CR_SANDBOX_ADB; dot-source runtime.env.ps1 first" }),
     [string]$Serial = "emulator-5554",
-    [string]$RuntimeDirectory = "D:\Codex\E\AI ClashRoyale\native_host\build\runtime-x86_64",
+    [string]$RuntimeDirectory = $(if ($env:CR_SANDBOX_RUNTIME_DIR) { $env:CR_SANDBOX_RUNTIME_DIR } else { throw "Missing CR_SANDBOX_RUNTIME_DIR; dot-source runtime.env.ps1 first" }),
     [string]$Bridge = "",
-    [string]$BaseApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\base.apk",
-    [string]$ReplayJson = "D:\Codex\E\AI ClashRoyale\examples\native_replay_probe.json",
-    [string]$AssetDirectory = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\extracted\assets",
-    [string]$AssetPackApk = "D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks\split_install_time_asset_pack.apk",
+    [string]$BaseApk = $(if ($env:CR_SANDBOX_BASE_APK) { $env:CR_SANDBOX_BASE_APK } else { throw "Missing CR_SANDBOX_BASE_APK; dot-source runtime.env.ps1 first" }),
+    [string]$ReplayJson = "",
+    [string]$AssetDirectory = $(if ($env:CR_SANDBOX_ASSETS) { $env:CR_SANDBOX_ASSETS } else { throw "Missing CR_SANDBOX_ASSETS; dot-source runtime.env.ps1 first" }),
+    [string]$AssetPackApk = $(if ($env:CR_SANDBOX_ASSET_PACK_APK) { $env:CR_SANDBOX_ASSET_PACK_APK } else { throw "Missing CR_SANDBOX_ASSET_PACK_APK; dot-source runtime.env.ps1 first" }),
     [string]$RemoteRoot = "/data/local/tmp/cr-native-core-probe",
-    [string]$EvidenceRoot = "D:\AI_data\cr-native-core\experiment-0001",
+    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "probe" } else { throw "Missing CR_SANDBOX_DATA; dot-source runtime.env.ps1 first" }),
     [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
+if (-not $ReplayJson) {
+    $ReplayJson = Join-Path $ProjectRoot "examples\eight-card-bootstrap.json"
+}
 $Jar = Join-Path $ProjectRoot "artifacts\lifecycle-probe.jar"
 if (-not $Bridge) {
     $Bridge = Join-Path $ProjectRoot "artifacts\libnative_core_probe.so"

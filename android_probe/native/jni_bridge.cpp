@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -42,7 +43,30 @@ constexpr uintptr_t kRuntimeClockGlobalRva = 0x1ABC008;
 constexpr uintptr_t kThreadOptionSetRva = 0x11E6DA0;
 constexpr uintptr_t kStageRegistryGlobalRva = 0x1A7C500;
 constexpr uintptr_t kBattleDataRootGlobalRva = 0x1A75E30;
+// Native DataTables factory used by LoadingState::update and by the generated
+// table loader.  This is observed only; startup readiness must not fabricate
+// or overwrite any of its state.
+constexpr uintptr_t kDataTablesFactoryGlobalRva = 0x1A8C240;
+constexpr uintptr_t kBlockingResourceRequestRva = 0x72A3A0;
+constexpr uintptr_t kCoreTextsPathRva = 0x1A8C200;
+constexpr uintptr_t kSafeResourceResolveRva = 0x11EA4D0;
+constexpr uintptr_t kResourceLoadedPredicateRva = 0x11EA880;
 constexpr uintptr_t kGameMainInitRva = 0x727050;
+constexpr uintptr_t kPlatformServiceInitCallRva = 0x727304;
+constexpr uintptr_t kBinderlessStringRegistrationRva = 0x14A8760;
+constexpr uintptr_t kBinderlessFlagRegistrationRva = 0x14A88D0;
+constexpr std::array<uintptr_t, 5> kBinderlessConfigGetterRvas = {
+    0x12799D0, 0x1279A00, 0x1279A30, 0x1279A60, 0x1279AA0};
+constexpr uintptr_t kBinderlessConfigGetterGuardCaveRva = 0x17EA1C6;
+constexpr uintptr_t kBinderlessConfigPostprocessCallRva = 0xE7160C;
+constexpr uintptr_t kBinderlessConfigPostprocessFunctionRva = 0xE6F450;
+constexpr uintptr_t kBinderlessConfigPostprocessGuardCaveRva = 0x17F6EA6;
+constexpr uintptr_t kBinderlessConfigPostprocessNullReturnRva = 0xE6F603;
+constexpr uintptr_t kBinderlessConfigPostprocessValidResumeRva = 0xE6F45A;
+constexpr uintptr_t kBinderlessDeferredNullDependencyGuardRva = 0x12960C0;
+constexpr uintptr_t kBinderlessDeferredNullDependencyCaveRva = 0x17F6EA6;
+constexpr uintptr_t kBinderlessDeferredNullDependencyResumeRva = 0x12960C5;
+constexpr uintptr_t kBinderlessDeferredOptionalClientGlobalsRva = 0xE47A70;
 constexpr uintptr_t kRendererBootstrapCallRva = 0x727424;
 constexpr uintptr_t kRendererDeviceBlockRva = 0x727687;
 constexpr uintptr_t kRendererResolutionCallRva = 0x7276FC;
@@ -51,12 +75,55 @@ constexpr uintptr_t kRendererLateConfigureCallRva = 0x7279D0;
 constexpr uintptr_t kGamePresentationToggleRva = 0x72C8C0;
 constexpr uintptr_t kHomeResolutionBlockRva = 0xCE8E66;
 constexpr uintptr_t kHomeGraphicsCreateCallRva = 0xCE8F5F;
+// Loading completion updates a small SC3D/UI status object through the global
+// graphics context. Binderless workers intentionally do not create that
+// context. Preserve the native path when it exists and use the function's
+// existing epilogue when the context itself is absent.
+constexpr uintptr_t kBinderlessSc3dContextGuardRva = 0x72E2AC;
+constexpr uintptr_t kBinderlessSc3dContextGuardCaveRva = 0x1830DC2;
+constexpr uintptr_t kBinderlessSc3dContextGlobalRva = 0x1ABDF20;
+constexpr uintptr_t kBinderlessSc3dContextNullTargetRva = 0x72E39B;
+constexpr uintptr_t kBinderlessSc3dContextValidResumeRva = 0x72E2B7;
+constexpr uintptr_t kBinderlessSc3dCapabilityGuardRva = 0x7314DB;
+constexpr uintptr_t kBinderlessSc3dCapabilityGuardCaveRva = 0x17ECEEC;
+constexpr uintptr_t kBinderlessSc3dCapabilityNullTargetRva = 0x731738;
+constexpr uintptr_t kBinderlessSc3dCapabilityValidResumeRva = 0x7314E1;
+constexpr uintptr_t kBinderlessSc3dFeatureGuardRva = 0x725AA7;
+constexpr uintptr_t kBinderlessSc3dFeatureGuardCaveRva = 0x1819D8A;
+constexpr uintptr_t kBinderlessSc3dFeatureNullTargetRva = 0x725ADD;
+constexpr uintptr_t kBinderlessSc3dFeatureValidResumeRva = 0x725AAD;
+constexpr uintptr_t kBinderlessUiLocaleContainerGuardRva = 0x14ABA25;
+constexpr uintptr_t kBinderlessUiLocaleContainerGuardCaveRva = 0x180B1E5;
+constexpr uintptr_t kBinderlessUiLocaleContainerNullTargetRva = 0x14ABA2A;
+constexpr uintptr_t kBinderlessUiLocaleContainerValidResumeRva = 0x14ABA2A;
+constexpr uintptr_t kBinderlessUiLocaleRegistrationTargetRva = 0x1AE0270;
+constexpr uintptr_t kBinderlessLoadingScreenInitRva = 0xCEDFF0;
 constexpr uintptr_t kDataLoadTaskStartRva = 0xCDC5B0;
 constexpr uintptr_t kDataLoadTaskPumpRva = 0xCDC620;
 constexpr uintptr_t kDataLoadTaskCompleteRva = 0xCDC5A0;
 constexpr uintptr_t kDataTablesLoadRangeRva = 0xE74B40;
 constexpr uintptr_t kLoadingStateUpdateRva = 0xCE98F0;
 constexpr uintptr_t kLoadingStateCompleteRva = 0xCE9750;
+constexpr uintptr_t kBinderlessInvalidAssetBranchRva = 0x1246173;
+constexpr uintptr_t kBinderlessValidAssetTargetRva = 0x12461C0;
+constexpr uintptr_t kBinderlessInvalidAssetCaveRva = 0x18069A6;
+constexpr uintptr_t kBinderlessInvalidAssetCleanupRva = 0x13533E0;
+constexpr uintptr_t kBinderlessInvalidAssetReturnRva = 0x12463CF;
+constexpr std::array<uintptr_t, 2> kBinderlessAsyncMetadataCallRvas = {
+    0x12B095B, 0x12B097E};
+constexpr uintptr_t kBinderlessAsyncMetadataTargetRva = 0x11E4160;
+constexpr uintptr_t kBinderlessMetadataValidityGuardRva = 0x11E41D1;
+constexpr uintptr_t kBinderlessMetadataValidityCaveRva = 0x17E6103;
+constexpr uintptr_t kBinderlessMetadataInvalidTargetRva = 0x11E4418;
+constexpr uintptr_t kBinderlessMetadataValidResumeRva = 0x11E421D;
+constexpr std::array<uintptr_t, 4> kBinderlessPresentationAssetCallRvas = {
+    0x12B04D3, 0x12B0529, 0x12B0584, 0x12B05F9};
+constexpr uintptr_t kBinderlessPresentationAssetTargetRva = 0x1246110;
+constexpr uintptr_t kBinderlessExternalAssetGuardRva = 0x11F7C44;
+constexpr uintptr_t kBinderlessExternalAssetCaveRva = 0x18A1F9F;
+constexpr uintptr_t kBinderlessExternalAssetCheckRva = 0x1353510;
+constexpr uintptr_t kBinderlessExternalAssetFailureRva = 0x11F8407;
+constexpr uintptr_t kBinderlessExternalAssetResumeRva = 0x11F7C4B;
 constexpr uintptr_t kLoadingPresentationCallRva = 0xCEA6BB;
 constexpr uintptr_t kLoadingPlatformUiCallRva = 0xCEA6C8;
 constexpr uintptr_t kResourceGateUpdateRva = 0xB11690;
@@ -163,6 +230,9 @@ using DataTablesLoadRange = bool (*)(
 using LoadingStateUpdate = void (*)(void*, float);
 using LoadingStateComplete = bool (*)(void*);
 using ResourceGateUpdate = void (*)(void*, float);
+using BlockingResourceRequest = bool (*)(void*, bool);
+using SafeResourceResolve = void* (*)(void*);
+using ResourceLoadedPredicate = bool (*)(void*);
 using ResourceVariantDecode = void* (*)(void*, void*, const uint8_t*);
 using BattleStateUpdate = void (*)(void*, float);
 using BattleLoadReplay = void (*)(void*, void*, void*, void*);
@@ -575,6 +645,73 @@ void throw_state(JNIEnv* env, const std::string& message) {
 }
 
 }  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeRegisterAndroidRuntime(
+    JNIEnv* env, jclass) {
+  constexpr const char* kStartRegSymbol =
+      "_ZN7android14AndroidRuntime8startRegEP7_JNIEnv";
+  struct AndroidDlextInfo {
+    uint64_t flags = 0;
+    void* reserved_addr = nullptr;
+    size_t reserved_size = 0;
+    int relro_fd = -1;
+    int library_fd = -1;
+    int64_t library_fd_offset = 0;
+    void* library_namespace = nullptr;
+  };
+  using GetExportedNamespace = void* (*)(const char*);
+  using AndroidDlopenExt = void* (*)(
+      const char*, int, const AndroidDlextInfo*);
+  void* handle = nullptr;
+  void* exported = dlsym(RTLD_DEFAULT, kStartRegSymbol);
+  if (exported == nullptr) {
+    auto get_namespace = reinterpret_cast<GetExportedNamespace>(
+        dlsym(RTLD_DEFAULT, "android_get_exported_namespace"));
+    auto dlopen_ext = reinterpret_cast<AndroidDlopenExt>(
+        dlsym(RTLD_DEFAULT, "android_dlopen_ext"));
+    if (get_namespace != nullptr && dlopen_ext != nullptr) {
+      AndroidDlextInfo info{};
+      info.flags = 0x200;  // ANDROID_DLEXT_USE_NAMESPACE.
+      info.library_namespace = get_namespace("system");
+      if (info.library_namespace != nullptr) {
+        handle = dlopen_ext(
+            "/system/lib64/libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL,
+            &info);
+      }
+    }
+    if (handle == nullptr) {
+      // Binderless ART exposes libandroid_runtime through the synthetic public
+      // library list, so a soname lookup stays inside the class-loader link.
+      handle = dlopen("libandroid_runtime.so", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (handle != nullptr) {
+      exported = dlsym(handle, kStartRegSymbol);
+    }
+  }
+  if (exported == nullptr) {
+    const char* error = dlerror();
+    throw_state(
+        env, std::string("cannot resolve AndroidRuntime::startReg: ") +
+                 (error != nullptr ? error : "unknown dlsym error"));
+    if (handle != nullptr) {
+      dlclose(handle);
+    }
+    return nullptr;
+  }
+  using StartReg = jint (*)(JNIEnv*);
+  const jint result = reinterpret_cast<StartReg>(exported)(env);
+  if (handle != nullptr) {
+    dlclose(handle);
+  }
+  if (result < 0) {
+    throw_state(env, "AndroidRuntime::startReg rejected binderless bootstrap");
+    return nullptr;
+  }
+  return env->NewStringUTF(
+      "{\"schema_version\":1,\"stage\":\"android_runtime_jni\","
+      "\"mode\":\"binderless\",\"ok\":true}");
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativeAct(
@@ -2723,6 +2860,29 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
     // edits stay inside GameMain::init, and the original bytes are restored
     // before returning. No battle or data-table routine is modified.
     auto initialize = reinterpret_cast<GameMainInit>(base + kGameMainInitRva);
+    auto* platform_service_patch_site = reinterpret_cast<uint8_t*>(
+        base + kPlatformServiceInitCallRva);
+    auto* binderless_string_registration = reinterpret_cast<uint8_t*>(
+        base + kBinderlessStringRegistrationRva);
+    auto* binderless_flag_registration = reinterpret_cast<uint8_t*>(
+        base + kBinderlessFlagRegistrationRva);
+    std::array<uint8_t*, kBinderlessConfigGetterRvas.size()>
+        binderless_config_getters{};
+    for (size_t index = 0; index < binderless_config_getters.size(); ++index) {
+      binderless_config_getters[index] = reinterpret_cast<uint8_t*>(
+          base + kBinderlessConfigGetterRvas[index]);
+    }
+    auto* binderless_config_getter_guard_cave =
+        reinterpret_cast<uint8_t*>(
+            base + kBinderlessConfigGetterGuardCaveRva);
+    auto* binderless_config_postprocess = reinterpret_cast<uint8_t*>(
+        base + kBinderlessConfigPostprocessCallRva);
+    auto* binderless_config_postprocess_function =
+        reinterpret_cast<uint8_t*>(
+            base + kBinderlessConfigPostprocessFunctionRva);
+    auto* binderless_config_postprocess_guard_cave =
+        reinterpret_cast<uint8_t*>(
+            base + kBinderlessConfigPostprocessGuardCaveRva);
     auto* patch_site = reinterpret_cast<uint8_t*>(
         base + kRendererBootstrapCallRva);
     auto* device_patch_site = reinterpret_cast<uint8_t*>(
@@ -2733,6 +2893,44 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
         base + kRendererObjectsBlockRva);
     auto* late_configure_patch_site = reinterpret_cast<uint8_t*>(
         base + kRendererLateConfigureCallRva);
+    const std::array<uint8_t, 5> platform_service_expected = {
+        0xE8, 0x67, 0x08, 0x00, 0x00};
+    const std::array<uint8_t, 9> binderless_string_expected = {
+        0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53};
+    const std::array<uint8_t, 9> binderless_flag_expected = {
+        0x55, 0x41, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x10, 0x89};
+    const std::array<uint8_t, 9> binderless_registration_bypass = {
+        0xC3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const std::array<uint8_t, 5> binderless_config_getter_expected = {
+        0x53, 0x48, 0x83, 0xC7, 0x18};
+    const std::array<uint8_t, 5> binderless_config_getter_bypass = {
+        0x31, 0xC0, 0xC3, 0x90, 0x90};
+    std::array<uint8_t, 26> binderless_config_getter_guard_cave_expected{};
+    binderless_config_getter_guard_cave_expected.fill(0xCC);
+    const std::array<uint8_t, 20> binderless_config_getter_guard_cave_code = {
+        0x48, 0x85, 0xFF, 0x74, 0x08,
+        0x58, 0x53, 0x48, 0x83, 0xC7, 0x18, 0x50, 0xC3,
+        0x48, 0x83, 0xC4, 0x08, 0x31, 0xC0, 0xC3};
+    const std::array<uint8_t, 5> binderless_config_postprocess_expected = {
+        0xE8, 0x3F, 0xDE, 0xFF, 0xFF};
+    const std::array<uint8_t, 10>
+        binderless_config_postprocess_function_expected = {
+            0x83, 0x7E, 0x4C, 0x00, 0x0F,
+            0x8E, 0xA9, 0x01, 0x00, 0x00};
+    const std::array<uint8_t, 10>
+        binderless_config_postprocess_function_guard = {
+            0xE9, 0x51, 0x7A, 0x98, 0x00,
+            0x90, 0x90, 0x90, 0x90, 0x90};
+    std::array<uint8_t, 26>
+        binderless_config_postprocess_guard_cave_expected{};
+    binderless_config_postprocess_guard_cave_expected.fill(0xCC);
+    const std::array<uint8_t, 24>
+        binderless_config_postprocess_guard_cave_code = {
+            0x48, 0x85, 0xF6,
+            0x0F, 0x84, 0x54, 0x87, 0x67, 0xFF,
+            0x83, 0x7E, 0x4C, 0x00,
+            0x0F, 0x8E, 0x4A, 0x87, 0x67, 0xFF,
+            0xE9, 0x9C, 0x85, 0x67, 0xFF};
     const std::array<uint8_t, 5> expected = {0xE8, 0x27, 0x9C, 0x47, 0x00};
     const std::array<uint8_t, 5> device_expected = {
         0x31, 0xFF, 0xE8, 0x52, 0x3A};
@@ -2746,11 +2944,48 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
         0xE9, 0x88, 0x01, 0x00, 0x00};
     const std::array<uint8_t, 5> late_configure_expected = {
         0xE8, 0x1B, 0x38, 0xB1, 0x00};
+    std::array<uint8_t, 5> platform_service_original{};
+    std::array<uint8_t, 9> binderless_string_original{};
+    std::array<uint8_t, 9> binderless_flag_original{};
+    std::array<std::array<uint8_t, 5>, kBinderlessConfigGetterRvas.size()>
+        binderless_config_getter_originals{};
+    std::array<uint8_t, 26> binderless_config_getter_guard_cave_original{};
+    std::array<uint8_t, 5> binderless_config_postprocess_original{};
+    std::array<uint8_t, 10>
+        binderless_config_postprocess_function_original{};
+    std::array<uint8_t, 26>
+        binderless_config_postprocess_guard_cave_original{};
     std::array<uint8_t, 5> original{};
     std::array<uint8_t, 5> device_original{};
     std::array<uint8_t, 5> resolution_original{};
     std::array<uint8_t, 5> objects_original{};
     std::array<uint8_t, 5> late_configure_original{};
+    std::memcpy(platform_service_original.data(), platform_service_patch_site,
+                platform_service_original.size());
+    std::memcpy(binderless_string_original.data(),
+                binderless_string_registration,
+                binderless_string_original.size());
+    std::memcpy(binderless_flag_original.data(),
+                binderless_flag_registration,
+                binderless_flag_original.size());
+    for (size_t index = 0;
+         index < binderless_config_getter_originals.size(); ++index) {
+      std::memcpy(binderless_config_getter_originals[index].data(),
+                  binderless_config_getters[index],
+                  binderless_config_getter_originals[index].size());
+    }
+    std::memcpy(binderless_config_getter_guard_cave_original.data(),
+                binderless_config_getter_guard_cave,
+                binderless_config_getter_guard_cave_original.size());
+    std::memcpy(binderless_config_postprocess_original.data(),
+                binderless_config_postprocess,
+                binderless_config_postprocess_original.size());
+    std::memcpy(binderless_config_postprocess_function_original.data(),
+                binderless_config_postprocess_function,
+                binderless_config_postprocess_function_original.size());
+    std::memcpy(binderless_config_postprocess_guard_cave_original.data(),
+                binderless_config_postprocess_guard_cave,
+                binderless_config_postprocess_guard_cave_original.size());
     std::memcpy(original.data(), patch_site, original.size());
     std::memcpy(device_original.data(), device_patch_site,
                 device_original.size());
@@ -2760,6 +2995,152 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
                 objects_original.size());
     std::memcpy(late_configure_original.data(), late_configure_patch_site,
                 late_configure_original.size());
+    const char* binderless_value = std::getenv("CR_BINDERLESS_ANDROID");
+    const bool binderless_android =
+        binderless_value != nullptr && std::strcmp(binderless_value, "1") == 0;
+    const auto read_binderless_binary_switch = [&](const char* name,
+                                                    bool* enabled) {
+      const char* value = std::getenv(name);
+      if (value == nullptr || value[0] == '\0' ||
+          std::strcmp(value, "0") == 0) {
+        *enabled = false;
+        return true;
+      }
+      if (std::strcmp(value, "1") == 0) {
+        *enabled = true;
+        return true;
+      }
+      return false;
+    };
+    bool native_config_registrations = false;
+    bool native_config_getters = false;
+    bool native_config_postprocess = false;
+    if (binderless_android &&
+        (!read_binderless_binary_switch(
+             "CR_BINDERLESS_NATIVE_CONFIG_REGISTRATIONS",
+             &native_config_registrations) ||
+         !read_binderless_binary_switch(
+             "CR_BINDERLESS_NATIVE_CONFIG_GETTERS",
+             &native_config_getters) ||
+         !read_binderless_binary_switch(
+             "CR_BINDERLESS_NATIVE_CONFIG_POSTPROCESS",
+             &native_config_postprocess))) {
+      dlclose(handle);
+      throw_state(
+          env,
+          "binderless native config switches must be unset, 0, or 1");
+      return nullptr;
+    }
+    if (binderless_android) {
+      std::fprintf(
+          stderr,
+          "BINDERLESS_NATIVE_CONFIG_POLICY registrations=%s getters=%s "
+          "postprocess=%s\n",
+          native_config_registrations ? "native" : "bypass",
+          native_config_getters ? "guarded" : "bypass",
+          native_config_postprocess ? "native" : "bypass");
+      std::fflush(stderr);
+    }
+    const bool binderless_config_getters_match = std::all_of(
+        binderless_config_getter_originals.begin(),
+        binderless_config_getter_originals.end(),
+        [&](const std::array<uint8_t, 5>& value) {
+          return value == binderless_config_getter_expected;
+        });
+    std::array<std::array<uint8_t, 5>, kBinderlessConfigGetterRvas.size()>
+        binderless_config_getter_guard_calls{};
+    bool binderless_config_getter_guard_targets_match = true;
+    for (size_t index = 0;
+         index < binderless_config_getter_guard_calls.size(); ++index) {
+      auto& call = binderless_config_getter_guard_calls[index];
+      call[0] = 0xE8;
+      const intptr_t displacement =
+          static_cast<intptr_t>(kBinderlessConfigGetterGuardCaveRva) -
+          static_cast<intptr_t>(kBinderlessConfigGetterRvas[index] + 5);
+      if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        binderless_config_getter_guard_targets_match = false;
+        continue;
+      }
+      const int32_t relative = static_cast<int32_t>(displacement);
+      std::memcpy(call.data() + 1, &relative, sizeof(relative));
+      int32_t decoded = 0;
+      std::memcpy(&decoded, call.data() + 1, sizeof(decoded));
+      binderless_config_getter_guard_targets_match =
+          binderless_config_getter_guard_targets_match &&
+          kBinderlessConfigGetterRvas[index] + call.size() +
+                  static_cast<intptr_t>(decoded) ==
+              kBinderlessConfigGetterGuardCaveRva;
+    }
+    const auto decode_config_relative_target = [](
+        uintptr_t instruction_rva, size_t instruction_size,
+        const uint8_t* displacement_bytes) {
+      int32_t displacement = 0;
+      std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+      return instruction_rva + instruction_size +
+          static_cast<intptr_t>(displacement);
+    };
+    const uintptr_t binderless_config_postprocess_guard_cave_target =
+        decode_config_relative_target(
+            kBinderlessConfigPostprocessFunctionRva, 5,
+            binderless_config_postprocess_function_guard.data() + 1);
+    const uintptr_t binderless_config_postprocess_null_target0 =
+        decode_config_relative_target(
+            kBinderlessConfigPostprocessGuardCaveRva + 3, 6,
+            binderless_config_postprocess_guard_cave_code.data() + 5);
+    const uintptr_t binderless_config_postprocess_null_target1 =
+        decode_config_relative_target(
+            kBinderlessConfigPostprocessGuardCaveRva + 13, 6,
+            binderless_config_postprocess_guard_cave_code.data() + 15);
+    const uintptr_t binderless_config_postprocess_valid_resume =
+        decode_config_relative_target(
+            kBinderlessConfigPostprocessGuardCaveRva + 19, 5,
+            binderless_config_postprocess_guard_cave_code.data() + 20);
+    if (binderless_android &&
+        platform_service_original != platform_service_expected) {
+      dlclose(handle);
+      throw_state(env, "platform service patch guard rejected libg bytes");
+      return nullptr;
+    }
+    if (binderless_android &&
+        (binderless_string_original != binderless_string_expected ||
+         binderless_flag_original != binderless_flag_expected)) {
+      dlclose(handle);
+      throw_state(
+          env, "binderless config registration guard rejected libg bytes");
+      return nullptr;
+    }
+    if (binderless_android &&
+        (!binderless_config_getters_match ||
+         !binderless_config_getter_guard_targets_match ||
+         (native_config_getters &&
+          binderless_config_getter_guard_cave_original !=
+              binderless_config_getter_guard_cave_expected))) {
+      dlclose(handle);
+      throw_state(env,
+                  "binderless guarded config getter rejected libg bytes");
+      return nullptr;
+    }
+    if (binderless_android &&
+        (binderless_config_postprocess_original !=
+             binderless_config_postprocess_expected ||
+         (native_config_postprocess &&
+          (binderless_config_postprocess_function_original !=
+               binderless_config_postprocess_function_expected ||
+           binderless_config_postprocess_guard_cave_original !=
+               binderless_config_postprocess_guard_cave_expected ||
+           binderless_config_postprocess_guard_cave_target !=
+               kBinderlessConfigPostprocessGuardCaveRva ||
+           binderless_config_postprocess_null_target0 !=
+               kBinderlessConfigPostprocessNullReturnRva ||
+           binderless_config_postprocess_null_target1 !=
+               kBinderlessConfigPostprocessNullReturnRva ||
+           binderless_config_postprocess_valid_resume !=
+               kBinderlessConfigPostprocessValidResumeRva)))) {
+      dlclose(handle);
+      throw_state(
+          env, "binderless guarded config postprocess rejected libg bytes");
+      return nullptr;
+    }
     if (original != expected || device_original != device_expected ||
         resolution_original != resolution_expected ||
         objects_original != objects_expected ||
@@ -2782,6 +3163,211 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
       throw_state(env, "cannot open renderer bootstrap page for guarded patch");
       return nullptr;
     }
+    const uintptr_t binderless_registration_page =
+        reinterpret_cast<uintptr_t>(binderless_string_registration) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_getter_page0 =
+        reinterpret_cast<uintptr_t>(binderless_config_getters.front()) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_getter_page1 =
+        reinterpret_cast<uintptr_t>(binderless_config_getters.back()) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_getter_guard_cave_page =
+        reinterpret_cast<uintptr_t>(binderless_config_getter_guard_cave) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_postprocess_page =
+        reinterpret_cast<uintptr_t>(binderless_config_postprocess) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_postprocess_function_page =
+        reinterpret_cast<uintptr_t>(binderless_config_postprocess_function) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t binderless_config_postprocess_guard_cave_page =
+        reinterpret_cast<uintptr_t>(
+            binderless_config_postprocess_guard_cave) &
+        ~static_cast<uintptr_t>(page_size - 1);
+    if (binderless_android &&
+        mprotect(reinterpret_cast<void*>(binderless_registration_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+               PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless registration page");
+      return nullptr;
+    }
+    if (binderless_android &&
+        (mprotect(reinterpret_cast<void*>(binderless_config_getter_page0),
+                  static_cast<size_t>(page_size),
+                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+         mprotect(reinterpret_cast<void*>(binderless_config_getter_page1),
+                  static_cast<size_t>(page_size),
+                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0)) {
+      mprotect(reinterpret_cast<void*>(binderless_registration_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+               PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless config getter pages");
+      return nullptr;
+    }
+    if (binderless_android && native_config_getters &&
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_getter_guard_cave_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page0),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page1),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_registration_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+               PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open guarded config getter cave page");
+      return nullptr;
+    }
+    if (binderless_android && native_config_postprocess &&
+        (mprotect(
+             reinterpret_cast<void*>(
+                 binderless_config_postprocess_function_page),
+             static_cast<size_t>(page_size),
+             PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+         mprotect(
+             reinterpret_cast<void*>(
+                 binderless_config_postprocess_guard_cave_page),
+             static_cast<size_t>(page_size),
+             PROT_READ | PROT_WRITE | PROT_EXEC) != 0)) {
+      mprotect(
+          reinterpret_cast<void*>(
+              binderless_config_postprocess_function_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(
+          reinterpret_cast<void*>(
+              binderless_config_postprocess_guard_cave_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      if (native_config_getters) {
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_getter_guard_cave_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      }
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page0),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page1),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_registration_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+               PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open guarded config postprocess pages");
+      return nullptr;
+    }
+    if (binderless_android &&
+        mprotect(reinterpret_cast<void*>(binderless_config_postprocess_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      if (native_config_postprocess) {
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_postprocess_function_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_postprocess_guard_cave_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      }
+      if (native_config_getters) {
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_getter_guard_cave_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      }
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page0),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page1),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_registration_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
+               PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless config postprocess page");
+      return nullptr;
+    }
+    if (binderless_android) {
+      if (!native_config_registrations) {
+        std::memcpy(binderless_string_registration,
+                    binderless_registration_bypass.data(),
+                    binderless_registration_bypass.size());
+        std::memcpy(binderless_flag_registration,
+                    binderless_registration_bypass.data(),
+                    binderless_registration_bypass.size());
+      }
+      if (native_config_getters) {
+        std::memcpy(binderless_config_getter_guard_cave,
+                    binderless_config_getter_guard_cave_code.data(),
+                    binderless_config_getter_guard_cave_code.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(binderless_config_getter_guard_cave),
+            reinterpret_cast<char*>(
+                binderless_config_getter_guard_cave +
+                binderless_config_getter_guard_cave_code.size()));
+        for (size_t index = 0;
+             index < binderless_config_getters.size(); ++index) {
+          std::memcpy(binderless_config_getters[index],
+                      binderless_config_getter_guard_calls[index].data(),
+                      binderless_config_getter_guard_calls[index].size());
+        }
+        std::fprintf(
+            stderr,
+            "BINDERLESS_CONFIG_GETTER_GUARD cave=0x%llx sites=%zu "
+            "null=return_null valid=replay_original installed=true\n",
+            static_cast<unsigned long long>(
+                kBinderlessConfigGetterGuardCaveRva),
+            binderless_config_getters.size());
+        std::fflush(stderr);
+      } else {
+        for (uint8_t* site : binderless_config_getters) {
+          std::memcpy(site, binderless_config_getter_bypass.data(),
+                      binderless_config_getter_bypass.size());
+        }
+      }
+      if (native_config_postprocess) {
+        std::memcpy(binderless_config_postprocess_guard_cave,
+                    binderless_config_postprocess_guard_cave_code.data(),
+                    binderless_config_postprocess_guard_cave_code.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_guard_cave),
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_guard_cave +
+                binderless_config_postprocess_guard_cave_code.size()));
+        std::memcpy(binderless_config_postprocess_function,
+                    binderless_config_postprocess_function_guard.data(),
+                    binderless_config_postprocess_function_guard.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(binderless_config_postprocess_function),
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_function +
+                binderless_config_postprocess_function_guard.size()));
+        std::fprintf(
+            stderr,
+            "BINDERLESS_CONFIG_POSTPROCESS_GUARD site=0x%llx "
+            "cave=0x%llx null=return valid=replay_original "
+            "installed=true\n",
+            static_cast<unsigned long long>(
+                kBinderlessConfigPostprocessFunctionRva),
+            static_cast<unsigned long long>(
+                kBinderlessConfigPostprocessGuardCaveRva));
+        std::fflush(stderr);
+      } else {
+        std::memset(binderless_config_postprocess, 0x90,
+                    binderless_config_postprocess_original.size());
+      }
+    }
     std::memset(patch_site, 0x90, original.size());
     std::memcpy(device_patch_site, device_bypass.data(), device_bypass.size());
     std::memset(resolution_patch_site, 0x90, resolution_original.size());
@@ -2790,10 +3376,81 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
     std::memset(late_configure_patch_site, 0x90,
                 late_configure_original.size());
     __builtin___clear_cache(
-        reinterpret_cast<char*>(patch_site),
+        reinterpret_cast<char*>(platform_service_patch_site),
         reinterpret_cast<char*>(late_configure_patch_site +
                                 late_configure_original.size()));
+    if (binderless_android) {
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_string_registration),
+          reinterpret_cast<char*>(binderless_flag_registration +
+                                  binderless_registration_bypass.size()));
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_config_getters.front()),
+          reinterpret_cast<char*>(binderless_config_getters.back() +
+                                  binderless_config_getter_bypass.size()));
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_config_postprocess),
+          reinterpret_cast<char*>(binderless_config_postprocess +
+                                  binderless_config_postprocess_original.size()));
+    }
     initialize(reinterpret_cast<void*>(game), reinterpret_cast<void*>(context));
+    if (binderless_android) {
+      std::memcpy(platform_service_patch_site,
+                  platform_service_original.data(),
+                  platform_service_original.size());
+      if (!native_config_registrations) {
+        std::memcpy(binderless_string_registration,
+                    binderless_string_original.data(),
+                    binderless_string_original.size());
+        std::memcpy(binderless_flag_registration,
+                    binderless_flag_original.data(),
+                    binderless_flag_original.size());
+      }
+      for (size_t index = 0;
+           index < binderless_config_getter_originals.size(); ++index) {
+        std::memcpy(binderless_config_getters[index],
+                    binderless_config_getter_originals[index].data(),
+                    binderless_config_getter_originals[index].size());
+      }
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_config_getters.front()),
+          reinterpret_cast<char*>(
+              binderless_config_getters.back() +
+              binderless_config_getter_originals.back().size()));
+      if (native_config_getters) {
+        std::memcpy(binderless_config_getter_guard_cave,
+                    binderless_config_getter_guard_cave_original.data(),
+                    binderless_config_getter_guard_cave_original.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(binderless_config_getter_guard_cave),
+            reinterpret_cast<char*>(
+                binderless_config_getter_guard_cave +
+                binderless_config_getter_guard_cave_original.size()));
+      }
+      if (native_config_postprocess) {
+        std::memcpy(binderless_config_postprocess_function,
+                    binderless_config_postprocess_function_original.data(),
+                    binderless_config_postprocess_function_original.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(binderless_config_postprocess_function),
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_function +
+                binderless_config_postprocess_function_original.size()));
+        std::memcpy(binderless_config_postprocess_guard_cave,
+                    binderless_config_postprocess_guard_cave_original.data(),
+                    binderless_config_postprocess_guard_cave_original.size());
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_guard_cave),
+            reinterpret_cast<char*>(
+                binderless_config_postprocess_guard_cave +
+                binderless_config_postprocess_guard_cave_original.size()));
+      } else {
+        std::memcpy(binderless_config_postprocess,
+                    binderless_config_postprocess_original.data(),
+                    binderless_config_postprocess_original.size());
+      }
+    }
     std::memcpy(patch_site, original.data(), original.size());
     std::memcpy(device_patch_site, device_original.data(),
                 device_original.size());
@@ -2804,9 +3461,39 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
     std::memcpy(late_configure_patch_site, late_configure_original.data(),
                 late_configure_original.size());
     __builtin___clear_cache(
-        reinterpret_cast<char*>(patch_site),
+        reinterpret_cast<char*>(platform_service_patch_site),
         reinterpret_cast<char*>(late_configure_patch_site +
                                 late_configure_original.size()));
+    if (binderless_android) {
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_string_registration),
+          reinterpret_cast<char*>(binderless_flag_registration +
+                                  binderless_flag_original.size()));
+      mprotect(reinterpret_cast<void*>(binderless_registration_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page0),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(binderless_config_getter_page1),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      if (native_config_getters) {
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_getter_guard_cave_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      }
+      if (native_config_postprocess) {
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_postprocess_function_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+        mprotect(
+            reinterpret_cast<void*>(
+                binderless_config_postprocess_guard_cave_page),
+            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      }
+      mprotect(reinterpret_cast<void*>(binderless_config_postprocess_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    }
     mprotect(reinterpret_cast<void*>(page), static_cast<size_t>(page_size),
              PROT_READ | PROT_EXEC);
   }
@@ -2876,6 +3563,123 @@ Java_royale_nativehost_JniHost_nativeInitGameMain(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativePreloadCoreData(
+    JNIEnv* env, jclass, jstring libg_path) {
+  const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
+  if (path_chars == nullptr) {
+    return nullptr;
+  }
+  void* handle = dlopen(path_chars, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+  env->ReleaseStringUTFChars(libg_path, path_chars);
+  if (handle == nullptr) {
+    throw_state(env, "libg is not loaded for core data preload");
+    return nullptr;
+  }
+  void* exported = dlsym(handle, "JNI_OnLoad");
+  Dl_info info{};
+  if (exported == nullptr || dladdr(exported, &info) == 0 ||
+      info.dli_fbase == nullptr) {
+    dlclose(handle);
+    throw_state(env, "cannot resolve libg base for core data preload");
+    return nullptr;
+  }
+  const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  if (reinterpret_cast<uintptr_t>(exported) - base != kExpectedJniOnLoadRva) {
+    dlclose(handle);
+    throw_state(env, "libg version guard rejected core data preload");
+    return nullptr;
+  }
+  SafeMemoryReader memory;
+  uint64_t loader = 0;
+  if (!memory.read(base + kResourceLoaderGlobalRva, &loader) || loader == 0) {
+    dlclose(handle);
+    throw_state(env, "resource loader is not initialized for core preload");
+    return nullptr;
+  }
+  void* path = reinterpret_cast<void*>(base + kCoreTextsPathRva);
+  int32_t path_length = -1;
+  const char* native_path = native_data_string_chars(
+      memory, path, &path_length);
+  constexpr const char* kExpectedPath = "csv_client/texts.csv";
+  constexpr size_t kExpectedPathLength = 20;
+  std::array<char, kExpectedPathLength + 1> path_copy{};
+  if (native_path == nullptr ||
+      path_length != static_cast<int32_t>(kExpectedPathLength) ||
+      !memory.read_bytes(reinterpret_cast<uintptr_t>(native_path),
+                         path_copy.data(), kExpectedPathLength) ||
+      std::memcmp(path_copy.data(), kExpectedPath,
+                  kExpectedPathLength) != 0) {
+    dlclose(handle);
+    throw_state(env, "core preload path guard rejected native texts path");
+    return nullptr;
+  }
+  auto safe_resolve = reinterpret_cast<SafeResourceResolve>(
+      base + kSafeResourceResolveRva);
+  auto is_loaded = reinterpret_cast<ResourceLoadedPredicate>(
+      base + kResourceLoadedPredicateRva);
+  auto blocking_request = reinterpret_cast<BlockingResourceRequest>(
+      base + kBlockingResourceRequestRva);
+  const bool loaded_before = is_loaded(path);
+  void* resolver_before = safe_resolve(path);
+  bool requested = false;
+  bool request_result = false;
+  if (!loaded_before) {
+    requested = true;
+    request_result = blocking_request(path, false);
+  }
+  const bool loaded_after = is_loaded(path);
+  void* resolver_after = safe_resolve(path);
+  auto raw_resolve = reinterpret_cast<SafeResourceResolve>(
+      base + kDataStringResolveRva);
+  void* raw_resolver_after = loaded_after ? raw_resolve(path) : nullptr;
+  // 11EA4D0 intentionally returns null for loaded non-type-2 resources.
+  // 11EA880 is the native loaded predicate used by 72A3A0 itself and is the
+  // authoritative success condition; resolver pointers remain diagnostics.
+  const bool success = loaded_after;
+  std::fprintf(
+      stderr,
+      "BINDERLESS_PRELOAD_CORE_DATA path=%s rva=0x%llx loader=0x%llx "
+      "loaded_before=%s resolver_before=%p requested=%s request_result=%s "
+      "loaded_after=%s resolver_after=%p raw_resolver_after=%p success=%s\n",
+      kExpectedPath,
+      static_cast<unsigned long long>(kCoreTextsPathRva),
+      static_cast<unsigned long long>(loader),
+      loaded_before ? "true" : "false", resolver_before,
+      requested ? "true" : "false",
+      request_result ? "true" : "false",
+      loaded_after ? "true" : "false", resolver_after,
+      raw_resolver_after,
+      success ? "true" : "false");
+  std::fflush(stderr);
+  char payload[512];
+  std::snprintf(
+      payload, sizeof(payload),
+      "{\"called\":true,\"path\":\"%s\",\"path_rva\":\"0x%llx\","
+      "\"loader\":\"0x%llx\",\"loaded_before\":%s,"
+      "\"resolver_before\":\"0x%llx\","
+      "\"requested\":%s,\"request_result\":%s,"
+      "\"loaded_after\":%s,\"resolver_after\":\"0x%llx\","
+      "\"raw_resolver_after\":\"0x%llx\","
+      "\"success\":%s}",
+      kExpectedPath,
+      static_cast<unsigned long long>(kCoreTextsPathRva),
+      static_cast<unsigned long long>(loader),
+      loaded_before ? "true" : "false",
+      static_cast<unsigned long long>(
+          reinterpret_cast<uintptr_t>(resolver_before)),
+      requested ? "true" : "false",
+      request_result ? "true" : "false",
+      loaded_after ? "true" : "false",
+      static_cast<unsigned long long>(
+          reinterpret_cast<uintptr_t>(resolver_after)),
+      static_cast<unsigned long long>(
+          reinterpret_cast<uintptr_t>(raw_resolver_after)),
+      success ? "true" : "false");
+  dlclose(handle);
+  return env->NewStringUTF(payload);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativeProbePrerequisites(
     JNIEnv* env, jclass, jstring libg_path) {
   const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
@@ -2922,19 +3726,61 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
   uint64_t loading_state = 0;
   uint64_t data_load_task = 0;
   uint64_t data_load_task_words[8] = {};
+  int32_t current_state_type = -1;
+  int32_t pending_state_type = -1;
+  int32_t loading_phase = -1;
+  int32_t data_load_task_state = -1;
+  int32_t data_load_task_progress = -1;
+  uint64_t data_load_task_tables = 0;
+  uint64_t data_load_resource_collection = 0;
+  int32_t data_load_resource_count = -1;
+  uint8_t data_tables_complete_latch = 0;
+  uint64_t data_tables_factory_vtable = 0;
+  uint64_t data_tables_factory_method20 = 0;
+  uint64_t data_tables_factory_method28 = 0;
+  uint64_t data_tables_factory_method30 = 0;
   uint64_t game_methods[24] = {};
   uint64_t battle_data_root_vtable = 0;
   uint64_t battle_data_root_methods[12] = {};
   memory.read(base + kManagerGlobalRva, &manager);
   if (manager != 0) {
+    memory.read(manager + 0x30, &current_state_type);
+    memory.read(manager + 0x34, &pending_state_type);
     memory.read(manager + 0x20, &loading_state);
     if (loading_state != 0) {
+      memory.read(loading_state + 0x0C, &loading_phase);
       memory.read(loading_state + 0x10, &data_load_task);
       if (data_load_task != 0) {
         memory.read_bytes(data_load_task, data_load_task_words,
                           sizeof(data_load_task_words));
+        memory.read(data_load_task + 0x00, &data_load_task_tables);
+        memory.read(data_load_task + 0x08,
+                    &data_load_resource_collection);
+        memory.read(data_load_task + 0x10, &data_load_task_state);
+        memory.read(data_load_task + 0x1C, &data_load_task_progress);
+        if (data_load_resource_collection != 0) {
+          memory.read(data_load_resource_collection + 0x0C,
+                      &data_load_resource_count);
+        }
+        if (data_load_task_tables != 0) {
+          // CDC5A0 delegates to E2A640, whose exact completion predicate is
+          // the DataTables byte at +0x6E8. Observe that native latch directly
+          // rather than inferring completion from a non-null content array.
+          memory.read(data_load_task_tables + 0x6E8,
+                      &data_tables_complete_latch);
+        }
       }
     }
+  }
+  memory.read(base + kDataTablesFactoryGlobalRva,
+              &data_tables_factory_vtable);
+  if (data_tables_factory_vtable != 0) {
+    memory.read(data_tables_factory_vtable + 0x20,
+                &data_tables_factory_method20);
+    memory.read(data_tables_factory_vtable + 0x28,
+                &data_tables_factory_method28);
+    memory.read(data_tables_factory_vtable + 0x30,
+                &data_tables_factory_method30);
   }
   memory.read(base + kResourceLoaderGlobalRva, &loader);
   memory.read(base + kAssetSystemGlobalRva, &asset_system);
@@ -3105,7 +3951,41 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
   }
   data_loader_methods_payload[data_loader_methods_offset++] = ']';
   data_loader_methods_payload[data_loader_methods_offset] = '\0';
-  char payload[4096];
+  const auto belongs_to_libg = [&](uint64_t address) {
+    if (address == 0) {
+      return false;
+    }
+    Dl_info pointer_info{};
+    return dladdr(reinterpret_cast<void*>(address), &pointer_info) != 0 &&
+           pointer_info.dli_fbase == info.dli_fbase;
+  };
+  const bool data_tables_factory_structurally_valid =
+      belongs_to_libg(data_tables_factory_vtable) &&
+      belongs_to_libg(data_tables_factory_method20) &&
+      belongs_to_libg(data_tables_factory_method28) &&
+      belongs_to_libg(data_tables_factory_method30);
+  const bool data_load_task_structurally_ready =
+      data_load_task != 0 && battle_data_object != 0 &&
+      data_load_task_tables == battle_data_object &&
+      data_load_resource_collection != 0 && data_load_resource_count > 0;
+  // CE9F60 invokes the native resource loader and CEA02B advances the
+  // LoadingState phase to 3 only after that call succeeds.  A non-null factory
+  // vtable exists earlier and is therefore only a structural guard, never a
+  // readiness signal by itself.
+  const bool natural_loading_phase_ready = loading_phase >= 3;
+  // The task latch may be set during CDC620 before LoadingState consumes it.
+  // Phase 5 is reached only after the following native manager frame runs the
+  // CEA49C/CEA5A0 post-processing path. Phase 7 is an alternate/error path;
+  // CE9750 accepts exactly phase 5 as complete.
+  const bool natural_loading_postprocess_ready = loading_phase == 5;
+  const bool data_load_task_ready =
+      natural_loading_phase_ready && data_load_task_structurally_ready;
+  const bool data_load_task_complete =
+      data_load_task_structurally_ready && data_tables_complete_latch != 0;
+  const bool natural_data_tables_ready =
+      battle_data_content != 0 && data_load_task_complete &&
+      natural_loading_postprocess_ready;
+  char payload[8192];
   std::snprintf(
       payload, sizeof(payload),
       "{\"manager\":\"0x%llx\",\"loader\":\"0x%llx\","
@@ -3126,6 +4006,24 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
       "\"battle_data_loader_methods_rva\":%s,"
       "\"loading_state\":\"0x%llx\","
       "\"data_load_task\":\"0x%llx\","
+      "\"current_state_type\":%d,\"pending_state_type\":%d,"
+      "\"loading_phase\":%d,\"data_load_task_state\":%d,"
+      "\"data_load_task_progress\":%d,"
+      "\"data_load_task_tables\":\"0x%llx\","
+      "\"data_load_resource_collection\":\"0x%llx\","
+      "\"data_load_resource_count\":%d,"
+      "\"data_tables_complete_latch\":%u,"
+      "\"data_tables_factory\":\"0x%llx\","
+      "\"data_tables_factory_vtable_rva\":\"0x%llx\","
+      "\"data_tables_factory_methods_rva\":[\"0x%llx\","
+      "\"0x%llx\",\"0x%llx\"],"
+      "\"data_tables_factory_structurally_valid\":%s,"
+      "\"natural_loading_phase_ready\":%s,"
+      "\"natural_loading_postprocess_ready\":%s,"
+      "\"data_load_task_structurally_ready\":%s,"
+      "\"data_load_task_ready\":%s,"
+      "\"data_load_task_complete\":%s,"
+      "\"natural_data_tables_ready\":%s,"
       "\"data_load_task_words\":[\"0x%llx\",\"0x%llx\","
       "\"0x%llx\",\"0x%llx\",\"0x%llx\",\"0x%llx\","
       "\"0x%llx\",\"0x%llx\"],"
@@ -3161,6 +4059,36 @@ Java_royale_nativehost_JniHost_nativeProbePrerequisites(
       data_loader_methods_payload,
       static_cast<unsigned long long>(loading_state),
       static_cast<unsigned long long>(data_load_task),
+      current_state_type, pending_state_type, loading_phase,
+      data_load_task_state, data_load_task_progress,
+      static_cast<unsigned long long>(data_load_task_tables),
+      static_cast<unsigned long long>(data_load_resource_collection),
+      data_load_resource_count,
+      static_cast<unsigned int>(data_tables_complete_latch),
+      static_cast<unsigned long long>(base + kDataTablesFactoryGlobalRva),
+      static_cast<unsigned long long>(
+          data_tables_factory_vtable >= base
+              ? data_tables_factory_vtable - base
+              : data_tables_factory_vtable),
+      static_cast<unsigned long long>(
+          data_tables_factory_method20 >= base
+              ? data_tables_factory_method20 - base
+              : data_tables_factory_method20),
+      static_cast<unsigned long long>(
+          data_tables_factory_method28 >= base
+              ? data_tables_factory_method28 - base
+              : data_tables_factory_method28),
+      static_cast<unsigned long long>(
+          data_tables_factory_method30 >= base
+              ? data_tables_factory_method30 - base
+              : data_tables_factory_method30),
+      data_tables_factory_structurally_valid ? "true" : "false",
+      natural_loading_phase_ready ? "true" : "false",
+      natural_loading_postprocess_ready ? "true" : "false",
+      data_load_task_structurally_ready ? "true" : "false",
+      data_load_task_ready ? "true" : "false",
+      data_load_task_complete ? "true" : "false",
+      natural_data_tables_ready ? "true" : "false",
       static_cast<unsigned long long>(data_load_task_words[0]),
       static_cast<unsigned long long>(data_load_task_words[1]),
       static_cast<unsigned long long>(data_load_task_words[2]),
@@ -3193,6 +4121,10 @@ Java_royale_nativehost_JniHost_nativeInitResources(
     runtime_root.resize(final_separator);
   }
   const std::string direct_asset_root = runtime_root + "/assets";
+  const char* binderless_value = std::getenv("CR_BINDERLESS_ANDROID");
+  const bool binderless_android =
+      binderless_value != nullptr && std::strcmp(binderless_value, "1") == 0;
+  std::array<char, 4096> direct_cwd{};
   env->ReleaseStringUTFChars(libg_path, path_chars);
   if (handle == nullptr) {
     throw_state(env, "libg is not loaded for direct manager init");
@@ -3231,7 +4163,7 @@ Java_royale_nativehost_JniHost_nativeInitResources(
     throw_state(env, "libg asset system initializer did not publish a root");
     return nullptr;
   }
-  if (asset_system_before == 0) {
+  if (asset_system_before == 0 || binderless_android) {
   auto asset_system_get = reinterpret_cast<AssetSystemGet>(
       base + kAssetSystemGetRva);
   auto asset_system_prepare = reinterpret_cast<AssetSystemPrepare>(
@@ -3326,6 +4258,27 @@ Java_royale_nativehost_JniHost_nativeInitResources(
   mount_path(kCachePathGetterRva, "cache:");
   mount_path(kSavePathGetterRva, "save:");
   mount_path(kTempPathGetterRva, "temp:");
+  }
+  if (binderless_android) {
+    if (chdir(direct_asset_root.c_str()) != 0) {
+      const int error_number = errno;
+      dlclose(handle);
+      throw_state(
+          env, std::string("cannot chdir to direct asset root: ") +
+                   std::strerror(error_number));
+      return nullptr;
+    }
+    if (getcwd(direct_cwd.data(), direct_cwd.size()) == nullptr) {
+      const int error_number = errno;
+      dlclose(handle);
+      throw_state(
+          env, std::string("cannot verify direct asset cwd: ") +
+                   std::strerror(error_number));
+      return nullptr;
+    }
+    std::fprintf(stderr, "DIRECT_CWD asset_root=%s cwd=%s\n",
+                 direct_asset_root.c_str(), direct_cwd.data());
+    std::fflush(stderr);
   }
   auto runtime_clock_init = reinterpret_cast<RuntimeClockInit>(
       base + kRuntimeClockInitRva);
@@ -3481,6 +4434,33 @@ Java_royale_nativehost_JniHost_nativePumpDataTables(
   memory.read(task + 8, &resource_collection);
   if (resource_collection != 0) {
     memory.read(resource_collection + 0x0C, &resource_count);
+  }
+  int32_t natural_loading_phase = -1;
+  uint64_t data_tables_factory_vtable = 0;
+  uint64_t data_tables_factory_method20 = 0;
+  uint64_t data_tables_factory_method28 = 0;
+  uint64_t data_tables_factory_method30 = 0;
+  memory.read(loading_state + 0x0C, &natural_loading_phase);
+  memory.read(base + kDataTablesFactoryGlobalRva,
+              &data_tables_factory_vtable);
+  if (data_tables_factory_vtable != 0) {
+    memory.read(data_tables_factory_vtable + 0x20,
+                &data_tables_factory_method20);
+    memory.read(data_tables_factory_vtable + 0x28,
+                &data_tables_factory_method28);
+    memory.read(data_tables_factory_vtable + 0x30,
+                &data_tables_factory_method30);
+  }
+  if (natural_loading_phase < 3 || resource_collection == 0 ||
+      resource_count <= 0 || data_tables_factory_vtable == 0 ||
+      data_tables_factory_method20 == 0 ||
+      data_tables_factory_method28 == 0 ||
+      data_tables_factory_method30 == 0) {
+    dlclose(handle);
+    throw_state(
+        env,
+        "native LoadingState has not completed factory/resource setup");
+    return nullptr;
   }
 
   int32_t state_before = -1;
@@ -3758,6 +4738,1194 @@ Java_royale_nativehost_JniHost_nativePumpManager(
   }
   auto manager_update = reinterpret_cast<GameStateManagerUpdate>(
       base + kGameStateManagerUpdateRva);
+  const char* binderless_value = std::getenv("CR_BINDERLESS_ANDROID");
+  const bool binderless_android =
+      binderless_value != nullptr && std::strcmp(binderless_value, "1") == 0;
+  const char* defer_null_dependencies_value =
+      std::getenv("CR_BINDERLESS_DEFER_NULL_DEPENDENCIES");
+  if (binderless_android && defer_null_dependencies_value != nullptr &&
+      defer_null_dependencies_value[0] != '\0' &&
+      std::strcmp(defer_null_dependencies_value, "0") != 0 &&
+      std::strcmp(defer_null_dependencies_value, "1") != 0) {
+    dlclose(handle);
+    throw_state(
+        env,
+        "CR_BINDERLESS_DEFER_NULL_DEPENDENCIES must be unset, 0, or 1");
+    return nullptr;
+  }
+  const bool defer_null_dependencies =
+      binderless_android && defer_null_dependencies_value != nullptr &&
+      std::strcmp(defer_null_dependencies_value, "1") == 0;
+  auto* deferred_null_dependency_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDeferredNullDependencyGuardRva);
+  auto* deferred_null_dependency_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDeferredNullDependencyCaveRva);
+  const std::array<uint8_t, 5> deferred_null_dependency_expected = {
+      0x55, 0x41, 0x57, 0x41, 0x56};
+  const std::array<uint8_t, 5> deferred_null_dependency_jump = {
+      0xE9, 0xE1, 0x0D, 0x56, 0x00};
+  std::array<uint8_t, 26> deferred_null_dependency_cave_expected{};
+  deferred_null_dependency_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 18> deferred_null_dependency_cave_code = {
+      0x48, 0x85, 0xFF,
+      0x74, 0x0A,
+      0x55, 0x41, 0x57, 0x41, 0x56,
+      0xE9, 0x10, 0xF2, 0xA9, 0xFF,
+      0x31, 0xC0, 0xC3};
+  static bool deferred_null_dependency_guard_installed = false;
+  if (defer_null_dependencies) {
+    std::array<uint8_t, 5> guard_original{};
+    std::array<uint8_t, 26> cave_original{};
+    std::memcpy(guard_original.data(), deferred_null_dependency_guard,
+                guard_original.size());
+    std::memcpy(cave_original.data(), deferred_null_dependency_cave,
+                cave_original.size());
+    std::array<uint8_t, 26> cave_installed =
+        deferred_null_dependency_cave_expected;
+    std::memcpy(cave_installed.data(),
+                deferred_null_dependency_cave_code.data(),
+                deferred_null_dependency_cave_code.size());
+    auto decode_relative_target = [](
+        uintptr_t instruction_rva, size_t instruction_size,
+        const uint8_t* displacement_bytes) {
+      int32_t displacement = 0;
+      std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+      return instruction_rva + instruction_size +
+          static_cast<intptr_t>(displacement);
+    };
+    const uintptr_t cave_target = decode_relative_target(
+        kBinderlessDeferredNullDependencyGuardRva, 5,
+        deferred_null_dependency_jump.data() + 1);
+    const uintptr_t null_target =
+        kBinderlessDeferredNullDependencyCaveRva + 5 +
+        static_cast<int8_t>(deferred_null_dependency_cave_code[4]);
+    const uintptr_t valid_resume = decode_relative_target(
+        kBinderlessDeferredNullDependencyCaveRva + 10, 5,
+        deferred_null_dependency_cave_code.data() + 11);
+    if ((deferred_null_dependency_guard_installed
+             ? (guard_original != deferred_null_dependency_jump ||
+                cave_original != cave_installed)
+             : (guard_original != deferred_null_dependency_expected ||
+                cave_original != deferred_null_dependency_cave_expected)) ||
+        cave_target != kBinderlessDeferredNullDependencyCaveRva ||
+        null_target != kBinderlessDeferredNullDependencyCaveRva + 15 ||
+        valid_resume != kBinderlessDeferredNullDependencyResumeRva) {
+      dlclose(handle);
+      throw_state(
+          env, "deferred null dependency guard rejected libg bytes");
+      return nullptr;
+    }
+    if (!deferred_null_dependency_guard_installed) {
+      const long guard_page_size = sysconf(_SC_PAGESIZE);
+      if (guard_page_size <= 0) {
+        dlclose(handle);
+        throw_state(env, "cannot resolve deferred dependency page size");
+        return nullptr;
+      }
+      const uintptr_t guard_page =
+          reinterpret_cast<uintptr_t>(deferred_null_dependency_guard) &
+          ~static_cast<uintptr_t>(guard_page_size - 1);
+      const uintptr_t cave_page =
+          reinterpret_cast<uintptr_t>(deferred_null_dependency_cave) &
+          ~static_cast<uintptr_t>(guard_page_size - 1);
+      if (mprotect(reinterpret_cast<void*>(guard_page),
+                   static_cast<size_t>(guard_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(cave_page),
+                   static_cast<size_t>(guard_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        mprotect(reinterpret_cast<void*>(guard_page),
+                 static_cast<size_t>(guard_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(cave_page),
+                 static_cast<size_t>(guard_page_size),
+                 PROT_READ | PROT_EXEC);
+        dlclose(handle);
+        throw_state(env, "cannot open deferred dependency guard pages");
+        return nullptr;
+      }
+      std::memcpy(deferred_null_dependency_cave,
+                  deferred_null_dependency_cave_code.data(),
+                  deferred_null_dependency_cave_code.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(deferred_null_dependency_cave),
+          reinterpret_cast<char*>(
+              deferred_null_dependency_cave +
+              deferred_null_dependency_cave_code.size()));
+      std::memcpy(deferred_null_dependency_guard,
+                  deferred_null_dependency_jump.data(),
+                  deferred_null_dependency_jump.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(deferred_null_dependency_guard),
+          reinterpret_cast<char*>(deferred_null_dependency_guard +
+                                  deferred_null_dependency_jump.size()));
+      mprotect(reinterpret_cast<void*>(guard_page),
+               static_cast<size_t>(guard_page_size),
+               PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(cave_page),
+               static_cast<size_t>(guard_page_size),
+               PROT_READ | PROT_EXEC);
+      deferred_null_dependency_guard_installed = true;
+      std::fprintf(
+          stderr,
+          "BINDERLESS_DEFER_NULL_DEPENDENCY_GUARD site=0x%llx "
+          "cave=0x%llx null=return_null valid=replay_original "
+          "installed=true\n",
+          static_cast<unsigned long long>(
+              kBinderlessDeferredNullDependencyGuardRva),
+          static_cast<unsigned long long>(
+              kBinderlessDeferredNullDependencyCaveRva));
+      std::fflush(stderr);
+    }
+  }
+  const char* defer_optional_client_globals_value =
+      std::getenv("CR_BINDERLESS_DEFER_OPTIONAL_CLIENT_GLOBALS");
+  if (binderless_android && defer_optional_client_globals_value != nullptr &&
+      defer_optional_client_globals_value[0] != '\0' &&
+      std::strcmp(defer_optional_client_globals_value, "0") != 0 &&
+      std::strcmp(defer_optional_client_globals_value, "1") != 0) {
+    dlclose(handle);
+    throw_state(
+        env,
+        "CR_BINDERLESS_DEFER_OPTIONAL_CLIENT_GLOBALS must be unset, 0, or 1");
+    return nullptr;
+  }
+  const bool defer_optional_client_globals =
+      binderless_android && defer_optional_client_globals_value != nullptr &&
+      std::strcmp(defer_optional_client_globals_value, "1") == 0;
+  static bool deferred_optional_client_globals_installed = false;
+  if (defer_optional_client_globals) {
+    auto* optional_client_globals = reinterpret_cast<uint8_t*>(
+        base + kBinderlessDeferredOptionalClientGlobalsRva);
+    const uint8_t current = *optional_client_globals;
+    const uint8_t expected =
+        deferred_optional_client_globals_installed ? 0xC3 : 0x55;
+    if (current != expected) {
+      dlclose(handle);
+      throw_state(
+          env, "deferred optional ClientGlobals guard rejected libg byte");
+      return nullptr;
+    }
+    if (!deferred_optional_client_globals_installed) {
+      const long optional_page_size = sysconf(_SC_PAGESIZE);
+      if (optional_page_size <= 0) {
+        dlclose(handle);
+        throw_state(env, "cannot resolve optional ClientGlobals page size");
+        return nullptr;
+      }
+      const uintptr_t optional_page =
+          reinterpret_cast<uintptr_t>(optional_client_globals) &
+          ~static_cast<uintptr_t>(optional_page_size - 1);
+      if (mprotect(reinterpret_cast<void*>(optional_page),
+                   static_cast<size_t>(optional_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        dlclose(handle);
+        throw_state(env, "cannot open optional ClientGlobals page");
+        return nullptr;
+      }
+      // Diagnostic-only meta cache: its keys are BOAT_PVE, NPC_TRADER,
+      // CONSUMABLES, SEASON_PASS, PRESTIGE and ROYAL_TOURNAMENTS. The caller
+      // ignores the return value; leaving these fields zero does not remove or
+      // rewrite any battle ClientGlobals table.
+      *optional_client_globals = 0xC3;
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(optional_client_globals),
+          reinterpret_cast<char*>(optional_client_globals + 1));
+      mprotect(reinterpret_cast<void*>(optional_page),
+               static_cast<size_t>(optional_page_size),
+               PROT_READ | PROT_EXEC);
+      deferred_optional_client_globals_installed = true;
+      std::fprintf(
+          stderr,
+          "BINDERLESS_DEFER_OPTIONAL_CLIENT_GLOBALS site=0x%llx "
+          "scope=non_battle_meta installed=true\n",
+          static_cast<unsigned long long>(
+              kBinderlessDeferredOptionalClientGlobalsRva));
+      std::fflush(stderr);
+    }
+  }
+  auto* binderless_sc3d_context_global_load = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dContextGuardRva - 7);
+  auto* binderless_sc3d_context_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dContextGuardRva);
+  auto* binderless_sc3d_context_guard_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dContextGuardCaveRva);
+  const std::array<uint8_t, 7> binderless_sc3d_context_global_expected = {
+      0x4C, 0x8D, 0x25, 0x74, 0xFC, 0x38, 0x01};
+  const std::array<uint8_t, 11> binderless_sc3d_context_guard_expected = {
+      0x49, 0x8B, 0x04, 0x24, 0x4C, 0x8B, 0xB8, 0xC8, 0x02, 0x00, 0x00};
+  const std::array<uint8_t, 5> binderless_sc3d_context_guard_jump = {
+      0xE9, 0x11, 0x2B, 0x10, 0x01};
+  std::array<uint8_t, 30> binderless_sc3d_context_cave_expected{};
+  binderless_sc3d_context_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 25> binderless_sc3d_context_cave_code = {
+      0x49, 0x8B, 0x04, 0x24,              // mov rax, [r12]
+      0x48, 0x85, 0xC0,                    // test rax, rax
+      0x0F, 0x84, 0xCC, 0xD5, 0xEF, 0xFE,  // je 0x72E39B
+      0x4C, 0x8B, 0xB8, 0xC8, 0x02, 0x00, 0x00,
+      0xE9, 0xDC, 0xD4, 0xEF, 0xFE};       // jmp 0x72E2B7
+  auto* binderless_sc3d_capability_global_load = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dCapabilityGuardRva - 7);
+  auto* binderless_sc3d_capability_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dCapabilityGuardRva);
+  auto* binderless_sc3d_capability_guard_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dCapabilityGuardCaveRva);
+  const std::array<uint8_t, 7> binderless_sc3d_capability_global_expected = {
+      0x48, 0x8D, 0x05, 0x45, 0xCA, 0x38, 0x01};
+  const std::array<uint8_t, 6> binderless_sc3d_capability_guard_expected = {
+      0x48, 0x8B, 0x38, 0x48, 0x8B, 0x07};
+  const std::array<uint8_t, 5> binderless_sc3d_capability_guard_jump = {
+      0xE9, 0x0C, 0xBA, 0x0B, 0x01};
+  std::array<uint8_t, 20> binderless_sc3d_capability_cave_expected{};
+  binderless_sc3d_capability_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 20> binderless_sc3d_capability_cave_code = {
+      0x48, 0x8B, 0x38,                    // mov rdi, [rax]
+      0x48, 0x85, 0xFF,                    // test rdi, rdi
+      0x0F, 0x84, 0x40, 0x48, 0xF4, 0xFE,  // je 0x731738
+      0x48, 0x8B, 0x07,                    // mov rax, [rdi]
+      0xE9, 0xE1, 0x45, 0xF4, 0xFE};       // jmp 0x7314E1
+  static bool binderless_sc3d_context_guard_installed = false;
+  if (binderless_android) {
+    std::array<uint8_t, 7> global_load_original{};
+    std::array<uint8_t, 11> guard_original{};
+    std::array<uint8_t, 30> cave_original{};
+    std::array<uint8_t, 7> capability_global_load_original{};
+    std::array<uint8_t, 6> capability_guard_original{};
+    std::array<uint8_t, 20> capability_cave_original{};
+    std::memcpy(global_load_original.data(),
+                binderless_sc3d_context_global_load,
+                global_load_original.size());
+    std::memcpy(guard_original.data(), binderless_sc3d_context_guard,
+                guard_original.size());
+    std::memcpy(cave_original.data(), binderless_sc3d_context_guard_cave,
+                cave_original.size());
+    std::memcpy(capability_global_load_original.data(),
+                binderless_sc3d_capability_global_load,
+                capability_global_load_original.size());
+    std::memcpy(capability_guard_original.data(),
+                binderless_sc3d_capability_guard,
+                capability_guard_original.size());
+    std::memcpy(capability_cave_original.data(),
+                binderless_sc3d_capability_guard_cave,
+                capability_cave_original.size());
+    auto guard_installed = binderless_sc3d_context_guard_expected;
+    std::copy(binderless_sc3d_context_guard_jump.begin(),
+              binderless_sc3d_context_guard_jump.end(),
+              guard_installed.begin());
+    auto cave_installed = binderless_sc3d_context_cave_expected;
+    std::copy(binderless_sc3d_context_cave_code.begin(),
+              binderless_sc3d_context_cave_code.end(),
+              cave_installed.begin());
+    auto capability_guard_installed =
+        binderless_sc3d_capability_guard_expected;
+    std::copy(binderless_sc3d_capability_guard_jump.begin(),
+              binderless_sc3d_capability_guard_jump.end(),
+              capability_guard_installed.begin());
+    auto decode_sc3d_target = [](
+        uintptr_t instruction_rva, size_t instruction_size,
+        const uint8_t* displacement_bytes) {
+      int32_t displacement = 0;
+      std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+      return instruction_rva + instruction_size +
+          static_cast<intptr_t>(displacement);
+    };
+    const uintptr_t global_target = decode_sc3d_target(
+        kBinderlessSc3dContextGuardRva - 7, 7,
+        binderless_sc3d_context_global_expected.data() + 3);
+    const uintptr_t cave_target = decode_sc3d_target(
+        kBinderlessSc3dContextGuardRva, 5,
+        binderless_sc3d_context_guard_jump.data() + 1);
+    const uintptr_t null_target = decode_sc3d_target(
+        kBinderlessSc3dContextGuardCaveRva + 7, 6,
+        binderless_sc3d_context_cave_code.data() + 9);
+    const uintptr_t valid_resume = decode_sc3d_target(
+        kBinderlessSc3dContextGuardCaveRva + 20, 5,
+        binderless_sc3d_context_cave_code.data() + 21);
+    const uintptr_t capability_global_target = decode_sc3d_target(
+        kBinderlessSc3dCapabilityGuardRva - 7, 7,
+        binderless_sc3d_capability_global_expected.data() + 3);
+    const uintptr_t capability_cave_target = decode_sc3d_target(
+        kBinderlessSc3dCapabilityGuardRva, 5,
+        binderless_sc3d_capability_guard_jump.data() + 1);
+    const uintptr_t capability_null_target = decode_sc3d_target(
+        kBinderlessSc3dCapabilityGuardCaveRva + 6, 6,
+        binderless_sc3d_capability_cave_code.data() + 8);
+    const uintptr_t capability_valid_resume = decode_sc3d_target(
+        kBinderlessSc3dCapabilityGuardCaveRva + 15, 5,
+        binderless_sc3d_capability_cave_code.data() + 16);
+    if (global_load_original != binderless_sc3d_context_global_expected ||
+        capability_global_load_original !=
+            binderless_sc3d_capability_global_expected ||
+        (binderless_sc3d_context_guard_installed
+             ? (guard_original != guard_installed ||
+                cave_original != cave_installed ||
+                capability_guard_original != capability_guard_installed ||
+                capability_cave_original !=
+                    binderless_sc3d_capability_cave_code)
+             : (guard_original != binderless_sc3d_context_guard_expected ||
+                cave_original != binderless_sc3d_context_cave_expected ||
+                capability_guard_original !=
+                    binderless_sc3d_capability_guard_expected ||
+                capability_cave_original !=
+                    binderless_sc3d_capability_cave_expected)) ||
+        global_target != kBinderlessSc3dContextGlobalRva ||
+        cave_target != kBinderlessSc3dContextGuardCaveRva ||
+        null_target != kBinderlessSc3dContextNullTargetRva ||
+        valid_resume != kBinderlessSc3dContextValidResumeRva ||
+        capability_global_target != kBinderlessSc3dContextGlobalRva ||
+        capability_cave_target != kBinderlessSc3dCapabilityGuardCaveRva ||
+        capability_null_target != kBinderlessSc3dCapabilityNullTargetRva ||
+        capability_valid_resume !=
+            kBinderlessSc3dCapabilityValidResumeRva) {
+      dlclose(handle);
+      throw_state(env, "binderless SC3D context guard rejected libg bytes");
+      return nullptr;
+    }
+    if (!binderless_sc3d_context_guard_installed) {
+      const long sc3d_page_size = sysconf(_SC_PAGESIZE);
+      if (sc3d_page_size <= 0) {
+        dlclose(handle);
+        throw_state(env, "cannot resolve SC3D context guard page size");
+        return nullptr;
+      }
+      const uintptr_t guard_page =
+          reinterpret_cast<uintptr_t>(binderless_sc3d_context_guard) &
+          ~static_cast<uintptr_t>(sc3d_page_size - 1);
+      const uintptr_t cave_page =
+          reinterpret_cast<uintptr_t>(binderless_sc3d_context_guard_cave) &
+          ~static_cast<uintptr_t>(sc3d_page_size - 1);
+      const uintptr_t capability_guard_page =
+          reinterpret_cast<uintptr_t>(binderless_sc3d_capability_guard) &
+          ~static_cast<uintptr_t>(sc3d_page_size - 1);
+      const uintptr_t capability_cave_page =
+          reinterpret_cast<uintptr_t>(
+              binderless_sc3d_capability_guard_cave) &
+          ~static_cast<uintptr_t>(sc3d_page_size - 1);
+      if (mprotect(reinterpret_cast<void*>(guard_page),
+                   static_cast<size_t>(sc3d_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(cave_page),
+                   static_cast<size_t>(sc3d_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(capability_guard_page),
+                   static_cast<size_t>(sc3d_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(capability_cave_page),
+                   static_cast<size_t>(sc3d_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        mprotect(reinterpret_cast<void*>(guard_page),
+                 static_cast<size_t>(sc3d_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(cave_page),
+                 static_cast<size_t>(sc3d_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(capability_guard_page),
+                 static_cast<size_t>(sc3d_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(capability_cave_page),
+                 static_cast<size_t>(sc3d_page_size),
+                 PROT_READ | PROT_EXEC);
+        dlclose(handle);
+        throw_state(env, "cannot open SC3D context guard pages");
+        return nullptr;
+      }
+      std::memcpy(binderless_sc3d_context_guard_cave,
+                  binderless_sc3d_context_cave_code.data(),
+                  binderless_sc3d_context_cave_code.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_context_guard_cave),
+          reinterpret_cast<char*>(binderless_sc3d_context_guard_cave +
+                                  binderless_sc3d_context_cave_code.size()));
+      std::memcpy(binderless_sc3d_context_guard,
+                  binderless_sc3d_context_guard_jump.data(),
+                  binderless_sc3d_context_guard_jump.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_context_guard),
+          reinterpret_cast<char*>(binderless_sc3d_context_guard +
+                                  binderless_sc3d_context_guard_jump.size()));
+      std::memcpy(binderless_sc3d_capability_guard_cave,
+                  binderless_sc3d_capability_cave_code.data(),
+                  binderless_sc3d_capability_cave_code.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_capability_guard_cave),
+          reinterpret_cast<char*>(binderless_sc3d_capability_guard_cave +
+                                  binderless_sc3d_capability_cave_code.size()));
+      std::memcpy(binderless_sc3d_capability_guard,
+                  binderless_sc3d_capability_guard_jump.data(),
+                  binderless_sc3d_capability_guard_jump.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_capability_guard),
+          reinterpret_cast<char*>(binderless_sc3d_capability_guard +
+                                  binderless_sc3d_capability_guard_jump.size()));
+      mprotect(reinterpret_cast<void*>(guard_page),
+               static_cast<size_t>(sc3d_page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(cave_page),
+               static_cast<size_t>(sc3d_page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(capability_guard_page),
+               static_cast<size_t>(sc3d_page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(capability_cave_page),
+               static_cast<size_t>(sc3d_page_size), PROT_READ | PROT_EXEC);
+      binderless_sc3d_context_guard_installed = true;
+      std::fprintf(
+          stderr,
+          "BINDERLESS_SC3D_CONTEXT_GUARD site=0x%llx cave=0x%llx "
+          "capability_site=0x%llx capability_cave=0x%llx global=0x%llx "
+          "null=return valid=replay_original installed=true\n",
+          static_cast<unsigned long long>(kBinderlessSc3dContextGuardRva),
+          static_cast<unsigned long long>(
+              kBinderlessSc3dContextGuardCaveRva),
+          static_cast<unsigned long long>(
+              kBinderlessSc3dCapabilityGuardRva),
+          static_cast<unsigned long long>(
+              kBinderlessSc3dCapabilityGuardCaveRva),
+          static_cast<unsigned long long>(kBinderlessSc3dContextGlobalRva));
+      std::fflush(stderr);
+    }
+  }
+  auto* binderless_sc3d_feature_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dFeatureGuardRva);
+  auto* binderless_sc3d_feature_guard_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessSc3dFeatureGuardCaveRva);
+  const std::array<uint8_t, 6> binderless_sc3d_feature_guard_expected = {
+      0x49, 0x8B, 0x07, 0x4C, 0x89, 0xFF};
+  const std::array<uint8_t, 5> binderless_sc3d_feature_guard_jump = {
+      0xE9, 0xDE, 0x42, 0x0F, 0x01};
+  std::array<uint8_t, 22> binderless_sc3d_feature_cave_expected{};
+  binderless_sc3d_feature_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 20> binderless_sc3d_feature_cave_code = {
+      0x4D, 0x85, 0xFF,                    // test r15, r15
+      0x0F, 0x84, 0x4A, 0xBD, 0xF0, 0xFE,  // je 0x725ADD
+      0x49, 0x8B, 0x07,                    // mov rax, [r15]
+      0x4C, 0x89, 0xFF,                    // mov rdi, r15
+      0xE9, 0x0F, 0xBD, 0xF0, 0xFE};       // jmp 0x725AAD
+  static bool binderless_sc3d_feature_guard_installed = false;
+  if (binderless_android) {
+    std::array<uint8_t, 6> guard_original{};
+    std::array<uint8_t, 22> cave_original{};
+    std::memcpy(guard_original.data(), binderless_sc3d_feature_guard,
+                guard_original.size());
+    std::memcpy(cave_original.data(), binderless_sc3d_feature_guard_cave,
+                cave_original.size());
+    auto guard_installed = binderless_sc3d_feature_guard_expected;
+    std::copy(binderless_sc3d_feature_guard_jump.begin(),
+              binderless_sc3d_feature_guard_jump.end(),
+              guard_installed.begin());
+    auto cave_installed = binderless_sc3d_feature_cave_expected;
+    std::copy(binderless_sc3d_feature_cave_code.begin(),
+              binderless_sc3d_feature_cave_code.end(),
+              cave_installed.begin());
+    auto decode_sc3d_feature_target = [](
+        uintptr_t instruction_rva, size_t instruction_size,
+        const uint8_t* displacement_bytes) {
+      int32_t displacement = 0;
+      std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+      return instruction_rva + instruction_size +
+          static_cast<intptr_t>(displacement);
+    };
+    const uintptr_t cave_target = decode_sc3d_feature_target(
+        kBinderlessSc3dFeatureGuardRva, 5,
+        binderless_sc3d_feature_guard_jump.data() + 1);
+    const uintptr_t null_target = decode_sc3d_feature_target(
+        kBinderlessSc3dFeatureGuardCaveRva + 3, 6,
+        binderless_sc3d_feature_cave_code.data() + 5);
+    const uintptr_t valid_resume = decode_sc3d_feature_target(
+        kBinderlessSc3dFeatureGuardCaveRva + 15, 5,
+        binderless_sc3d_feature_cave_code.data() + 16);
+    if ((binderless_sc3d_feature_guard_installed
+             ? (guard_original != guard_installed ||
+                cave_original != cave_installed)
+             : (guard_original != binderless_sc3d_feature_guard_expected ||
+                cave_original != binderless_sc3d_feature_cave_expected)) ||
+        cave_target != kBinderlessSc3dFeatureGuardCaveRva ||
+        null_target != kBinderlessSc3dFeatureNullTargetRva ||
+        valid_resume != kBinderlessSc3dFeatureValidResumeRva) {
+      dlclose(handle);
+      throw_state(env, "binderless SC3D feature guard rejected libg bytes");
+      return nullptr;
+    }
+    if (!binderless_sc3d_feature_guard_installed) {
+      const long feature_page_size = sysconf(_SC_PAGESIZE);
+      if (feature_page_size <= 0) {
+        dlclose(handle);
+        throw_state(env, "cannot resolve SC3D feature guard page size");
+        return nullptr;
+      }
+      const uintptr_t guard_page =
+          reinterpret_cast<uintptr_t>(binderless_sc3d_feature_guard) &
+          ~static_cast<uintptr_t>(feature_page_size - 1);
+      const uintptr_t cave_page =
+          reinterpret_cast<uintptr_t>(binderless_sc3d_feature_guard_cave) &
+          ~static_cast<uintptr_t>(feature_page_size - 1);
+      if (mprotect(reinterpret_cast<void*>(guard_page),
+                   static_cast<size_t>(feature_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(cave_page),
+                   static_cast<size_t>(feature_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        mprotect(reinterpret_cast<void*>(guard_page),
+                 static_cast<size_t>(feature_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(cave_page),
+                 static_cast<size_t>(feature_page_size),
+                 PROT_READ | PROT_EXEC);
+        dlclose(handle);
+        throw_state(env, "cannot open SC3D feature guard pages");
+        return nullptr;
+      }
+      std::memcpy(binderless_sc3d_feature_guard_cave,
+                  binderless_sc3d_feature_cave_code.data(),
+                  binderless_sc3d_feature_cave_code.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_feature_guard_cave),
+          reinterpret_cast<char*>(binderless_sc3d_feature_guard_cave +
+                                  binderless_sc3d_feature_cave_code.size()));
+      std::memcpy(binderless_sc3d_feature_guard,
+                  binderless_sc3d_feature_guard_jump.data(),
+                  binderless_sc3d_feature_guard_jump.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_sc3d_feature_guard),
+          reinterpret_cast<char*>(binderless_sc3d_feature_guard +
+                                  binderless_sc3d_feature_guard_jump.size()));
+      mprotect(reinterpret_cast<void*>(guard_page),
+               static_cast<size_t>(feature_page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(cave_page),
+               static_cast<size_t>(feature_page_size), PROT_READ | PROT_EXEC);
+      binderless_sc3d_feature_guard_installed = true;
+      std::fprintf(
+          stderr,
+          "BINDERLESS_SC3D_FEATURE_GUARD site=0x%llx cave=0x%llx "
+          "null=fallback_cleanup valid=replay_original installed=true\n",
+          static_cast<unsigned long long>(kBinderlessSc3dFeatureGuardRva),
+          static_cast<unsigned long long>(
+              kBinderlessSc3dFeatureGuardCaveRva));
+      std::fflush(stderr);
+    }
+  }
+  auto* binderless_ui_locale_container_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessUiLocaleContainerGuardRva);
+  auto* binderless_ui_locale_container_guard_cave =
+      reinterpret_cast<uint8_t*>(
+          base + kBinderlessUiLocaleContainerGuardCaveRva);
+  const std::array<uint8_t, 5>
+      binderless_ui_locale_container_guard_expected = {
+          0xE8, 0x46, 0x48, 0x63, 0x00};
+  const std::array<uint8_t, 5> binderless_ui_locale_container_guard_jump = {
+      0xE9, 0xBB, 0xF7, 0x35, 0x00};
+  std::array<uint8_t, 27> binderless_ui_locale_container_cave_expected{};
+  binderless_ui_locale_container_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 26> binderless_ui_locale_container_cave_code = {
+      0x48, 0x85, 0xFF, 0x74, 0x10,        // null container -> cleanup
+      0x48, 0x83, 0x3F, 0x00, 0x74, 0x0A,  // null registry -> cleanup
+      0xE8, 0x7B, 0x50, 0x2D, 0x00,        // call 0x1AE0270
+      0xE9, 0x30, 0x08, 0xCA, 0xFF,        // valid -> 0x14ABA2A
+      0xE9, 0x2B, 0x08, 0xCA, 0xFF};       // null -> 0x14ABA2A
+  static bool binderless_ui_locale_container_guard_installed = false;
+  if (binderless_android) {
+    std::array<uint8_t, 5> guard_original{};
+    std::array<uint8_t, 27> cave_original{};
+    std::memcpy(guard_original.data(), binderless_ui_locale_container_guard,
+                guard_original.size());
+    std::memcpy(cave_original.data(),
+                binderless_ui_locale_container_guard_cave,
+                cave_original.size());
+    auto guard_installed = binderless_ui_locale_container_guard_expected;
+    std::copy(binderless_ui_locale_container_guard_jump.begin(),
+              binderless_ui_locale_container_guard_jump.end(),
+              guard_installed.begin());
+    auto cave_installed = binderless_ui_locale_container_cave_expected;
+    std::copy(binderless_ui_locale_container_cave_code.begin(),
+              binderless_ui_locale_container_cave_code.end(),
+              cave_installed.begin());
+    auto decode_ui_locale_target = [](
+        uintptr_t instruction_rva, size_t instruction_size,
+        const uint8_t* displacement_bytes) {
+      int32_t displacement = 0;
+      std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+      return instruction_rva + instruction_size +
+          static_cast<intptr_t>(displacement);
+    };
+    const uintptr_t original_registration_target = decode_ui_locale_target(
+        kBinderlessUiLocaleContainerGuardRva, 5,
+        binderless_ui_locale_container_guard_expected.data() + 1);
+    const uintptr_t cave_target = decode_ui_locale_target(
+        kBinderlessUiLocaleContainerGuardRva, 5,
+        binderless_ui_locale_container_guard_jump.data() + 1);
+    const uintptr_t cave_registration_target = decode_ui_locale_target(
+        kBinderlessUiLocaleContainerGuardCaveRva + 11, 5,
+        binderless_ui_locale_container_cave_code.data() + 12);
+    const uintptr_t null_branch0 =
+        kBinderlessUiLocaleContainerGuardCaveRva + 5 +
+        static_cast<int8_t>(binderless_ui_locale_container_cave_code[4]);
+    const uintptr_t null_branch1 =
+        kBinderlessUiLocaleContainerGuardCaveRva + 11 +
+        static_cast<int8_t>(binderless_ui_locale_container_cave_code[10]);
+    const uintptr_t valid_resume = decode_ui_locale_target(
+        kBinderlessUiLocaleContainerGuardCaveRva + 16, 5,
+        binderless_ui_locale_container_cave_code.data() + 17);
+    const uintptr_t null_target = decode_ui_locale_target(
+        kBinderlessUiLocaleContainerGuardCaveRva + 21, 5,
+        binderless_ui_locale_container_cave_code.data() + 22);
+    if ((binderless_ui_locale_container_guard_installed
+             ? (guard_original != guard_installed ||
+                cave_original != cave_installed)
+             : (guard_original !=
+                    binderless_ui_locale_container_guard_expected ||
+                cave_original !=
+                    binderless_ui_locale_container_cave_expected)) ||
+        original_registration_target !=
+            kBinderlessUiLocaleRegistrationTargetRva ||
+        cave_target != kBinderlessUiLocaleContainerGuardCaveRva ||
+        cave_registration_target !=
+            kBinderlessUiLocaleRegistrationTargetRva ||
+        null_branch0 != kBinderlessUiLocaleContainerGuardCaveRva + 21 ||
+        null_branch1 != kBinderlessUiLocaleContainerGuardCaveRva + 21 ||
+        null_target != kBinderlessUiLocaleContainerNullTargetRva ||
+        valid_resume != kBinderlessUiLocaleContainerValidResumeRva) {
+      dlclose(handle);
+      throw_state(
+          env, "binderless UI locale container guard rejected libg bytes");
+      return nullptr;
+    }
+    if (!binderless_ui_locale_container_guard_installed) {
+      const long locale_page_size = sysconf(_SC_PAGESIZE);
+      if (locale_page_size <= 0) {
+        dlclose(handle);
+        throw_state(env, "cannot resolve UI locale guard page size");
+        return nullptr;
+      }
+      const uintptr_t guard_page =
+          reinterpret_cast<uintptr_t>(binderless_ui_locale_container_guard) &
+          ~static_cast<uintptr_t>(locale_page_size - 1);
+      const uintptr_t cave_page = reinterpret_cast<uintptr_t>(
+          binderless_ui_locale_container_guard_cave) &
+          ~static_cast<uintptr_t>(locale_page_size - 1);
+      if (mprotect(reinterpret_cast<void*>(guard_page),
+                   static_cast<size_t>(locale_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0 ||
+          mprotect(reinterpret_cast<void*>(cave_page),
+                   static_cast<size_t>(locale_page_size),
+                   PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        mprotect(reinterpret_cast<void*>(guard_page),
+                 static_cast<size_t>(locale_page_size),
+                 PROT_READ | PROT_EXEC);
+        mprotect(reinterpret_cast<void*>(cave_page),
+                 static_cast<size_t>(locale_page_size),
+                 PROT_READ | PROT_EXEC);
+        dlclose(handle);
+        throw_state(env, "cannot open UI locale guard pages");
+        return nullptr;
+      }
+      std::memcpy(binderless_ui_locale_container_guard_cave,
+                  binderless_ui_locale_container_cave_code.data(),
+                  binderless_ui_locale_container_cave_code.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_ui_locale_container_guard_cave),
+          reinterpret_cast<char*>(binderless_ui_locale_container_guard_cave +
+                                  binderless_ui_locale_container_cave_code.size()));
+      std::memcpy(binderless_ui_locale_container_guard,
+                  binderless_ui_locale_container_guard_jump.data(),
+                  binderless_ui_locale_container_guard_jump.size());
+      __builtin___clear_cache(
+          reinterpret_cast<char*>(binderless_ui_locale_container_guard),
+          reinterpret_cast<char*>(binderless_ui_locale_container_guard +
+                                  binderless_ui_locale_container_guard_jump.size()));
+      mprotect(reinterpret_cast<void*>(guard_page),
+               static_cast<size_t>(locale_page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(cave_page),
+               static_cast<size_t>(locale_page_size), PROT_READ | PROT_EXEC);
+      binderless_ui_locale_container_guard_installed = true;
+      std::fprintf(
+          stderr,
+          "BINDERLESS_UI_LOCALE_CONTAINER_GUARD site=0x%llx cave=0x%llx "
+          "null=cleanup valid=replay_original installed=true\n",
+          static_cast<unsigned long long>(
+              kBinderlessUiLocaleContainerGuardRva),
+          static_cast<unsigned long long>(
+              kBinderlessUiLocaleContainerGuardCaveRva));
+      std::fflush(stderr);
+    }
+  }
+  auto* binderless_invalid_asset_branch = reinterpret_cast<uint8_t*>(
+      base + kBinderlessInvalidAssetBranchRva);
+  const std::array<uint8_t, 9> binderless_invalid_asset_expected = {
+      0x84, 0xC0, 0x75, 0x49, 0x41, 0x83, 0x7E, 0x04, 0x08};
+  const std::array<uint8_t, 9> binderless_invalid_asset_bypass = {
+      0x84, 0xC0, 0x75, 0x49, 0xE9, 0x2A, 0x08, 0x5C, 0x00};
+  auto* binderless_invalid_asset_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessInvalidAssetCaveRva);
+  std::array<uint8_t, 26> binderless_invalid_asset_cave_expected{};
+  binderless_invalid_asset_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 18> binderless_invalid_asset_cave_bypass = {
+      0x48, 0x8D, 0x7C, 0x24, 0x10,
+      0xE8, 0x30, 0xCA, 0xB4, 0xFF,
+      0x45, 0x31, 0xFF,
+      0xE9, 0x17, 0xFA, 0xA3, 0xFF};
+  static bool binderless_invalid_asset_bypass_installed = false;
+  std::array<uint8_t, 9> binderless_invalid_asset_original{};
+  std::array<uint8_t, 26> binderless_invalid_asset_cave_original{};
+  std::memcpy(binderless_invalid_asset_original.data(),
+              binderless_invalid_asset_branch,
+              binderless_invalid_asset_original.size());
+  std::memcpy(binderless_invalid_asset_cave_original.data(),
+              binderless_invalid_asset_cave,
+              binderless_invalid_asset_cave_original.size());
+  const uintptr_t binderless_valid_asset_target =
+      kBinderlessInvalidAssetBranchRva + 4 +
+      static_cast<int8_t>(binderless_invalid_asset_original[3]);
+  int32_t binderless_invalid_asset_displacement = 0;
+  std::memcpy(&binderless_invalid_asset_displacement,
+              binderless_invalid_asset_bypass.data() + 5,
+              sizeof(binderless_invalid_asset_displacement));
+  const uintptr_t binderless_invalid_asset_target =
+      kBinderlessInvalidAssetBranchRva +
+      binderless_invalid_asset_bypass.size() +
+      static_cast<intptr_t>(binderless_invalid_asset_displacement);
+  int32_t binderless_invalid_asset_cleanup_displacement = 0;
+  std::memcpy(&binderless_invalid_asset_cleanup_displacement,
+              binderless_invalid_asset_cave_bypass.data() + 6,
+              sizeof(binderless_invalid_asset_cleanup_displacement));
+  const uintptr_t binderless_invalid_asset_cleanup_target =
+      kBinderlessInvalidAssetCaveRva + 10 +
+      static_cast<intptr_t>(binderless_invalid_asset_cleanup_displacement);
+  int32_t binderless_invalid_asset_return_displacement = 0;
+  std::memcpy(&binderless_invalid_asset_return_displacement,
+              binderless_invalid_asset_cave_bypass.data() + 14,
+              sizeof(binderless_invalid_asset_return_displacement));
+  const uintptr_t binderless_invalid_asset_return_target =
+      kBinderlessInvalidAssetCaveRva +
+      binderless_invalid_asset_cave_bypass.size() +
+      static_cast<intptr_t>(binderless_invalid_asset_return_displacement);
+  if (binderless_android && !binderless_invalid_asset_bypass_installed &&
+      (binderless_invalid_asset_original !=
+           binderless_invalid_asset_expected ||
+       binderless_invalid_asset_cave_original !=
+           binderless_invalid_asset_cave_expected ||
+       binderless_valid_asset_target != kBinderlessValidAssetTargetRva ||
+       binderless_invalid_asset_target !=
+           kBinderlessInvalidAssetCaveRva ||
+       binderless_invalid_asset_cleanup_target !=
+           kBinderlessInvalidAssetCleanupRva ||
+       binderless_invalid_asset_return_target !=
+           kBinderlessInvalidAssetReturnRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless invalid asset branch guard rejected libg bytes");
+    return nullptr;
+  }
+  std::array<uint8_t*, kBinderlessAsyncMetadataCallRvas.size()>
+      binderless_async_metadata_calls{};
+  std::array<std::array<uint8_t, 5>,
+             kBinderlessAsyncMetadataCallRvas.size()>
+      binderless_async_metadata_originals{};
+  static bool binderless_async_metadata_bypass_installed = false;
+  bool binderless_async_metadata_calls_match = true;
+  for (size_t index = 0;
+       index < binderless_async_metadata_calls.size(); ++index) {
+    binderless_async_metadata_calls[index] = reinterpret_cast<uint8_t*>(
+        base + kBinderlessAsyncMetadataCallRvas[index]);
+    if (!binderless_async_metadata_bypass_installed) {
+      std::memcpy(binderless_async_metadata_originals[index].data(),
+                  binderless_async_metadata_calls[index],
+                  binderless_async_metadata_originals[index].size());
+      int32_t displacement = 0;
+      std::memcpy(&displacement,
+                  binderless_async_metadata_originals[index].data() + 1,
+                  sizeof(displacement));
+      const uintptr_t target =
+          kBinderlessAsyncMetadataCallRvas[index] +
+          binderless_async_metadata_originals[index].size() +
+          static_cast<intptr_t>(displacement);
+      binderless_async_metadata_calls_match =
+          binderless_async_metadata_calls_match &&
+          binderless_async_metadata_originals[index][0] == 0xE8 &&
+          target == kBinderlessAsyncMetadataTargetRva;
+    }
+  }
+  if (binderless_android && !binderless_async_metadata_bypass_installed &&
+      !binderless_async_metadata_calls_match) {
+    dlclose(handle);
+    throw_state(env, "binderless async metadata call guard rejected libg bytes");
+    return nullptr;
+  }
+  auto* binderless_metadata_validity_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessMetadataValidityGuardRva);
+  auto* binderless_metadata_validity_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessMetadataValidityCaveRva);
+  const std::array<uint8_t, 5> binderless_metadata_validity_expected = {
+      0x84, 0xC0, 0x75, 0x43, 0x45};
+  const std::array<uint8_t, 5> binderless_metadata_validity_jump = {
+      0xE9, 0x2D, 0x1F, 0x60, 0x00};
+  std::array<uint8_t, 29> binderless_metadata_validity_cave_expected{};
+  binderless_metadata_validity_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 18> binderless_metadata_validity_cave_bypass = {
+      0x84, 0xC0,
+      0x0F, 0x84, 0x0D, 0xE3, 0x9F, 0xFF,
+      0x4C, 0x8D, 0x74, 0x24, 0x10,
+      0xE9, 0x08, 0xE1, 0x9F, 0xFF};
+  static bool binderless_metadata_validity_bypass_installed = false;
+  std::array<uint8_t, 5> binderless_metadata_validity_original{};
+  std::array<uint8_t, 29> binderless_metadata_validity_cave_original{};
+  std::memcpy(binderless_metadata_validity_original.data(),
+              binderless_metadata_validity_guard,
+              binderless_metadata_validity_original.size());
+  std::memcpy(binderless_metadata_validity_cave_original.data(),
+              binderless_metadata_validity_cave,
+              binderless_metadata_validity_cave_original.size());
+  auto decode_metadata_target = [](uintptr_t instruction_rva,
+                                   size_t instruction_size,
+                                   const uint8_t* displacement_bytes) {
+    int32_t displacement = 0;
+    std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+    return instruction_rva + instruction_size +
+        static_cast<intptr_t>(displacement);
+  };
+  const uintptr_t binderless_metadata_validity_cave_target =
+      decode_metadata_target(kBinderlessMetadataValidityGuardRva, 5,
+                             binderless_metadata_validity_jump.data() + 1);
+  const uintptr_t binderless_metadata_invalid_target =
+      decode_metadata_target(kBinderlessMetadataValidityCaveRva + 2, 6,
+                             binderless_metadata_validity_cave_bypass.data() + 4);
+  const uintptr_t binderless_metadata_valid_resume =
+      decode_metadata_target(kBinderlessMetadataValidityCaveRva + 13, 5,
+                             binderless_metadata_validity_cave_bypass.data() + 14);
+  if (binderless_android &&
+      !binderless_metadata_validity_bypass_installed &&
+      (binderless_metadata_validity_original !=
+           binderless_metadata_validity_expected ||
+       binderless_metadata_validity_cave_original !=
+           binderless_metadata_validity_cave_expected ||
+       binderless_metadata_validity_cave_target !=
+           kBinderlessMetadataValidityCaveRva ||
+       binderless_metadata_invalid_target !=
+           kBinderlessMetadataInvalidTargetRva ||
+       binderless_metadata_valid_resume !=
+           kBinderlessMetadataValidResumeRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless metadata validity guard rejected libg bytes");
+    return nullptr;
+  }
+  std::array<uint8_t*, kBinderlessPresentationAssetCallRvas.size()>
+      binderless_presentation_asset_calls{};
+  const std::array<std::array<uint8_t, 5>,
+                   kBinderlessPresentationAssetCallRvas.size()>
+      binderless_presentation_asset_expected = {{
+          {0xE8, 0x38, 0x5C, 0xF9, 0xFF},
+          {0xE8, 0xE2, 0x5B, 0xF9, 0xFF},
+          {0xE8, 0x87, 0x5B, 0xF9, 0xFF},
+          {0xE8, 0x12, 0x5B, 0xF9, 0xFF},
+      }};
+  std::array<std::array<uint8_t, 5>,
+             kBinderlessPresentationAssetCallRvas.size()>
+      binderless_presentation_asset_originals{};
+  static bool binderless_presentation_asset_bypass_installed = false;
+  bool binderless_presentation_asset_calls_match = true;
+  for (size_t index = 0;
+       index < binderless_presentation_asset_calls.size(); ++index) {
+    binderless_presentation_asset_calls[index] = reinterpret_cast<uint8_t*>(
+        base + kBinderlessPresentationAssetCallRvas[index]);
+    if (!binderless_presentation_asset_bypass_installed) {
+      std::memcpy(binderless_presentation_asset_originals[index].data(),
+                  binderless_presentation_asset_calls[index],
+                  binderless_presentation_asset_originals[index].size());
+      int32_t displacement = 0;
+      std::memcpy(&displacement,
+                  binderless_presentation_asset_originals[index].data() + 1,
+                  sizeof(displacement));
+      const uintptr_t target =
+          kBinderlessPresentationAssetCallRvas[index] +
+          binderless_presentation_asset_originals[index].size() +
+          static_cast<intptr_t>(displacement);
+      binderless_presentation_asset_calls_match =
+          binderless_presentation_asset_calls_match &&
+          binderless_presentation_asset_originals[index] ==
+              binderless_presentation_asset_expected[index] &&
+          target == kBinderlessPresentationAssetTargetRva;
+    }
+  }
+  if (binderless_android &&
+      !binderless_presentation_asset_bypass_installed &&
+      !binderless_presentation_asset_calls_match) {
+    dlclose(handle);
+    throw_state(
+        env, "binderless presentation asset call guard rejected libg bytes");
+    return nullptr;
+  }
+  auto* binderless_external_asset_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessExternalAssetGuardRva);
+  auto* binderless_external_asset_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessExternalAssetCaveRva);
+  const std::array<uint8_t, 7> binderless_external_asset_expected = {
+      0x66, 0xC7, 0x44, 0x24, 0x06, 0x00, 0x00};
+  const std::array<uint8_t, 7> binderless_external_asset_jump = {
+      0xE9, 0x56, 0xA3, 0x6A, 0x00, 0x90, 0x90};
+  std::array<uint8_t, 33> binderless_external_asset_cave_expected{};
+  binderless_external_asset_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 28> binderless_external_asset_cave_bypass = {
+      0x48, 0x89, 0xDF,
+      0xE8, 0x69, 0x15, 0xAB, 0xFF,
+      0x84, 0xC0,
+      0x0F, 0x84, 0x58, 0x64, 0x95, 0xFF,
+      0x66, 0xC7, 0x44, 0x24, 0x06, 0x00, 0x00,
+      0xE9, 0x90, 0x5C, 0x95, 0xFF};
+  static bool binderless_external_asset_bypass_installed = false;
+  std::array<uint8_t, 7> binderless_external_asset_original{};
+  std::array<uint8_t, 33> binderless_external_asset_cave_original{};
+  std::memcpy(binderless_external_asset_original.data(),
+              binderless_external_asset_guard,
+              binderless_external_asset_original.size());
+  std::memcpy(binderless_external_asset_cave_original.data(),
+              binderless_external_asset_cave,
+              binderless_external_asset_cave_original.size());
+  auto decode_external_target = [](uintptr_t instruction_rva,
+                                   size_t instruction_size,
+                                   const uint8_t* displacement_bytes) {
+    int32_t displacement = 0;
+    std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+    return instruction_rva + instruction_size +
+        static_cast<intptr_t>(displacement);
+  };
+  const uintptr_t binderless_external_asset_cave_target =
+      decode_external_target(kBinderlessExternalAssetGuardRva, 5,
+                             binderless_external_asset_jump.data() + 1);
+  const uintptr_t binderless_external_asset_check_target =
+      decode_external_target(kBinderlessExternalAssetCaveRva + 3, 5,
+                             binderless_external_asset_cave_bypass.data() + 4);
+  const uintptr_t binderless_external_asset_failure_target =
+      decode_external_target(kBinderlessExternalAssetCaveRva + 10, 6,
+                             binderless_external_asset_cave_bypass.data() + 12);
+  const uintptr_t binderless_external_asset_resume_target =
+      decode_external_target(kBinderlessExternalAssetCaveRva + 23, 5,
+                             binderless_external_asset_cave_bypass.data() + 24);
+  if (binderless_android && !binderless_external_asset_bypass_installed &&
+      (binderless_external_asset_original !=
+           binderless_external_asset_expected ||
+       binderless_external_asset_cave_original !=
+           binderless_external_asset_cave_expected ||
+       binderless_external_asset_cave_target !=
+           kBinderlessExternalAssetCaveRva ||
+       binderless_external_asset_check_target !=
+           kBinderlessExternalAssetCheckRva ||
+       binderless_external_asset_failure_target !=
+           kBinderlessExternalAssetFailureRva ||
+       binderless_external_asset_resume_target !=
+           kBinderlessExternalAssetResumeRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless external asset guard rejected libg bytes");
+    return nullptr;
+  }
+  // Retained only as forensic context for the failed A/B branch.  These
+  // DataTable patches are intentionally compiled out: they suppress native
+  // gameplay configuration and are not valid for semantic training.
+#if 0
+  auto* binderless_data_table_getter_jump = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDataTableGetterJumpRva);
+  const std::array<uint8_t, 5> binderless_data_table_getter_expected = {
+      0x53, 0x31, 0xF6, 0xE8, 0xA8};
+  const std::array<uint8_t, 5> binderless_data_table_getter_bypass = {
+      0xE9, 0x1B, 0x00, 0x00, 0x00};
+  static bool binderless_data_table_getter_bypass_installed = false;
+  std::array<uint8_t, 5> binderless_data_table_getter_original{};
+  std::memcpy(binderless_data_table_getter_original.data(),
+              binderless_data_table_getter_jump,
+              binderless_data_table_getter_original.size());
+  int32_t binderless_data_table_getter_displacement = 0;
+  std::memcpy(&binderless_data_table_getter_displacement,
+              binderless_data_table_getter_bypass.data() + 1,
+              sizeof(binderless_data_table_getter_displacement));
+  const uintptr_t binderless_data_table_getter_target =
+      kBinderlessDataTableGetterJumpRva +
+      binderless_data_table_getter_bypass.size() +
+      static_cast<intptr_t>(binderless_data_table_getter_displacement);
+  if (binderless_android &&
+      !binderless_data_table_getter_bypass_installed &&
+      (binderless_data_table_getter_original !=
+           binderless_data_table_getter_expected ||
+       binderless_data_table_getter_target !=
+           kBinderlessDataTableGetterTargetRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless DataTable getter jump guard rejected libg bytes");
+    return nullptr;
+  }
+  auto* binderless_data_table_inner_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDataTableInnerGuardRva);
+  auto* binderless_data_table_inner_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDataTableInnerCaveRva);
+  const std::array<uint8_t, 7> binderless_data_table_inner_expected = {
+      0x48, 0x83, 0x78, 0x08, 0x00, 0x74, 0x33};
+  const std::array<uint8_t, 7> binderless_data_table_inner_jump = {
+      0xE9, 0x09, 0xBC, 0x5F, 0x00, 0x90, 0x90};
+  std::array<uint8_t, 25> binderless_data_table_inner_cave_expected{};
+  binderless_data_table_inner_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 25> binderless_data_table_inner_cave_bypass = {
+      0x48, 0x85, 0xC0,
+      0x0F, 0x84, 0x23, 0x44, 0xA0, 0xFF,
+      0x48, 0x83, 0x78, 0x08, 0x00,
+      0x0F, 0x84, 0x18, 0x44, 0xA0, 0xFF,
+      0xE9, 0xE0, 0x43, 0xA0, 0xFF};
+  static bool binderless_data_table_inner_bypass_installed = false;
+  std::array<uint8_t, 7> binderless_data_table_inner_original{};
+  std::array<uint8_t, 25> binderless_data_table_inner_cave_original{};
+  std::memcpy(binderless_data_table_inner_original.data(),
+              binderless_data_table_inner_guard,
+              binderless_data_table_inner_original.size());
+  std::memcpy(binderless_data_table_inner_cave_original.data(),
+              binderless_data_table_inner_cave,
+              binderless_data_table_inner_cave_original.size());
+  auto decode_relative_target = [](uintptr_t instruction_rva,
+                                   size_t instruction_size,
+                                   const uint8_t* displacement_bytes) {
+    int32_t displacement = 0;
+    std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+    return instruction_rva + instruction_size +
+        static_cast<intptr_t>(displacement);
+  };
+  const uintptr_t binderless_data_table_inner_cave_target =
+      decode_relative_target(kBinderlessDataTableInnerGuardRva, 5,
+                             binderless_data_table_inner_jump.data() + 1);
+  const uintptr_t binderless_data_table_inner_null_target0 =
+      decode_relative_target(kBinderlessDataTableInnerCaveRva + 3, 6,
+                             binderless_data_table_inner_cave_bypass.data() + 5);
+  const uintptr_t binderless_data_table_inner_null_target1 =
+      decode_relative_target(kBinderlessDataTableInnerCaveRva + 14, 6,
+                             binderless_data_table_inner_cave_bypass.data() + 16);
+  const uintptr_t binderless_data_table_inner_valid_target =
+      decode_relative_target(kBinderlessDataTableInnerCaveRva + 20, 5,
+                             binderless_data_table_inner_cave_bypass.data() + 21);
+  if (binderless_android &&
+      !binderless_data_table_inner_bypass_installed &&
+      (binderless_data_table_inner_original !=
+           binderless_data_table_inner_expected ||
+       binderless_data_table_inner_cave_original !=
+           binderless_data_table_inner_cave_expected ||
+       binderless_data_table_inner_cave_target !=
+           kBinderlessDataTableInnerCaveRva ||
+       binderless_data_table_inner_null_target0 !=
+           kBinderlessDataTableInnerNullTargetRva ||
+       binderless_data_table_inner_null_target1 !=
+           kBinderlessDataTableInnerNullTargetRva ||
+       binderless_data_table_inner_valid_target !=
+           kBinderlessDataTableInnerValidTargetRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless DataTable inner guard rejected libg bytes");
+    return nullptr;
+  }
+  auto* binderless_data_table_secondary_guard = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDataTableSecondaryGuardRva);
+  auto* binderless_data_table_secondary_cave = reinterpret_cast<uint8_t*>(
+      base + kBinderlessDataTableSecondaryCaveRva);
+  const std::array<uint8_t, 7> binderless_data_table_secondary_expected = {
+      0x48, 0x83, 0x78, 0x08, 0x00, 0x74, 0x33};
+  const std::array<uint8_t, 7> binderless_data_table_secondary_jump = {
+      0xE9, 0x6C, 0x0A, 0x60, 0x00, 0x90, 0x90};
+  std::array<uint8_t, 25> binderless_data_table_secondary_cave_expected{};
+  binderless_data_table_secondary_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 25> binderless_data_table_secondary_cave_bypass = {
+      0x48, 0x85, 0xC0,
+      0x0F, 0x84, 0xC0, 0xF5, 0x9F, 0xFF,
+      0x48, 0x83, 0x78, 0x08, 0x00,
+      0x0F, 0x84, 0xB5, 0xF5, 0x9F, 0xFF,
+      0xE9, 0x7D, 0xF5, 0x9F, 0xFF};
+  static bool binderless_data_table_secondary_bypass_installed = false;
+  std::array<uint8_t, 7> binderless_data_table_secondary_original{};
+  std::array<uint8_t, 25> binderless_data_table_secondary_cave_original{};
+  std::memcpy(binderless_data_table_secondary_original.data(),
+              binderless_data_table_secondary_guard,
+              binderless_data_table_secondary_original.size());
+  std::memcpy(binderless_data_table_secondary_cave_original.data(),
+              binderless_data_table_secondary_cave,
+              binderless_data_table_secondary_cave_original.size());
+  const uintptr_t binderless_data_table_secondary_cave_target =
+      decode_relative_target(kBinderlessDataTableSecondaryGuardRva, 5,
+                             binderless_data_table_secondary_jump.data() + 1);
+  const uintptr_t binderless_data_table_secondary_null_target0 =
+      decode_relative_target(kBinderlessDataTableSecondaryCaveRva + 3, 6,
+                             binderless_data_table_secondary_cave_bypass.data() + 5);
+  const uintptr_t binderless_data_table_secondary_null_target1 =
+      decode_relative_target(kBinderlessDataTableSecondaryCaveRva + 14, 6,
+                             binderless_data_table_secondary_cave_bypass.data() + 16);
+  const uintptr_t binderless_data_table_secondary_valid_target =
+      decode_relative_target(kBinderlessDataTableSecondaryCaveRva + 20, 5,
+                             binderless_data_table_secondary_cave_bypass.data() + 21);
+  if (binderless_android &&
+      !binderless_data_table_secondary_bypass_installed &&
+      (binderless_data_table_secondary_original !=
+           binderless_data_table_secondary_expected ||
+       binderless_data_table_secondary_cave_original !=
+           binderless_data_table_secondary_cave_expected ||
+       binderless_data_table_secondary_cave_target !=
+           kBinderlessDataTableSecondaryCaveRva ||
+       binderless_data_table_secondary_null_target0 !=
+           kBinderlessDataTableSecondaryNullTargetRva ||
+       binderless_data_table_secondary_null_target1 !=
+           kBinderlessDataTableSecondaryNullTargetRva ||
+       binderless_data_table_secondary_valid_target !=
+           kBinderlessDataTableSecondaryValidTargetRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless DataTable secondary guard rejected libg bytes");
+    return nullptr;
+  }
+  auto* binderless_data_table_null_dependency_guard =
+      reinterpret_cast<uint8_t*>(
+          base + kBinderlessDataTableNullDependencyGuardRva);
+  auto* binderless_data_table_null_dependency_cave =
+      reinterpret_cast<uint8_t*>(
+          base + kBinderlessDataTableNullDependencyCaveRva);
+  const std::array<uint8_t, 5>
+      binderless_data_table_null_dependency_expected = {
+          0x55, 0x41, 0x57, 0x41, 0x56};
+  const std::array<uint8_t, 5>
+      binderless_data_table_null_dependency_jump = {
+          0xE9, 0xE1, 0x0D, 0x56, 0x00};
+  std::array<uint8_t, 26>
+      binderless_data_table_null_dependency_cave_expected{};
+  binderless_data_table_null_dependency_cave_expected.fill(0xCC);
+  const std::array<uint8_t, 18>
+      binderless_data_table_null_dependency_cave_bypass = {
+          0x48, 0x85, 0xFF,
+          0x74, 0x0A,
+          0x55, 0x41, 0x57, 0x41, 0x56,
+          0xE9, 0x10, 0xF2, 0xA9, 0xFF,
+          0x31, 0xC0, 0xC3};
+  static bool binderless_data_table_null_dependency_bypass_installed = false;
+  std::array<uint8_t, 5>
+      binderless_data_table_null_dependency_original{};
+  std::array<uint8_t, 26>
+      binderless_data_table_null_dependency_cave_original{};
+  std::memcpy(binderless_data_table_null_dependency_original.data(),
+              binderless_data_table_null_dependency_guard,
+              binderless_data_table_null_dependency_original.size());
+  std::memcpy(binderless_data_table_null_dependency_cave_original.data(),
+              binderless_data_table_null_dependency_cave,
+              binderless_data_table_null_dependency_cave_original.size());
+  const uintptr_t binderless_data_table_null_dependency_cave_target =
+      decode_relative_target(
+          kBinderlessDataTableNullDependencyGuardRva, 5,
+          binderless_data_table_null_dependency_jump.data() + 1);
+  const uintptr_t binderless_data_table_null_dependency_null_target =
+      kBinderlessDataTableNullDependencyCaveRva + 5 +
+      static_cast<int8_t>(
+          binderless_data_table_null_dependency_cave_bypass[4]);
+  const uintptr_t binderless_data_table_null_dependency_resume_target =
+      decode_relative_target(
+          kBinderlessDataTableNullDependencyCaveRva + 10, 5,
+          binderless_data_table_null_dependency_cave_bypass.data() + 11);
+  if (binderless_android &&
+      !binderless_data_table_null_dependency_bypass_installed &&
+      (binderless_data_table_null_dependency_original !=
+           binderless_data_table_null_dependency_expected ||
+       binderless_data_table_null_dependency_cave_original !=
+           binderless_data_table_null_dependency_cave_expected ||
+       binderless_data_table_null_dependency_cave_target !=
+           kBinderlessDataTableNullDependencyCaveRva ||
+       binderless_data_table_null_dependency_null_target !=
+           kBinderlessDataTableNullDependencyCaveRva + 15 ||
+       binderless_data_table_null_dependency_resume_target !=
+           kBinderlessDataTableNullDependencyResumeRva)) {
+    dlclose(handle);
+    throw_state(
+        env, "binderless DataTable null dependency guard rejected libg bytes");
+    return nullptr;
+  }
+#endif
   __atomic_store_n(
       reinterpret_cast<unsigned char*>(
           base + kSkipCoreAndPresentationFlagRva),
@@ -3768,6 +5936,11 @@ Java_royale_nativehost_JniHost_nativePumpManager(
       base + kHomeResolutionBlockRva);
   auto* home_graphics_create = reinterpret_cast<uint8_t*>(
       base + kHomeGraphicsCreateCallRva);
+  auto* binderless_loading_screen_init = reinterpret_cast<uint8_t*>(
+      base + kBinderlessLoadingScreenInitRva);
+  static bool binderless_loading_screen_bypass_installed = false;
+  const uint8_t binderless_loading_screen_original =
+      *binderless_loading_screen_init;
   const uint8_t presentation_original = *presentation_toggle;
   const std::array<uint8_t, 17> resolution_expected = {
       0x48, 0x8D, 0x05, 0xE3, 0x21, 0xDD, 0x00, 0x48, 0x8B,
@@ -3779,6 +5952,9 @@ Java_royale_nativehost_JniHost_nativePumpManager(
   std::array<uint8_t, 17> resolution_original{};
   const std::array<uint8_t, 5> graphics_create_expected = {
       0xE8, 0x1C, 0xC3, 0x4F, 0x00};
+  const std::array<uint8_t, 5> graphics_create_bypass = {
+      0x90, 0x90, 0x90, 0x90, 0x90};
+  static bool binderless_graphics_create_bypass_installed = false;
   std::array<uint8_t, 5> graphics_create_original{};
   std::memcpy(resolution_original.data(), home_resolution_block,
               resolution_original.size());
@@ -3786,9 +5962,210 @@ Java_royale_nativehost_JniHost_nativePumpManager(
               graphics_create_original.size());
   if (presentation_original != 0x53 ||
       resolution_original != resolution_expected ||
-      graphics_create_original != graphics_create_expected) {
+      (binderless_android && binderless_graphics_create_bypass_installed
+           ? graphics_create_original != graphics_create_bypass
+           : graphics_create_original != graphics_create_expected)) {
     dlclose(handle);
     throw_state(env, "presentation toggle patch guard rejected libg bytes");
+    return nullptr;
+  }
+#if 0
+  const auto decode_loading_intro_target = [](
+      uintptr_t instruction_rva, size_t instruction_size,
+      const uint8_t* displacement_bytes) {
+    int32_t displacement = 0;
+    std::memcpy(&displacement, displacement_bytes, sizeof(displacement));
+    return instruction_rva + instruction_size +
+        static_cast<intptr_t>(displacement);
+  };
+  const uintptr_t binderless_loading_intro_cave_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingIntroGuardRva, 5,
+          binderless_loading_intro_jump.data() + 1);
+  const uintptr_t binderless_loading_intro_null_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingIntroGuardCaveRva + 7, 6,
+          binderless_loading_intro_cave_code.data() + 9);
+  const uintptr_t binderless_loading_intro_valid_resume =
+      decode_loading_intro_target(
+          kBinderlessLoadingIntroGuardCaveRva + 20, 5,
+          binderless_loading_intro_cave_code.data() + 21);
+  const uintptr_t binderless_loading_ui_cave_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingUiGuardRva, 5,
+          binderless_loading_ui_jump.data() + 1);
+  const uintptr_t binderless_loading_ui_null_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingUiGuardCaveRva + 10, 6,
+          binderless_loading_ui_cave_code.data() + 12);
+  const uintptr_t binderless_loading_ui_valid_resume =
+      decode_loading_intro_target(
+          kBinderlessLoadingUiGuardCaveRva + 20, 5,
+          binderless_loading_ui_cave_code.data() + 21);
+  const uintptr_t binderless_loading_bg_cave_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingBgCallGuardRva, 5,
+          binderless_loading_bg_call_jump.data() + 1);
+  const uintptr_t binderless_loading_bg_call_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingBgCallGuardCaveRva + 5, 5,
+          binderless_loading_bg_call_cave_code.data() + 6);
+  const uintptr_t binderless_loading_bg_resume =
+      decode_loading_intro_target(
+          kBinderlessLoadingBgCallGuardCaveRva + 19, 5,
+          binderless_loading_bg_call_cave_code.data() + 20);
+  const uintptr_t binderless_loading_bg_null_branch =
+      kBinderlessLoadingBgCallGuardCaveRva + 5 +
+      static_cast<int8_t>(binderless_loading_bg_call_cave_code[4]);
+  const uintptr_t binderless_loading_bg_result_null_branch =
+      kBinderlessLoadingBgCallGuardCaveRva + 15 +
+      static_cast<int8_t>(binderless_loading_bg_call_cave_code[14]);
+  const uintptr_t binderless_loading_root_cave_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingRootCallGuardRva, 5,
+          binderless_loading_root_call_jump.data() + 1);
+  const uintptr_t binderless_loading_root_call_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingRootCallGuardCaveRva + 5, 5,
+          binderless_loading_root_call_cave_code.data() + 6);
+  const uintptr_t binderless_loading_root_valid_resume =
+      decode_loading_intro_target(
+          kBinderlessLoadingRootCallGuardCaveRva + 10, 5,
+          binderless_loading_root_call_cave_code.data() + 11);
+  const uintptr_t binderless_loading_root_null_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingRootCallGuardCaveRva + 15, 5,
+          binderless_loading_root_call_cave_code.data() + 16);
+  const uintptr_t binderless_loading_root_null_branch =
+      kBinderlessLoadingRootCallGuardCaveRva + 5 +
+      static_cast<int8_t>(binderless_loading_root_call_cave_code[4]);
+  const uintptr_t binderless_loading_bg_init_cave_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingBgInitCallGuardRva, 5,
+          binderless_loading_bg_init_call_guarded.data() + 1);
+  const uintptr_t binderless_loading_bg_init_valid_target =
+      decode_loading_intro_target(
+          kBinderlessLoadingBgInitCallGuardCaveRva + 5, 5,
+          binderless_loading_bg_init_cave_code.data() + 6);
+  const uintptr_t binderless_loading_bg_init_null_return =
+      kBinderlessLoadingBgInitCallGuardCaveRva + 5 +
+      static_cast<int8_t>(binderless_loading_bg_init_cave_code[4]);
+  if (binderless_android &&
+      ((binderless_loading_intro_guard_installed
+            ? (binderless_loading_intro_original !=
+                   binderless_loading_intro_installed ||
+               binderless_loading_intro_cave_original !=
+                   binderless_loading_intro_cave_installed)
+            : (binderless_loading_intro_original !=
+                   binderless_loading_intro_expected ||
+               binderless_loading_intro_cave_original !=
+                   binderless_loading_intro_cave_expected)) ||
+       binderless_loading_intro_cave_target !=
+           kBinderlessLoadingIntroGuardCaveRva ||
+       binderless_loading_intro_null_target !=
+           kBinderlessLoadingIntroNullTargetRva ||
+       binderless_loading_intro_valid_resume !=
+           kBinderlessLoadingIntroValidResumeRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading intro guard rejected libg bytes");
+    return nullptr;
+  }
+  if (binderless_android &&
+      ((binderless_loading_ui_guard_installed
+            ? (binderless_loading_ui_original !=
+                   binderless_loading_ui_installed ||
+               binderless_loading_ui_cave_original !=
+                   binderless_loading_ui_cave_installed)
+            : (binderless_loading_ui_original !=
+                   binderless_loading_ui_expected ||
+               binderless_loading_ui_cave_original !=
+                   binderless_loading_ui_cave_expected)) ||
+       binderless_loading_ui_cave_target !=
+           kBinderlessLoadingUiGuardCaveRva ||
+       binderless_loading_ui_null_target !=
+           kBinderlessLoadingUiResumeRva ||
+       binderless_loading_ui_valid_resume !=
+           kBinderlessLoadingUiResumeRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading UI guard rejected libg bytes");
+    return nullptr;
+  }
+  if (binderless_android &&
+      ((binderless_loading_bg_call_guard_installed
+            ? (binderless_loading_bg_call_original !=
+                   binderless_loading_bg_call_jump ||
+               binderless_loading_bg_call_cave_original !=
+                   binderless_loading_bg_call_cave_code)
+            : (binderless_loading_bg_call_original !=
+                   binderless_loading_bg_call_expected ||
+               binderless_loading_bg_call_cave_original !=
+                   binderless_loading_bg_call_cave_expected)) ||
+       binderless_loading_bg_cave_target !=
+           kBinderlessLoadingBgCallGuardCaveRva ||
+       binderless_loading_bg_call_target !=
+           kBinderlessLoadingBgCallTargetRva ||
+       binderless_loading_bg_resume != kBinderlessLoadingBgResumeRva ||
+       binderless_loading_bg_null_branch !=
+           kBinderlessLoadingBgCallGuardCaveRva + 19 ||
+       binderless_loading_bg_result_null_branch !=
+           kBinderlessLoadingBgCallGuardCaveRva + 19)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading_bg call guard rejected libg bytes");
+    return nullptr;
+  }
+  if (binderless_android &&
+      ((binderless_loading_root_call_guard_installed
+            ? (binderless_loading_root_call_original !=
+                   binderless_loading_root_call_jump ||
+               binderless_loading_root_call_cave_original !=
+                   binderless_loading_root_call_cave_code)
+            : (binderless_loading_root_call_original !=
+                   binderless_loading_root_call_expected ||
+               binderless_loading_root_call_cave_original !=
+                   binderless_loading_root_call_cave_expected)) ||
+       binderless_loading_root_cave_target !=
+           kBinderlessLoadingRootCallGuardCaveRva ||
+       binderless_loading_root_call_target !=
+           kBinderlessLoadingRootCallTargetRva ||
+       binderless_loading_root_valid_resume !=
+           kBinderlessLoadingRootCallValidResumeRva ||
+       binderless_loading_root_null_target !=
+           kBinderlessLoadingRootCallNullTargetRva ||
+       binderless_loading_root_null_branch !=
+           kBinderlessLoadingRootCallGuardCaveRva + 15)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading root call guard rejected libg bytes");
+    return nullptr;
+  }
+  if (binderless_android &&
+      ((binderless_loading_bg_init_call_guard_installed
+            ? (binderless_loading_bg_init_call_original !=
+                   binderless_loading_bg_init_call_guarded ||
+               binderless_loading_bg_init_cave_original !=
+                   binderless_loading_bg_init_cave_installed)
+            : (binderless_loading_bg_init_call_original !=
+                   binderless_loading_bg_init_call_expected ||
+               binderless_loading_bg_init_cave_original !=
+                   binderless_loading_bg_init_cave_expected)) ||
+       binderless_loading_bg_init_cave_target !=
+           kBinderlessLoadingBgInitCallGuardCaveRva ||
+       binderless_loading_bg_init_valid_target !=
+           kBinderlessLoadingBgInitCallTargetRva ||
+       binderless_loading_bg_init_null_return !=
+           kBinderlessLoadingBgInitCallGuardCaveRva + 10 ||
+       kBinderlessLoadingBgInitCallGuardRva + 5 !=
+           kBinderlessLoadingBgInitCallResumeRva)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading_bg init guard rejected libg bytes");
+    return nullptr;
+  }
+#endif
+  if (binderless_android &&
+      (binderless_loading_screen_bypass_installed
+           ? binderless_loading_screen_original != 0xC3
+           : binderless_loading_screen_original != 0x55)) {
+    dlclose(handle);
+    throw_state(env, "binderless loading screen guard rejected libg bytes");
     return nullptr;
   }
   const long page_size = sysconf(_SC_PAGESIZE);
@@ -3819,10 +6196,862 @@ Java_royale_nativehost_JniHost_nativePumpManager(
     throw_state(env, "cannot open home presentation page for guarded patch");
     return nullptr;
   }
+#if 0
+  const uintptr_t binderless_loading_intro_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_intro_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_loading_intro_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_intro_guard_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_loading_intro_guard_installed) {
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_loading_intro_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading intro guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_loading_intro_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(binderless_loading_intro_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading intro cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_loading_intro_guard_cave,
+                binderless_loading_intro_cave_code.data(),
+                binderless_loading_intro_cave_code.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_intro_guard_cave),
+        reinterpret_cast<char*>(
+            binderless_loading_intro_guard_cave +
+            binderless_loading_intro_cave_code.size()));
+    std::memcpy(binderless_loading_intro_guard,
+                binderless_loading_intro_jump.data(),
+                binderless_loading_intro_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_intro_guard),
+        reinterpret_cast<char*>(binderless_loading_intro_guard +
+                                binderless_loading_intro_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_loading_intro_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_loading_intro_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_intro_guard_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_INTRO_GUARD site=0x%llx cave=0x%llx "
+        "null=skip_sc_intro valid=replay_original installed=true\n",
+        static_cast<unsigned long long>(kBinderlessLoadingIntroGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessLoadingIntroGuardCaveRva));
+  }
+  const uintptr_t binderless_loading_ui_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_ui_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_loading_ui_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_ui_guard_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_loading_ui_guard_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_loading_ui_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading UI guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(binderless_loading_ui_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(binderless_loading_ui_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading UI cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_loading_ui_guard_cave,
+                binderless_loading_ui_cave_code.data(),
+                binderless_loading_ui_cave_code.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_ui_guard_cave),
+        reinterpret_cast<char*>(binderless_loading_ui_guard_cave +
+                                binderless_loading_ui_cave_code.size()));
+    std::memcpy(binderless_loading_ui_guard,
+                binderless_loading_ui_jump.data(),
+                binderless_loading_ui_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_ui_guard),
+        reinterpret_cast<char*>(binderless_loading_ui_guard +
+                                binderless_loading_ui_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_loading_ui_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_loading_ui_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_ui_guard_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_UI_GUARD site=0x%llx cave=0x%llx "
+        "null=skip_ui_write valid=replay_original installed=true\n",
+        static_cast<unsigned long long>(kBinderlessLoadingUiGuardRva),
+        static_cast<unsigned long long>(kBinderlessLoadingUiGuardCaveRva));
+  }
+  const uintptr_t binderless_loading_bg_call_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_bg_call_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_loading_bg_call_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_bg_call_guard_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_loading_bg_call_guard_installed) {
+    if (mprotect(
+            reinterpret_cast<void*>(
+                binderless_loading_bg_call_guard_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading_bg call page");
+      return nullptr;
+    }
+    if (mprotect(
+            reinterpret_cast<void*>(
+                binderless_loading_bg_call_cave_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(
+          reinterpret_cast<void*>(binderless_loading_bg_call_guard_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading_bg cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_loading_bg_call_guard_cave,
+                binderless_loading_bg_call_cave_code.data(),
+                binderless_loading_bg_call_cave_code.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_bg_call_guard_cave),
+        reinterpret_cast<char*>(
+            binderless_loading_bg_call_guard_cave +
+            binderless_loading_bg_call_cave_code.size()));
+    std::memcpy(binderless_loading_bg_call_guard,
+                binderless_loading_bg_call_jump.data(),
+                binderless_loading_bg_call_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_bg_call_guard),
+        reinterpret_cast<char*>(binderless_loading_bg_call_guard +
+                                binderless_loading_bg_call_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_loading_bg_call_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_loading_bg_call_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_bg_call_guard_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_BG_CALL_GUARD site=0x%llx cave=0x%llx "
+        "null_input_or_result=skip valid=replay_original installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessLoadingBgCallGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessLoadingBgCallGuardCaveRva));
+  }
+  const uintptr_t binderless_loading_root_call_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_root_call_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_loading_root_call_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_root_call_guard_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_loading_root_call_guard_installed) {
+    if (mprotect(
+            reinterpret_cast<void*>(
+                binderless_loading_root_call_guard_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading root call page");
+      return nullptr;
+    }
+    if (mprotect(
+            reinterpret_cast<void*>(
+                binderless_loading_root_call_cave_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(
+          reinterpret_cast<void*>(binderless_loading_root_call_guard_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading root cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_loading_root_call_guard_cave,
+                binderless_loading_root_call_cave_code.data(),
+                binderless_loading_root_call_cave_code.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_root_call_guard_cave),
+        reinterpret_cast<char*>(
+            binderless_loading_root_call_guard_cave +
+            binderless_loading_root_call_cave_code.size()));
+    std::memcpy(binderless_loading_root_call_guard,
+                binderless_loading_root_call_jump.data(),
+                binderless_loading_root_call_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_root_call_guard),
+        reinterpret_cast<char*>(binderless_loading_root_call_guard +
+                                binderless_loading_root_call_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_loading_root_call_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_loading_root_call_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_root_call_guard_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_ROOT_CALL_GUARD site=0x%llx cave=0x%llx "
+        "null=cleanup valid=replay_original installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessLoadingRootCallGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessLoadingRootCallGuardCaveRva));
+  }
+  const uintptr_t binderless_loading_bg_init_call_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_bg_init_call_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_loading_bg_init_cave_page =
+      reinterpret_cast<uintptr_t>(
+          binderless_loading_bg_init_call_guard_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_loading_bg_init_call_guard_installed) {
+    if (mprotect(
+            reinterpret_cast<void*>(
+                binderless_loading_bg_init_call_guard_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading_bg init call page");
+      return nullptr;
+    }
+    if (mprotect(
+            reinterpret_cast<void*>(binderless_loading_bg_init_cave_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(
+          reinterpret_cast<void*>(
+              binderless_loading_bg_init_call_guard_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading_bg init cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_loading_bg_init_call_guard_cave,
+                binderless_loading_bg_init_cave_code.data(),
+                binderless_loading_bg_init_cave_code.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_bg_init_call_guard_cave),
+        reinterpret_cast<char*>(
+            binderless_loading_bg_init_call_guard_cave +
+            binderless_loading_bg_init_cave_code.size()));
+    std::memcpy(binderless_loading_bg_init_call_guard,
+                binderless_loading_bg_init_call_guarded.data(),
+                binderless_loading_bg_init_call_guarded.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_bg_init_call_guard),
+        reinterpret_cast<char*>(
+            binderless_loading_bg_init_call_guard +
+            binderless_loading_bg_init_call_guarded.size()));
+    mprotect(
+        reinterpret_cast<void*>(binderless_loading_bg_init_call_guard_page),
+        static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_loading_bg_init_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_bg_init_call_guard_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_BG_INIT_GUARD site=0x%llx cave=0x%llx "
+        "null=return valid=tail_native installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessLoadingBgInitCallGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessLoadingBgInitCallGuardCaveRva));
+  }
+#endif
+  const uintptr_t binderless_loading_screen_page =
+      reinterpret_cast<uintptr_t>(binderless_loading_screen_init) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_loading_screen_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_loading_screen_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless loading screen page");
+      return nullptr;
+    }
+    *binderless_loading_screen_init = 0xC3;
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_loading_screen_init),
+        reinterpret_cast<char*>(binderless_loading_screen_init + 1));
+    mprotect(reinterpret_cast<void*>(binderless_loading_screen_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_loading_screen_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_LOADING_SCREEN_BYPASS rva=0x%llx installed=true\n",
+        static_cast<unsigned long long>(kBinderlessLoadingScreenInitRva));
+  }
+  const uintptr_t binderless_invalid_asset_page =
+      reinterpret_cast<uintptr_t>(binderless_invalid_asset_branch) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_invalid_asset_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_invalid_asset_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_invalid_asset_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_invalid_asset_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless invalid asset branch page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(binderless_invalid_asset_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(binderless_invalid_asset_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless invalid asset cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_invalid_asset_cave,
+                binderless_invalid_asset_cave_bypass.data(),
+                binderless_invalid_asset_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_invalid_asset_cave),
+        reinterpret_cast<char*>(binderless_invalid_asset_cave +
+                                binderless_invalid_asset_cave_bypass.size()));
+    std::memcpy(binderless_invalid_asset_branch,
+                binderless_invalid_asset_bypass.data(),
+                binderless_invalid_asset_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_invalid_asset_branch),
+        reinterpret_cast<char*>(binderless_invalid_asset_branch +
+                                binderless_invalid_asset_bypass.size()));
+    mprotect(reinterpret_cast<void*>(binderless_invalid_asset_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_invalid_asset_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_invalid_asset_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_INVALID_ASSET_BYPASS site=0x%llx cave=0x%llx "
+        "valid_target=0x%llx cleanup=0x%llx return=0x%llx "
+        "installed=true\n",
+        static_cast<unsigned long long>(kBinderlessInvalidAssetBranchRva),
+        static_cast<unsigned long long>(binderless_invalid_asset_target),
+        static_cast<unsigned long long>(binderless_valid_asset_target),
+        static_cast<unsigned long long>(binderless_invalid_asset_cleanup_target),
+        static_cast<unsigned long long>(binderless_invalid_asset_return_target));
+  }
+  // Kept only as forensic context. Per-call nulling suppressed valid metadata
+  // providers; the wrapper-level validity guard below is the fail-closed path.
+#if 0
+  const uintptr_t binderless_async_metadata_page =
+      reinterpret_cast<uintptr_t>(binderless_async_metadata_calls.front()) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_async_metadata_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_async_metadata_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless async metadata call page");
+      return nullptr;
+    }
+    const std::array<uint8_t, 5> return_null = {
+        0x31, 0xC0, 0x90, 0x90, 0x90};
+    for (uint8_t* call : binderless_async_metadata_calls) {
+      std::memcpy(call, return_null.data(), return_null.size());
+    }
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_async_metadata_calls.front()),
+        reinterpret_cast<char*>(binderless_async_metadata_calls.back() +
+                                return_null.size()));
+    mprotect(reinterpret_cast<void*>(binderless_async_metadata_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_async_metadata_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_ASYNC_METADATA_BYPASS calls=2 target=0x%llx "
+        "installed=true\n",
+        static_cast<unsigned long long>(kBinderlessAsyncMetadataTargetRva));
+  }
+#endif
+  const uintptr_t binderless_metadata_validity_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_metadata_validity_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_metadata_validity_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_metadata_validity_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_metadata_validity_bypass_installed) {
+    if (mprotect(
+            reinterpret_cast<void*>(binderless_metadata_validity_guard_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless metadata validity guard page");
+      return nullptr;
+    }
+    if (mprotect(
+            reinterpret_cast<void*>(binderless_metadata_validity_cave_page),
+            static_cast<size_t>(page_size),
+            PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(
+          reinterpret_cast<void*>(binderless_metadata_validity_guard_page),
+          static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless metadata validity cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_metadata_validity_cave,
+                binderless_metadata_validity_cave_bypass.data(),
+                binderless_metadata_validity_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_metadata_validity_cave),
+        reinterpret_cast<char*>(binderless_metadata_validity_cave +
+                                binderless_metadata_validity_cave_bypass.size()));
+    std::memcpy(binderless_metadata_validity_guard,
+                binderless_metadata_validity_jump.data(),
+                binderless_metadata_validity_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_metadata_validity_guard),
+        reinterpret_cast<char*>(binderless_metadata_validity_guard +
+                                binderless_metadata_validity_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_metadata_validity_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_metadata_validity_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_metadata_validity_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_METADATA_VALIDITY_BYPASS site=0x%llx cave=0x%llx "
+        "invalid=0x%llx valid=0x%llx installed=true\n",
+        static_cast<unsigned long long>(kBinderlessMetadataValidityGuardRva),
+        static_cast<unsigned long long>(kBinderlessMetadataValidityCaveRva),
+        static_cast<unsigned long long>(binderless_metadata_invalid_target),
+        static_cast<unsigned long long>(binderless_metadata_valid_resume));
+  }
+#if 0
+  const uintptr_t binderless_presentation_asset_page =
+      reinterpret_cast<uintptr_t>(
+          binderless_presentation_asset_calls.front()) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_presentation_asset_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_presentation_asset_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless presentation asset call page");
+      return nullptr;
+    }
+    const std::array<uint8_t, 5> return_false = {
+        0x31, 0xC0, 0x90, 0x90, 0x90};
+    for (uint8_t* call : binderless_presentation_asset_calls) {
+      std::memcpy(call, return_false.data(), return_false.size());
+    }
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_presentation_asset_calls.front()),
+        reinterpret_cast<char*>(binderless_presentation_asset_calls.back() +
+                                return_false.size()));
+    mprotect(reinterpret_cast<void*>(binderless_presentation_asset_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_presentation_asset_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_PRESENTATION_ASSET_BYPASS calls=4 target=0x%llx "
+        "installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessPresentationAssetTargetRva));
+  }
+#endif
+  const uintptr_t binderless_external_asset_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_external_asset_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_external_asset_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_external_asset_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android && !binderless_external_asset_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_external_asset_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless external asset guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(binderless_external_asset_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(binderless_external_asset_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless external asset cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_external_asset_cave,
+                binderless_external_asset_cave_bypass.data(),
+                binderless_external_asset_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_external_asset_cave),
+        reinterpret_cast<char*>(binderless_external_asset_cave +
+                                binderless_external_asset_cave_bypass.size()));
+    std::memcpy(binderless_external_asset_guard,
+                binderless_external_asset_jump.data(),
+                binderless_external_asset_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_external_asset_guard),
+        reinterpret_cast<char*>(binderless_external_asset_guard +
+                                binderless_external_asset_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_external_asset_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_external_asset_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_external_asset_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_EXTERNAL_ASSET_BYPASS site=0x%llx cave=0x%llx "
+        "check=0x%llx failure=0x%llx resume=0x%llx installed=true\n",
+        static_cast<unsigned long long>(kBinderlessExternalAssetGuardRva),
+        static_cast<unsigned long long>(kBinderlessExternalAssetCaveRva),
+        static_cast<unsigned long long>(kBinderlessExternalAssetCheckRva),
+        static_cast<unsigned long long>(kBinderlessExternalAssetFailureRva),
+        static_cast<unsigned long long>(kBinderlessExternalAssetResumeRva));
+  }
+#if 0
+  const uintptr_t binderless_data_table_getter_page =
+      reinterpret_cast<uintptr_t>(binderless_data_table_getter_jump) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_data_table_getter_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(binderless_data_table_getter_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless DataTable getter jump page");
+      return nullptr;
+    }
+    std::memcpy(binderless_data_table_getter_jump,
+                binderless_data_table_getter_bypass.data(),
+                binderless_data_table_getter_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_getter_jump),
+        reinterpret_cast<char*>(binderless_data_table_getter_jump +
+                                binderless_data_table_getter_bypass.size()));
+    mprotect(reinterpret_cast<void*>(binderless_data_table_getter_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_data_table_getter_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_DATATABLE_GETTER_BYPASS rva=0x%llx target=0x%llx "
+        "installed=true\n",
+        static_cast<unsigned long long>(kBinderlessDataTableGetterJumpRva),
+        static_cast<unsigned long long>(binderless_data_table_getter_target));
+  }
+  const uintptr_t binderless_data_table_inner_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_data_table_inner_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_data_table_inner_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_data_table_inner_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_data_table_inner_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_inner_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless DataTable inner guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_inner_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(
+                   binderless_data_table_inner_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless DataTable inner cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_data_table_inner_cave,
+                binderless_data_table_inner_cave_bypass.data(),
+                binderless_data_table_inner_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_inner_cave),
+        reinterpret_cast<char*>(binderless_data_table_inner_cave +
+                                binderless_data_table_inner_cave_bypass.size()));
+    std::memcpy(binderless_data_table_inner_guard,
+                binderless_data_table_inner_jump.data(),
+                binderless_data_table_inner_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_inner_guard),
+        reinterpret_cast<char*>(binderless_data_table_inner_guard +
+                                binderless_data_table_inner_jump.size()));
+    mprotect(reinterpret_cast<void*>(binderless_data_table_inner_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(binderless_data_table_inner_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_data_table_inner_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_DATATABLE_INNER_BYPASS site=0x%llx cave=0x%llx "
+        "null_target=0x%llx valid_target=0x%llx installed=true\n",
+        static_cast<unsigned long long>(kBinderlessDataTableInnerGuardRva),
+        static_cast<unsigned long long>(kBinderlessDataTableInnerCaveRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableInnerNullTargetRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableInnerValidTargetRva));
+  }
+  const uintptr_t binderless_data_table_secondary_guard_page =
+      reinterpret_cast<uintptr_t>(binderless_data_table_secondary_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_data_table_secondary_cave_page =
+      reinterpret_cast<uintptr_t>(binderless_data_table_secondary_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_data_table_secondary_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_secondary_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless DataTable secondary guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_secondary_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(
+                   binderless_data_table_secondary_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(env, "cannot open binderless DataTable secondary cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_data_table_secondary_cave,
+                binderless_data_table_secondary_cave_bypass.data(),
+                binderless_data_table_secondary_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_secondary_cave),
+        reinterpret_cast<char*>(binderless_data_table_secondary_cave +
+                                binderless_data_table_secondary_cave_bypass.size()));
+    std::memcpy(binderless_data_table_secondary_guard,
+                binderless_data_table_secondary_jump.data(),
+                binderless_data_table_secondary_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_secondary_guard),
+        reinterpret_cast<char*>(binderless_data_table_secondary_guard +
+                                binderless_data_table_secondary_jump.size()));
+    mprotect(reinterpret_cast<void*>(
+                 binderless_data_table_secondary_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(
+                 binderless_data_table_secondary_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_data_table_secondary_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_DATATABLE_SECONDARY_BYPASS site=0x%llx cave=0x%llx "
+        "null_target=0x%llx valid_target=0x%llx installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessDataTableSecondaryGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableSecondaryCaveRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableSecondaryNullTargetRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableSecondaryValidTargetRva));
+  }
+  const uintptr_t binderless_data_table_null_dependency_guard_page =
+      reinterpret_cast<uintptr_t>(
+          binderless_data_table_null_dependency_guard) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  const uintptr_t binderless_data_table_null_dependency_cave_page =
+      reinterpret_cast<uintptr_t>(
+          binderless_data_table_null_dependency_cave) &
+      ~static_cast<uintptr_t>(page_size - 1);
+  if (binderless_android &&
+      !binderless_data_table_null_dependency_bypass_installed) {
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_null_dependency_guard_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(
+          env, "cannot open binderless DataTable null dependency guard page");
+      return nullptr;
+    }
+    if (mprotect(reinterpret_cast<void*>(
+                     binderless_data_table_null_dependency_cave_page),
+                 static_cast<size_t>(page_size),
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+      mprotect(reinterpret_cast<void*>(
+                   binderless_data_table_null_dependency_guard_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(patch_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      mprotect(reinterpret_cast<void*>(home_config_page),
+               static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+      dlclose(handle);
+      throw_state(
+          env, "cannot open binderless DataTable null dependency cave page");
+      return nullptr;
+    }
+    std::memcpy(binderless_data_table_null_dependency_cave,
+                binderless_data_table_null_dependency_cave_bypass.data(),
+                binderless_data_table_null_dependency_cave_bypass.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_null_dependency_cave),
+        reinterpret_cast<char*>(binderless_data_table_null_dependency_cave +
+                                binderless_data_table_null_dependency_cave_bypass.size()));
+    std::memcpy(binderless_data_table_null_dependency_guard,
+                binderless_data_table_null_dependency_jump.data(),
+                binderless_data_table_null_dependency_jump.size());
+    __builtin___clear_cache(
+        reinterpret_cast<char*>(binderless_data_table_null_dependency_guard),
+        reinterpret_cast<char*>(binderless_data_table_null_dependency_guard +
+                                binderless_data_table_null_dependency_jump.size()));
+    mprotect(reinterpret_cast<void*>(
+                 binderless_data_table_null_dependency_guard_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    mprotect(reinterpret_cast<void*>(
+                 binderless_data_table_null_dependency_cave_page),
+             static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+    binderless_data_table_null_dependency_bypass_installed = true;
+    std::fprintf(
+        stderr,
+        "BINDERLESS_DATATABLE_NULL_DEPENDENCY_BYPASS site=0x%llx "
+        "cave=0x%llx resume=0x%llx installed=true\n",
+        static_cast<unsigned long long>(
+            kBinderlessDataTableNullDependencyGuardRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableNullDependencyCaveRva),
+        static_cast<unsigned long long>(
+            kBinderlessDataTableNullDependencyResumeRva));
+  }
+#endif
   *presentation_toggle = 0xC3;
   std::memcpy(home_resolution_block, resolution_bypass.data(),
               resolution_bypass.size());
   std::memset(home_graphics_create, 0x90, graphics_create_original.size());
+  const bool binderless_graphics_create_installed_now =
+      binderless_android && !binderless_graphics_create_bypass_installed;
+  if (binderless_android) {
+    binderless_graphics_create_bypass_installed = true;
+  }
   __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
                           reinterpret_cast<char*>(presentation_toggle + 1));
   __builtin___clear_cache(
@@ -3832,12 +7061,18 @@ Java_royale_nativehost_JniHost_nativePumpManager(
       reinterpret_cast<char*>(home_graphics_create),
       reinterpret_cast<char*>(home_graphics_create +
                               graphics_create_original.size()));
-  manager_update(reinterpret_cast<void*>(manager), 0.0f);
+  int32_t manager_type_before = -1;
+  memory.read(manager + 0x30, &manager_type_before);
+  const float manager_delta =
+      binderless_android && manager_type_before != 4 ? 0.05f : 0.0f;
+  manager_update(reinterpret_cast<void*>(manager), manager_delta);
   *presentation_toggle = presentation_original;
   std::memcpy(home_resolution_block, resolution_original.data(),
               resolution_original.size());
-  std::memcpy(home_graphics_create, graphics_create_original.data(),
-              graphics_create_original.size());
+  if (!binderless_android) {
+    std::memcpy(home_graphics_create, graphics_create_original.data(),
+                graphics_create_original.size());
+  }
   __builtin___clear_cache(reinterpret_cast<char*>(presentation_toggle),
                           reinterpret_cast<char*>(presentation_toggle + 1));
   __builtin___clear_cache(
@@ -3851,6 +7086,12 @@ Java_royale_nativehost_JniHost_nativePumpManager(
            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
   mprotect(reinterpret_cast<void*>(home_config_page),
            static_cast<size_t>(page_size), PROT_READ | PROT_EXEC);
+  if (binderless_graphics_create_installed_now) {
+    std::fprintf(
+        stderr,
+        "BINDERLESS_GRAPHICS_CREATE_BYPASS rva=0x%llx installed=true\n",
+        static_cast<unsigned long long>(kHomeGraphicsCreateCallRva));
+  }
 
   int32_t current_type = -1;
   int32_t pending_type = -1;

@@ -1,5 +1,5 @@
 param(
-    [string]$Adb = "D:\Codex\toolchains\android-sdk\platform-tools\adb.exe",
+    [string]$Adb = $(if ($env:CR_SANDBOX_ADB) { $env:CR_SANDBOX_ADB } else { throw "Missing CR_SANDBOX_ADB; dot-source runtime.env.ps1 first" }),
     [string]$Serial = "emulator-5554",
     [int]$Port = 37031,
     [int]$Slot = 0

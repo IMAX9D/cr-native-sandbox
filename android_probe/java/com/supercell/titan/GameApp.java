@@ -122,11 +122,17 @@ public final class GameApp extends Activity {
     }
 
     public static Display.Mode[] getDisplayModes() {
+        if ("1".equals(System.getenv("CR_BINDERLESS_ANDROID"))) {
+            return new Display.Mode[] {createBinderlessDisplayMode()};
+        }
         Display display = getDefaultDisplay();
         return display == null ? new Display.Mode[0] : display.getSupportedModes();
     }
 
     public static Display.Mode getCurrentDisplayMode() {
+        if ("1".equals(System.getenv("CR_BINDERLESS_ANDROID"))) {
+            return createBinderlessDisplayMode();
+        }
         Display display = getDefaultDisplay();
         return display == null ? null : display.getMode();
     }
@@ -137,6 +143,21 @@ public final class GameApp extends Activity {
 
     /** Headless mode never schedules Android notifications. */
     public static void cancelAllNotifications() {}
+
+    private static Display.Mode createBinderlessDisplayMode() {
+        try {
+            java.lang.reflect.Constructor<Display.Mode> constructor =
+                Display.Mode.class.getDeclaredConstructor(
+                    int.class, int.class, int.class, float.class
+                );
+            constructor.setAccessible(true);
+            return constructor.newInstance(1, 1080, 2400, 60.0f);
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException(
+                "cannot construct binderless Display.Mode", error
+            );
+        }
+    }
 
     private static Display getDefaultDisplay() {
         if (instance == null) {

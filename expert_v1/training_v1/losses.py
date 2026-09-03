@@ -304,6 +304,8 @@ def _sequence_only_loss(
 
 
 class MetricAccumulator:
+    VERSION = "valid_label_count_v2"
+
     def __init__(self) -> None:
         self.weighted: dict[str, float] = defaultdict(float)
         self.weights: dict[str, float] = defaultdict(float)
@@ -316,15 +318,21 @@ class MetricAccumulator:
                 self.weights[key] = 1.0
                 continue
             if key.startswith("card_"):
-                weight = max(1.0, float(metrics.get("card_count", 0.0)))
+                weight = max(0.0, float(metrics.get("card_count", 0.0)))
             elif key.startswith("position_"):
-                weight = max(1.0, float(metrics.get("position_count", 0.0)))
+                weight = max(0.0, float(metrics.get("position_count", 0.0)))
             elif key.startswith("ability_"):
-                weight = max(1.0, float(metrics.get("ability_count", 0.0)))
+                weight = max(0.0, float(metrics.get("ability_count", 0.0)))
             elif key.startswith("kind_"):
-                weight = max(1.0, float(metrics.get("kind_count", 0.0)))
+                weight = max(0.0, float(metrics.get("kind_count", 0.0)))
             else:
                 weight = base
+            if weight == 0.0:
+                # Empty supervised batches have no accuracy/error observation.
+                # Keep the result key/count contract without inserting a fake sample.
+                self.weighted.setdefault(key, 0.0)
+                self.weights.setdefault(key, 0.0)
+                continue
             self.weighted[key] += float(value) * weight
             self.weights[key] += weight
 

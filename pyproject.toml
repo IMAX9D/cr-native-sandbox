@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cr-native-sandbox"
+version = "0.2.0"
+description = "Version-pinned native Clash Royale battle runtime and training stack"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "IMAX9D"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+training = [
+  "numpy>=1.26",
+  "torch>=2.2",
+  "psutil>=5.9",
+  "nvidia-ml-py>=12",
+  "tensorboard>=2.16",
+]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = [
+  "native_core*",
+  "training*",
+  "selfplay_v2*",
+  "expert_v1*",
+  "expert_selfplay_v1*",
+]
+
+[tool.setuptools.package-data]
+native_core = ["data/*.json"]

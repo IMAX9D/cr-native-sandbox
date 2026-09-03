@@ -493,6 +493,73 @@ class PotentialReward:
         return {0: reward0, 1: -reward0}
 
 
+class DefensiveTowerReward:
+    """Dense tower reward used by the external PPO reference, at native scale.
+
+    This intentionally is not zero-sum: equal tower-HP trades are negative for
+    both actors because damage received is weighted 20% more than damage dealt.
+    The time discount remains an independent trainer concern and must be scaled
+    for the native 20 Hz decision clock.
+    """
+
+    schema_version = "defensive_tower_damage_v1"
+    damage_dealt_scale = 0.001
+    damage_received_scale = 0.0012
+    tower_destroyed_reward = 5.0
+    terminal_win_reward = 10.0
+
+    @staticmethod
+    def _tower_summary(state: Mapping[str, Any]) -> tuple[list[int], list[int]]:
+        hp = [0, 0]
+        alive = [0, 0]
+        for tower in state.get("episode", {}).get("crown_towers", []):
+            side = int(tower.get("side", -1))
+            if side not in (0, 1):
+                continue
+            value = max(0, int(tower.get("hp", 0)))
+            hp[side] += value
+            alive[side] += int(value > 0)
+        return hp, alive
+
+    def transition(
+        self,
+        previous: Mapping[str, Any],
+        current: Mapping[str, Any] | None,
+        *,
+        terminal_rewards: Mapping[int, float] | None = None,
+        done: bool = False,
+    ) -> dict[int, float]:
+        previous_hp, previous_alive = self._tower_summary(previous)
+        if current is None:
+            current_hp, current_alive = previous_hp, previous_alive
+        else:
+            current_hp, current_alive = self._tower_summary(current)
+        damage_received = [
+            max(0, previous_hp[side] - current_hp[side]) for side in (0, 1)
+        ]
+        towers_lost = [
+            max(0, previous_alive[side] - current_alive[side])
+            for side in (0, 1)
+        ]
+        rewards: dict[int, float] = {}
+        terminal_rewards = terminal_rewards or {0: 0.0, 1: 0.0}
+        for side in (0, 1):
+            enemy = 1 - side
+            reward = (
+                self.damage_dealt_scale * damage_received[enemy]
+                - self.damage_received_scale * damage_received[side]
+                + self.tower_destroyed_reward * towers_lost[enemy]
+                - self.tower_destroyed_reward * towers_lost[side]
+            )
+            if done:
+                terminal = float(terminal_rewards.get(side, 0.0))
+                reward += self.terminal_win_reward * (
+                    1.0 if terminal > 0 else -1.0 if terminal < 0 else 0.0
+                )
+            rewards[side] = float(reward)
+        return rewards
+
+
 @dataclass(frozen=True)
 class TrainingPaths:
     root: Path

@@ -8,6 +8,7 @@ from typing import NamedTuple
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 from .schema import (
     ARENA_COLUMNS,
@@ -33,9 +34,28 @@ class ExpertPolicyConfig:
     lambda_initial: float = 0.30
     native_tick_seconds: float = 0.05
     observation_mode: str = OBSERVATION_NATIVE
+    position_head_fp32: bool = False
+    position_logit_softcap: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.position_head_fp32, bool):
+            raise ValueError("position_head_fp32 must be a boolean")
+        if self.position_logit_softcap is not None:
+            if not self.position_head_fp32:
+                raise ValueError("position softcap requires the FP32 position head")
+            if not math.isfinite(self.position_logit_softcap) or self.position_logit_softcap <= 0:
+                raise ValueError("position softcap must be finite and positive")
 
     def to_dict(self) -> dict[str, int | float | str]:
-        return asdict(self)
+        value = asdict(self)
+        # Default/legacy checkpoints must retain their exact historical contract.
+        if not self.position_head_fp32:
+            value.pop("position_head_fp32")
+        if self.position_logit_softcap is None:
+            value.pop("position_logit_softcap")
+        else:
+            value["position_logit_softcap"] = float(self.position_logit_softcap)
+        return value
 
 
 class ExpertPolicyOutput(NamedTuple):
@@ -48,10 +68,22 @@ class ExpertPolicyOutput(NamedTuple):
     hidden: tuple[Tensor, Tensor]
 
 
+class ExpertPolicyWithFeatures(NamedTuple):
+    output: ExpertPolicyOutput
+    pre_head_latent: Tensor
+
+
 def masked_logits(logits: Tensor, mask: Tensor) -> Tensor:
     if logits.shape != mask.shape:
         raise ValueError(f"mask shape {mask.shape} != logits shape {logits.shape}")
     return logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+
+
+def configure_position_precision(config: ExpertPolicyConfig) -> None:
+    """Opt-in numeric policy for the owning training/inference process."""
+    if config.position_head_fp32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
 
 class RecurrentExpertPolicy(nn.Module):
@@ -153,6 +185,62 @@ class RecurrentExpertPolicy(nn.Module):
         denominator = mask.sum(dim=-2).clamp_min(1)
         return numerator / denominator
 
+    def _query_fp32(self, value: Tensor) -> Tensor:
+        first, _activation, last = self.position_query
+        value = F.linear(value.float(), first.weight.float(), first.bias.float())
+        value = F.silu(value)
+        return F.linear(value, last.weight.float(), last.bias.float())
+
+    def _cells_fp32(self, value: Tensor) -> Tensor:
+        assert self.cell_features is not None
+        layer = self.cell_features
+        bias = layer.bias.float() if layer.bias is not None else None
+        return F.conv2d(value.float(), layer.weight.float(), bias,
+                        layer.stride, layer.padding, layer.dilation, layer.groups)
+
+    def _cap_position_scores(self, scores: Tensor) -> Tensor:
+        cap = self.config.position_logit_softcap
+        if cap is None:
+            return scores
+        scores = scores - scores.mean(dim=-1, keepdim=True)
+        return cap * torch.tanh(scores / cap)
+
+    def _stable_position_logits(
+        self, recurrent: Tensor, hand: Tensor, flat_spatial: Tensor | None,
+        legacy_cells: Tensor, indices: tuple[Tensor, Tensor, Tensor] | None,
+    ) -> Tensor:
+        batch, steps = recurrent.shape[:2]
+        if indices is not None and indices[0].numel() == 0:
+            # No supervised positions: keep the original zero-gradient graph,
+            # including AdamW's zero-grad vs None-grad behavior, without a large
+            # dense FP32 allocation. These unused scores are not inference output.
+            query = self.position_query(torch.cat(
+                (recurrent.unsqueeze(2).expand(-1, -1, 4, -1), hand), dim=-1))
+            return torch.einsum("btse,btpe->btsp", query, legacy_cells) / math.sqrt(legacy_cells.shape[-1])
+        with torch.autocast(device_type=recurrent.device.type, enabled=False):
+            if indices is not None:
+                b, t, card = indices
+                query = self._query_fp32(torch.cat((recurrent[b, t].float(), hand[b, t, card].float()), dim=-1))
+                if flat_spatial is not None:
+                    features = self._cells_fp32(flat_spatial.index_select(0, b * steps + t))
+                    cells = features.flatten(2).transpose(1, 2)
+                else:
+                    cells = legacy_cells[b, t].float()
+                scores = torch.einsum("ne,npe->np", query, cells) / math.sqrt(cells.shape[-1])
+                scores = self._cap_position_scores(scores)
+                output = scores.new_zeros(batch, steps, 4, POSITION_COUNT)
+                output[b, t, card] = scores
+                return output
+            query = self._query_fp32(torch.cat(
+                (recurrent.float().unsqueeze(2).expand(-1, -1, 4, -1), hand.float()), dim=-1))
+            if flat_spatial is not None:
+                cells = self._cells_fp32(flat_spatial).flatten(2).transpose(1, 2)
+                cells = cells.reshape(batch, steps, POSITION_COUNT, -1)
+            else:
+                cells = legacy_cells.float()
+            scores = torch.einsum("btse,btpe->btsp", query, cells) / math.sqrt(cells.shape[-1])
+            return self._cap_position_scores(scores)
+
     def forward_sequence(
         self,
         *,
@@ -173,8 +261,11 @@ class RecurrentExpertPolicy(nn.Module):
         previous_event_side: Tensor | None = None,
         previous_event_position: Tensor | None = None,
         hidden: tuple[Tensor, Tensor] | None = None,
+        _position_indices: tuple[Tensor, Tensor, Tensor] | None = None,
+        _feature_sink: list[Tensor] | None = None,
     ) -> ExpertPolicyOutput:
         batch, steps = public_scalars.shape[:2]
+        flat_spatial = None
         if self.config.observation_mode == OBSERVATION_NATIVE:
             if grid is None or grid.ndim != 5:
                 raise ValueError("grid must have shape [batch,time,channels,32,18]")
@@ -269,6 +360,8 @@ class RecurrentExpertPolicy(nn.Module):
             (pooled, self.scalar(public_scalars), card_context, delta), dim=-1
         )
         recurrent, next_hidden = self.recurrent(recurrent_input, hidden)
+        if _feature_sink is not None:
+            _feature_sink.append(recurrent)
 
         card_logits = torch.einsum(
             "bte,btse->bts",
@@ -284,11 +377,14 @@ class RecurrentExpertPolicy(nn.Module):
         else:
             cells = self.sequence_cell_embedding.weight.unsqueeze(0).unsqueeze(0)
             cells = cells.expand(batch, steps, -1, -1)
-        position_queries = self.position_query(
-            torch.cat((recurrent.unsqueeze(2).expand(-1, -1, 4, -1), hand), dim=-1)
-        )
-        position_logits = torch.einsum("btse,btpe->btsp", position_queries, cells)
-        position_logits = position_logits / math.sqrt(cells.shape[-1])
+        if self.config.position_head_fp32:
+            position_logits = self._stable_position_logits(recurrent, hand, flat_spatial, cells, _position_indices)
+        else:
+            position_queries = self.position_query(
+                torch.cat((recurrent.unsqueeze(2).expand(-1, -1, 4, -1), hand), dim=-1)
+            )
+            position_logits = torch.einsum("btse,btpe->btsp", position_queries, cells)
+            position_logits = position_logits / math.sqrt(cells.shape[-1])
 
         if ability_tokens is None:
             ability_logits = recurrent.new_zeros(
@@ -327,7 +423,26 @@ class RecurrentExpertPolicy(nn.Module):
             next_hidden,
         )
 
-    def forward_batch(self, batch: dict[str, Tensor]) -> ExpertPolicyOutput:
+    def forward_with_features(self, **values: Tensor | tuple[Tensor, Tensor] | None) -> ExpertPolicyWithFeatures:
+        """Return the existing actor output plus its pre-head recurrent latent.
+
+        This is a non-parameterized adapter surface for Actor/Critic training.
+        The default forward API and ``state_dict`` remain byte-compatible with
+        existing inference checkpoints.
+        """
+        sink: list[Tensor] = []
+        output = self.forward_sequence(**values, _feature_sink=sink)
+        if len(sink) != 1:
+            raise RuntimeError("expert recurrent feature capture failed")
+        return ExpertPolicyWithFeatures(output=output, pre_head_latent=sink[0])
+
+    def forward_batch(self, batch: dict[str, Tensor], *, supervised_positions: bool = False) -> ExpertPolicyOutput:
+        """Actor output by default; supervised mode is only a loss-computation optimization.
+
+        The default never consults targets and returns every hand-slot position
+        distribution. Training/evaluation may request only the rows whose
+        position loss is supervised; their values/derivatives match dense mode.
+        """
         common = (
             "public_scalars",
             "own_deck_tokens",
@@ -337,6 +452,9 @@ class RecurrentExpertPolicy(nn.Module):
             "delta_ticks",
         )
         values = {name: batch[name] for name in common}
+        if self.config.position_head_fp32 and supervised_positions:
+            b, t = (batch["loss_mask"] & batch["position_label_mask"]).nonzero(as_tuple=True)
+            values["_position_indices"] = (b, t, batch["card_slot"][b, t].clamp(0, 3))
         if self.config.observation_mode == OBSERVATION_SEQUENCE:
             values.update(
                 grid=None,

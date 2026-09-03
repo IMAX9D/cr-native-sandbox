@@ -51,9 +51,11 @@ public final class JniHost {
         int graphicsApi,
         String externalFilesDir
     );
+    private static native String nativeRegisterAndroidRuntime();
     private static native String nativeProbeRuntime(String libgPath);
     private static native String nativeProbePrerequisites(String libgPath);
     private static native String nativeInitGameMain(String libgPath);
+    private static native String nativePreloadCoreData(String libgPath);
     private static native String nativeInitResources(String libgPath);
     private static native String nativeInitManager(String libgPath);
     private static native String nativePumpManager(String libgPath);
@@ -89,8 +91,18 @@ public final class JniHost {
             System.exit(64);
         }
         String mode = args.length >= 2 ? args[1] : "load";
+        boolean binderlessAndroid =
+            "1".equals(System.getenv("CR_BINDERLESS_ANDROID"));
         String path = args[0] + "/libg.so";
         System.load(args[0] + "/libnative_host_bridge.so");
+        // A normal Android app_process registers the framework JNI table before
+        // invoking this class.  The cloud-native runner deliberately starts ART
+        // without app_process so it does not require /dev/binder; register the
+        // same table explicitly only for that opt-in runtime.
+        if (binderlessAndroid) {
+            System.out.println(nativeRegisterAndroidRuntime());
+            System.out.flush();
+        }
         System.out.println(
             "{\"schema_version\":1,\"stage\":\"jni_on_load\","
                 + "\"event\":\"before_system_load\",\"path\":\""
@@ -116,7 +128,9 @@ public final class JniHost {
             return;
         }
         try {
-            Object packageContext = createPackageContext("com.supercell.clashroyale");
+            Object packageContext = createPackageContext(
+                args[0], "com.supercell.clashroyale"
+            );
             Method getAssets = Class.forName("android.content.Context").getMethod("getAssets");
             Object assets = getAssets.invoke(packageContext);
             System.out.println(
@@ -203,36 +217,295 @@ public final class JniHost {
                             nativeInitResources(args[0] + "/libg.so") + "}"
                     );
                     System.out.flush();
+                    String directCoreInit =
+                        nativeInitGameMain(args[0] + "/libg.so");
                     System.out.println(
                         "{\"schema_version\":1,\"stage\":\"direct_game_main_init\"," +
                             "\"event\":\"after_call\",\"value\":" +
-                            nativeInitGameMain(args[0] + "/libg.so") + "}"
+                            directCoreInit + "}"
                     );
                     System.out.flush();
+                    if (binderlessAndroid &&
+                        "1".equals(System.getenv("CR_BINDERLESS_HOLD_AFTER_GAMEMAIN"))) {
+                        emitStage("binderless_preflight_hold", "ready");
+                        Thread.sleep(600_000L);
+                        return;
+                    }
                     System.out.println(
                         "{\"schema_version\":1,\"stage\":\"direct_loading_state\"," +
                             "\"event\":\"after_call\",\"value\":" +
                             nativePumpManager(args[0] + "/libg.so") + "}"
                     );
                     System.out.flush();
+                    String preloadCoreDataValue = System.getenv(
+                        "CR_BINDERLESS_PRELOAD_CORE_DATA"
+                    );
+                    if (binderlessAndroid && preloadCoreDataValue != null &&
+                        !preloadCoreDataValue.isEmpty() &&
+                        !"0".equals(preloadCoreDataValue) &&
+                        !"1".equals(preloadCoreDataValue)) {
+                        throw new IllegalArgumentException(
+                            "CR_BINDERLESS_PRELOAD_CORE_DATA must be " +
+                                "unset, 0, or 1"
+                        );
+                    }
+                    if (binderlessAndroid &&
+                        "1".equals(preloadCoreDataValue)) {
+                        JSONObject preloadResult = new JSONObject(
+                            nativePreloadCoreData(args[0] + "/libg.so")
+                        );
+                        System.out.println(
+                            "{\"schema_version\":1," +
+                                "\"stage\":\"direct_core_data_preload\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                preloadResult.toString() + "}"
+                        );
+                        System.out.flush();
+                        if (!preloadResult.optBoolean("success", false)) {
+                            throw new IllegalStateException(
+                                "native core data preload did not reach " +
+                                    "the loaded state"
+                            );
+                        }
+                    }
+                    int loadingMaxFrames = (int) readBoundedEnv(
+                        "CR_NATIVE_LOADING_MAX_FRAMES", 10_000L,
+                        1L, 10000L
+                    );
+                    long loadingTimeoutMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_TIMEOUT_MS", 30_000L,
+                        1_000L, 120_000L
+                    );
+                    long loadingSleepMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_SLEEP_MS", 5L, 0L, 100L
+                    );
+                    long loadingInitialSettleMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_INITIAL_SETTLE_MS", 500L,
+                        0L, 30_000L
+                    );
+                    long loadingStartedNanos = System.nanoTime();
                     JSONObject directLoadingFrame = null;
-                    for (int loadingFrame = 0; loadingFrame < 8;
-                         ++loadingFrame) {
+                    JSONObject directLoadingReadiness = new JSONObject(
+                        nativeProbePrerequisites(args[0] + "/libg.so")
+                    );
+                    boolean applyInitialSettle =
+                        loadingInitialSettleMillis > 0L &&
+                        !directLoadingReadiness.optBoolean(
+                            "natural_data_tables_ready", false
+                        ) &&
+                        directLoadingReadiness.optInt(
+                            "current_state_type", -1
+                        ) == 1;
+                    JSONObject initialSettleBefore = new JSONObject();
+                    initialSettleBefore.put(
+                        "configured_ms", loadingInitialSettleMillis
+                    );
+                    initialSettleBefore.put("applied", applyInitialSettle);
+                    initialSettleBefore.put(
+                        "readiness", directLoadingReadiness
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1," +
+                            "\"stage\":\"direct_loading_initial_settle\"," +
+                            "\"event\":\"before\",\"value\":" +
+                            initialSettleBefore.toString() + "}"
+                    );
+                    System.out.flush();
+                    long initialSettleStartedNanos = System.nanoTime();
+                    if (applyInitialSettle) {
+                        Thread.sleep(loadingInitialSettleMillis);
+                    }
+                    directLoadingReadiness = new JSONObject(
+                        nativeProbePrerequisites(args[0] + "/libg.so")
+                    );
+                    JSONObject initialSettleAfter = new JSONObject();
+                    initialSettleAfter.put(
+                        "configured_ms", loadingInitialSettleMillis
+                    );
+                    initialSettleAfter.put("applied", applyInitialSettle);
+                    initialSettleAfter.put(
+                        "elapsed_ms",
+                        (System.nanoTime() - initialSettleStartedNanos) /
+                            1_000_000.0
+                    );
+                    initialSettleAfter.put(
+                        "readiness", directLoadingReadiness
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1," +
+                            "\"stage\":\"direct_loading_initial_settle\"," +
+                            "\"event\":\"after\",\"value\":" +
+                            initialSettleAfter.toString() + "}"
+                    );
+                    System.out.flush();
+                    int loadingFrames = 0;
+                    int previousLoadingPhase = directLoadingReadiness.optInt(
+                        "loading_phase", -1
+                    );
+                    boolean factorySetupObserved =
+                        previousLoadingPhase >= 3;
+                    boolean loadingPostprocessObserved =
+                        previousLoadingPhase == 5;
+                    boolean dataLoadCompleteObserved =
+                        directLoadingReadiness.optBoolean(
+                            "data_load_task_complete", false
+                        );
+                    boolean dataContentObserved = !"0x0".equals(
+                        directLoadingReadiness.optString(
+                            "battle_data_content", "0x0"
+                        )
+                    );
+                    while (loadingFrames < loadingMaxFrames &&
+                           !directLoadingReadiness.optBoolean(
+                               "natural_data_tables_ready", false
+                           ) &&
+                           directLoadingReadiness.optInt(
+                               "current_state_type", -1
+                           ) == 1 &&
+                           (System.nanoTime() - loadingStartedNanos) <
+                               loadingTimeoutMillis * 1_000_000L) {
                         directLoadingFrame = new JSONObject(
                             nativePumpManager(args[0] + "/libg.so")
                         );
+                        ++loadingFrames;
+                        directLoadingReadiness = new JSONObject(
+                            nativeProbePrerequisites(args[0] + "/libg.so")
+                        );
+                        int loadingPhase = directLoadingReadiness.optInt(
+                            "loading_phase", -1
+                        );
+                        factorySetupObserved =
+                            factorySetupObserved || loadingPhase >= 3;
+                        loadingPostprocessObserved =
+                            loadingPostprocessObserved || loadingPhase == 5;
+                        dataLoadCompleteObserved =
+                            dataLoadCompleteObserved ||
+                            directLoadingReadiness.optBoolean(
+                                "data_load_task_complete", false
+                            );
+                        dataContentObserved =
+                            dataContentObserved || !"0x0".equals(
+                                directLoadingReadiness.optString(
+                                    "battle_data_content", "0x0"
+                                )
+                            );
+                        if (loadingPhase != previousLoadingPhase ||
+                            loadingFrames % 64 == 0 ||
+                            directLoadingReadiness.optBoolean(
+                                "natural_data_tables_ready", false
+                            )) {
+                            JSONObject progress = new JSONObject();
+                            progress.put("frame", loadingFrames);
+                            progress.put(
+                                "elapsed_ms",
+                                (System.nanoTime() - loadingStartedNanos) /
+                                    1_000_000.0
+                            );
+                            progress.put("readiness", directLoadingReadiness);
+                            System.out.println(
+                                "{\"schema_version\":1," +
+                                    "\"stage\":\"direct_loading_progress\"," +
+                                    "\"event\":\"checkpoint\",\"value\":" +
+                                    progress.toString() + "}"
+                            );
+                            System.out.flush();
+                            previousLoadingPhase = loadingPhase;
+                        }
+                        if (loadingSleepMillis > 0L &&
+                            !directLoadingReadiness.optBoolean(
+                                "natural_data_tables_ready", false
+                            )) {
+                            Thread.sleep(loadingSleepMillis);
+                        }
                     }
+                    long loadingElapsedNanos =
+                        System.nanoTime() - loadingStartedNanos;
+                    boolean loadingTimedOut =
+                        !directLoadingReadiness.optBoolean(
+                            "natural_data_tables_ready", false
+                        ) &&
+                        (loadingFrames >= loadingMaxFrames ||
+                         loadingElapsedNanos >=
+                             loadingTimeoutMillis * 1_000_000L);
+                    JSONObject loadingSummary = new JSONObject();
+                    loadingSummary.put("frames", loadingFrames);
+                    loadingSummary.put(
+                        "elapsed_ms", loadingElapsedNanos / 1_000_000.0
+                    );
+                    loadingSummary.put("timed_out", loadingTimedOut);
+                    loadingSummary.put(
+                        "factory_setup_observed", factorySetupObserved
+                    );
+                    loadingSummary.put(
+                        "loading_postprocess_observed",
+                        loadingPostprocessObserved
+                    );
+                    loadingSummary.put(
+                        "data_load_complete_observed",
+                        dataLoadCompleteObserved
+                    );
+                    loadingSummary.put(
+                        "data_content_observed", dataContentObserved
+                    );
+                    loadingSummary.put(
+                        "manager",
+                        directLoadingFrame != null
+                            ? directLoadingFrame : JSONObject.NULL
+                    );
+                    loadingSummary.put(
+                        "readiness", directLoadingReadiness
+                    );
                     System.out.println(
                         "{\"schema_version\":1,\"stage\":\"direct_loading_frames\"," +
                             "\"event\":\"after_call\",\"value\":" +
-                            directLoadingFrame.toString() + "}"
+                            loadingSummary.toString() + "}"
                     );
+                    if (binderlessAndroid) {
+                        String settleMillisValue = System.getenv(
+                            "CR_BINDERLESS_RESOURCE_SETTLE_MS"
+                        );
+                        if (settleMillisValue != null &&
+                            !settleMillisValue.isEmpty()) {
+                            long settleMillis = Long.parseLong(settleMillisValue);
+                            if (settleMillis < 0L || settleMillis > 60_000L) {
+                                throw new IllegalArgumentException(
+                                    "CR_BINDERLESS_RESOURCE_SETTLE_MS must be in 0..60000"
+                                );
+                            }
+                            if (settleMillis > 0L) {
+                                System.out.println(
+                                    "{\"schema_version\":1," +
+                                        "\"stage\":\"binderless_resource_settle\"," +
+                                        "\"event\":\"before\",\"milliseconds\":" +
+                                        settleMillis + "}"
+                                );
+                                System.out.flush();
+                                Thread.sleep(settleMillis);
+                                emitStage("binderless_resource_settle", "after");
+                            }
+                        }
+                    }
                     String preDataTablesJson =
                         nativeProbePrerequisites(args[0] + "/libg.so");
                     JSONObject preDataTables = new JSONObject(
                         preDataTablesJson
                     );
-                    if ("0x0".equals(preDataTables.optString(
+                    // E74B40 is a generated full-range loader. Calling it here
+                    // before LoadingState has established native dependency
+                    // order can pass a null per-table dependency to 12960C0.
+                    // Keep the JNI entry point only as an explicitly unsafe
+                    // reverse-engineering diagnostic; production startup is
+                    // driven exclusively by manager updates.
+                    boolean manualDataTablesDiagnostic = "1".equals(
+                        System.getenv(
+                            "CR_NATIVE_UNSAFE_MANUAL_DATATABLE_PUMP"
+                        )
+                    );
+                    if (manualDataTablesDiagnostic &&
+                        preDataTables.optBoolean(
+                            "data_load_task_ready", false
+                        ) &&
+                        "0x0".equals(preDataTables.optString(
                             "battle_data_content", "0x0")) &&
                         !"0x0".equals(preDataTables.optString(
                             "data_load_task", "0x0"))) {
@@ -1066,6 +1339,22 @@ public final class JniHost {
         }
     }
 
+    private static long readBoundedEnv(
+        String name, long defaultValue, long minimum, long maximum
+    ) {
+        String raw = System.getenv(name);
+        if (raw == null || raw.isEmpty()) {
+            return defaultValue;
+        }
+        long value = Long.parseLong(raw);
+        if (value < minimum || value > maximum) {
+            throw new IllegalArgumentException(
+                name + " must be in " + minimum + ".." + maximum
+            );
+        }
+        return value;
+    }
+
     private static JSONObject waitForBattle(
         String root, long timeoutMillis, String previousReplay, int minimumTick
     )
@@ -1100,11 +1389,16 @@ public final class JniHost {
         System.out.flush();
     }
 
-    private static Object createPackageContext(String packageName) throws Exception {
+    private static Object createPackageContext(
+        String runtimeRoot, String packageName
+    ) throws Exception {
         Class<?> looperClass = Class.forName("android.os.Looper");
         Method myLooper = looperClass.getMethod("myLooper");
         if (myLooper.invoke(null) == null) {
             looperClass.getMethod("prepareMainLooper").invoke(null);
+        }
+        if ("1".equals(System.getenv("CR_BINDERLESS_ANDROID"))) {
+            return new BinderlessContext(runtimeRoot, packageName);
         }
         Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
         Method systemMain = activityThreadClass.getDeclaredMethod("systemMain");

@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import unittest
 
-from training.schema import PotentialReward
+from training.schema import DefensiveTowerReward, PotentialReward
 
 
 def _state(side0_damage: int = 0, side1_damage: int = 0) -> dict:
@@ -28,6 +28,29 @@ def _state(side0_damage: int = 0, side1_damage: int = 0) -> dict:
 
 
 class RewardContractTests(unittest.TestCase):
+    def test_defensive_dense_reward_matches_reference_weights(self):
+        reward = DefensiveTowerReward()
+        previous = _state(side0_damage=0, side1_damage=0)
+        current = _state(side0_damage=1000, side1_damage=2000)
+        value = reward.transition(previous, current)
+        self.assertAlmostEqual(value[0], 2.0 - 1.2)
+        self.assertAlmostEqual(value[1], 1.0 - 2.4)
+
+    def test_defensive_dense_reward_adds_towers_and_terminal_outcome(self):
+        reward = DefensiveTowerReward()
+        previous = _state()
+        current = _state(side1_damage=4824)
+        value = reward.transition(previous, current)
+        self.assertAlmostEqual(value[0], 4.824 + 5.0)
+        self.assertAlmostEqual(value[1], -5.7888 - 5.0)
+        terminal = reward.transition(
+            current,
+            None,
+            terminal_rewards={0: 1.0, 1: -1.0},
+            done=True,
+        )
+        self.assertEqual(terminal, {0: 10.0, 1: -10.0})
+
     def test_potential_is_only_normalized_total_tower_hp_difference(self):
         reward = PotentialReward(gamma=0.99995, shaping_scale=0.20)
         state = _state(side0_damage=1200, side1_damage=2800)

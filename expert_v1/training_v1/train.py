@@ -11,9 +11,10 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Callable
 
 import numpy as np
 import torch
@@ -21,7 +22,7 @@ from torch.utils.data import DataLoader, RandomSampler
 
 from .dataset import NativeExpertSequenceDataset, collate_sequences
 from .losses import MetricAccumulator, behaviour_cloning_loss
-from .model import ExpertPolicyConfig, RecurrentExpertPolicy
+from .model import ExpertPolicyConfig, RecurrentExpertPolicy, configure_position_precision
 from .schema import (
     OBSERVATION_NATIVE,
     OBSERVATION_SEQUENCE,
@@ -144,6 +145,40 @@ class DatasetPrecomputedNormalizer:
             raise RuntimeError(f"checkpoint normalizer state is incompatible: {state}")
 
 
+class LiveTrainingWindow:
+    """Telemetry only: actual minibatch means, without changing the loss."""
+
+    FIELDS = ("loss", "loss_position", "loss_card", "gradient_norm")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.sums = {name: 0.0 for name in self.FIELDS}
+        self.loss_max = 0.0
+        self.gradient_max = 0.0
+        self.spikes10 = 0
+        self.spikes20 = 0
+
+    def add(self, metrics: Mapping[str, float]) -> None:
+        self.count += 1
+        for name in self.FIELDS:
+            self.sums[name] += float(metrics.get(name, 0.0))
+        loss = float(metrics["loss"])
+        self.loss_max = max(self.loss_max, loss)
+        self.gradient_max = max(self.gradient_max, float(metrics["gradient_norm"]))
+        self.spikes10 += int(loss > 10.0)
+        self.spikes20 += int(loss > 20.0)
+
+    def summary(self) -> dict[str, int | float]:
+        return {
+            "window_batches": self.count,
+            **{f"{name}_window_mean": value / max(1, self.count) for name, value in self.sums.items()},
+            "loss_window_max": self.loss_max,
+            "gradient_norm_window_max": self.gradient_max,
+            "loss_window_gt10": self.spikes10,
+            "loss_window_gt20": self.spikes20,
+        }
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
@@ -193,6 +228,90 @@ def _append_jsonl(path: Path, value: Mapping[str, Any]) -> None:
         handle.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _pending_checkpoint_request(run_root: Path, run_id: str, step: int) -> dict[str, Any] | None:
+    """Read-only command polling; malformed requests never change training settings."""
+    request_path = run_root / "control" / "checkpoint-request.json"
+    response_path = run_root / "control" / "checkpoint-response.json"
+    if not request_path.is_file():
+        return None
+    raw = request_path.read_bytes() if request_path.stat().st_size <= 8192 else b"oversized-request"
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        response = json.loads(response_path.read_text()) if response_path.is_file() else {}
+        if response.get("request_sha256") == digest:
+            return None
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("request must be an object")
+        request_id = value.get("request_id")
+        if not isinstance(request_id, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,96}", request_id) is None:
+            raise ValueError("invalid checkpoint request id")
+        if response.get("request_id") == request_id and response.get("status") == "saved":
+            return None
+        if value.get("expected_run_id") != run_id:
+            raise ValueError("checkpoint request run identity mismatch")
+        allowed = {"request_id", "expected_run_id", "at_step", "stop_after_save", "preserve", "export_fp16", "reason"}
+        if set(value) - allowed:
+            raise ValueError("unsupported checkpoint control fields")
+        at_step = value.get("at_step", 0)
+        if not isinstance(at_step, int) or isinstance(at_step, bool) or at_step < 0:
+            raise ValueError("at_step must be a nonnegative integer")
+        for name, default in (("stop_after_save", False), ("preserve", True), ("export_fp16", True)):
+            value.setdefault(name, default)
+            if not isinstance(value[name], bool):
+                raise ValueError(f"{name} must be boolean")
+        if step < at_step:
+            return None
+        return {**value, "request_sha256": digest}
+    except (ValueError, TypeError, UnicodeError) as error:
+        _atomic_json(response_path, {"status": "rejected", "request_sha256": digest,
+            "error": str(error), "global_step": step, "updated_utc": datetime.now(timezone.utc).isoformat()})
+        _append_jsonl(run_root / "events.jsonl", {"event": "checkpoint_request_rejected",
+            "request_sha256": digest, "global_step": step, "error": str(error)})
+        return None
+
+
+def _finish_checkpoint_request(run_root: Path, request: Mapping[str, Any], checkpoint: Mapping[str, Any],
+                               model: RecurrentExpertPolicy) -> dict[str, Any]:
+    step = int(checkpoint["global_step"])
+    latest = run_root / "checkpoints" / "latest.pt"
+    snapshot_root = run_root / "checkpoints" / "manual" / str(request["request_id"])
+    response = {"status": "saved", "request_id": request["request_id"],
+        "request_sha256": request.get("request_sha256"), "global_step": step,
+        "checkpoint": str(latest.resolve()), "stop_after_save": bool(request.get("stop_after_save", False)),
+        "updated_utc": datetime.now(timezone.utc).isoformat()}
+    if request.get("preserve", True) or request.get("export_fp16", True):
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+    if request.get("preserve", True):
+        snapshot = snapshot_root / f"checkpoint-{step}.pt"
+        if snapshot.exists():
+            if sha256_file(snapshot) != sha256_file(latest):
+                raise RuntimeError("conflicting existing manual checkpoint; preserving both states")
+        else:
+            _atomic_copy(latest, snapshot)
+        response["preserved_checkpoint"] = str(snapshot.resolve())
+        response["checkpoint_sha256"] = sha256_file(snapshot)
+        best = run_root / "checkpoints" / "best.pt"
+        if best.exists() and not (snapshot_root / "best.pt").exists():
+            _atomic_copy(best, snapshot_root / "best.pt")
+        if (snapshot_root / "best.pt").exists():
+            response["preserved_best_checkpoint"] = str((snapshot_root / "best.pt").resolve())
+        manifest = run_root / "manifest.json"
+        if manifest.exists() and not (snapshot_root / "source-run-manifest.json").exists():
+            _atomic_copy(manifest, snapshot_root / "source-run-manifest.json")
+    if request.get("export_fp16", True):
+        export = snapshot_root / f"weights-{step}-fp16.pt"
+        if not export.exists():
+            _atomic_torch(export, _inference_weights_payload(epoch=int(checkpoint["epoch"]), global_step=step,
+                model=model, dataset_manifest_sha256=str(checkpoint["dataset_manifest_sha256"]),
+                run_signature_sha256=str(checkpoint["run_signature_sha256"]), run_id=str(checkpoint["run_id"])))
+        response["inference_export"] = str(export.resolve())
+        response["inference_export_sha256"] = sha256_file(export)
+    _atomic_json(run_root / "control" / "checkpoint-response.json", response)
+    _append_jsonl(run_root / "events.jsonl", {"event": "checkpoint_requested_saved", **response})
+    return response
 
 
 def _seed(seed: int) -> None:
@@ -297,6 +416,10 @@ def _run_signature(
         payload["prefetch_factor"] = prefetch_factor
     if fused_adamw:
         payload["fused_adamw"] = True
+    if bool(getattr(args, "position_head_fp32", False)):
+        payload["position_head_fp32"] = True
+    if getattr(args, "position_logit_softcap", None) is not None:
+        payload["position_logit_softcap"] = float(args.position_logit_softcap)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest(), payload
 
@@ -423,6 +546,7 @@ def _evaluate(
     maximum_batches: int,
     normalizer: DatasetPrecomputedNormalizer,
     precision: str = "fp32",
+    progress_callback: Callable[[int, dict[str, float]], None] | None = None,
 ) -> dict[str, float]:
     model.eval()
     accumulator = MetricAccumulator()
@@ -436,9 +560,13 @@ def _evaluate(
                 dtype=torch.bfloat16,
                 enabled=precision == "bf16",
             ):
-                output = model.forward_batch(batch)
+                output = model.forward_batch(batch, supervised_positions=model.config.position_head_fp32)
                 _loss, metrics = behaviour_cloning_loss(output, batch, model.config)
+            if not bool(torch.isfinite(_loss)):
+                raise FloatingPointError("expert BC validation loss became non-finite")
             accumulator.add(metrics)
+            if progress_callback is not None:
+                progress_callback(index + 1, accumulator.result())
     return accumulator.result()
 
 
@@ -558,6 +686,7 @@ def _checkpoint_payload(
     batch_in_epoch: int,
     batches_in_epoch: int,
     epoch_start_train_generator_state: torch.Tensor,
+    epoch_sampler_needs_tail: bool = False,
 ) -> dict[str, Any]:
     return {
         "kind": CHECKPOINT_KIND,
@@ -587,6 +716,7 @@ def _checkpoint_payload(
         "epoch_start_train_generator_state": (
             epoch_start_train_generator_state.detach().cpu().clone()
         ),
+        "epoch_sampler_needs_tail": bool(epoch_sampler_needs_tail) if not epoch_complete else False,
     }
 
 
@@ -660,6 +790,8 @@ def _certify_checkpoint(
         raise RuntimeError(f"checkpoint role mismatch: {path}")
     if not isinstance(value.get("model_state"), Mapping):
         raise RuntimeError(f"checkpoint model state is malformed: {path}")
+    if "epoch_sampler_needs_tail" in value and not isinstance(value["epoch_sampler_needs_tail"], bool):
+        raise RuntimeError(f"checkpoint sampler continuation flag is malformed: {path}")
     optimizer_state = value.get("optimizer_state")
     if (
         not isinstance(optimizer_state, Mapping)
@@ -954,7 +1086,10 @@ def run(args: argparse.Namespace) -> Path:
             lambda_max=args.lambda_max,
             lambda_initial=args.lambda_initial,
             observation_mode=observation_mode,
+            position_head_fp32=bool(getattr(args, "position_head_fp32", False)),
+            position_logit_softcap=getattr(args, "position_logit_softcap", None),
         )
+        configure_position_precision(config)
         optimizer_identity_sha256, optimizer_contract = _optimizer_identity(
             args,
             run_id=run_id,
@@ -1134,6 +1269,7 @@ def run(args: argparse.Namespace) -> Path:
         completed_epoch = 0
         resume_batch_in_epoch = 0
         resume_epoch_start_generator_state: torch.Tensor | None = None
+        resume_sampler_needs_tail = False
         latest_exists = (run_root / "checkpoints" / "latest.pt").is_file()
         if continuing and latest_exists:
             checkpoint_path, checkpoint = _load_resume_checkpoint(
@@ -1164,6 +1300,10 @@ def run(args: argparse.Namespace) -> Path:
                 run_id=run_id,
                 optimizer_identity_sha256=optimizer_identity_sha256,
             )
+            # Legacy resumed runs used an explicit suffix sampler. Missing
+            # metadata preserves that historical behavior. New checkpoints
+            # track RandomSampler's otherwise-empty final randperm consumption.
+            resume_sampler_needs_tail = bool(checkpoint.get("epoch_sampler_needs_tail", False))
             latest_path = run_root / "checkpoints" / "latest.pt"
             if checkpoint_path != latest_path:
                 _atomic_torch(latest_path, checkpoint)
@@ -1202,6 +1342,18 @@ def run(args: argparse.Namespace) -> Path:
                 train_batches_total, int(args.max_train_batches)
             )
         total_training_steps = train_batches_total * args.epochs
+        stop_at_step = int(getattr(args, "stop_at_step", 0))
+        stop_after_epoch = int(getattr(args, "stop_after_epoch", 0))
+        if stop_after_epoch and completed_epoch >= stop_after_epoch:
+            _atomic_json(progress_path, {"kind": "cr_expert_training_progress_v1", "status": "paused",
+                "global_step": updates, "epoch": completed_epoch, "epochs": args.epochs,
+                "reason": "stop_after_epoch", "updated_utc": datetime.now(timezone.utc).isoformat()})
+            return run_root
+        if stop_at_step and updates >= stop_at_step:
+            _atomic_json(progress_path, {"kind": "cr_expert_training_progress_v1", "status": "paused",
+                "global_step": updates, "epoch": completed_epoch, "epochs": args.epochs,
+                "reason": "stop_at_step_already_reached", "updated_utc": datetime.now(timezone.utc).isoformat()})
+            return run_root
         last_saved_percent = min(
             100, (updates * 100) // max(total_training_steps, 1)
         )
@@ -1219,6 +1371,10 @@ def run(args: argparse.Namespace) -> Path:
                 epoch_start_generator_state = train_generator.get_state().cpu().clone()
                 epoch_loader = train_loader
                 batch_offset = 0
+                sampler_needs_tail = (
+                    not args.max_train_batches or args.max_train_batches >= len(train_loader)
+                )
+                explicit_resume_loader = False
                 if (
                     resume_batch_in_epoch > 0
                     and epoch == completed_epoch + 1
@@ -1254,8 +1410,11 @@ def run(args: argparse.Namespace) -> Path:
                         **resume_loader_options,
                     )
                     batch_offset = resume_batch_in_epoch
+                    sampler_needs_tail = resume_sampler_needs_tail
+                    explicit_resume_loader = True
                 model.train()
                 accumulator = MetricAccumulator()
+                live_window = LiveTrainingWindow()
                 epoch_started = time.perf_counter()
                 examples = 0
                 _atomic_json(progress_path, {
@@ -1279,7 +1438,7 @@ def run(args: argparse.Namespace) -> Path:
                         dtype=torch.bfloat16,
                         enabled=precision == "bf16",
                     ):
-                        output = model.forward_batch(batch)
+                        output = model.forward_batch(batch, supervised_positions=config.position_head_fp32)
                         loss, metrics = behaviour_cloning_loss(output, batch, config)
                     if not bool(torch.isfinite(loss)):
                         raise FloatingPointError("expert BC loss became non-finite")
@@ -1291,6 +1450,7 @@ def run(args: argparse.Namespace) -> Path:
                         raise FloatingPointError("expert BC gradient became non-finite")
                     optimizer.step()
                     metrics["gradient_norm"] = float(gradient_norm.detach().item())
+                    live_window.add(metrics)
                     accumulator.add(metrics)
                     examples += int(batch["loss_mask"].sum().item())
                     updates += 1
@@ -1299,7 +1459,12 @@ def run(args: argparse.Namespace) -> Path:
                         100,
                         (updates * 100) // max(total_training_steps, 1),
                     )
-                    if completed_percent > last_saved_percent:
+                    checkpoint_request = _pending_checkpoint_request(run_root, run_id, updates)
+                    if stop_at_step and updates >= stop_at_step:
+                        checkpoint_request = {"request_id": f"stop-at-{stop_at_step}", "expected_run_id": run_id,
+                            "stop_after_save": True, "preserve": True, "export_fp16": True,
+                            "reason": "bounded_validation_target"}
+                    if completed_percent > last_saved_percent or checkpoint_request is not None:
                         rolling_checkpoint = _checkpoint_payload(
                             epoch=epoch,
                             global_step=updates,
@@ -1323,11 +1488,24 @@ def run(args: argparse.Namespace) -> Path:
                             epoch_start_train_generator_state=(
                                 epoch_start_generator_state
                             ),
+                            epoch_sampler_needs_tail=sampler_needs_tail,
                         )
                         _save_rolling_latest(
                             run_root / "checkpoints", rolling_checkpoint
                         )
                         last_saved_percent = completed_percent
+                        if checkpoint_request is not None:
+                            response = _finish_checkpoint_request(run_root, checkpoint_request, rolling_checkpoint, model)
+                            if checkpoint_request.get("stop_after_save", False):
+                                _atomic_json(progress_path, {"kind": "cr_expert_training_progress_v1", "status": "paused",
+                                    "epoch": epoch, "epochs": args.epochs, "batch": completed_batch,
+                                    "batches": train_batches_total, "global_step": updates,
+                                    "loss": float(loss.detach().item()), **live_window.summary(),
+                                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                                    "checkpoint": response, "updated_utc": datetime.now(timezone.utc).isoformat()})
+                                _append_jsonl(events, {"event": "run_paused", "global_step": updates,
+                                    "request_id": checkpoint_request["request_id"], "reason": checkpoint_request.get("reason", "user_request")})
+                                return run_root
                     if (
                         completed_batch % 100 == 0
                         or completed_batch == train_batches_total
@@ -1341,10 +1519,21 @@ def run(args: argparse.Namespace) -> Path:
                             "batches": train_batches_total,
                             "global_step": updates,
                             "loss": float(loss.detach().item()),
+                            **live_window.summary(),
+                            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                            "position_logit_absmax": float(output.position_logits.detach().abs().amax().item()),
                             "updated_utc": datetime.now(timezone.utc).isoformat(),
                         })
+                        live_window = LiveTrainingWindow()
+                if explicit_resume_loader and sampler_needs_tail:
+                    # RandomSampler consumes a second permutation even when
+                    # its final slice is empty; a fixed-index suffix does not.
+                    # Match the uninterrupted sampler state without changing
+                    # any batch that is actually trained.
+                    torch.randperm(len(train_loader.dataset), generator=train_generator)
                 resume_batch_in_epoch = 0
                 resume_epoch_start_generator_state = None
+                resume_sampler_needs_tail = False
                 _atomic_json(progress_path, {
                     "kind": "cr_expert_training_progress_v1",
                     "status": "validation",
@@ -1437,6 +1626,16 @@ def run(args: argparse.Namespace) -> Path:
                 )
                 _append_jsonl(events, epoch_event)
                 print(json.dumps(epoch_event, ensure_ascii=False), flush=True)
+                if stop_after_epoch and epoch >= stop_after_epoch:
+                    # All epoch artifacts and full validation precede this runtime-only stop.
+                    _append_jsonl(events, {"event": "run_paused", "reason": "stop_after_epoch",
+                        "epoch": epoch, "global_step": updates})
+                    _atomic_json(progress_path, {"kind": "cr_expert_training_progress_v1", "status": "paused",
+                        "epoch": epoch, "epochs": args.epochs, "batch": train_batches_total,
+                        "batches": train_batches_total, "global_step": updates,
+                        "reason": "stop_after_epoch", "validation": validation_metrics,
+                        "updated_utc": datetime.now(timezone.utc).isoformat()})
+                    return run_root
                 if epochs_without_improvement >= args.early_stopping_patience:
                     _append_jsonl(
                         events,
@@ -1573,6 +1772,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spatial-size", type=int, default=64)
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--fused-adamw", action="store_true")
+    parser.add_argument("--position-head-fp32", action="store_true")
+    parser.add_argument("--position-logit-softcap", type=float)
+    parser.add_argument("--stop-at-step", type=int, default=0,
+                        help="runtime-only global step limit: save complete state and pause; excluded from model signature")
+    parser.add_argument("--stop-after-epoch", type=int, default=0,
+                        help="runtime-only pause after validation and all epoch artifacts; excluded from model signature")
     parser.add_argument("--lambda-max", type=float, default=20.0)
     parser.add_argument("--lambda-initial", type=float, default=0.30)
     parser.add_argument("--early-stopping-patience", type=int, default=3)
@@ -1606,6 +1811,10 @@ def main() -> int:
         raise ValueError("workers and integrity workers must be non-negative")
     if args.prefetch_factor <= 0 or args.spatial_size <= 0:
         raise ValueError("prefetch factor and spatial size must be positive")
+    if args.stop_at_step < 0:
+        raise ValueError("stop-at-step must be nonnegative")
+    if args.stop_after_epoch < 0 or args.stop_after_epoch > args.epochs:
+        raise ValueError("stop-after-epoch must be zero or within the configured epochs")
     split_names = (args.train_split, args.validation_split, args.test_split)
     if set(split_names) != {"train", "validation", "test"}:
         raise ValueError(

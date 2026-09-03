@@ -1,183 +1,182 @@
 # CR Native Core
 
-当前沙盒模拟器主技术文档：
-[`docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md`](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+基于原版 Android x86_64 `libg.so` 的无界面《皇室战争》标准 1v1
+运行内核，并包含 Self-Play、专家模仿训练和可选的 MuMu 实时实验工具。
 
-原生全卡、觉醒/英雄形态与主动技能接口：
-[`docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md`](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+本仓库提供：
 
-历史综合技术路线（包含旧八卡阶段）：
-[`docs/TECHNICAL_ROUTE.zh-CN.md`](docs/TECHNICAL_ROUTE.zh-CN.md)
+- 原生 20 Hz 战斗推进、Replay 创建与进程内 reset；
+- 全卡、觉醒、英雄形态与主动技能接口；
+- 完整/紧凑原生观测与稳定 JSON-line TCP API；
+- Python 环境、Self-Play v0.1/v0.2 与 Expert Self-Play v1；
+- 环境引导、Runtime 哈希冻结、doctor 和一键 smoke；
+- 可选的人机 GUI、训练看板与 MuMu ARM64 只读观测/触控控制实验。
 
-Self-Play 吞吐优化报告：
-[`docs/throughput-optimization-20260823.md`](docs/throughput-optimization-20260823.md)
+仓库不包含游戏 APK、`libg.so`、付费/私有数据集、模型权重或训练产物。
+这些文件必须由使用者合法取得，并放入 Git 忽略目录。
 
-正式训练并发 Scaling Sweep：
-[`docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md`](docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md)
+## 版本兼容性
 
-Self-Play v0.2 20 Hz连续行动率设计：
-[`docs/SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md`](docs/SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md)
+| 路线 | 已验证版本 | 状态 |
+| --- | --- | --- |
+| 无界面 x86_64 原生内核 | `15.535.29 / 150535029` | 已冻结并通过证书 |
+| MuMu ARM64 实时实验 | `versionCode 160402002` | 严格版本锁，仅实验用途 |
+| 游戏商店当前更新版 | 未重新定位/认证 | 拒绝运行，不能复用旧 RVA |
 
-Self-Play v0.2 下一步训练方案：
-[`docs/SELFPLAY_V0_2_NEXT_TRAINING_PLAN.zh-CN.md`](docs/SELFPLAY_V0_2_NEXT_TRAINING_PLAN.zh-CN.md)
+游戏更新后不能只修改版本号。新 APK/`libg.so` 必须重新冻结哈希、重定位
+JNI/函数 RVA/结构偏移、重建卡牌目录，并重新通过 DataTables、Replay、六塔、
+RNG、下牌、技能、reset、时间、圣水和终局证书。完整步骤见
+[版本升级流程](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md#27-版本升级流程)。
 
-Isolated feasibility project for driving the original Clash Royale `libg.so`
-as a headless battle oracle and, if the experiment succeeds, as a high-speed
-self-play kernel.
+## 快速开始
 
-## Historical frozen training target
+### 1. 前置条件
 
-- Android runtime version: `150535029`
-- Content identity: `15.535.29` / packaged Core8-equivalent content
-- ABI: `x86_64`
-- Mode: standard 1v1
-- Levels: card 11, tower 11
-- Variants: the frozen v0.1/v0.2 policy uses base forms only
-- Deck: Knight, Archers, Giant, Skeletons, Musketeer, Hog Rider, Cannon, Arrows
+- Windows 10/11 x64；
+- Git、PowerShell 5.1+、Python 3.11+、JDK 17；
+- Android SDK Command-line Tools；
+- BIOS/UEFI 已开启 VT-x/AMD-V；
+- Windows Hypervisor Platform 或 Hyper-V；
+- 与绑定清单完全匹配、由你合法取得的 `150535029` Split APK/Runtime。
 
-This section describes the historical eight-card policy/checkpoint boundary,
-not the current native runtime. The runtime now accepts all 122 visible
-standard cards, 41 evolution forms, 16 hero forms, and the original active
-ability command. Existing eight-card Actor heads remain frozen and are not
-silently reused as full-card models.
-
-## Prime directive
-
-This repository does **not** reimplement battle rules. It tests whether the
-original native `Logic*` implementation can be initialized, stepped, observed,
-and reset behind a small stable ABI. Python/Rust code may provide lifecycle,
-input, output, batching, and training adapters only.
-
-## Isolation boundary
-
-- Production sandbox: `D:\Codex\E\AI ClashRoyale` (read-only reference)
-- Reverse-engineering evidence: `D:\Deepseek\cr_re` (read-only reference)
-- Large runtime inputs and generated evidence: `D:\AI_data`
-- All experimental source code and design decisions: this repository
-
-No feasibility experiment may modify either existing project. A successful
-prototype must expose its own manifest and explicit paths to external runtime
-artifacts.
-
-## First acceptance gate: passed
-
-The direct-native route is considered feasible only after one isolated command
-can:
-
-1. attest the exact runtime/content/libg identity;
-2. initialize or obtain a standard 1v1 `LogicBattle` without a visible game UI;
-3. advance an idle battle for 100 consecutive logic ticks;
-4. read back tick, both players, six towers, RNG, hands, cycle, and elixir;
-5. reproduce the same canonical state hash across ten fresh runs; and
-6. report measured startup latency and sustained ticks per second.
-
-All six conditions passed again against the v6 observation scope on
-2026-08-24. The certificate is reproducible with:
+### 2. 克隆和安装 Python 包
 
 ```powershell
-.\scripts\accept_direct_core.ps1 -Runs 10
+git clone https://github.com/IMAX9D/cr-native-sandbox.git
+cd cr-native-sandbox
+
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
 ```
 
-## One-click training: passed
-
-Double-click [`START_TRAINING.cmd`](START_TRAINING.cmd), or run:
+只运行原生 API 不需要训练依赖。需要训练、看板和完整测试时：
 
 ```powershell
-.\scripts\start_selfplay_v0_1.ps1
+python -m pip install -e ".[training,test]"
 ```
 
-The entry point builds the Java host and JNI bridge, starts the no-window
-Android x86_64 ABI containers when necessary, launches eight persistent
-Surface-free `app_process` workers, attests the original battle state, and
-runs recurrent PPO self-play. It does not start MuMu or the visual game.
+`third_party/Scroll` 只是历史架构参考，日常构建和运行不需要初始化该子模块。
 
-`START_TRAINING.cmd` invokes the guarded v0.1 stage runner
-`scripts/start_selfplay_v0_1.ps1`: 2 AVD / 8 Worker, 1M native ticks,
-milestone checkpoints, resource monitoring, paired side-swapped evaluation
-and report generation. `scripts/start_training.ps1` remains the lower-level
-launcher.
+### 3. 放置 Runtime
 
-To resume the frozen P010 checkpoint to the controlled 2M gate with live
-telemetry, double-click [`TRAINING_DASHBOARD.cmd`](TRAINING_DASHBOARD.cmd).
-The loopback-only browser page shows PPO losses, entropy/KL/explained variance,
-throughput, resources, card usage, progress and ETA. It cannot hide or stop an
-active training process, and the native Workers stop automatically at 2M.
+把同一安装包的 5 个 Split APK 放到：
 
-All mutable output is under `D:\AI_data\cr-native-core`:
+```text
+runtime/apks/
+├─ base.apk
+├─ split_config.en.apk
+├─ split_config.hdpi.apk
+├─ split_config.x86_64.apk
+└─ split_install_time_asset_pack.apk
+```
 
-- `selfplay-v0.1\runs\<run-id>\manifest.json`: immutable run configuration;
-- `selfplay-v0.1\runs\<run-id>\trajectories`: replayable episode tensors/metadata;
-- `selfplay-v0.1\runs\<run-id>\logs\events.jsonl`: append-only progress events;
-- `selfplay-v0.1\runs\<run-id>\checkpoints`: P000/latest/recovery state;
-- `selfplay-v0.1\latest_run.json`: atomic pointer to the newest checkpoint.
+不要混用不同版本、ABI 或不同安装来源的 Split。仓库不会下载或分发游戏文件。
 
-For a bounded end-to-end check, double-click
-[`SMOKE_TEST_TRAINING.cmd`](SMOKE_TEST_TRAINING.cmd). The acceptance requires a
-native episode, a PPO backward/update pass, and a loadable checkpoint—not just
-a responsive launcher.
-
-To inspect battle logic manually, double-click
-[`GAME_LOGIC_GUI.cmd`](GAME_LOGIC_GUI.cmd). The GUI exposes both sides, current
-hand cards, raw/native versus final training deployment masks, single/batched
-ticks, target links, path nodes, entity-native fields, state hash/RNG, terminal
-state, and JSON snapshot export. The top-right clock follows the certified
-3-minute regulation + 2-minute overtime schedule and labels ×1/×2/×3 elixir.
-
-The same entry was verified from a fully stopped VM/service and with four
-concurrent native workers on 2026-08-23. Training uses Emulator loopback TCP
-redirection (host ports 38031+) and CUDA Graph inference by default; the ADB
-ports 37031+ remain available for GUI/debug and fallback. See
-[`docs/training-system.md`](docs/training-system.md).
-
-The measured throughput sweet spot on the current machine is two 4-vCPU AVDs,
-four Workers per AVD, and policy batch 16. Launch it explicitly with:
+### 4. 配置本机路径
 
 ```powershell
-.\scripts\start_training.ps1 -Avds 2 -Workers 8
+Copy-Item runtime.env.example.ps1 runtime.env.ps1
+notepad runtime.env.ps1
+. .\runtime.env.ps1
 ```
 
-The formal default is 2 AVD / 8 Worker. Because measured free RAM can fall
-below 1 GiB, close unrelated memory-heavy applications before starting it.
+通常只需修改 Android SDK 与 JDK 路径。Runtime、AVD 与可写输出默认放在
+`runtime/`、用户 Android AVD 目录和 `%LOCALAPPDATA%`，均不会提交到 Git。
 
-## Native-core status
+### 5. 引导、诊断和验收
 
-- Strict no-Surface cold start is proven. No Surface is created, attached, or
-  borrowed at any point in `probe-direct`.
-- Original `libg` code loads all 158 DataTables resources, loads the standard
-  arena and tilemap through the native resource request list, creates the
-  standard 1v1 battle, and advances `0 -> 100` logic ticks.
-- Ten fresh processes produced the same RNG, hands, cycle, six tower entities,
-  tower HP, and `public-observe-v6` state hash `96598dc9028e1802`.
-- Mean cold process wall time was `14.405 s`. The measured replay-injection to
-  100-tick observation path averaged `9.795 ms`, or about `10,209` validated
-  ticks/s for one process. Cold wall time includes deployment orchestration and
-  a deliberate platform initialization fence.
+```powershell
+.\scripts\bootstrap.ps1
+.\scripts\doctor.ps1
+.\scripts\smoke.ps1
+```
 
-See `docs/experiment-0002-results.md` for exact direct-core evidence and native
-call-chain boundaries.
+- `bootstrap.ps1` 安装固定 SDK/NDK/System Image、创建 rootable AOSP AVD、
+  提取 Runtime 并冻结哈希；
+- `doctor.ps1` 检查工具链、Runtime、Assets、AVD、虚拟化、端口和磁盘；
+- `smoke.ps1` 构建宿主并验证 Tick 0→100、六塔、无 Surface 和规范状态哈希。
 
-## Experiment layout
+`smoke.ps1` 会启动无窗口 AVD；只想做静态检查时仅运行 `doctor.ps1`。
 
-- `android_probe/`: isolated Java lifecycle probe. It intentionally keeps the
-  JNI class name expected by the frozen bridge while varying only lifecycle
-  calls around the original `libg.so`.
-- `scripts/`: build/deploy/measurement entry points owned by this repository.
-- `scripts/accept_direct_core.ps1`: fresh-process determinism and baseline
-  certificate.
-- `native_core/`: persistent Worker lifecycle plus stable JSON-line client/env.
-- `training/`: observation schema, action masks, recurrent actor/critic,
-  self-play collection, PPO update, and atomic run storage.
-- `START_TRAINING.cmd`: guarded Self-Play v0.1 2-AVD/8-Worker stage entry.
-- `SMOKE_TEST_TRAINING.cmd`: bounded one-iteration acceptance entry.
-- `GAME_LOGIC_GUI.cmd`: interactive native battle-logic acceptance entry.
-- `artifacts/`: generated JARs, logs, and result JSON (ignored by Git).
+## 日常运行
 
-The Worker consumes frozen APK/runtime inputs from the production repository
-through explicit read-only paths. The Java host, JNI bridge, Python environment,
-training stack, and all writes are owned by this repository or `D:\AI_data`.
+加载环境后启动一个 Worker：
 
-## Upstream reference
+```powershell
+. .\runtime.env.ps1
+python -m native_core.worker start --workers 1
+```
 
-`third_party/Scroll` pins Reversed Rooms' experimental Clash Royale v1.3.2
-server-on-libg prototype. It is architectural evidence only: its ARMv7 layouts,
-RVAs, resources, and lifecycle must never be reused as current-version facts.
+停止服务并关闭其 AVD：
+
+```powershell
+python -m native_core.worker stop --workers 1 --stop-vm
+```
+
+Python API 示例：
+
+```python
+from native_core import NativeRoyaleEnv
+
+with NativeRoyaleEnv(port=37031) as env:
+    state = env.reset()
+    state = env.step(20)
+    print(state["tick"], state["state_hash"])
+```
+
+更多 API、部署网格、技能命令与观测字段见：
+
+- [沙盒运行时技术文档](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+- [全卡/形态/技能接口](docs/NATIVE_FULL_CARD_RUNTIME.zh-CN.md)
+- [Android 生命周期探针](android_probe/README.md)
+
+## 训练与 Expert Self-Play
+
+仓库包含三层训练代码：
+
+1. `training/`：历史 Self-Play v0.1；
+2. `selfplay_v2/`：连续行动率 Self-Play v0.2；
+3. `expert_v1/` 与 `expert_selfplay_v1/`：专家数据编译、BC、在线采样、
+   Critic/PPO、Promotion 和恢复流程。
+
+训练数据、checkpoint 和运行目录不在仓库中。旧的根目录 `.cmd` 与部分实验脚本
+记录了作者机器上的具体实验入口；对外部署应优先使用参数化的 Python/PowerShell
+入口，并显式传入 dataset、checkpoint、output/data-root。不要把文档中的本地
+`D:\...` 证据路径当成可移植默认值。
+
+当前实现说明：
+
+- [Expert Self-Play v1](docs/EXPERT_SELFPLAY_V1_IMPLEMENTATION.zh-CN.md)
+- [Expert Training v1](docs/EXPERT_TRAINING_V1.zh-CN.md)
+- [Self-Play v0.2 设计](docs/SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md)
+- [训练系统](docs/training-system.md)
+
+## MuMu 实时实验
+
+`native_core/mumu_live_controller.py` 是可选实验路径：只读观察游戏进程内存，
+动作通过普通 Android 触控发送，不会修改 `libg` 或在在线客户端中调用内部命令。
+
+它严格要求已验证的 `versionCode 160402002`。游戏更新后版本不一致会直接拒绝，
+这是预期保护。重新适配前不要关闭版本守卫，也不要把旧偏移套到新版本。
+
+## 发布与安全边界
+
+提交前应确认：
+
+- `git status --ignored` 中 APK、SO、JAR、Runtime、模型、数据与日志均被忽略；
+- 没有上传账号令牌、私有路径配置或训练样本；
+- `python -m pytest -q` 通过；
+- 对原生 Runtime 的声明只覆盖已证实的版本和 ABI。
+
+本仓库只提供研究与测试基础设施。使用者需要自行遵守游戏许可、平台条款及所在地
+法律。MIT 许可证仅覆盖本仓库原创代码，不覆盖 Supercell 或其他第三方资产。
+
+## 文档导航
+
+- [2026-09-03 发布整理说明](docs/RELEASE_20260903.zh-CN.md)
+- [主技术文档](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
+- [历史综合技术路线](docs/TECHNICAL_ROUTE.zh-CN.md)
+- [Self-Play 吞吐优化](docs/throughput-optimization-20260823.md)
+- [训练并发 Scaling](docs/TRAINING_CONCURRENCY_SCALING.zh-CN.md)

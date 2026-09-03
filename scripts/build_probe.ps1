@@ -1,7 +1,7 @@
 param(
-    [string]$JdkRoot = "D:\Codex\toolchains\jdk-17.0.20.1+1",
-    [string]$AndroidCommandLineTools = "D:\Codex\toolchains\android-sdk\cmdline-tools\latest",
-    [string]$AndroidJar = "D:\Codex\toolchains\android-sdk\platforms\android-35\android.jar"
+    [string]$JdkRoot = $(if ($env:CR_SANDBOX_JDK) { $env:CR_SANDBOX_JDK } else { throw "Missing CR_SANDBOX_JDK; copy and dot-source runtime.env.ps1 first" }),
+    [string]$AndroidCommandLineTools = $(if ($env:CR_SANDBOX_ANDROID_TOOLS) { $env:CR_SANDBOX_ANDROID_TOOLS } else { throw "Missing CR_SANDBOX_ANDROID_TOOLS; copy and dot-source runtime.env.ps1 first" }),
+    [string]$AndroidJar = $(if ($env:CR_SANDBOX_ANDROID_JAR) { $env:CR_SANDBOX_ANDROID_JAR } else { throw "Missing CR_SANDBOX_ANDROID_JAR; copy and dot-source runtime.env.ps1 first" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,8 +13,9 @@ $Output = Join-Path $ArtifactRoot "lifecycle-probe.jar"
 $Javac = Join-Path $JdkRoot "bin\javac.exe"
 $Java = Join-Path $JdkRoot "bin\java.exe"
 $D8Jar = Join-Path $AndroidCommandLineTools "lib\r8.jar"
+$AndroidTestMockJar = Join-Path (Split-Path -Parent $AndroidJar) "optional\android.test.mock.jar"
 
-foreach ($Path in @($Javac, $Java, $D8Jar, $AndroidJar)) {
+foreach ($Path in @($Javac, $Java, $D8Jar, $AndroidJar, $AndroidTestMockJar)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Missing probe build dependency: $Path"
     }
@@ -31,10 +32,12 @@ if (Test-Path -LiteralPath $ResolvedClasses -PathType Container) {
 New-Item -ItemType Directory -Path $ResolvedClasses -Force | Out-Null
 
 $Sources = @(Get-ChildItem -LiteralPath $SourceRoot -Recurse -Filter "*.java")
-& $Javac --release 8 -g -classpath $AndroidJar -d $ResolvedClasses $Sources.FullName
+$CompileClasspath = "$AndroidJar;$AndroidTestMockJar"
+& $Javac --release 8 -g -classpath $CompileClasspath -d $ResolvedClasses $Sources.FullName
 if ($LASTEXITCODE -ne 0) { throw "javac failed: $LASTEXITCODE" }
 $ClassFiles = @(Get-ChildItem -LiteralPath $ResolvedClasses -Recurse -Filter "*.class")
-& $Java -cp $D8Jar com.android.tools.r8.D8 --debug --min-api 23 --lib $AndroidJar --output $Output $ClassFiles.FullName
+& $Java -cp $D8Jar com.android.tools.r8.D8 --debug --min-api 23 `
+    --lib $AndroidJar --lib $AndroidTestMockJar --output $Output $ClassFiles.FullName
 if ($LASTEXITCODE -ne 0) { throw "D8 failed: $LASTEXITCODE" }
 
 [pscustomobject]@{

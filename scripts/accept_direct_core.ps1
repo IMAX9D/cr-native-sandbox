@@ -2,7 +2,7 @@ param(
     [ValidateRange(1, 100)]
     [int]$Runs = 10,
     [string]$ExpectedHash = "96598dc9028e1802",
-    [string]$EvidenceRoot = "D:\AI_data\cr-native-core\acceptance-direct-core"
+    [string]$EvidenceRoot = $(if ($env:CR_SANDBOX_DATA) { Join-Path $env:CR_SANDBOX_DATA "acceptance-direct-core" } else { throw "Missing CR_SANDBOX_DATA; dot-source runtime.env.ps1 first" })
 )
 
 $ErrorActionPreference = "Stop"

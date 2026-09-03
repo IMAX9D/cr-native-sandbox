@@ -21,11 +21,24 @@ from .client import request
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SDK = Path(r"D:\Codex\toolchains\android-sdk")
-DEFAULT_JDK = Path(r"D:\Codex\toolchains\jdk-17.0.20.1+1")
-DEFAULT_DATA = Path(r"D:\AI_data\cr-native-core")
-DEFAULT_APKS = Path(
-    r"D:\Codex\E\AI ClashRoyale\runtime\installed-150535029\apks"
+
+
+def _configured_path(name: str, fallback: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else fallback
+
+
+DEFAULT_SDK = _configured_path(
+    "CR_SANDBOX_ANDROID_SDK", PROJECT_ROOT / "local" / "android-sdk"
+)
+DEFAULT_JDK = _configured_path(
+    "CR_SANDBOX_JDK", PROJECT_ROOT / "local" / "jdk-17"
+)
+DEFAULT_DATA = _configured_path(
+    "CR_SANDBOX_DATA", PROJECT_ROOT / "local" / "data"
+)
+DEFAULT_APKS = _configured_path(
+    "CR_SANDBOX_APKS", PROJECT_ROOT / "runtime" / "apks"
 )
 DEFAULT_AVD_NAMES = (
     "royale_worker_api31",
@@ -75,8 +88,9 @@ class WorkerConfig:
 
     @property
     def avd_home(self) -> Path:
-        # The provisioned AVD is durable shared infrastructure under D:\AI_data.
-        return Path(r"D:\AI_data\android\avd")
+        return _configured_path(
+            "CR_SANDBOX_AVD_HOME", PROJECT_ROOT / "local" / "avd"
+        )
 
     @property
     def logs(self) -> Path:
@@ -126,8 +140,26 @@ class HeadlessWorkerPool:
         except Exception:
             return False
 
+    def _ensure_adb_root(self, timeout: float = 20.0) -> None:
+        """Reused AVDs may have restarted adbd as shell since provisioning."""
+        if self._adb("shell", "id", "-u", timeout=3).strip() == "0":
+            return
+        output = self._adb("root", timeout=15, check=False)
+        if "cannot run as root" in output.lower():
+            raise WorkerError("the native worker requires a root-capable debug AVD: " + output.strip())
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if self._adb("shell", "id", "-u", timeout=3).strip() == "0":
+                    return
+            except (WorkerError, subprocess.TimeoutExpired):
+                pass  # adbd briefly disconnects while changing identity.
+            time.sleep(0.5)
+        raise WorkerError("ADB did not regain root; preserving existing native assets")
+
     def start_vm(self, timeout: float = 150.0) -> dict[str, Any]:
         if self.vm_ready():
+            self._ensure_adb_root()
             return {"ready": True, "started": False, "serial": self.config.serial}
         self._require(self.config.emulator, self.config.adb)
         self.config.logs.mkdir(parents=True, exist_ok=True)
@@ -152,8 +184,7 @@ class HeadlessWorkerPool:
                 detail = stderr_path.read_text(encoding="utf-8", errors="replace")[-3000:]
                 raise WorkerError(f"emulator exited {process.returncode}: {detail}")
             if self.vm_ready():
-                self._adb("root", timeout=15, check=False)
-                time.sleep(1)
+                self._ensure_adb_root()
                 return {
                     "ready": True, "started": True, "serial": self.config.serial,
                     "launcher_pid": process.pid,

@@ -28,6 +28,7 @@ def main() -> int:
     parser.add_argument("--events", type=Path, required=True)
     parser.add_argument("--log-dir", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=2.0)
+    parser.add_argument("--cache-status", type=Path)
     args = parser.parse_args()
     args.log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(args.log_dir), flush_secs=2)
@@ -44,6 +45,21 @@ def main() -> int:
                 if step >= 0 and step != last_progress_step:
                     if isinstance(progress.get("loss"), (int, float)):
                         writer.add_scalar("train/loss_live", float(progress["loss"]), step)
+                    for source, tag in {
+                        "loss_window_mean": "train/loss",
+                        "loss_window_max": "train/loss_window_max",
+                        "loss_position_window_mean": "train/loss_position_window_mean",
+                        "loss_card_window_mean": "train/loss_card_window_mean",
+                        "gradient_norm_window_mean": "train/gradient_norm_window_mean",
+                        "gradient_norm_window_max": "train/gradient_norm_window_max",
+                        "loss_window_gt10": "train/loss_window_gt10",
+                        "loss_window_gt20": "train/loss_window_gt20",
+                        "window_batches": "train/window_batches",
+                        "learning_rate": "train/learning_rate",
+                        "position_logit_absmax": "train/position_logit_absmax",
+                    }.items():
+                        if isinstance(progress.get(source), (int, float)):
+                            writer.add_scalar(tag, float(progress[source]), step)
                     epoch = int(progress.get("epoch", 0))
                     batch = int(progress.get("batch", 0))
                     batches = int(progress.get("batches", 0))
@@ -54,6 +70,23 @@ def main() -> int:
                     writer.add_scalar("progress/epoch", epoch, step)
                     writer.add_scalar("progress/batch", batch, step)
                     writer.add_text("run/status", str(progress.get("status", "")), step)
+                    if args.cache_status is not None:
+                        try:
+                            cache = json.loads(args.cache_status.read_text())
+                            pid = int(cache["pid"])
+                            process = Path(f"/proc/{pid}")
+                            locked_gib = 0.0
+                            if (process / "status").is_file():
+                                for line in (process / "status").read_text().splitlines():
+                                    if line.startswith("VmLck:"):
+                                        locked_gib = int(line.split()[1]) / (1024 ** 2)
+                            writer.add_scalar("cache/locked_GiB", locked_gib, step)
+                            writer.add_scalar("cache/budget_GiB", float(cache["budget_gib"]), step)
+                            writer.add_scalar("cache/reserve_GiB", float(cache["reserve_gib"]), step)
+                            used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+                            writer.add_scalar("cache/container_used_GiB", used / (1024 ** 3), step)
+                        except (OSError, ValueError, KeyError):
+                            pass
                     last_progress_step = step
                     writer.flush()
             if args.events.is_file():
@@ -66,6 +99,11 @@ def main() -> int:
                             except json.JSONDecodeError:
                                 continue
                             step = int(event.get("global_step", 0))
+                            if event.get("event") == "checkpoint_validation_complete" and event.get("full_validation") is True:
+                                validation = event.get("validation") or {}
+                                add_numeric_group(writer, "checkpoint/validation", validation, step)
+                                if isinstance(validation.get("loss"), (int, float)):
+                                    writer.add_scalar("val/loss", float(validation["loss"]), step)
                             if event.get("event") == "epoch_complete":
                                 add_numeric_group(
                                     writer,
@@ -79,6 +117,11 @@ def main() -> int:
                                     event.get("validation") or {},
                                     step,
                                 )
+                                validation_loss = (event.get("validation") or {}).get("loss")
+                                if isinstance(validation_loss, (int, float)):
+                                    # Discoverable alias for COMPLETE epoch validation.
+                                    # Small-subset diagnostics must use a separate tag.
+                                    writer.add_scalar("val/loss", float(validation_loss), step)
                                 writer.add_scalar(
                                     "epoch/wall_seconds",
                                     float(event.get("wall_seconds", 0.0)),

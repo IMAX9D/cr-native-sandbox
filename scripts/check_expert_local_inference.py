@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from expert_v1.training_v1.dataset import NativeExpertSequenceDataset, collate_sequences
-from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy
+from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy, configure_position_precision
 from expert_v1.training_v1.schema import OBSERVATION_NATIVE, read_manifest
 
 
@@ -27,6 +29,8 @@ def main() -> int:
     parser.add_argument("--hidden-size", type=int)
     parser.add_argument("--card-embedding-size", type=int)
     parser.add_argument("--spatial-size", type=int)
+    parser.add_argument("--position-head-fp32", action="store_true", help="explicit architecture-only benchmark override")
+    parser.add_argument("--position-logit-softcap", type=float)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--steps", type=int, default=100)
     args = parser.parse_args()
@@ -51,6 +55,8 @@ def main() -> int:
         weights_payload = torch.load(args.weights, map_location="cpu", weights_only=False)
         if weights_payload.get("kind") != "cr_native_expert_inference_weights_v1":
             raise RuntimeError("unsupported inference weights artifact")
+        if weights_payload.get("dataset_manifest_sha256") != hashlib.sha256((root / "manifest.json").read_bytes()).hexdigest():
+            raise RuntimeError("weights and dataset manifest do not match")
         config = ExpertPolicyConfig(**weights_payload["model_config"])
     else:
         if any(
@@ -76,6 +82,11 @@ def main() -> int:
             lambda_initial=0.3,
             observation_mode=OBSERVATION_NATIVE,
         )
+    if args.position_head_fp32:
+        config = replace(config, position_head_fp32=True, position_logit_softcap=args.position_logit_softcap)
+    elif args.position_logit_softcap is not None:
+        raise ValueError("softcap override requires --position-head-fp32")
+    configure_position_precision(config)
     model = RecurrentExpertPolicy(config)
     if weights_payload is not None:
         model.load_state_dict(weights_payload["model_state"], strict=True)
@@ -104,6 +115,8 @@ def main() -> int:
             else None
         ),
         "parameters": parameters,
+        "runtime_model_config": config.to_dict(),
+        "configuration_override": bool(args.position_head_fp32),
         "weights_fp32_mib": parameters * 4 / (1024**2),
         "steps": args.steps,
         "milliseconds_per_tick": elapsed * 1000.0 / args.steps,

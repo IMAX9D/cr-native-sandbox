@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import time
@@ -19,7 +21,8 @@ import torch
 
 from expert_v1.compile_native_bc_dataset import _cell, _grid, _public_scalars
 from expert_v1.tick_store_v1.schema import actor_projection, normalize_native_state
-from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy
+from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy, configure_position_precision
+from .card_catalog import metadata
 from .env import CARD_NAMES, NativeRoyaleEnv
 from .gui import CARD_COSTS, NativeCoreGui
 from .worker import HeadlessWorkerPool, WorkerConfig
@@ -46,6 +49,7 @@ DEFAULT_EXPERT_DATASET = Path(
     r"\one-click-schema5-v3-current-frontier-v5\compiled\native-bc-v1"
 )
 EXPERT_WEIGHTS_KIND = "cr_native_expert_inference_weights_v1"
+EXPERT_POLICY_VERSIONS = ("expert-v1.1", "expert-v1.2-softcap")
 
 
 def _native_id_tokens(vocabulary: list[str]) -> dict[int, int]:
@@ -57,6 +61,50 @@ def _native_id_tokens(vocabulary: list[str]) -> dict[int, int]:
     return result
 
 
+def _deck_token_id(card: dict[str, int]) -> int:
+    """Match the compiler's form-specific deck vocabulary (not entity identity)."""
+    base = int(card["card_id"])
+    flags = int(card.get("form_flags", 0))
+    if flags == 3:
+        raise ValueError("Combined hero/evolution decks need an explicit token contract")
+    if flags:
+        key = {1: "evolution_form_id", 2: "hero_form_id"}[flags]
+        return int(metadata(base)[key])
+    return base
+
+
+def _ability_inputs(state: Any, side: int, vocabulary: dict[int, int], capacity: int,
+                    commands_allowed: bool) -> tuple[list[Any], list[int], list[bool]]:
+    # Slot assignment MUST retain cooling/unavailable entities, as in compilation.
+    candidates = sorted(
+        (entity for entity in state.entities if entity.side == side
+         and entity.ability_slot > 0 and entity.card_id in vocabulary),
+        key=lambda entity: entity.key,
+    )
+    if len(candidates) > capacity:
+        raise RuntimeError("Live ability candidates exceed trained capacity")
+    tokens = [vocabulary[entity.card_id] for entity in candidates]
+    mask = [commands_allowed and bool(entity.ability_available) for entity in candidates]
+    return candidates, tokens + [0] * (capacity - len(tokens)), mask + [False] * (capacity - len(mask))
+
+
+def _native_action(action: dict[str, Any]) -> dict[str, Any]:
+    fields = {"side", "type", "entity_id"} if action.get("type") == "ability" else {
+        "side", "deck_index", "x", "y"
+    }
+    return {key: value for key, value in action.items() if key in fields}
+
+
+def _policy_label(model_meta: dict[str, Any]) -> str:
+    version = str(model_meta.get("policy_version", "v0.1"))
+    if version in EXPERT_POLICY_VERSIONS:
+        step = int(model_meta.get("training_step", model_meta.get("native_ticks", 0)))
+        epoch = int(model_meta.get("iteration", 0))
+        label = "Expert v1.2" if version == "expert-v1.2-softcap" else "Expert"
+        return f"{label} 第{epoch}轮 · {step:,}步"
+    return "P050" if version == "v0.2" else "P010"
+
+
 def _load_policy(
     checkpoint_path: Path,
     *,
@@ -64,24 +112,28 @@ def _load_policy(
     cuda_graph: bool,
     expert_dataset_root: Path,
 ) -> tuple[Any, dict[str, Any]]:
-    """Load either the legacy v0.1 policy or continuous-rate v0.2."""
+    """Load a self-play policy or dataset-bound expert inference weights."""
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
     )
     if checkpoint.get("kind") == EXPERT_WEIGHTS_KIND:
-        manifest = json.loads(
-            (expert_dataset_root / "manifest.json").read_text(encoding="utf-8-sig")
-        )
+        manifest_bytes = (expert_dataset_root / "manifest.json").read_bytes()
+        expected_manifest = checkpoint.get("dataset_manifest_sha256")
+        if not expected_manifest or hashlib.sha256(manifest_bytes).hexdigest() != expected_manifest:
+            raise RuntimeError("expert weights and local dataset vocabulary manifest do not match")
+        manifest = json.loads(manifest_bytes.decode("utf-8-sig"))
         config = ExpertPolicyConfig(**checkpoint["model_config"])
+        configure_position_precision(config)
         model = RecurrentExpertPolicy(config).to(device)
         model.load_state_dict(checkpoint["model_state"], strict=True)
         model.eval()
         digest = state_dict_digest(model.state_dict())
         return model, {
             "kind": "checkpoint",
-            "policy_version": "expert-v1.1",
+            "policy_version": "expert-v1.2-softcap" if config.position_head_fp32 else "expert-v1.1",
             "path": str(checkpoint_path.resolve()),
             "native_ticks": int(checkpoint.get("global_step", 0)),
+            "training_step": int(checkpoint.get("global_step", 0)),
             "iteration": int(checkpoint.get("epoch", 0)),
             "model_digest": digest,
             "card_id_to_token": _native_id_tokens(
@@ -119,6 +171,24 @@ def _load_policy(
     }
 
 
+def _expert_card_or_position_choice(probabilities: torch.Tensor, generator: torch.Generator,
+                                    mode: str = "sample") -> int:
+    if mode not in ("sample", "greedy-placement"):
+        raise ValueError("unknown expert choice mode")
+    # Consume the same categorical draw in either mode. The separate timing
+    # hazard and action-kind draws retain their established sampling semantics.
+    sampled = int(torch.multinomial(probabilities, 1, generator=generator).item())
+    return int(probabilities.argmax().item()) if mode == "greedy-placement" else sampled
+
+
+def _expert_play_probability(rate: torch.Tensor, tick_seconds: float, scale: float = 1.0) -> torch.Tensor:
+    scale = float(scale)
+    if not math.isfinite(scale) or not 0 < scale <= 10:
+        raise ValueError("expert play-rate scale must be finite and in (0, 10]")
+    scaled_rate = rate if scale == 1.0 else rate * scale
+    return -torch.expm1(-scaled_rate * tick_seconds)
+
+
 class HumanVsAiGui(NativeCoreGui):
     HUMAN_SIDE = 0
     AI_SIDE = 1
@@ -136,18 +206,24 @@ class HumanVsAiGui(NativeCoreGui):
         device: torch.device,
         policy_seed: int,
         autostart: bool = True,
+        expert_choice_mode: str = "sample",
+        expert_play_rate_scale: float = 1.0,
     ) -> None:
         self.checkpoint = checkpoint.resolve()
         self.model = model
         self.model_meta = model_meta
         self.policy_version = str(model_meta.get("policy_version", "v0.1"))
-        self.policy_label = (
-            "Expert 3%"
-            if self.policy_version == "expert-v1.1"
-            else ("P050" if self.policy_version == "v0.2" else "P010")
-        )
+        self.policy_label = _policy_label(model_meta)
         self.device = device
         self.policy_seed = int(policy_seed)
+        if expert_choice_mode not in ("sample", "greedy-placement"):
+            raise ValueError("unknown expert choice mode")
+        self.expert_choice_mode = expert_choice_mode
+        self.expert_play_rate_scale = float(expert_play_rate_scale)
+        if not math.isfinite(self.expert_play_rate_scale) or not 0 < self.expert_play_rate_scale <= 10:
+            raise ValueError("expert play-rate scale must be finite and in (0, 10]")
+        if self.expert_play_rate_scale != 1.0:
+            self.policy_label += f" · {self.expert_play_rate_scale:g}x出牌频率"
         self.autostart = autostart
         self.encoder = ObservationEncoder()
         self.mask_cache = ActionMaskCache()
@@ -178,6 +254,8 @@ class HumanVsAiGui(NativeCoreGui):
         self.ai_last_action = "WAIT"
         self.human_plays = 0
         self.ai_plays = 0
+        self.human_abilities = 0
+        self.ai_abilities = 0
         self.unexpected_rejections = 0
         super().__init__(root, env, replay)
         self.selected_side.set(self.HUMAN_SIDE)
@@ -185,6 +263,12 @@ class HumanVsAiGui(NativeCoreGui):
         root.title(f"Clash Royale · 人类（蓝）vs {self.policy_label}（红）")
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._lock_debug_controls()
+        self.ability_box = ttk.LabelFrame(self.card_buttons[0].master, text="英雄 / 冠军主动技能")
+        self.ability_box.pack(fill="x", after=self.card_buttons[-1], pady=4)
+        self.ability_hint = ttk.Label(self.ability_box, text="部署英雄后显示技能；由原生核心判定冷却和圣水")
+        self.ability_hint.pack(fill="x")
+        self.ability_buttons: dict[int, Any] = {}
+        self._refresh_abilities()
 
     def _lock_debug_controls(self) -> None:
         stack = list(self.root.winfo_children())
@@ -231,6 +315,8 @@ class HumanVsAiGui(NativeCoreGui):
         self.ai_last_action = "WAIT"
         self.human_plays = 0
         self.ai_plays = 0
+        self.human_abilities = 0
+        self.ai_abilities = 0
         self.unexpected_rejections = 0
         self.action_log = []
         self.running = self.autostart
@@ -253,6 +339,8 @@ class HumanVsAiGui(NativeCoreGui):
         for index, button in enumerate(self.card_buttons):
             card_id = int(self.env.decks[self.HUMAN_SIDE][index]["card_id"])
             name = CARD_NAMES.get(card_id, str(card_id))
+            flags = int(self.env.decks[self.HUMAN_SIDE][index].get("form_flags", 0))
+            name += {0: "", 1: " [觉醒]", 2: " [英雄]", 3: " [双形态]"}[flags]
             cost = CARD_COSTS[card_id]
             playable = (
                 index in available
@@ -266,7 +354,47 @@ class HumanVsAiGui(NativeCoreGui):
                 state="normal" if playable else "disabled",
             )
 
+    def _refresh_abilities(self) -> None:
+        if not hasattr(self, "ability_box") or self.state is None:
+            return
+        entities = {int(e["entity_id"]): e for e in self.state.get("entities", [])
+                    if int(e.get("side", -1)) == self.HUMAN_SIDE
+                    and int(e.get("ability_slot", 0)) > 0 and int(e.get("hp", 0)) > 0}
+        for entity_id in set(self.ability_buttons) - set(entities):
+            self.ability_buttons.pop(entity_id).destroy()
+        gate = self.running and bool(self.state.get("episode", {}).get("commands_allowed", True))
+        for entity_id, entity in entities.items():
+            if entity_id not in self.ability_buttons:
+                button = ttk.Button(self.ability_box, command=lambda key=entity_id: self.queue_ability(key))
+                button.pack(fill="x", pady=1)
+                self.ability_buttons[entity_id] = button
+            available = bool(entity.get("ability_available"))
+            cooldown = int(entity.get("ability_cooldown_remaining_ms", 0)) / 1000
+            detail = "可发动" if available else f"未就绪 / 冷却 {cooldown:.1f}s"
+            name = entity.get("name", entity.get("form_name", str(entity["card_id"])))
+            self.ability_buttons[entity_id].configure(
+                text=f"{name} 技能 ({entity.get('ability_mana_cost', '?')}费) · {detail}",
+                state="normal" if available and gate else "disabled")
+        self.ability_hint.configure(text=f"技能发动：你 {self.human_abilities} / AI {self.ai_abilities}"
+                                    + (" · 先部署英雄" if not entities else " · 点击技能按钮发动"))
+
+    def queue_ability(self, entity_id: int) -> None:
+        if not self.running or self.state is None or self.pending_human_action is not None:
+            return
+        for entity in self.state.get("entities", []):
+            if (int(entity.get("entity_id", -1)) == entity_id
+                    and int(entity.get("side", -1)) == self.HUMAN_SIDE
+                    and int(entity.get("hp", 0)) > 0 and entity.get("ability_available")
+                    and self.state.get("episode", {}).get("commands_allowed", True)):
+                self.pending_human_action = {"type": "ability", "side": self.HUMAN_SIDE,
+                                             "entity_id": entity_id, "card_id": int(entity["card_id"])}
+                self.status.set("技能已排入下一个原生 Tick")
+                return
+
     def deploy(self, event: tk.Event[tk.Canvas]) -> None:
+        if self.pending_human_action is not None:
+            self.status.set("本 Tick 已有待执行动作")
+            return
         if not self.running or self.state is None:
             self.status.set("本局尚未运行或已经结束")
             return
@@ -386,7 +514,7 @@ class HumanVsAiGui(NativeCoreGui):
         native_state = normalize_native_state(self.state)
         actor = actor_projection(native_state, actor_side=self.AI_SIDE)
         deck_tokens = [
-            self.expert_card_id_to_token[int(card["card_id"])]
+            self.expert_card_id_to_token[_deck_token_id(card)]
             for card in self.env.decks[self.AI_SIDE]
         ]
         hand_tokens = [
@@ -395,6 +523,11 @@ class HumanVsAiGui(NativeCoreGui):
         ]
         next_token = deck_tokens[actor.own_player.next_deck_index]
         revealed = (self.expert_revealed_enemy_tokens + [0] * 8)[:8]
+        candidates, ability_tokens, ability_mask = _ability_inputs(
+            native_state, self.AI_SIDE, self.expert_ability_id_to_token,
+            self.model.config.max_ability_slots,
+            bool(self.state.get("episode", {}).get("commands_allowed", True)),
+        )
         known_entities = [
             entity
             for entity in actor.entities
@@ -454,11 +587,7 @@ class HumanVsAiGui(NativeCoreGui):
                 revealed_enemy_tokens=torch.tensor(
                     revealed, device=self.device
                 ).reshape(1, 1, 8),
-                ability_tokens=torch.zeros(
-                    (1, 1, self.model.config.max_ability_slots),
-                    dtype=torch.long,
-                    device=self.device,
-                ),
+                ability_tokens=torch.tensor(ability_tokens, dtype=torch.long, device=self.device).reshape(1, 1, -1),
                 delta_ticks=torch.ones((1, 1), device=self.device),
                 entity_tokens=entity_tokens,
                 entity_positions=entity_positions,
@@ -472,12 +601,15 @@ class HumanVsAiGui(NativeCoreGui):
             torch.sigmoid(output.rate_logits[0, 0].float())
             * self.model.config.lambda_max
         )
-        play_probability = -torch.expm1(-rate * self.TICK_SECONDS)
+        play_probability = _expert_play_probability(rate, self.TICK_SECONDS,
+            getattr(self, "expert_play_rate_scale", 1.0))
         draw = torch.rand((), generator=self.expert_generator, device=self.device)
         legal_cards = torch.as_tensor(
             card_mask, dtype=torch.bool, device=self.device
         )
-        if bool(draw >= play_probability) or not bool(legal_cards.any()):
+        legal_abilities = torch.tensor(ability_mask, dtype=torch.bool, device=self.device)
+        kind_mask = torch.stack((legal_cards.any(), legal_abilities.any()))
+        if bool(draw >= play_probability) or not bool(kind_mask.any()):
             return 0, 0, {
                 "card": 0,
                 "position": 0,
@@ -487,15 +619,28 @@ class HumanVsAiGui(NativeCoreGui):
                 "value": 0.0,
                 "play_probability": float(play_probability.item()),
             }
+        kind_probabilities = torch.softmax(output.action_kind_logits[0, 0].float().masked_fill(
+            ~kind_mask, torch.finfo(torch.float32).min), dim=-1)
+        kind = int(torch.multinomial(kind_probabilities, 1, generator=self.expert_generator).item())
+        kind_log_probability = torch.log(kind_probabilities[kind].clamp_min(1e-7))
+        if kind == 1:
+            probabilities = torch.softmax(output.ability_logits[0, 0].float().masked_fill(
+                ~legal_abilities, torch.finfo(torch.float32).min), dim=-1)
+            slot = int(torch.multinomial(probabilities, 1, generator=self.expert_generator).item())
+            entity = candidates[slot]
+            return 0, 0, {
+                "action_type": "ability", "entity_id": int(entity.key),
+                "card_id": int(entity.card_id), "ability_slot": slot,
+                "play_probability": float(play_probability.item()), "value": 0.0,
+                "log_probability": float((torch.log(play_probability.clamp_min(1e-7))
+                    + kind_log_probability + torch.log(probabilities[slot].clamp_min(1e-7))).item()),
+            }
         card_logits = output.card_logits[0, 0].float().masked_fill(
             ~legal_cards, torch.finfo(torch.float32).min
         )
         card_probabilities = torch.softmax(card_logits, dim=-1)
-        slot = int(
-            torch.multinomial(
-                card_probabilities, 1, generator=self.expert_generator
-            ).item()
-        )
+        slot = _expert_card_or_position_choice(card_probabilities, self.expert_generator,
+                                              getattr(self, "expert_choice_mode", "sample"))
         legal_positions = torch.as_tensor(
             position_masks[slot], dtype=torch.bool, device=self.device
         )
@@ -511,13 +656,11 @@ class HumanVsAiGui(NativeCoreGui):
             ~legal_positions, torch.finfo(torch.float32).min
         )
         position_probabilities = torch.softmax(position_logits, dim=-1)
-        position = int(
-            torch.multinomial(
-                position_probabilities, 1, generator=self.expert_generator
-            ).item()
-        )
+        position = _expert_card_or_position_choice(position_probabilities, self.expert_generator,
+                                                  getattr(self, "expert_choice_mode", "sample"))
         log_probability = (
             torch.log(play_probability.clamp_min(1e-7))
+            + kind_log_probability
             + torch.log(card_probabilities[slot].clamp_min(1e-7))
             + torch.log(position_probabilities[position].clamp_min(1e-7))
         )
@@ -532,12 +675,6 @@ class HumanVsAiGui(NativeCoreGui):
     def _sample_ai(self) -> tuple[dict[str, int] | None, dict[str, Any]]:
         assert self.state is not None
         self._prepare_ai_masks()
-        grid, scalars = self.encoder.encode(
-            self.state,
-            side=self.AI_SIDE,
-            public_actions=self.public_actions,
-        )
-        privileged = self.encoder.privileged(self.state, side=self.AI_SIDE)
         card_mask, position_masks, hand = build_action_masks(
             self.state,
             side=self.AI_SIDE,
@@ -548,13 +685,17 @@ class HumanVsAiGui(NativeCoreGui):
         position_masks = self._canonical_positions(
             position_masks, self.AI_SIDE
         )
-        if self.policy_version == "expert-v1.1":
+        if self.policy_version in EXPERT_POLICY_VERSIONS:
             card, position, sample_meta = self._sample_expert(
                 visible_hand=hand,
                 card_mask=card_mask[1:],
                 position_masks=position_masks,
             )
             self.ai_last_value = 0.0
+            if sample_meta.get("action_type") == "ability":
+                self.ai_last_action = f"技能 #{sample_meta['entity_id']}"
+                return {"type": "ability", "side": self.AI_SIDE,
+                        "entity_id": sample_meta["entity_id"], "card_id": sample_meta["card_id"]}, sample_meta
             if card == 0:
                 self.ai_last_action = "WAIT"
                 return None, sample_meta
@@ -569,6 +710,8 @@ class HumanVsAiGui(NativeCoreGui):
                 "y": y,
                 "card_id": card_id,
             }, sample_meta
+        grid, scalars = self.encoder.encode(self.state, side=self.AI_SIDE, public_actions=self.public_actions)
+        privileged = self.encoder.privileged(self.state, side=self.AI_SIDE)
         tensors = (
             torch.from_numpy(grid).unsqueeze(0).to(self.device),
             torch.from_numpy(scalars).unsqueeze(0).to(self.device),
@@ -623,10 +766,7 @@ class HumanVsAiGui(NativeCoreGui):
         self.pending_human_action = None
         ai_action, ai_sample = self._sample_ai()
         actions = [
-            {
-                key: value for key, value in action.items()
-                if key in {"side", "deck_index", "x", "y"}
-            }
+            _native_action(action)
             for action in (human_action, ai_action)
             if action is not None
         ]
@@ -653,11 +793,13 @@ class HumanVsAiGui(NativeCoreGui):
                 + json.dumps(results_by_side.get(self.HUMAN_SIDE), ensure_ascii=False)
             )
         next_public: dict[int, dict[str, int] | None] = {0: None, 1: None}
-        if human_action is not None and self.HUMAN_SIDE in accepted:
+        if human_action is not None and self.HUMAN_SIDE in accepted and human_action.get("type") == "ability":
+            self.human_abilities += 1
+        elif human_action is not None and self.HUMAN_SIDE in accepted:
             self.human_plays += 1
-            if self.policy_version == "expert-v1.1":
+            if self.policy_version in EXPERT_POLICY_VERSIONS:
                 token = self.expert_card_id_to_token.get(
-                    int(human_action["card_id"])
+                    _deck_token_id(self.env.decks[self.HUMAN_SIDE][int(human_action["deck_index"])])
                 )
                 if token is not None and token not in self.expert_revealed_enemy_tokens:
                     self.expert_revealed_enemy_tokens.append(token)
@@ -666,7 +808,9 @@ class HumanVsAiGui(NativeCoreGui):
                 "x": int(human_action["x"]),
                 "y": int(human_action["y"]),
             }
-        if ai_action is not None and self.AI_SIDE in accepted:
+        if ai_action is not None and self.AI_SIDE in accepted and ai_action.get("type") == "ability":
+            self.ai_abilities += 1
+        elif ai_action is not None and self.AI_SIDE in accepted:
             self.ai_plays += 1
             next_public[self.AI_SIDE] = {
                 "card_id": int(ai_action["card_id"]),
@@ -718,10 +862,12 @@ class HumanVsAiGui(NativeCoreGui):
 
     def render(self) -> None:
         super().render()
+        self._refresh_abilities()
         if self.state is None or self.state.get("episode", {}).get("terminated"):
             return
         queued = (
-            CARD_NAMES.get(int(self.pending_human_action["card_id"]), "?")
+            ("技能" if self.pending_human_action.get("type") == "ability" else
+             CARD_NAMES.get(int(self.pending_human_action["card_id"]), "?"))
             if self.pending_human_action else "无"
         )
         self.status.set(
@@ -742,11 +888,15 @@ class HumanVsAiGui(NativeCoreGui):
             "checkpoint": str(self.checkpoint),
             "model": self.model_meta,
             "policy_seed": self.policy_seed,
+            "expert_choice_mode": getattr(self, "expert_choice_mode", "sample"),
+            "expert_play_rate_scale": getattr(self, "expert_play_rate_scale", 1.0),
             "battle_seed": int(self.seed.get()),
             "native_tick_hz": 20,
             "policy_updated": False,
             "human_plays": self.human_plays,
             "ai_plays": self.ai_plays,
+            "human_abilities": self.human_abilities,
+            "ai_abilities": self.ai_abilities,
             "unexpected_rejections": self.unexpected_rejections,
             "state": self.state,
             "episode": (self.state or {}).get("episode", {}),
@@ -829,9 +979,14 @@ def main() -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--policy-seed", type=int, default=20260824)
     parser.add_argument("--battle-seed", type=int, default=20260824)
+    parser.add_argument("--expert-choice-mode", choices=("sample", "greedy-placement"), default="sample")
+    parser.add_argument("--expert-play-rate-scale", type=float, default=1.0,
+                        help="inference-only action-rate multiplier; native legality checks remain unchanged")
     parser.add_argument("--keep-worker", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
+    if not math.isfinite(args.expert_play_rate_scale) or not 0 < args.expert_play_rate_scale <= 10:
+        parser.error("expert-play-rate-scale must be finite and in (0, 10]")
     if args.device == "auto":
         args.device = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(args.device)
@@ -858,6 +1013,8 @@ def main() -> int:
         device=device,
         policy_seed=args.policy_seed,
         autostart=not args.smoke,
+        expert_choice_mode=args.expert_choice_mode,
+        expert_play_rate_scale=args.expert_play_rate_scale,
     )
     gui.seed.set(args.battle_seed)
     try:
