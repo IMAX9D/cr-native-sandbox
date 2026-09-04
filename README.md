@@ -61,7 +61,17 @@ python -m pip install -e ".[training,test]"
 
 ### 3. 放置 Runtime
 
-把同一安装包的 5 个 Split APK 放到：
+如果已经取得配套 `cr-native-sandbox-runtime-150535029.zip`，先校验：
+
+```powershell
+$Expected = "8d829f219455ad5cb48abba717eaac2ffa97e0d51c8c9dbc76d2ad91ed15bc28"
+$Actual = (Get-FileHash .\cr-native-sandbox-runtime-150535029.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Expected) { throw "Runtime ZIP SHA-256 mismatch: $Actual" }
+Expand-Archive .\cr-native-sandbox-runtime-150535029.zip -DestinationPath .
+```
+
+ZIP 内以 `runtime/` 为根目录，直接解压到仓库即可。也可以手工把同一安装包的
+5 个 Split APK 放到：
 
 ```text
 runtime/apks/
@@ -99,6 +109,9 @@ notepad runtime.env.ps1
 - `smoke.ps1` 构建宿主并验证 Tick 0→100、六塔、无 Surface 和规范状态哈希。
 
 `smoke.ps1` 会启动无窗口 AVD；只想做静态检查时仅运行 `doctor.ps1`。
+
+Linux x86_64 无 AVD/KVM 部署见独立仓库：
+[IMAX9D/cr-native-linux-bionic](https://github.com/IMAX9D/cr-native-linux-bionic)。
 
 ## 日常运行
 

@@ -7,8 +7,8 @@
   "mode": "standard_1v1",
   "bundle": {
     "name": "cr-native-sandbox-runtime-150535029.zip",
-    "size": 896114476,
-    "sha256": "82b2e79eaa03aa98d83f5cfec78b053179a77f1f7c0d1fd274f8ec5c833c4310"
+    "size": 899751022,
+    "sha256": "8d829f219455ad5cb48abba717eaac2ffa97e0d51c8c9dbc76d2ad91ed15bc28"
   },
   "frozen_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
   "note": "Canonical local runtime bundle. The archive itself is not distributed in this repository. Every listed APK/native library is re-verified by doctor.ps1.",
