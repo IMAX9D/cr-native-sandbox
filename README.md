@@ -62,6 +62,7 @@ python -m pip install -e ".[training,test]"
 ### 3. 放置 Runtime
 
 如果已经取得配套 `cr-native-sandbox-runtime-150535029.zip`，先校验：
+发布包可从 [Runtime 150535029 Release](https://github.com/IMAX9D/cr-native-sandbox/releases/tag/runtime-150535029-20260903) 下载。
 
 ```powershell
 $Expected = "8d829f219455ad5cb48abba717eaac2ffa97e0d51c8c9dbc76d2ad91ed15bc28"
