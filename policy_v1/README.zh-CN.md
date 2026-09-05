@@ -14,12 +14,17 @@
 git clone https://github.com/IMAX9D/cr-native-sandbox.git
 cd cr-native-sandbox
 # 如果 V1 尚未合并 main：git switch feature/policy-v1-offline-bc
+# 旧服务器镜像先升级安装工具；这些版本兼容 Python 3.8。
+python -m pip install --upgrade pip==24.3.1 setuptools==75.3.2 wheel==0.45.1
 python -m pip install 'numpy>=1.22,<2'
 # 镜像已有可用的 PyTorch 2.x，可跳过下一行。
 python -m pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
-python -m pip install --no-deps -e ./policy_v1
+python -m pip install --no-build-isolation --no-deps -e ./policy_v1
 cr-policy-smoke
 ```
+
+若出现 `setup.py or setup.cfg not found`，是旧 pip 不支持 PEP 660 可编辑安装。
+先执行上面的安装工具升级命令，再重试安装；不需要添加 setup.py 或安装原生运行时。
 
 `cr-policy-smoke` 自动生成很小的合成数据、准备事件索引，在 CPU 上训练三步并评估、保存 checkpoint。
 这只验证安装与训练链路，输出目录会打印到终端。可指定一个新目录：

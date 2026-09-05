@@ -5,7 +5,8 @@ See [Linux setup, data preparation, training and DDP instructions (中文)](READ
 Install **this directory**, not the parent runtime project:
 
 ```bash
-python -m pip install -e ./policy_v1
+python -m pip install --upgrade pip==24.3.1 setuptools==75.3.2 wheel==0.45.1
+python -m pip install --no-build-isolation -e ./policy_v1
 cr-policy-smoke
 ```
 
