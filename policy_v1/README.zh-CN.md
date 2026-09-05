@@ -163,3 +163,34 @@ FP16 起始 loss scale 较大时可能出现梯度溢出。训练器会输出 `p
 降低 scale 并丢弃该批更新，不修改权重或优化器状态，也不增加成功更新的 `step`。
 连续 32 批仍溢出则停止，避免隐藏持续数值问题；可在新目录用 `--precision fp32` 对照排查。
 FP32/BF16 出现非有限梯度仍直接报错。CUDA 数值稳定性应在目标服务器验证。
+
+## 定位 GPU 等数据
+
+独立组件，不修改训练入口，不读取或保存模型权重。使用与训练相同的数据加载、
+模型、损失和优化器更新；随机初始化临时模型，默认预热 5 批后测量 50 批。
+在仓库根目录运行，无需重新安装。请与长训错开，避免争抢 GPU/数据盘。
+以下 split 参数适用于历史大训练集名为 validation 的数据：
+
+```bash
+python -m policy_v1.benchmark \
+  --data /root/autodl-tmp/expert-dataset/native-bc-v1 \
+  --cache /root/autodl-tmp/policy-v1-cache \
+  --split validation --device cuda --precision fp16 \
+  --width 256 --layers 3 --heads 8 \
+  --batch-size 32 --workers 2 --warmup 5 --steps 50
+```
+
+最终 `phase: benchmark` 的 `stage_ms_per_batch` 给出每批平均毫秒数：
+
+- `data_wait`：等待下一批，包括未被预取隐藏的读取、CPU 整理、collate 和 pin-memory。
+  它不能单独区分磁盘慢还是 CPU 慢。
+- `host_to_device`：传到 GPU 完成的时间。
+- `forward` / `backward`：前向/反向，包含 CPU 调度。
+- `loss`：损失和指标计算，包含其同步开销。
+- `optimizer`：梯度检查、裁剪和参数更新。
+
+`data_wait_percent` 是等待占上述阶段总耗时的比例；`windows_per_timed_second` 是相同口径的吞吐。
+`successful_updates` 和 `skipped_overflows` 仅统计预热后的批次。
+CUDA 在阶段边界同步，避免异步提交造成计时失真，但会改变流水重叠，结果不是无扰动生产吞吐。
+不测验证、保存和日志时间。数据不足时报告实际测量批数。
+可保持其他参数相同，对比 `--workers 0/2/4`；系统文件缓存会影响先后测试，建议重复比较。
