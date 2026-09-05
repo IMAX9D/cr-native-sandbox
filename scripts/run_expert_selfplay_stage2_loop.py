@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import json
 import math
@@ -13,11 +15,16 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from expert_selfplay_v1.mps_runtime import ManagedMPS
+
 COLLECT_SCRIPT = PROJECT_ROOT / "scripts" / "run_expert_selfplay_v1.py"
 TRAIN_SCRIPT = PROJECT_ROOT / "scripts" / "train_expert_selfplay_stage2.py"
 ENSURE_WORKERS_SCRIPT = PROJECT_ROOT / "scripts" / "ensure_bionic_workers.py"
@@ -47,6 +54,32 @@ def read_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"JSON root must be an object: {path}")
     return value
+
+
+def evict_file_cache(path: Path) -> bool:
+    """Release pages for an immutable rollout after its learner consumed it."""
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return False
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(descriptor)
+    return True
+
+
+def evict_rollout_cache(update_dir: Path) -> tuple[int, int]:
+    count = 0
+    size = 0
+    for payload in update_dir.glob("collect-p*/rollouts/shard-*/rollout.pt"):
+        length = payload.stat().st_size
+        if evict_file_cache(payload):
+            count += 1
+            size += length
+    return count, size
 
 
 def parse_ports(value: str) -> list[int]:
@@ -98,7 +131,7 @@ def collector_command(
     policy_version: int,
     behavior_checkpoint: Path,
 ) -> list[str]:
-    return [
+    command = [
         str(args.python), str(args.collect_script.resolve()),
         "--checkpoint", str(behavior_checkpoint),
         "--opponent-checkpoint", str(args.base_opponent_checkpoint.resolve()),
@@ -121,6 +154,28 @@ def collector_command(
         "--device", str(args.device),
         "--cpu-threads", str(args.collector_cpu_threads),
     ]
+    idle_step_ticks = getattr(args, "idle_step_ticks", None)
+    if idle_step_ticks is not None:
+        command.extend(("--idle-step-ticks", str(idle_step_ticks)))
+    collection_waves = int(getattr(args, "collection_waves", 1))
+    if collection_waves != 1:
+        command.extend(("--collection-waves", str(collection_waves)))
+    if bool(getattr(args, "async_shard_writes", False)):
+        command.append("--async-shard-writes")
+    if bool(getattr(args, "rolling_collection", False)):
+        command.append("--rolling-collection")
+    if bool(getattr(args, "compile_actor", False)):
+        command.extend((
+            "--compile-actor",
+            "--compile-batch-size", str(args.compile_batch_size),
+            "--compile-entity-slots", str(args.compile_entity_slots),
+        ))
+    if bool(getattr(args, "dense_policy_sampling", False)):
+        command.append("--dense-policy-sampling")
+    policy_server_address = getattr(args, "policy_server_address", None)
+    if policy_server_address:
+        command.extend(("--policy-server-address", str(policy_server_address)))
+    return command
 
 
 def trainer_command(
@@ -140,10 +195,24 @@ def trainer_command(
         "--cpu-threads", str(args.trainer_cpu_threads),
         "--ppo-epochs", str(args.ppo_epochs),
         "--chunk-batch-size", str(args.chunk_batch_size),
+        "--preprocess-window-size", str(
+            getattr(args, "preprocess_window_size", 256)
+        ),
+        "--preprocess-batch-size", str(
+            getattr(args, "preprocess_batch_size", 3)
+        ),
         "--retain-checkpoints", str(args.retain_checkpoints),
     ]
     for shard in shards:
         command.extend(("--shard", str(shard)))
+    if getattr(args, "prepared_cache_gib", 4.0) != 4.0:
+        command.extend(("--prepared-cache-gib", str(args.prepared_cache_gib)))
+    if getattr(args, "training_precision", "float32") != "float32":
+        command.extend(("--training-precision", str(args.training_precision)))
+    if bool(getattr(args, "fused_optimizer", False)):
+        command.append("--fused-optimizer")
+    if int(getattr(args, "chunk_padding_multiple", 0)):
+        command.extend(("--chunk-padding-multiple", str(args.chunk_padding_multiple)))
     return command
 
 
@@ -152,6 +221,8 @@ def ensure_workers_command(
     *,
     ports: Sequence[int],
 ) -> list[str] | None:
+    if bool(getattr(args, "skip_worker_restore", False)):
+        return None
     script = getattr(args, "ensure_workers_script", None)
     if script is None:
         return None
@@ -166,18 +237,88 @@ def ensure_workers_command(
         "--runtime-root", str(Path(runtime_root).resolve()),
         "--base-port", str(min(ports)),
         "--count", str(len(ports)),
+        "--execution-mode", str(
+            getattr(args, "worker_execution_mode", "interpreter")
+        ),
         "--ready-timeout", str(getattr(args, "worker_ready_timeout", 120.0)),
     ]
 
 
 def validate_collection(run_dir: Path) -> Path:
+    return validate_collection_shards(run_dir)[0]
+
+
+def wait_collectors(
+    processes: Sequence[subprocess.Popen],
+    collection_dirs: Sequence[Path],
+    *,
+    prepare_shard: Callable[[Path], None] | None = None,
+    timeout_seconds: float = 900.0,
+) -> int:
+    """Prepare atomically published shards while other native games continue."""
+    deadline = time.monotonic() + timeout_seconds
+    queued: set[Path] = set()
+    futures = []
+    pool = None if prepare_shard is None else ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="rollout-preparation"
+    )
+    try:
+        while True:
+            codes = [process.poll() for process in processes]
+            if any(code not in (None, 0) for code in codes):
+                details = {}
+                for index, code in enumerate(codes):
+                    if code not in (None, 0):
+                        log = collection_dirs[index].with_suffix(".log")
+                        if log.is_file():
+                            details[str(log)] = log.read_text(encoding="utf-8", errors="replace")[-4000:]
+                raise RuntimeError(f"Stage-2 collector failure codes: {codes}; logs={details}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Stage-2 collection/preparation exceeded its time limit")
+            if pool is not None:
+                for directory in collection_dirs:
+                    for shard in sorted(directory.glob("rollouts/shard-*")):
+                        if shard not in queued and (shard / "manifest.json").is_file():
+                            queued.add(shard)
+                            futures.append(pool.submit(prepare_shard, shard))
+                for future in futures:
+                    if future.done():
+                        future.result()
+            if all(code == 0 for code in codes):
+                break
+            time.sleep(0.25)
+        for future in futures:
+            future.result(timeout=max(0.01, deadline - time.monotonic()))
+        return len(queued)
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        raise
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+
+def validate_collection_shards(run_dir: Path) -> list[Path]:
     result = read_object(run_dir / "collection-result.json")
     if result.get("status") != "collected" or result.get("ledger_state") != "CLOSED":
         raise RuntimeError(f"Stage-2 collector did not close safely: {run_dir}")
-    shard = Path(str(result.get("shard", ""))).resolve()
-    if not shard.is_dir():
+    raw_shards = result.get("shards")
+    paths = (
+        [Path(str(row.get("directory", ""))).resolve() for row in raw_shards]
+        if isinstance(raw_shards, list) and raw_shards
+        else [Path(str(result.get("shard", ""))).resolve()]
+    )
+    if any(not path.is_dir() for path in paths):
         raise RuntimeError(f"Stage-2 collector shard is missing: {run_dir}")
-    return shard
+    return paths
 
 
 def validate_update(run_dir: Path) -> tuple[dict[str, Any], Path, Path]:
@@ -200,6 +341,10 @@ def validate_update(run_dir: Path) -> tuple[dict[str, Any], Path, Path]:
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if bool(getattr(args, "overlap_preparation", False)) and not bool(
+        getattr(args, "persistent_learner", False)
+    ):
+        raise ValueError("overlap preparation requires a persistent learner")
     ports = parse_ports(args.ports)
     groups = split_ports(ports, args.collectors)
     if args.updates < 1 or not 1 <= args.step_ticks <= 16:
@@ -226,6 +371,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     atomic_json(run_root / "progress.json", progress)
     events = run_root / "events.jsonl"
+    mps_runtime = ManagedMPS(
+        enabled=bool(getattr(args, "enable_mps", False)),
+        root=(
+            getattr(args, "mps_root", None)
+            or (run_root / "mps-runtime")
+        ),
+    )
+    process_environment = os.environ.copy()
+    resident_learner = None
 
     def event(name: str, **fields: Any) -> None:
         with events.open("a", encoding="utf-8", newline="\n") as output:
@@ -237,7 +391,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             os.fsync(output.fileno())
 
     try:
+        process_environment = mps_runtime.start()
+        event(
+            "mps_runtime_ready",
+            enabled=bool(getattr(args, "enable_mps", False)),
+            root=str(mps_runtime.root),
+        )
+        if bool(getattr(args, "persistent_learner", False)):
+            if args.train_script.resolve() != TRAIN_SCRIPT.resolve():
+                raise ValueError("persistent learner requires the production Stage-2 trainer")
+            from scripts.train_expert_selfplay_stage2 import PersistentStage2Learner
+
+            resident_learner = PersistentStage2Learner()
         for update_index in range(1, args.updates + 1):
+            update_started_at = time.monotonic()
             free_gib = shutil.disk_usage(run_root).free / 1024**3
             if free_gib < args.minimum_free_gb:
                 raise RuntimeError(
@@ -269,6 +436,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         check=False,
+                        env=process_environment,
                     )
                 if restored.returncode != 0:
                     raise RuntimeError(
@@ -278,6 +446,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 event("worker_fleet_ready", update=update_index, workers=len(ports))
             progress["active_update"]["state"] = "collecting"
             atomic_json(run_root / "progress.json", progress)
+            overlap_preparation = bool(getattr(args, "overlap_preparation", False))
+            if overlap_preparation:
+                resident_learner.initialize(argparse.Namespace(**{
+                    **vars(args), "continuation_checkpoint": continuation,
+                }))
+                event("resident_learner_ready_for_preparation", update=update_index)
 
             processes = []
             logs = []
@@ -304,36 +478,52 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
+                        env=process_environment,
                     )
                     processes.append(process)
-                codes = [process.wait() for process in processes]
+                prepared_count = wait_collectors(
+                    processes, collection_dirs,
+                    prepare_shard=resident_learner.prepare if overlap_preparation else None,
+                    timeout_seconds=float(getattr(args, "collector_timeout_seconds", 900.0)),
+                )
             finally:
                 for log in logs:
                     log.close()
-            if any(code != 0 for code in codes):
-                raise RuntimeError(f"Stage-2 collector failure codes: {codes}")
-            shards = [validate_collection(path) for path in collection_dirs]
+            shards = [
+                shard
+                for path in collection_dirs
+                for shard in validate_collection_shards(path)
+            ]
             progress["active_update"]["state"] = "training"
             progress["active_update"]["shards"] = [str(path) for path in shards]
             atomic_json(run_root / "progress.json", progress)
             event("policy_batch_closed", update=update_index, shards=len(shards))
+            event("overlapped_preparation_complete", update=update_index, shards=prepared_count)
 
             train_dir = update_dir / "learner"
             with (update_dir / "learner.log").open("w", encoding="utf-8") as log:
-                trained = subprocess.run(
-                    trainer_command(
-                        args, run_dir=train_dir,
-                        continuation=continuation, shards=shards,
-                    ),
-                    cwd=str(PROJECT_ROOT),
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=False,
+                command = trainer_command(
+                    args, run_dir=train_dir,
+                    continuation=continuation, shards=shards,
                 )
-            if trained.returncode != 0:
+                if resident_learner is None:
+                    trained = subprocess.run(
+                        command, cwd=str(PROJECT_ROOT), stdin=subprocess.DEVNULL,
+                        stdout=log, stderr=subprocess.STDOUT, check=False,
+                        env=process_environment,
+                        timeout=float(getattr(args, "learner_timeout_seconds", 900.0)),
+                    )
+                    training_returncode = trained.returncode
+                else:
+                    from scripts.train_expert_selfplay_stage2 import build_parser as learner_parser
+
+                    with redirect_stdout(log), redirect_stderr(log):
+                        trained_result = resident_learner.run(learner_parser().parse_args(command[2:]))
+                        print(json.dumps(trained_result, ensure_ascii=False, allow_nan=False))
+                    training_returncode = 0
+            if training_returncode != 0:
                 raise RuntimeError(
-                    f"Stage-2 learner failed with exit code {trained.returncode}: {train_dir}"
+                    f"Stage-2 learner failed with exit code {training_returncode}: {train_dir}"
                 )
             result, checkpoint, export = validate_update(train_dir)
             if int(result["policy_version"]) != policy_version + 1:
@@ -348,13 +538,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "metrics": result["metrics"],
                 "retry_attempt": int(result["retry_attempt"]),
                 "completed_utc": utc_now(),
+                "episodes": int(result.get("rollout", {}).get("episodes", 0)),
+                "decisions": int(result.get("rollout", {}).get("decisions", 0)),
+                "elapsed_seconds": time.monotonic() - update_started_at,
+                "overlap_preparation": overlap_preparation,
             }
+            record["completed_games_per_day_estimate"] = (
+                record["episodes"] * 86400 / max(record["elapsed_seconds"], 1e-9)
+            )
             progress["completed_updates"].append(record)
             progress["latest_checkpoint"] = str(checkpoint)
             progress["latest_behavior_export"] = str(export)
             progress["active_update"] = None
             atomic_json(run_root / "progress.json", progress)
             event("guarded_policy_update_committed", **record)
+
+            evicted_files, evicted_bytes = evict_rollout_cache(update_dir)
+            event(
+                "rollout_file_cache_evicted",
+                update=update_index,
+                files=evicted_files,
+                bytes=evicted_bytes,
+            )
 
             # Keep exact hashes/manifests but prune old heavy rollout payloads.
             completed = progress["completed_updates"]
@@ -373,7 +578,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     f"update-{stale_index + 1:06d}-policy-"
                     f"{completed[stale_index]['pre_policy_version']:06d}"
                 ) / "learner"
-                for pattern in ("checkpoints/*.pt", "exports/*.pt"):
+                for pattern in ("checkpoints/*.pt", "exports/*.pt", "pre-update/*.pt"):
                     for payload in stale_dir.glob(pattern):
                         payload.resolve(strict=True).relative_to(stale_dir.resolve())
                         payload.unlink()
@@ -398,6 +603,116 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             traceback="".join(traceback.format_exception(error)),
         )
         raise
+    finally:
+        if resident_learner is not None:
+            resident_learner.close()
+        stopped = mps_runtime.stop()
+        if stopped["requested"]:
+            event("mps_runtime_stopped", **stopped)
+
+
+def run_isolated(args: argparse.Namespace) -> dict[str, Any]:
+    """Recycle the CUDA context after each committed version, keeping native Workers."""
+    root = args.run_root.resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    progress = {
+        "kind": KIND, "status": "running", "created_utc": utc_now(),
+        "target_updates": args.updates, "completed_updates": [], "active_update": None,
+        "latest_checkpoint": str(args.initial_continuation.resolve(strict=True)),
+        "latest_behavior_export": str((
+            getattr(args, "initial_behavior_export", None) or args.base_checkpoint
+        ).resolve(strict=True)),
+        "cuda_process_per_update": True,
+    }
+    runtime = ManagedMPS(
+        enabled=bool(getattr(args, "enable_mps", False)),
+        root=getattr(args, "mps_root", None) or root / "mps-runtime",
+    )
+
+    def event(name, **values):
+        with (root / "events.jsonl").open("a", encoding="utf-8") as output:
+            output.write(json.dumps({"at_utc": utc_now(), "event": name, **values},
+                                    ensure_ascii=False, allow_nan=False) + "\n")
+        atomic_json(root / "progress.json", progress)
+
+    event("isolated_pipeline_started")
+    try:
+        environment = runtime.start()
+        for index in range(1, args.updates + 1):
+            child_root = root / f"cycle-{index:06d}"
+            values = {
+                **vars(args), "run_root": child_root, "updates": 1,
+                "initial_continuation": Path(progress["latest_checkpoint"]),
+                "initial_behavior_export": Path(progress["latest_behavior_export"]),
+                "isolate_updates": False, "enable_mps": False, "mps_root": None,
+                "seed": args.seed + (index - 1) * args.collectors,
+            }
+            if getattr(args, "ensure_workers_script", None) is None:
+                values["skip_worker_restore"] = True
+            command = [str(args.python), str(Path(__file__).resolve())]
+            for name, value in values.items():
+                if value is None or value is False:
+                    continue
+                option = "--" + name.replace("_", "-")
+                if value is True:
+                    command.append(option)
+                else:
+                    command.extend((option, str(value)))
+            progress["active_update"] = {"index": index, "run_dir": str(child_root)}
+            event("isolated_update_started", update=index, run_dir=str(child_root))
+            started = time.monotonic()
+            with (root / f"cycle-{index:06d}.log").open("w", encoding="utf-8") as log:
+                result = subprocess.run(
+                    command, cwd=PROJECT_ROOT, env=environment, stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT, check=False,
+                    timeout=float(getattr(args, "collector_timeout_seconds", 900.0))
+                    + float(getattr(args, "learner_timeout_seconds", 900.0)),
+                )
+            if result.returncode:
+                child_progress = child_root / "progress.json"
+                details = read_object(child_progress).get("last_error") if child_progress.is_file() else None
+                raise RuntimeError(f"isolated update {index} failed: {details or result.returncode}")
+            child = read_object(child_root / "progress.json")
+            if child.get("status") != "completed" or len(child.get("completed_updates", [])) != 1:
+                raise RuntimeError("isolated update did not publish exactly one accepted policy")
+            record = dict(child["completed_updates"][0])
+            record.update(index=index, elapsed_seconds=time.monotonic() - started)
+            record["completed_games_per_day_estimate"] = (
+                int(record.get("episodes", 0)) * 86400 / max(record["elapsed_seconds"], 1e-9)
+            )
+            progress["completed_updates"].append(record)
+            progress["latest_checkpoint"] = record["checkpoint"]
+            progress["latest_behavior_export"] = record["behavior_export"]
+            progress["active_update"] = None
+            event("guarded_policy_update_committed", **record)
+            completed = progress["completed_updates"]
+            for stale in completed[-args.retain_rollout_updates - 1:-args.retain_rollout_updates]:
+                directory = Path(stale["checkpoint"]).parents[2].resolve()
+                directory.relative_to(root)
+                for path in directory.glob("collect-p*/rollouts/shard-*/rollout.pt"):
+                    path.resolve(strict=True).relative_to(root)
+                    path.unlink()
+            for stale in completed[-args.retain_artifact_updates - 1:-args.retain_artifact_updates]:
+                directory = Path(stale["checkpoint"]).parents[1].resolve()
+                directory.relative_to(root)
+                for pattern in ("checkpoints/*.pt", "exports/*.pt", "pre-update/*.pt"):
+                    for path in directory.glob(pattern):
+                        path.resolve(strict=True).relative_to(root)
+                        path.unlink()
+            if index < args.updates:
+                runtime.stop()
+                environment = runtime.start()
+                event("cuda_context_recycled", update=index)
+        progress.update(status="completed", completion_reason="requested_updates_committed")
+        event("isolated_pipeline_completed")
+        return progress
+    except BaseException as error:
+        progress.update(status="failed", last_error={"at_utc": utc_now(),
+                        "error_type": type(error).__name__, "error": str(error)})
+        event("isolated_pipeline_failed", **progress["last_error"])
+        raise
+    finally:
+        runtime.stop()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -415,6 +730,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--opponent-deck-root", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--step-ticks", type=int, default=4)
+    parser.add_argument("--idle-step-ticks", type=int)
+    parser.add_argument("--collection-waves", type=int, default=1)
+    parser.add_argument("--async-shard-writes", action="store_true")
+    parser.add_argument("--rolling-collection", action="store_true")
+    parser.add_argument("--compile-actor", action="store_true")
+    parser.add_argument("--compile-batch-size", type=int)
+    parser.add_argument("--compile-entity-slots", type=int)
+    parser.add_argument("--dense-policy-sampling", action="store_true")
+    parser.add_argument("--enable-mps", action="store_true")
+    parser.add_argument("--mps-root", type=Path)
     parser.add_argument("--max-decisions", type=int, default=3000)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20500000)
@@ -422,7 +747,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--collector-cpu-threads", type=int, default=2)
     parser.add_argument("--trainer-cpu-threads", type=int, default=12)
     parser.add_argument("--ppo-epochs", type=int, default=2)
-    parser.add_argument("--chunk-batch-size", type=int, default=2)
+    parser.add_argument("--chunk-batch-size", type=int, default=8)
+    parser.add_argument("--preprocess-window-size", type=int, default=256)
+    parser.add_argument("--preprocess-batch-size", type=int, default=3)
+    parser.add_argument("--prepared-cache-gib", type=float, default=4.0)
+    parser.add_argument("--training-precision", choices=("float32", "bfloat16", "float16"), default="float32")
+    parser.add_argument("--fused-optimizer", action="store_true")
+    parser.add_argument("--chunk-padding-multiple", type=int, default=0)
+    parser.add_argument("--persistent-learner", action="store_true")
+    parser.add_argument("--isolate-updates", action="store_true")
+    parser.add_argument("--skip-worker-restore", action="store_true")
+    parser.add_argument("--overlap-preparation", action="store_true")
+    parser.add_argument("--collector-timeout-seconds", type=float, default=900.0)
+    parser.add_argument("--learner-timeout-seconds", type=float, default=900.0)
     parser.add_argument("--retain-checkpoints", type=int, default=3)
     parser.add_argument("--retain-rollout-updates", type=int, default=2)
     parser.add_argument("--retain-artifact-updates", type=int, default=3)
@@ -437,6 +774,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=PROJECT_ROOT / "bionic-runtime",
     )
     parser.add_argument("--worker-ready-timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--worker-execution-mode",
+        choices=("interpreter", "jit"),
+        default="interpreter",
+        help="Bionic Java host mode used when restoring missing Workers",
+    )
     return parser
 
 
@@ -445,11 +788,15 @@ def main() -> int:
     if min(
         args.collectors, args.updates, args.collector_cpu_threads,
         args.trainer_cpu_threads, args.ppo_epochs, args.chunk_batch_size,
+        args.preprocess_window_size,
+        args.preprocess_batch_size,
+        args.collection_waves,
         args.retain_checkpoints, args.retain_rollout_updates,
         args.retain_artifact_updates,
     ) < 1:
         raise ValueError("Stage-2 loop values must be positive")
-    print(json.dumps(run(args), ensure_ascii=False, indent=2, allow_nan=False))
+    runner = run_isolated if args.isolate_updates else run
+    print(json.dumps(runner(args), ensure_ascii=False, indent=2, allow_nan=False))
     return 0
 
 

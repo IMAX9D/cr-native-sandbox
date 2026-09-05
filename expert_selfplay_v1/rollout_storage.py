@@ -463,11 +463,12 @@ class LearnerEpisodeChunker:
         episode: Mapping[str, Any] | LearnerEpisodeBuffer,
         *,
         step_payloads: Sequence[Mapping[str, Any]] | None = None,
+        validate_step_payloads: bool = True,
     ) -> list[dict[str, Any]]:
         frozen, header, decisions = _validate_complete_episode(episode)
         if step_payloads is not None and len(step_payloads) != len(decisions):
             raise ValueError("step payload count does not match learner decisions")
-        if step_payloads is not None:
+        if step_payloads is not None and validate_step_payloads:
             # Hashing the payload now also rejects non-finite and unsupported values.
             _semantic_digest(list(step_payloads))
 
@@ -518,9 +519,23 @@ class LearnerEpisodeChunker:
                 "loss_mask": loss_mask,
             }
             if step_payloads is not None:
-                chunk["step_payloads"] = list(
+                # Exact recurrent state is only required at the beginning of
+                # a chunk.  Keeping a hidden pair on every decision inflated
+                # native rollouts and retained the same state repeatedly in
+                # overlapping burn-in windows.
+                selected_payloads: list[dict[str, Any]] = []
+                for offset, raw_payload in enumerate(
                     step_payloads[sequence_start:sequence_end]
-                )
+                ):
+                    payload = dict(raw_payload)
+                    actor_inputs = payload.get("actor_inputs")
+                    if isinstance(actor_inputs, Mapping):
+                        actor_inputs = dict(actor_inputs)
+                        if offset:
+                            actor_inputs.pop("hidden", None)
+                        payload["actor_inputs"] = actor_inputs
+                    selected_payloads.append(payload)
+                chunk["step_payloads"] = selected_payloads
             chunks.append(chunk)
         return chunks
 
@@ -707,7 +722,14 @@ class ImmutableRolloutShardWriter:
                 None if step_payloads_by_episode is None
                 else step_payloads_by_episode.get(header.episode_id)
             )
-            chunks = self.chunker.chunk(frozen, step_payloads=sidecars)
+            # The complete shard semantic digest below validates every selected
+            # sidecar tensor.  Avoid hashing the same data once here and then a
+            # second time after it has been arranged into recurrent chunks.
+            chunks = self.chunker.chunk(
+                frozen,
+                step_payloads=sidecars,
+                validate_step_payloads=False,
+            )
             episode_rows.append({
                 "episode_id": header.episode_id,
                 "episode_content_sha256": frozen["content_sha256"],
@@ -819,6 +841,7 @@ def verify_rollout_shard(
     return_payload: bool = False,
     mmap: bool = False,
     verify_semantic_digest: bool = True,
+    known_torch_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Verify hashes, manifest binding, and learner-only terminal coverage."""
 
@@ -838,7 +861,13 @@ def verify_rollout_shard(
     }
     if _sha256_bytes(_canonical_json(metadata_without_digest)) != stored_content_digest:
         raise ValueError("rollout shard JSON content hash mismatch")
-    if _sha256_file(torch_path) != metadata.get("torch_sha256"):
+    if known_torch_sha256 is None:
+        actual_torch_sha256 = _sha256_file(torch_path)
+    else:
+        if not _SHA256.fullmatch(known_torch_sha256):
+            raise ValueError("known rollout torch hash is invalid")
+        actual_torch_sha256 = known_torch_sha256
+    if actual_torch_sha256 != metadata.get("torch_sha256"):
         raise ValueError("rollout shard torch hash mismatch")
     try:
         manifest = BatchManifest(**dict(metadata["batch_manifest"]))
@@ -863,9 +892,19 @@ def verify_rollout_shard(
     episodes = payload.get("episodes")
     if not isinstance(episodes, list) or not episodes:
         raise ValueError("rollout shard payload has no episodes")
+    episode_ids = [str(episode.get("episode_id", "")) for episode in episodes]
+    if (
+        len(set(episode_ids)) != len(episode_ids)
+        or metadata.get("episode_count") != len(episodes)
+        or metadata.get("episode_ids") != sorted(episode_ids)
+        or len(episodes) > manifest.episode_count
+    ):
+        raise ValueError("rollout shard episode coverage differs from its manifest")
     for episode in episodes:
         header = EpisodeHeader(**dict(episode["header"]))
         header.validate()
+        if header.episode_id != episode["episode_id"]:
+            raise ValueError("stored episode identity differs from its header")
         if header.batch_id != manifest.batch_id:
             raise ValueError("stored episode has the wrong batch_id")
         if header.behavior_policy_version != manifest.policy_version:

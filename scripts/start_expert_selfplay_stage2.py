@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.ensure_bionic_workers import ensure
-from scripts.run_expert_selfplay_stage2_loop import run
+from scripts.run_expert_selfplay_stage2_loop import run, run_isolated
 
 
 DEFAULT_BASE = PROJECT_ROOT / "models/expert-v1.1/candidate-lr5e-5-step157674-fp16.pt"
@@ -26,6 +26,28 @@ DEFAULT_STAGE1 = (
 )
 DEFAULT_DECK = PROJECT_ROOT / "examples/hog-2.6-evo-hero.json"
 DEFAULT_OPPONENT_DECKS = PROJECT_ROOT / "top-deck-presets-v1"
+
+
+def _completed_run_continuation(root: Path) -> tuple[Path, Path]:
+    progress_path = root.resolve(strict=True) / "progress.json"
+    value = json.loads(progress_path.read_text(encoding="utf-8-sig"))
+    completed = value.get("completed_updates")
+    if not (
+        value.get("kind") == "cr_native_expert_selfplay_stage2_loop_v1"
+        and value.get("status") == "completed"
+        and value.get("completion_reason") == "requested_updates_committed"
+        and isinstance(completed, list)
+        and completed
+    ):
+        raise RuntimeError("resume mode requires a completed guarded Stage-2 run")
+    last = completed[-1]
+    checkpoint = Path(value["latest_checkpoint"]).resolve(strict=True)
+    behavior = Path(value["latest_behavior_export"]).resolve(strict=True)
+    if str(checkpoint) != str(Path(last["checkpoint"]).resolve(strict=True)) or (
+        str(behavior) != str(Path(last["behavior_export"]).resolve(strict=True))
+    ):
+        raise RuntimeError("resume run latest artifacts do not match its last commit")
+    return checkpoint, behavior
 
 
 def _canary_continuation(root: Path) -> tuple[Path, Path]:
@@ -62,7 +84,26 @@ def main() -> int:
     parser.add_argument("--mode", choices=("canary", "formal"), default="canary")
     parser.add_argument("--run-root", type=Path)
     parser.add_argument("--canary-root", type=Path)
+    parser.add_argument("--resume-run", type=Path)
     parser.add_argument("--updates", type=int)
+    parser.add_argument("--base-port", type=int, default=19031)
+    parser.add_argument("--prepared-cache-gib", type=float)
+    parser.add_argument("--training-precision", choices=("float32", "bfloat16", "float16"))
+    parser.add_argument("--chunk-batch-size", type=int)
+    parser.add_argument("--chunk-padding-multiple", type=int)
+    parser.add_argument("--fused-optimizer", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--persistent-learner", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--overlap-preparation", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--isolate-updates", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--profile",
+        choices=("throughput", "conservative"),
+        default="throughput",
+        help=(
+            "96-worker JIT/MPS, BF16 padded-batch profile or the original "
+            "48-worker profile"
+        ),
+    )
     parser.add_argument("--base-checkpoint", type=Path, default=DEFAULT_BASE)
     parser.add_argument("--expert-manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--stage1-checkpoint", type=Path, default=DEFAULT_STAGE1)
@@ -76,9 +117,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.mode == "formal":
-        if args.canary_root is None:
-            raise ValueError("--canary-root is required in formal mode")
-        continuation, behavior = _canary_continuation(args.canary_root)
+        if args.resume_run is not None and args.canary_root is not None:
+            raise ValueError("use either --resume-run or --canary-root, not both")
+        if args.resume_run is not None:
+            continuation, behavior = _completed_run_continuation(args.resume_run)
+        else:
+            if args.canary_root is None:
+                raise ValueError(
+                    "--canary-root or --resume-run is required in formal mode"
+                )
+            continuation, behavior = _canary_continuation(args.canary_root)
         updates = 100 if args.updates is None else args.updates
     else:
         continuation = args.stage1_checkpoint.resolve(strict=True)
@@ -92,10 +140,46 @@ def main() -> int:
     else:
         run_root = args.run_root
 
+    if args.profile == "throughput":
+        worker_count = 96
+        collector_count = 6
+        step_ticks = 12
+        collection_waves = 2
+        worker_execution_mode = "jit"
+        enable_mps = True
+        defaults = {
+            "prepared_cache_gib": 8.0, "training_precision": "bfloat16",
+            "chunk_batch_size": 32, "chunk_padding_multiple": 80,
+            "fused_optimizer": True, "persistent_learner": True,
+            "overlap_preparation": True, "isolate_updates": True,
+        }
+        preprocess_window_size, preprocess_batch_size = 128, 2
+    else:
+        worker_count = 48
+        collector_count = 6
+        step_ticks = 4
+        collection_waves = 1
+        worker_execution_mode = "interpreter"
+        enable_mps = False
+        defaults = {
+            "prepared_cache_gib": 4.0, "training_precision": "float32",
+            "chunk_batch_size": 8, "chunk_padding_multiple": 0,
+            "fused_optimizer": False, "persistent_learner": False,
+            "overlap_preparation": False, "isolate_updates": False,
+        }
+        preprocess_window_size, preprocess_batch_size = 256, 3
+    for name, default in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, default)
+    if not args.persistent_learner:
+        args.overlap_preparation = False
+
     worker_result = ensure(argparse.Namespace(
         runtime_root=args.runtime_root,
-        base_port=39031,
-        count=48,
+        base_port=args.base_port,
+        count=worker_count,
+        slot_offset=0,
+        execution_mode=worker_execution_mode,
         ready_timeout=120.0,
     ))
     loop_args = argparse.Namespace(
@@ -104,22 +188,41 @@ def main() -> int:
         initial_continuation=continuation,
         initial_behavior_export=behavior,
         expert_manifest=args.expert_manifest,
-        ports="39031-39078",
-        collectors=3,
+        ports=f"{args.base_port}-{args.base_port + worker_count - 1}",
+        collectors=collector_count,
         updates=updates,
         run_root=run_root,
         learner_deck=args.learner_deck,
         opponent_deck_root=args.opponent_deck_root,
         host="127.0.0.1",
-        step_ticks=4,
+        step_ticks=step_ticks,
+        idle_step_ticks=None,
+        collection_waves=collection_waves,
+        async_shard_writes=False,
+        rolling_collection=False,
+        compile_actor=False,
+        compile_batch_size=None,
+        compile_entity_slots=None,
+        dense_policy_sampling=False,
+        enable_mps=enable_mps,
+        mps_root=None,
         max_decisions=3000,
         timeout=30.0,
         seed=20600000 if args.mode == "canary" else 20700000,
         device="cuda",
         collector_cpu_threads=2,
-        trainer_cpu_threads=12,
+        trainer_cpu_threads=8,
         ppo_epochs=2,
-        chunk_batch_size=2,
+        chunk_batch_size=args.chunk_batch_size,
+        chunk_padding_multiple=args.chunk_padding_multiple,
+        preprocess_window_size=preprocess_window_size,
+        preprocess_batch_size=preprocess_batch_size,
+        prepared_cache_gib=args.prepared_cache_gib,
+        training_precision=args.training_precision,
+        fused_optimizer=args.fused_optimizer,
+        persistent_learner=args.persistent_learner,
+        overlap_preparation=args.overlap_preparation,
+        isolate_updates=args.isolate_updates,
         retain_checkpoints=3,
         retain_rollout_updates=2,
         retain_artifact_updates=3,
@@ -130,10 +233,12 @@ def main() -> int:
         ensure_workers_script=PROJECT_ROOT / "scripts/ensure_bionic_workers.py",
         worker_runtime_root=args.runtime_root,
         worker_ready_timeout=120.0,
+        worker_execution_mode=worker_execution_mode,
     )
-    result = run(loop_args)
+    result = (run_isolated if args.isolate_updates else run)(loop_args)
     print(json.dumps({
         "mode": args.mode,
+        "profile": args.profile,
         "workers": worker_result,
         "run_root": str(run_root.resolve()),
         "result": result,

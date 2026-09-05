@@ -181,7 +181,7 @@ class Stage1RunnerContractTests(unittest.TestCase):
             self.closed = True
 
     class _Collector:
-        def __init__(self, *, encoder, policy_service, reward, max_decisions, rpc_workers, step_ticks):
+        def __init__(self, *, encoder, policy_service, reward, max_decisions, rpc_workers, step_ticks, lean_step_payloads=False):
             if rpc_workers != 1:
                 raise AssertionError("smoke collector must use the selected Worker count")
             if not 1 <= step_ticks <= 16:
@@ -274,6 +274,8 @@ class Stage1RunnerContractTests(unittest.TestCase):
             opponent_deck_root=pool,
             runtime_manifest=runtime,
             episodes=None,
+            collection_waves=1,
+            async_shard_writes=False,
             smoke_workers=1,
             updates=1,
             step_ticks=1,
@@ -390,6 +392,31 @@ class Stage1RunnerContractTests(unittest.TestCase):
                 header["behavior_actor_sha256"], header["opponent_actor_sha256"]
             )
             self.assertEqual(header["opponent_policy_id"], "BASE")
+
+    def test_collect_only_reuses_loaded_policy_across_multiple_waves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint, manifest = self._write_fixture(root)
+            args = self._run_args(root, checkpoint, manifest)
+            args.collect_only = True
+            args.collection_waves = 2
+            args.async_shard_writes = True
+            dependencies = RuntimeDependencies(
+                self._Collector, self._Spec, self._Trainer, self._TrainerConfig
+            )
+
+            result = run(args, dependencies=dependencies, env_type=self._Env)
+
+            self.assertEqual(result["episodes"], 2)
+            self.assertEqual(result["collection_waves"], 2)
+            self.assertTrue(result["async_shard_writes"])
+            self.assertEqual(result["decisions"], 2)
+            self.assertEqual(len(result["shards"]), 2)
+            self.assertTrue(all(
+                Path(row["directory"], "rollout.pt").is_file()
+                for row in result["shards"]
+            ))
+            self.assertEqual(result["ledger_state"], "CLOSED")
 
     def test_actor_mutation_aborts_before_ledger_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

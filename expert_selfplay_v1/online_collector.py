@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -100,6 +101,7 @@ class _Cursor:
     accepted_actions: int = 0
     native_ticks_advanced: int = 0
     terminal_episode: dict[str, Any] | None = None
+    final_rpc_profile: dict[str, float] | None = None
 
 
 ValueFunction = Callable[
@@ -294,8 +296,10 @@ class OnlineSelfPlayCollector:
         max_decisions: int = 10_000,
         rpc_workers: int | None = None,
         step_ticks: int = 1,
+        idle_step_ticks: int | None = None,
         critic_scalar_size: int = 32,
         critic_private_slot_count: int = 32,
+        lean_step_payloads: bool = False,
     ) -> None:
         self.encoder = encoder
         self.policy_service = policy_service
@@ -303,12 +307,21 @@ class OnlineSelfPlayCollector:
         self.max_decisions = int(max_decisions)
         self.rpc_workers = None if rpc_workers is None else int(rpc_workers)
         self.step_ticks = int(step_ticks)
+        self.idle_step_ticks = (
+            None if idle_step_ticks is None else int(idle_step_ticks)
+        )
         self.critic_scalar_size = int(critic_scalar_size)
         self.critic_private_slot_count = int(critic_private_slot_count)
+        self.lean_step_payloads = bool(lean_step_payloads)
+        self.last_profile: dict[str, float] = {}
         if self.max_decisions < 1 or self.critic_scalar_size < 1:
             raise ValueError("collector limits must be positive")
         if not 1 <= self.step_ticks <= 16:
             raise ValueError("step_ticks must be in 1..16")
+        if self.idle_step_ticks is not None and not (
+            self.step_ticks <= self.idle_step_ticks <= 16
+        ):
+            raise ValueError("idle_step_ticks must be in step_ticks..16")
         if self.critic_private_slot_count < 26:
             raise ValueError("critic private state needs at least 26 card slots")
 
@@ -544,6 +557,34 @@ class OnlineSelfPlayCollector:
             raise OnlineCollectorContractError("native transition did not return an object")
         return dict(result)
 
+    def _requested_step_ticks(self, cursor: _Cursor) -> int:
+        """Use a wider hazard window outside the arena's tactical zone.
+
+        A worker can keep long-lived troops/buildings in ``entities`` for most
+        of a battle, so list emptiness alone is not a useful idle signal.  A
+        side-0 entity moving upward becomes tactical near/over the river, as
+        does a side-1 entity moving downward.  Back-line deployment and travel
+        may use the wider window; river contact, pushes, and tower defence use
+        the fixed fast cadence.  Both the Actor exposure and native transition
+        receive this exact value, preserving variable-time rollout accounting.
+        """
+
+        if self.idle_step_ticks is None:
+            return self.step_ticks
+        entities = cursor.state.get("entities")
+        if not isinstance(entities, list):
+            return self.step_ticks
+        for entity in entities:
+            if not isinstance(entity, Mapping):
+                return self.step_ticks
+            side = entity.get("side")
+            y = entity.get("y")
+            if not isinstance(side, int) or not isinstance(y, int):
+                return self.step_ticks
+            if (side == 0 and y >= 13_000) or (side == 1 and y <= 19_000):
+                return self.step_ticks
+        return self.idle_step_ticks
+
     @staticmethod
     def _episode_from_transition(transition: Mapping[str, Any]) -> dict[str, Any]:
         episode = transition.get("step", {}).get("episode")
@@ -622,6 +663,8 @@ class OnlineSelfPlayCollector:
         self,
         cursor: _Cursor,
         initial: Mapping[str, Any],
+        *,
+        requested_steps: int,
     ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], int, bool]:
         """Resolve libg's one-RPC-late terminal without another Actor decision.
 
@@ -643,7 +686,7 @@ class OnlineSelfPlayCollector:
             cursor.state,
             transition,
             episode,
-            requested_steps=self.step_ticks,
+            requested_steps=requested_steps,
             allow_pending=True,
         )
         for _attempt in range(2):
@@ -658,7 +701,7 @@ class OnlineSelfPlayCollector:
                 cursor.state,
                 transition,
                 episode,
-                requested_steps=self.step_ticks,
+                requested_steps=requested_steps,
                 allow_pending=True,
             )
         if advanced == 0 and not done:
@@ -694,13 +737,23 @@ class OnlineSelfPlayCollector:
             ),
         }
 
+    @staticmethod
+    def _needs_hidden_anchor(decision_index: int) -> bool:
+        """Return whether v1 recurrent chunking retains this pre-action state."""
+
+        # RecurrentChunkConfig is fixed at burn_in=16 / unroll=64.  Chunk loss
+        # starts are 0,64,128,... and their sequence anchors are 0,48,112,... .
+        return decision_index == 0 or (
+            decision_index >= 48 and (decision_index - 48) % 64 == 0
+        )
+
     def _append_decision(
         self,
         cursor: _Cursor,
         *,
         action: SampledPolicyAction,
         actor_inputs: Mapping[str, Tensor],
-        pre_action_hidden: tuple[Tensor, Tensor],
+        pre_action_hidden: tuple[Tensor, Tensor] | None,
         masks: ExpertActionMasks,
         critic_private: CriticPrivateObservation,
         native_action: Mapping[str, Any] | None,
@@ -750,11 +803,12 @@ class OnlineSelfPlayCollector:
         cursor.episode.append(record)
         cursor.target_states.append(_tower_target_state(cursor.state))
         stored_actor_inputs: dict[str, Any] = _clone_tensor_mapping(actor_inputs)
-        stored_actor_inputs["hidden"] = tuple(
-            value.detach().cpu().contiguous().clone()
-            for value in pre_action_hidden
-        )
-        cursor.step_payloads.append({
+        if pre_action_hidden is not None:
+            stored_actor_inputs["hidden"] = tuple(
+                value.detach().cpu().contiguous().clone()
+                for value in pre_action_hidden
+            )
+        payload = {
             "schema_version": 1,
             "kind": STEP_PAYLOAD_KIND,
             "tick": record.tick,
@@ -763,16 +817,22 @@ class OnlineSelfPlayCollector:
             "actor_inputs": stored_actor_inputs,
             "action_masks": _mask_mapping(masks),
             "recorded_action": self._recorded_action_payload(action),
-            "critic_private": _critic_mapping(critic_private),
             "critic_inputs": _critic_inputs(critic_private),
-            "native_action": None if native_action is None else deepcopy(dict(native_action)),
-            "native_receipt": deepcopy(dict(native_receipt)),
-            "native_advanced_ticks": int(advanced_ticks),
             "reward_components": {name: float(item) for name, item in components.items()},
             "value": torch.tensor(value, dtype=torch.float32),
             "terminated": bool(terminated),
             "terminal_merged_from_zero_delta": False,
-        })
+        }
+        if not self.lean_step_payloads:
+            payload.update({
+                "critic_private": _critic_mapping(critic_private),
+                "native_action": (
+                    None if native_action is None else deepcopy(dict(native_action))
+                ),
+                "native_receipt": deepcopy(dict(native_receipt)),
+                "native_advanced_ticks": int(advanced_ticks),
+            })
+        cursor.step_payloads.append(payload)
 
     def _merge_zero_delta_terminal(
         self,
@@ -818,10 +878,11 @@ class OnlineSelfPlayCollector:
         payload["reward_components"] = rewards
         payload["terminated"] = True
         payload["terminal_merged_from_zero_delta"] = True
-        payload["late_terminal_first_joint_action"] = deepcopy(dict(first_receipt))
-        payload["late_terminal_resolution_joint_actions"] = [
-            deepcopy(dict(value)) for value in resolution_receipts
-        ]
+        if not self.lean_step_payloads:
+            payload["late_terminal_first_joint_action"] = deepcopy(dict(first_receipt))
+            payload["late_terminal_resolution_joint_actions"] = [
+                deepcopy(dict(value)) for value in resolution_receipts
+            ]
 
     def _finalize_critic_targets(self, cursor: _Cursor) -> None:
         """Attach outcome and future-5-second labels after the full game exists."""
@@ -899,6 +960,7 @@ class OnlineSelfPlayCollector:
         specs: Sequence[OnlineEpisodeSpec],
         *,
         value_fn: ValueFunction | None = None,
+        rolling_replacement: bool = False,
     ) -> list[CollectedEpisode]:
         """Collect a barrier batch while batching all Actor rows each Tick."""
 
@@ -908,22 +970,82 @@ class OnlineSelfPlayCollector:
         worker_count = self.rpc_workers or len(rows)
         if worker_count < 1:
             raise ValueError("rpc_workers must be positive")
+        profile = {
+            "start_seconds": 0.0,
+            "probe_seconds": 0.0,
+            "encode_seconds": 0.0,
+            "request_build_seconds": 0.0,
+            "policy_seconds": 0.0,
+            "action_decode_seconds": 0.0,
+            "transition_wait_seconds": 0.0,
+            "record_seconds": 0.0,
+            "transition_and_record_seconds": 0.0,
+            "finalize_seconds": 0.0,
+            "scheduler_turns": 0.0,
+            "actor_rows": 0.0,
+            "policy_forward_calls": 0.0,
+            "active_step_requests": 0.0,
+            "idle_step_requests": 0.0,
+            "requested_native_ticks": 0.0,
+            "total_seconds": 0.0,
+        }
+        batch_started = time.perf_counter()
+        forward_calls_before = int(
+            getattr(self.policy_service, "forward_calls", 0)
+        )
         cursors: list[_Cursor] = []
+        pending_by_worker: dict[Hashable, list[OnlineEpisodeSpec]] = {}
+        initial_rows = rows
+        if rolling_replacement:
+            initial_rows = []
+            env_by_worker: dict[Hashable, object] = {}
+            for spec in rows:
+                self._validate_spec(spec)
+                previous_env = env_by_worker.setdefault(spec.worker_id, spec.env)
+                if previous_env is not spec.env:
+                    raise OnlineCollectorContractError(
+                        "rolling worker_id maps to more than one native environment"
+                    )
+                queue = pending_by_worker.setdefault(spec.worker_id, [])
+                if not queue:
+                    initial_rows.append(spec)
+                queue.append(spec)
+            for spec in initial_rows:
+                pending_by_worker[spec.worker_id].pop(0)
         try:
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                cursors = self._start(rows, executor)
-                active = list(cursors)
+                stage_started = time.perf_counter()
+                active = self._start(initial_rows, executor)
+                cursors.extend(active)
+                profile["start_seconds"] += time.perf_counter() - stage_started
                 while active:
+                    profile["scheduler_turns"] += 1.0
+                    requested_steps = {
+                        id(cursor): self._requested_step_ticks(cursor)
+                        for cursor in active
+                    }
+                    profile["active_step_requests"] += float(sum(
+                        value == self.step_ticks for value in requested_steps.values()
+                    ))
+                    profile["idle_step_requests"] += float(sum(
+                        value != self.step_ticks for value in requested_steps.values()
+                    ))
+                    profile["requested_native_ticks"] += float(
+                        sum(requested_steps.values())
+                    )
                     for cursor in active:
                         if len(cursor.episode.decisions) >= self.max_decisions:
                             raise OnlineCollectorContractError(
                                 f"episode {cursor.spec.header.episode_id} exceeded max_decisions"
                             )
 
+                    stage_started = time.perf_counter()
                     probe_futures = [executor.submit(self._probe_cursor, cursor) for cursor in active]
                     for future in probe_futures:
                         future.result()
+                    profile["probe_seconds"] += time.perf_counter() - stage_started
 
+                    stage_started = time.perf_counter()
                     frames: list[NativeActorFrame] = []
                     owners: list[tuple[_Cursor, int]] = []
                     for cursor in active:
@@ -933,13 +1055,16 @@ class OnlineSelfPlayCollector:
                                 actor_side=side,
                                 own_deck=cursor.decks[side],
                                 revealed_enemy_tokens=cursor.tracker.tokens_for(side),
-                                delta_ticks=float(self.step_ticks),
+                                delta_ticks=float(requested_steps[id(cursor)]),
                             ))
                             owners.append((cursor, side))
                     encoded = self.encoder.encode_batch(frames)
+                    profile["encode_seconds"] += time.perf_counter() - stage_started
+                    profile["actor_rows"] += float(len(owners))
                     for cursor in active:
                         cursor._encoded = encoded  # type: ignore[attr-defined]
 
+                    stage_started = time.perf_counter()
                     policy_requests: list[PolicyRequest] = []
                     request_rows: list[dict[str, Any]] = []
                     row_by_cursor_side: dict[tuple[int, int], int] = {}
@@ -954,24 +1079,68 @@ class OnlineSelfPlayCollector:
                             actor_sha256=hashes[side],
                             actor_inputs=inputs,
                             masks=masks,
-                            delta_ticks=self.step_ticks,
+                            delta_ticks=requested_steps[id(cursor)],
                             reset_hidden=False,
                         ))
                         request_rows.append({
                             "cursor": cursor, "side": side, "masks": masks,
                             "hand": hand, "inputs": inputs, "encoded_row": index,
                         })
+                    profile["request_build_seconds"] += (
+                        time.perf_counter() - stage_started
+                    )
 
                     # This is intentionally exactly one service call per scheduler
                     # turn.  The service itself groups equal content hashes.
+                    stage_started = time.perf_counter()
                     sampled = self.policy_service.act(policy_requests)
+                    profile["policy_seconds"] += time.perf_counter() - stage_started
                     if len(sampled) != len(policy_requests):
                         raise OnlineCollectorContractError("policy service dropped an Actor row")
+                    anchor_indices = [
+                        index
+                        for index, (action, row) in enumerate(
+                            zip(sampled, request_rows, strict=True)
+                        )
+                        if action.side == row["cursor"].spec.header.learner_side
+                        and self._needs_hidden_anchor(
+                            len(row["cursor"].episode.decisions)
+                        )
+                    ]
+                    anchor_actions = [sampled[index] for index in anchor_indices]
+                    hidden_batch = getattr(
+                        self.policy_service, "last_pre_action_hidden_batch", None
+                    )
+                    if callable(hidden_batch):
+                        anchor_hiddens = hidden_batch(anchor_actions)
+                    else:
+                        anchor_hiddens = [
+                            self.policy_service.last_pre_action_hidden(
+                                actor_sha256=action.actor_sha256,
+                                worker_id=action.worker_id,
+                                side=action.side,
+                            )
+                            for action in anchor_actions
+                        ]
+                    if len(anchor_hiddens) != len(anchor_indices):
+                        raise OnlineCollectorContractError(
+                            "policy service dropped a recurrent anchor"
+                        )
+                    pre_action_hiddens: list[
+                        tuple[Tensor, Tensor] | None
+                    ] = [None] * len(sampled)
+                    for index, hidden in zip(
+                        anchor_indices, anchor_hiddens, strict=True
+                    ):
+                        pre_action_hiddens[index] = hidden
 
+                    stage_started = time.perf_counter()
                     per_cursor: dict[int, dict[str, Any]] = {
                         id(cursor): {"actions": [], "rows": {}} for cursor in active
                     }
-                    for action, row in zip(sampled, request_rows, strict=True):
+                    for action, row, pre_action_hidden in zip(
+                        sampled, request_rows, pre_action_hiddens, strict=True
+                    ):
                         cursor = row["cursor"]
                         side = int(row["side"])
                         ability_keys = encoded.ability_entity_keys[row["encoded_row"]]
@@ -982,37 +1151,44 @@ class OnlineSelfPlayCollector:
                             ability_entity_keys=ability_keys,
                         )
                         row["sample"] = action
-                        row["pre_action_hidden"] = (
-                            self.policy_service.last_pre_action_hidden(
-                                actor_sha256=action.actor_sha256,
-                                worker_id=action.worker_id,
-                                side=action.side,
-                            )
-                        )
+                        row["pre_action_hidden"] = pre_action_hidden
                         row["native_action"] = native
                         per_cursor[id(cursor)]["rows"][side] = row
                         if native is not None:
                             per_cursor[id(cursor)]["actions"].append(native)
+                    profile["action_decode_seconds"] += (
+                        time.perf_counter() - stage_started
+                    )
 
+                    stage_started = time.perf_counter()
                     transition_futures = {
                         id(cursor): executor.submit(
                             self._transition_one,
                             cursor,
                             per_cursor[id(cursor)]["actions"],
-                            steps=self.step_ticks,
+                            steps=requested_steps[id(cursor)],
                         )
                         for cursor in active
                     }
                     completed: list[_Cursor] = []
                     for cursor in active:
+                        wait_started = time.perf_counter()
                         initial_transition = transition_futures[id(cursor)].result()
+                        profile["transition_wait_seconds"] += (
+                            time.perf_counter() - wait_started
+                        )
+                        record_started = time.perf_counter()
                         (
                             transition,
                             first_receipt,
                             resolution_receipts,
                             advanced,
                             done,
-                        ) = self._resolve_pending_transition(cursor, initial_transition)
+                        ) = self._resolve_pending_transition(
+                            cursor,
+                            initial_transition,
+                            requested_steps=requested_steps[id(cursor)],
+                        )
                         episode = self._episode_from_transition(transition)
                         attempted, accepted_sides = self._accepted_actions(
                             transition,
@@ -1090,13 +1266,40 @@ class OnlineSelfPlayCollector:
                             completed.append(cursor)
                         else:
                             cursor.state = dict(transition["state"])
+                        profile["record_seconds"] += (
+                            time.perf_counter() - record_started
+                        )
                     if completed:
+                        for cursor in completed:
+                            cursor.final_rpc_profile = dict(
+                                getattr(cursor.spec.env, "rpc_profile", {})
+                            )
                         complete_ids = {id(cursor) for cursor in completed}
                         active = [cursor for cursor in active if id(cursor) not in complete_ids]
+                        if rolling_replacement:
+                            replacements = []
+                            for cursor in completed:
+                                queue = pending_by_worker.get(
+                                    cursor.spec.worker_id, []
+                                )
+                                if queue:
+                                    replacements.append(queue.pop(0))
+                            if replacements:
+                                replacement_started = time.perf_counter()
+                                started = self._start(replacements, executor)
+                                cursors.extend(started)
+                                active.extend(started)
+                                profile["start_seconds"] += (
+                                    time.perf_counter() - replacement_started
+                                )
+                    profile["transition_and_record_seconds"] += (
+                        time.perf_counter() - stage_started
+                    )
         finally:
             for spec in rows:
                 self.policy_service.reset_episode(spec.worker_id)
 
+        finalize_started = time.perf_counter()
         results: list[CollectedEpisode] = []
         for cursor in cursors:
             if cursor.terminal_episode is None:
@@ -1104,6 +1307,15 @@ class OnlineSelfPlayCollector:
             # freeze validates final-only termination and finite learner records.
             cursor.episode.freeze()
             self._finalize_critic_targets(cursor)
+            if self.lean_step_payloads:
+                cursor.step_payloads = [{
+                    name: payload[name]
+                    for name in (
+                        "schema_version", "kind", "tick", "delta_ticks",
+                        "actor_sha256", "actor_inputs", "action_masks",
+                        "recorded_action", "critic_inputs", "critic_targets",
+                    )
+                } for payload in cursor.step_payloads]
             results.append(CollectedEpisode(
                 episode=cursor.episode,
                 step_payloads=tuple(cursor.step_payloads),
@@ -1112,6 +1324,30 @@ class OnlineSelfPlayCollector:
                 accepted_actions=cursor.accepted_actions,
                 native_ticks_advanced=cursor.native_ticks_advanced,
             ))
+        profile["finalize_seconds"] = time.perf_counter() - finalize_started
+        profile["policy_forward_calls"] = float(
+            int(getattr(self.policy_service, "forward_calls", 0))
+            - forward_calls_before
+        )
+        for key in (
+            "rpc_calls", "rpc_failures", "rpc_request_bytes",
+            "rpc_response_bytes", "rpc_serialize_seconds",
+            "rpc_connect_seconds", "rpc_send_seconds",
+            "rpc_receive_seconds", "rpc_parse_seconds", "rpc_total_seconds",
+            "rpc_reconnects",
+        ):
+            profile[f"sum_{key}"] = sum(
+                float(
+                    (
+                        cursor.final_rpc_profile
+                        if cursor.final_rpc_profile is not None
+                        else getattr(cursor.spec.env, "rpc_profile", {})
+                    ).get(key, 0.0)
+                )
+                for cursor in cursors
+            )
+        profile["total_seconds"] = time.perf_counter() - batch_started
+        self.last_profile = profile
         return results
 
 

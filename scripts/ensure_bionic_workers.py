@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import time
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from native_core.client import request as native_request
 
 
 BOOT_JARS = (
@@ -41,13 +50,58 @@ BOOT_JARS = (
 
 def ready(port: int, timeout: float = 0.25) -> bool:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
+        response = native_request(
+            {"op": "status"}, host="127.0.0.1", port=port,
+            timeout=max(timeout, 0.5),
+        )
+        state = response.get("state") if isinstance(response, Mapping) else None
+        read_ok = state.get("read_ok") if isinstance(state, Mapping) else None
+        return bool(
+            response.get("ok")
+            and isinstance(state, Mapping)
+            and int(state.get("current_state_type", -1)) == 4
+            and int(state.get("tick", -1)) >= 0
+            and state.get("battle") not in (None, "0x0")
+            and state.get("replay_data") not in (None, "0x0")
+            and isinstance(read_ok, Mapping)
+            and all(
+                bool(read_ok.get(name, False))
+                for name in ("root", "context", "manager_fields", "battle", "tick")
+            )
+        )
+    except (OSError, ConnectionError, TypeError, ValueError):
         return False
 
 
-def command(direct: Path, port: int) -> list[str]:
+def port_bindable(port: int) -> bool:
+    """Return whether a replacement server can bind after a Worker exits."""
+    candidate = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        candidate.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        candidate.close()
+
+
+def wait_port_bindable(port: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if port_bindable(port):
+            return True
+        time.sleep(0.25)
+    return port_bindable(port)
+
+
+def command(
+    direct: Path,
+    port: int,
+    *,
+    execution_mode: str = "interpreter",
+) -> list[str]:
+    if execution_mode not in ("interpreter", "jit"):
+        raise ValueError("execution_mode must be interpreter or jit")
     boot = ":".join(BOOT_JARS)
     classpath = ":".join((
         "/system/framework/android.test.base.jar",
@@ -55,10 +109,11 @@ def command(direct: Path, port: int) -> list[str]:
         str(direct / "lifecycle-probe.jar"),
         str(direct / "base.apk"),
     ))
+    vm_mode = ["-Xint"] if execution_mode == "interpreter" else []
     return [
         "/apex/com.android.runtime/bin/linker64",
         "/apex/com.android.art/bin/dalvikvm64",
-        "-Xint",
+        *vm_mode,
         f"-Xbootclasspath:{boot}",
         f"-Xbootclasspath-locations:{boot}",
         f"-Djava.library.path={direct}",
@@ -118,6 +173,8 @@ def ensure_android_properties(runtime_root: Path) -> Path:
 
 
 def ensure(args: argparse.Namespace) -> dict[str, object]:
+    if args.count < 1 or not 1 <= args.base_port <= 65536 - args.count:
+        raise ValueError("Worker port range must fit in 1..65535")
     runtime_root = args.runtime_root.resolve(strict=True)
     property_serial = ensure_android_properties(runtime_root)
     working_directory = runtime_root / "worker0" / "assets"
@@ -134,9 +191,14 @@ def ensure(args: argparse.Namespace) -> dict[str, object]:
     if missing_system:
         raise RuntimeError(f"Bionic system image is incomplete: {missing_system}")
 
+    slot_offset = int(getattr(args, "slot_offset", 0))
+    execution_mode = str(getattr(args, "execution_mode", "interpreter"))
+    if slot_offset < 0 or execution_mode not in ("interpreter", "jit"):
+        raise ValueError("invalid Worker slot offset/execution mode")
     launched = []
-    for slot in range(args.count):
-        port = args.base_port + slot
+    for local_slot in range(args.count):
+        slot = slot_offset + local_slot
+        port = args.base_port + local_slot
         if ready(port):
             continue
         direct = Path(f"/data/local/tmp/cr-native-direct-{slot}")
@@ -150,11 +212,15 @@ def ensure(args: argparse.Namespace) -> dict[str, object]:
         missing = [str(path) for path in required if not path.exists()]
         if missing:
             raise RuntimeError(f"Worker {slot} runtime is incomplete: {missing}")
+        if not wait_port_bindable(port, args.ready_timeout):
+            raise RuntimeError(
+                f"Worker port {port} did not become bindable after a prior exit"
+            )
         (direct / "cache").mkdir(parents=True, exist_ok=True)
         log_path = log_root / f"worker-{slot:02d}-port-{port}.log"
         log = log_path.open("ab", buffering=0)
         process = subprocess.Popen(
-            command(direct, port),
+            command(direct, port, execution_mode=execution_mode),
             cwd=working_directory,
             env=environment(direct),
             stdin=subprocess.DEVNULL,
@@ -170,10 +236,22 @@ def ensure(args: argparse.Namespace) -> dict[str, object]:
         pending = [port for port in pending if not ready(port)]
         if pending:
             time.sleep(0.25)
+    if not pending:
+        # A bare TCP accept is insufficient: a stale process can disappear
+        # immediately after the first probe.  Require two semantic status
+        # passes before advertising the fleet to collectors.
+        for _ in range(2):
+            time.sleep(0.5)
+            pending = [
+                port for port in range(args.base_port, args.base_port + args.count)
+                if not ready(port)
+            ]
+            if pending:
+                break
     if pending:
         tails = {}
         for port in pending:
-            slot = port - args.base_port
+            slot = slot_offset + port - args.base_port
             path = log_root / f"worker-{slot:02d}-port-{port}.log"
             if path.is_file():
                 tails[str(port)] = path.read_text(
@@ -183,6 +261,8 @@ def ensure(args: argparse.Namespace) -> dict[str, object]:
     return {
         "ready": args.count,
         "base_port": args.base_port,
+        "slot_offset": slot_offset,
+        "execution_mode": execution_mode,
         "launched": launched,
         "reused": args.count - len(launched),
         "runtime_root": str(runtime_root),
@@ -199,6 +279,12 @@ def main() -> int:
     )
     parser.add_argument("--base-port", type=int, default=39031)
     parser.add_argument("--count", type=int, default=72)
+    parser.add_argument("--slot-offset", type=int, default=0)
+    parser.add_argument(
+        "--execution-mode",
+        choices=("interpreter", "jit"),
+        default="interpreter",
+    )
     parser.add_argument("--ready-timeout", type=float, default=120.0)
     args = parser.parse_args()
     if args.count < 1 or args.ready_timeout <= 0:

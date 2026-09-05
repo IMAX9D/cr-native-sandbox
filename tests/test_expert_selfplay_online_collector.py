@@ -299,11 +299,70 @@ class OnlineCollectorTests(unittest.TestCase):
             results[0].step_payloads[0]["actor_inputs"]["hidden"][0],
             torch.zeros(1, 1, 8),
         ))
-        self.assertTrue(torch.equal(
-            results[0].step_payloads[1]["actor_inputs"]["hidden"][0],
-            torch.ones(1, 1, 8),
-        ))
+        self.assertNotIn("hidden", results[0].step_payloads[1]["actor_inputs"])
         self.assertEqual(len(results[0].step_payloads), len(results[0].episode.decisions))
+
+    def test_hidden_is_copied_only_at_recurrent_chunk_anchors(self):
+        digest = "a" * 64
+        service = BatchedPolicyService(device="cpu", deterministic=True)
+        service.register_actor(ConstantActor(), actor_sha256=digest)
+        fixture = _fixture(17, 0)
+        result = OnlineSelfPlayCollector(_encoder(), service).collect_episode(
+            env=FakeNativeEnv(terminal_after=114), fixture=fixture,
+            header=_header(17, 0, digest, digest), actor_hashes={0: digest, 1: digest},
+        )
+        anchors = [
+            index
+            for index, payload in enumerate(result.step_payloads)
+            if "hidden" in payload["actor_inputs"]
+        ]
+        self.assertEqual(anchors, [0, 48, 112])
+
+    def test_rolling_replacement_reuses_worker_after_normal_terminal(self):
+        digest = "a" * 64
+        service = BatchedPolicyService(device="cpu", deterministic=True)
+        service.register_actor(ConstantActor(), actor_sha256=digest)
+        env = FakeNativeEnv(terminal_after=2)
+        specs = [
+            OnlineEpisodeSpec(
+                "worker-1", env, _fixture(seed, 0),
+                _header(seed, 0, digest, digest), {0: digest, 1: digest},
+            )
+            for seed in (18, 19)
+        ]
+        results = OnlineSelfPlayCollector(
+            _encoder(), service, rpc_workers=1
+        ).collect_batch(specs, rolling_replacement=True)
+        self.assertEqual(
+            {result.episode_id for result in results},
+            {"episode-18", "episode-19"},
+        )
+        self.assertTrue(all(
+            len(result.episode.decisions) == 2 for result in results
+        ))
+
+    def test_lean_stage2_payload_drops_audit_duplicates_after_finalization(self):
+        digest = "a" * 64
+        service = BatchedPolicyService(device="cpu", deterministic=True)
+        service.register_actor(ConstantActor(), actor_sha256=digest)
+        fixture = _fixture(3, 0)
+        result = OnlineSelfPlayCollector(
+            _encoder(), service, lean_step_payloads=True
+        ).collect_episode(
+            env=FakeNativeEnv(terminal_after=1), fixture=fixture,
+            header=_header(3, 0, digest, digest),
+            actor_hashes={0: digest, 1: digest},
+        )
+
+        payload = result.step_payloads[0]
+        self.assertEqual(set(payload), {
+            "schema_version", "kind", "tick", "delta_ticks",
+            "actor_sha256", "actor_inputs", "action_masks",
+            "recorded_action", "critic_inputs", "critic_targets",
+        })
+        self.assertNotIn("critic_private", payload)
+        self.assertNotIn("native_receipt", payload)
+        self.assertTrue(payload["critic_targets"])
 
     def test_different_actor_hashes_are_dispatched_in_the_same_service_call(self):
         hashes = {0: "a" * 64, 1: "b" * 64}
@@ -403,6 +462,50 @@ class OnlineCollectorTests(unittest.TestCase):
         self.assertEqual(
             [row["delta_ticks"] for row in chunks[0]["decisions"]], [4, 2]
         )
+
+    def test_adaptive_cadence_uses_idle_window_only_for_empty_arena(self):
+        digest = "a" * 64
+        service = BatchedPolicyService(device="cpu", deterministic=True)
+        service.register_actor(ConstantActor(), actor_sha256=digest)
+        fixture = _fixture(14, 0)
+        idle = OnlineSelfPlayCollector(
+            _encoder(), service, step_ticks=4, idle_step_ticks=12
+        ).collect_episode(
+            env=FakeNativeEnv(terminal_after=2), fixture=fixture,
+            header=_header(14, 0, digest, digest), actor_hashes={0: digest, 1: digest},
+        )
+        self.assertEqual([row.tick for row in idle.episode.decisions], [100, 112])
+        self.assertEqual([row.delta_ticks for row in idle.episode.decisions], [12, 12])
+
+        troop = {
+            "category": 1, "side": 0, "x": 4000, "y": 8000,
+            "card_id": CARDS[0], "level": 11, "hp": 1000, "max_hp": 1000,
+            "behavior_state": 1,
+        }
+        backline_service = BatchedPolicyService(device="cpu", deterministic=True)
+        backline_service.register_actor(ConstantActor(), actor_sha256=digest)
+        backline_fixture = _fixture(15, 0)
+        backline = OnlineSelfPlayCollector(
+            _encoder(), backline_service, step_ticks=4, idle_step_ticks=12
+        ).collect_episode(
+            env=FakeNativeEnv(terminal_after=2, entities=[troop]), fixture=backline_fixture,
+            header=_header(15, 0, digest, digest), actor_hashes={0: digest, 1: digest},
+        )
+        self.assertEqual([row.tick for row in backline.episode.decisions], [100, 112])
+        self.assertEqual([row.delta_ticks for row in backline.episode.decisions], [12, 12])
+
+        troop["y"] = 16_000
+        active_service = BatchedPolicyService(device="cpu", deterministic=True)
+        active_service.register_actor(ConstantActor(), actor_sha256=digest)
+        active_fixture = _fixture(16, 0)
+        active = OnlineSelfPlayCollector(
+            _encoder(), active_service, step_ticks=4, idle_step_ticks=12
+        ).collect_episode(
+            env=FakeNativeEnv(terminal_after=2, entities=[troop]), fixture=active_fixture,
+            header=_header(16, 0, digest, digest), actor_hashes={0: digest, 1: digest},
+        )
+        self.assertEqual([row.tick for row in active.episode.decisions], [100, 104])
+        self.assertEqual([row.delta_ticks for row in active.episode.decisions], [4, 4])
 
     def test_available_native_ability_maps_to_entity_command(self):
         hero = {

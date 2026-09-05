@@ -5,13 +5,17 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import unittest
 
 import torch
 
-from scripts.run_expert_selfplay_stage2_loop import run
-from scripts.start_expert_selfplay_stage2 import _canary_continuation
+from scripts.run_expert_selfplay_stage2_loop import run, run_isolated, wait_collectors
+from scripts.start_expert_selfplay_stage2 import (
+    _canary_continuation,
+    _completed_run_continuation,
+)
 
 
 COLLECTOR = r'''import argparse,json
@@ -29,7 +33,7 @@ a=p.parse_args();r=Path(a.run_dir);s=r/"rollouts"/"shard-1";s.mkdir(parents=True
 TRAINER = r'''import argparse,json,torch
 from pathlib import Path
 p=argparse.ArgumentParser()
-for name in ("base-checkpoint","continuation-checkpoint","expert-manifest","run-dir","device","cpu-threads","ppo-epochs","chunk-batch-size","retain-checkpoints"):
+for name in ("base-checkpoint","continuation-checkpoint","expert-manifest","run-dir","device","cpu-threads","ppo-epochs","chunk-batch-size","preprocess-window-size","preprocess-batch-size","retain-checkpoints"):
  p.add_argument("--"+name)
 p.add_argument("--shard",action="append")
 a=p.parse_args();c=torch.load(a.continuation_checkpoint,weights_only=False);pre=int(c.get("policy_version",0));glob=int(c["global_update"])+1
@@ -41,6 +45,60 @@ torch.save({"kind":"cr_native_expert_selfplay_stage2_checkpoint_v1","global_upda
 
 
 class Stage2LoopTests(unittest.TestCase):
+    def test_completed_shard_is_prepared_before_collector_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            producer = root / "producer.py"
+            producer.write_text(
+                "from pathlib import Path\nimport sys,time\nr=Path(sys.argv[1])\n"
+                "s=r/'rollouts'/'shard-1';s.mkdir(parents=True)\n"
+                "(s/'manifest.json').write_text('{}')\n"
+                "deadline=time.monotonic()+5\n"
+                "while not (r/'prepared').exists():\n"
+                " if time.monotonic()>deadline: raise RuntimeError('preparation did not overlap')\n"
+                " time.sleep(.01)\n"
+                "s=r/'rollouts'/'shard-2';s.mkdir()\n"
+                "(s/'manifest.json').write_text('{}')\n",
+                encoding="utf-8",
+            )
+            observed = []
+
+            def prepare(shard):
+                observed.append(shard.name)
+                (root / "prepared").write_text("ready")
+
+            process = subprocess.Popen([sys.executable, str(producer), str(root)])
+            count = wait_collectors([process], [root], prepare_shard=prepare, timeout_seconds=8)
+            self.assertEqual(count, 2)
+            self.assertEqual(observed, ["shard-1", "shard-2"])
+
+    def test_completed_run_resume_uses_last_committed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoint.pt"
+            behavior = root / "behavior.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            behavior.write_bytes(b"behavior")
+            progress = {
+                "kind": "cr_native_expert_selfplay_stage2_loop_v1",
+                "status": "completed",
+                "completion_reason": "requested_updates_committed",
+                "completed_updates": [{
+                    "checkpoint": str(checkpoint),
+                    "behavior_export": str(behavior),
+                    "metrics": {"loss": 1.0},
+                }],
+                "latest_checkpoint": str(checkpoint),
+                "latest_behavior_export": str(behavior),
+            }
+            (root / "progress.json").write_text(
+                json.dumps(progress), encoding="utf-8"
+            )
+            self.assertEqual(
+                _completed_run_continuation(root),
+                (checkpoint.resolve(), behavior.resolve()),
+            )
+
     def test_formal_entry_requires_three_completed_canary_updates(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -133,6 +191,12 @@ class Stage2LoopTests(unittest.TestCase):
                 [53, 54],
             )
             self.assertIsNone(result["active_update"])
+            args.run_root = root / "isolated-run"
+            args.enable_mps = False
+            isolated = run_isolated(args)
+            self.assertEqual(isolated["status"], "completed")
+            self.assertEqual([row["policy_version"] for row in isolated["completed_updates"]], [1, 2])
+            self.assertTrue(isolated["cuda_process_per_update"])
 
 
 if __name__ == "__main__":

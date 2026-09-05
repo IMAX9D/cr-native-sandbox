@@ -195,13 +195,16 @@ def load_base(
     expert_manifest_path: Path,
     *,
     device: torch.device,
+    actor_dtype: torch.dtype | None = None,
 ) -> LoadedBase:
     """Load and bind the inference Actor to its exact frozen encoder manifest."""
 
     checkpoint_path = checkpoint_path.resolve(strict=True)
     expert_manifest_path = expert_manifest_path.resolve(strict=True)
     expert_manifest_sha256 = sha256_file(expert_manifest_path)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False, mmap=True
+    )
     if not isinstance(checkpoint, Mapping) or checkpoint.get("kind") != EXPERT_INFERENCE_KIND:
         raise RuntimeError("--checkpoint is not an expert inference checkpoint")
     bound_manifest = str(checkpoint.get("dataset_manifest_sha256", ""))
@@ -224,8 +227,13 @@ def load_base(
     actor.eval()
     for parameter in actor.parameters():
         parameter.requires_grad_(False)
-    actor_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    actor.to(device=device, dtype=actor_dtype)
+    target_dtype = actor_dtype or (
+        torch.float16 if device.type == "cuda" else torch.float32
+    )
+    # Establish the exact inference dtype on CPU, verify/hash those final bytes
+    # once, then transfer them to the target device.  Hashing after CUDA upload
+    # forced one small GPU-to-CPU synchronization per state_dict tensor.
+    actor.to(device="cpu", dtype=target_dtype)
     if any(parameter.requires_grad for parameter in actor.parameters()):
         raise RuntimeError("Stage-1 BASE Actor was not frozen")
     if not all(
@@ -235,6 +243,7 @@ def load_base(
     ):
         raise FloatingPointError("BASE Actor contains NaN/Inf")
     actor_sha256 = actor_state_digest(actor)
+    actor.to(device=device)
     return LoadedBase(
         actor=actor,
         config=config,
@@ -319,6 +328,53 @@ def _complete_episode(value: Any) -> tuple[dict[str, Any], Sequence[Any]]:
     return frozen, step_payloads
 
 
+def _write_and_verify_wave(
+    *,
+    writer: ImmutableRolloutShardWriter,
+    batch_manifest: BatchManifest,
+    wave_index: int,
+    frozen_episodes: Sequence[Mapping[str, Any]],
+    payloads_by_episode: Mapping[str, Sequence[Any]],
+    gameplay_started_at: float,
+    gameplay_finished_at: float,
+    freeze_finished_at: float,
+) -> tuple[dict[str, Any], Any]:
+    writer_started_at = time.monotonic()
+    shard = writer.write(
+        f"shard-{wave_index + 1:06d}",
+        frozen_episodes,
+        step_payloads_by_episode=payloads_by_episode,
+    )
+    writer_finished_at = time.monotonic()
+    verified = verify_rollout_shard(
+        shard.directory,
+        expected_batch_manifest=batch_manifest,
+        mmap=True,
+        verify_semantic_digest=False,
+        known_torch_sha256=shard.torch_sha256,
+    )
+    verified_at = time.monotonic()
+    wave_decisions = sum(len(row["decisions"]) for row in frozen_episodes)
+    row = {
+        "wave": wave_index + 1,
+        "directory": str(shard.directory),
+        "content_sha256": shard.content_sha256,
+        "torch_sha256": shard.torch_sha256,
+        "episodes": len(frozen_episodes),
+        "decisions": wave_decisions,
+        "chunks": int(verified["chunk_count"]),
+        "timings": {
+            "gameplay_seconds": gameplay_finished_at - gameplay_started_at,
+            "freeze_and_prepare_seconds": freeze_finished_at - gameplay_finished_at,
+            "write_queue_seconds": writer_started_at - freeze_finished_at,
+            "write_seconds": writer_finished_at - writer_started_at,
+            "verify_seconds": verified_at - writer_finished_at,
+            "total_seconds": verified_at - gameplay_started_at,
+        },
+    }
+    return row, shard
+
+
 def _episode_spec(
     spec_type: type,
     *,
@@ -387,11 +443,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-manifest", type=Path, default=DEFAULT_RUNTIME_MANIFEST)
     parser.add_argument("--episodes", type=int)
     parser.add_argument(
+        "--collection-waves",
+        type=int,
+        default=1,
+        help="collect this many consecutive Worker-sized waves per loaded policy",
+    )
+    parser.add_argument(
+        "--async-shard-writes",
+        action="store_true",
+        help="write/verify the previous collect-only wave while the next wave runs",
+    )
+    parser.add_argument(
+        "--rolling-collection",
+        action="store_true",
+        help="replace each terminal Worker immediately instead of using wave barriers",
+    )
+    parser.add_argument(
         "--smoke-workers", type=int,
         help="bounded smoke: use exactly the first N explicit ports (normally 4)",
     )
     parser.add_argument("--updates", type=int, default=1)
     parser.add_argument("--step-ticks", type=int, default=1)
+    parser.add_argument(
+        "--idle-step-ticks",
+        type=int,
+        help=(
+            "optional wider hazard/transition window used only while the "
+            "native arena has no dynamic entities"
+        ),
+    )
     parser.add_argument("--max-decisions", type=int, default=12_000)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20260902)
@@ -399,7 +479,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum-stage", default="stage1_critic")
     parser.add_argument("--opponent-policy-id", default="BASE")
     parser.add_argument("--device", default="auto", choices=("auto", "cuda", "cpu"))
+    parser.add_argument(
+        "--policy-server-address",
+        help="local Unix socket for one shared policy process (collect-only)",
+    )
     parser.add_argument("--cpu-threads", type=int, default=16)
+    parser.add_argument("--compile-actor", action="store_true")
+    parser.add_argument("--compile-batch-size", type=int)
+    parser.add_argument("--compile-entity-slots", type=int)
+    parser.add_argument("--dense-policy-sampling", action="store_true")
     parser.add_argument("--retain-checkpoints", type=int, default=3)
     parser.add_argument(
         "--collect-only",
@@ -437,8 +525,33 @@ def run(
         raise ValueError("--episodes must be in 1..number of selected Worker ports")
     if args.updates != 1:
         raise ValueError("Stage-1 requires exactly one fresh rollout batch per update")
+    collection_waves = int(getattr(args, "collection_waves", 1))
+    if collection_waves < 1:
+        raise ValueError("--collection-waves must be positive")
+    if not collect_only and collection_waves != 1:
+        raise ValueError("--collection-waves greater than one is collect-only")
+    async_shard_writes = bool(getattr(args, "async_shard_writes", False))
+    if async_shard_writes and (not collect_only or collection_waves < 2):
+        raise ValueError(
+            "--async-shard-writes requires collect-only with at least two waves"
+        )
+    rolling_collection = bool(getattr(args, "rolling_collection", False))
+    if rolling_collection and (not collect_only or collection_waves < 2):
+        raise ValueError(
+            "--rolling-collection requires collect-only with at least two waves"
+        )
+    if rolling_collection and async_shard_writes:
+        raise ValueError(
+            "rolling collection already completes before shard publication"
+        )
+    total_episodes = episodes * collection_waves
     if not 1 <= args.step_ticks <= 16:
         raise ValueError("--step-ticks must be in 1..16")
+    idle_step_ticks = getattr(args, "idle_step_ticks", None)
+    if idle_step_ticks is not None and not (
+        args.step_ticks <= idle_step_ticks <= 16
+    ):
+        raise ValueError("--idle-step-ticks must be in --step-ticks..16")
     if args.max_decisions < 1 or args.timeout <= 0 or args.cpu_threads < 1:
         raise ValueError("invalid runtime limit")
     if args.retain_checkpoints < 1:
@@ -449,6 +562,22 @@ def run(
         raise ValueError("--opponent-checkpoint is supported only with --collect-only")
     if policy_version < 0 or not curriculum_stage or not opponent_policy_id:
         raise ValueError("invalid PPO policy/curriculum identity")
+    compile_actor = bool(getattr(args, "compile_actor", False))
+    compile_batch_size = getattr(args, "compile_batch_size", None)
+    compile_entity_slots = getattr(args, "compile_entity_slots", None)
+    if compile_actor and (
+        compile_batch_size is None or compile_entity_slots is None
+    ):
+        raise ValueError(
+            "--compile-actor requires --compile-batch-size and "
+            "--compile-entity-slots"
+        )
+    if not compile_actor and (
+        compile_batch_size is not None or compile_entity_slots is not None
+    ):
+        raise ValueError("compile capacities require --compile-actor")
+    if compile_actor and getattr(args, "policy_server_address", None):
+        raise ValueError("--compile-actor applies only to in-process policy service")
 
     run_dir = args.run_dir.resolve()
     if run_dir.exists():
@@ -460,6 +589,7 @@ def run(
 
     envs: list[NativeRoyaleEnv] = []
     ledger: RolloutLedger | None = None
+    policy_to_close: Any | None = None
     try:
         torch.set_num_threads(args.cpu_threads)
         if args.device == "auto":
@@ -468,14 +598,25 @@ def run(
             device = torch.device(args.device)
         if device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable")
+        policy_server_address = getattr(args, "policy_server_address", None)
+        if policy_server_address and not collect_only:
+            raise ValueError("shared policy service is collect-only")
+        load_device = torch.device("cpu") if policy_server_address else device
+        load_dtype = torch.float16 if policy_server_address else None
         native_runtime = _runtime_identity(args.runtime_manifest)
-        loaded = load_base(args.checkpoint, args.expert_manifest, device=device)
+        loaded = load_base(
+            args.checkpoint, args.expert_manifest,
+            device=load_device, actor_dtype=load_dtype,
+        )
         initial_actor_sha256 = loaded.actor_sha256
         initial_hidden_sha256 = _initial_hidden_sha256(loaded.actor)
         opponent_loaded = (
             loaded
             if opponent_checkpoint is None
-            else load_base(opponent_checkpoint, args.expert_manifest, device=device)
+            else load_base(
+                opponent_checkpoint, args.expert_manifest,
+                device=load_device, actor_dtype=load_dtype,
+            )
         )
         opponent_actor_sha256 = opponent_loaded.actor_sha256
         opponent_paths = sorted(args.opponent_deck_root.resolve(strict=True).glob("deck-*.json"))
@@ -483,7 +624,7 @@ def run(
             learner_preset=args.learner_deck.resolve(strict=True),
             opponent_presets=opponent_paths,
         )
-        fixtures = scheduler.build_batch(episode_count=episodes, seed=args.seed)
+        fixtures = scheduler.build_batch(episode_count=total_episodes, seed=args.seed)
 
         envs = [
             env_type(host=args.host, port=port, timeout=args.timeout, profile_native=True)
@@ -493,29 +634,58 @@ def run(
             worker_status = list(executor.map(_preflight_env, envs))
         journal.event("workers_preflight_complete", workers=len(worker_status))
 
-        policy = BatchedPolicyService(device=device, seed=args.seed)
-        registered = policy.register_actor(
-            loaded.actor, actor_sha256=initial_actor_sha256, verify_content=True
-        )
-        if registered != initial_actor_sha256 or len(policy.registered_actor_hashes) != 1:
-            raise RuntimeError("BASE Actor registry identity diverged")
-        if opponent_actor_sha256 != initial_actor_sha256:
-            opponent_registered = policy.register_actor(
-                opponent_loaded.actor,
-                actor_sha256=opponent_actor_sha256,
-                verify_content=True,
+        expected_hashes = tuple(sorted({
+            initial_actor_sha256, opponent_actor_sha256
+        }))
+        if policy_server_address:
+            from expert_selfplay_v1.remote_policy import RemotePolicyClient
+
+            policy = RemotePolicyClient(
+                policy_server_address,
+                expected_actor_hashes=expected_hashes,
             )
-            if opponent_registered != opponent_actor_sha256:
-                raise RuntimeError("opponent Actor registry identity diverged")
+            policy_to_close = policy
+        else:
+            policy = BatchedPolicyService(
+                device=device,
+                seed=args.seed,
+                compile_actors=compile_actor,
+                compile_batch_size=compile_batch_size,
+                compile_entity_slots=compile_entity_slots,
+                dense_sampling=bool(
+                    getattr(args, "dense_policy_sampling", False)
+                ),
+            )
+            policy.register_actor(
+                loaded.actor,
+                actor_sha256=initial_actor_sha256,
+                verify_content=False,
+            )
+            if opponent_actor_sha256 != initial_actor_sha256:
+                policy.register_actor(
+                    opponent_loaded.actor,
+                    actor_sha256=opponent_actor_sha256,
+                    verify_content=False,
+                )
+        if set(policy.registered_actor_hashes) != set(expected_hashes):
+            raise RuntimeError("Actor registry identity diverged")
 
         deps = dependencies or runtime_dependencies()
+        collector_options: dict[str, Any] = {
+            "encoder": loaded.encoder,
+            "policy_service": policy,
+            "reward": DefensiveTowerReward(),
+            "max_decisions": args.max_decisions,
+            "rpc_workers": len(envs),
+            "step_ticks": args.step_ticks,
+            "lean_step_payloads": (
+                collect_only and curriculum_stage == "stage2_reaction"
+            ),
+        }
+        if idle_step_ticks is not None:
+            collector_options["idle_step_ticks"] = idle_step_ticks
         collector = deps.collector_type(
-            encoder=loaded.encoder,
-            policy_service=policy,
-            reward=DefensiveTowerReward(),
-            max_decisions=args.max_decisions,
-            rpc_workers=len(envs),
-            step_ticks=args.step_ticks,
+            **collector_options,
         )
         trainer = None
         if not collect_only:
@@ -566,7 +736,7 @@ def run(
             action_schema_sha256=canonical_schema_hash(ACTION_SCHEMA),
             reward_schema_sha256=canonical_schema_hash(_reward_schema()),
             native_lib_sha256=native_runtime["libg_sha256"],
-            episode_count=episodes,
+            episode_count=total_episodes,
         )
         batch_manifest.validate()
         headers = [
@@ -586,18 +756,6 @@ def run(
             )
             for index, fixture in enumerate(fixtures)
         ]
-        specs = [
-            _episode_spec(
-                deps.episode_spec_type,
-                env=env,
-                fixture=fixture,
-                header=header,
-                learner_actor_sha256=initial_actor_sha256,
-                opponent_actor_sha256=opponent_actor_sha256,
-            )
-            for env, fixture, header in zip(envs, fixtures, headers, strict=True)
-        ]
-
         run_manifest = {
             "kind": RUN_KIND,
             "created_utc": utc_now(),
@@ -608,8 +766,13 @@ def run(
             "worker_process_management": False,
             "host": args.host,
             "ports": ports[:episodes],
-            "episodes": episodes,
+            "episodes": total_episodes,
+            "episodes_per_wave": episodes,
+            "collection_waves": collection_waves,
+            "async_shard_writes": async_shard_writes,
+            "rolling_collection": rolling_collection,
             "step_ticks": args.step_ticks,
+            "idle_step_ticks": idle_step_ticks,
             "updates": args.updates,
             "resume_checkpoint": (
                 None
@@ -622,6 +785,20 @@ def run(
             "seed": args.seed,
             "policy_version": policy_version,
             "device": str(device),
+            "policy_service": (
+                "shared_unix_socket_v1"
+                if policy_server_address else "in_process_v1"
+            ),
+            "actor_compilation": {
+                "enabled": compile_actor,
+                "batch_size": compile_batch_size,
+                "entity_slots": compile_entity_slots,
+                "backend": "inductor" if compile_actor else None,
+                "mode": "reduce-overhead" if compile_actor else None,
+            },
+            "dense_policy_sampling": bool(
+                getattr(args, "dense_policy_sampling", False)
+            ),
             "actor_dtype": "float16" if device.type == "cuda" else "float32",
             "critic_autocast_dtype": "bfloat16" if device.type == "cuda" else "float32",
             "checkpoint": {
@@ -667,49 +844,216 @@ def run(
             batch_id, policy_version=policy_version, actor_sha256=initial_actor_sha256
         )
         ledger.transition(batch_id, "COLLECTING")
-        journal.progress("collecting", episodes_completed=0, episodes=episodes)
-        journal.event("collection_started", batch_id=batch_id, episodes=episodes)
-        collected = collector.collect_batch(specs)
-        if len(collected) != episodes:
-            raise RuntimeError(
-                f"collector returned {len(collected)}/{episodes} requested episodes"
-            )
-
-        frozen_episodes: list[dict[str, Any]] = []
-        payloads_by_episode: dict[str, Sequence[Any]] = {}
+        journal.progress(
+            "collecting", episodes_completed=0, episodes=total_episodes,
+            waves_completed=0, collection_waves=collection_waves,
+        )
+        journal.event(
+            "collection_started", batch_id=batch_id, episodes=total_episodes,
+            collection_waves=collection_waves,
+        )
+        collection_started_at = time.monotonic()
         chunks: list[dict[str, Any]] = []
         chunker = LearnerEpisodeChunker()
-        for row in collected:
-            frozen, step_payloads = _complete_episode(row)
-            episode_id = str(frozen["header"]["episode_id"])
-            if episode_id in payloads_by_episode:
-                raise RuntimeError(f"collector returned duplicate episode: {episode_id}")
-            frozen_episodes.append(frozen)
-            payloads_by_episode[episode_id] = step_payloads
-            chunks.extend(chunker.chunk(frozen, step_payloads=step_payloads))
-        if {str(row["header"]["episode_id"]) for row in frozen_episodes} != {
-            header.episode_id for header in headers
-        }:
-            raise RuntimeError("collector episode identities differ from scheduled batch")
-
         writer = ImmutableRolloutShardWriter(
-            run_dir / "rollouts", batch_manifest, ledger=ledger, chunker=chunker
+            run_dir / "rollouts",
+            batch_manifest,
+            ledger=None if async_shard_writes else ledger,
+            chunker=chunker,
         )
-        shard = writer.write(
-            "shard-000001",
-            frozen_episodes,
-            step_payloads_by_episode=payloads_by_episode,
+        shard_rows: list[dict[str, Any]] = []
+        pending_writes: list[Any] = []
+        seen_episode_ids: set[str] = set()
+        total_decisions = 0
+        total_chunks = 0
+        profile_totals: dict[str, float] = {}
+        timing_totals = {
+            "gameplay_seconds": 0.0,
+            "freeze_and_prepare_seconds": 0.0,
+            "write_queue_seconds": 0.0,
+            "write_seconds": 0.0,
+            "verify_seconds": 0.0,
+        }
+        write_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-writer")
+            if async_shard_writes else None
         )
-        verified = verify_rollout_shard(
-            shard.directory, expected_batch_manifest=batch_manifest
-        )
-        ledger.close_collection(batch_id, minimum_shards=1)
+        rolling_batches: list[list[Any]] | None = None
+        rolling_started_at = 0.0
+        rolling_finished_at = 0.0
+        if rolling_collection:
+            rolling_specs = []
+            for wave_index in range(collection_waves):
+                start = wave_index * episodes
+                stop = start + episodes
+                rolling_specs.extend(
+                    _episode_spec(
+                        deps.episode_spec_type,
+                        env=env,
+                        fixture=fixture,
+                        header=header,
+                        learner_actor_sha256=initial_actor_sha256,
+                        opponent_actor_sha256=opponent_actor_sha256,
+                    )
+                    for env, fixture, header in zip(
+                        envs, fixtures[start:stop], headers[start:stop], strict=True
+                    )
+                )
+            rolling_started_at = time.monotonic()
+            rolling_results = collector.collect_batch(
+                rolling_specs, rolling_replacement=True
+            )
+            rolling_finished_at = time.monotonic()
+            if len(rolling_results) != total_episodes:
+                raise RuntimeError(
+                    f"rolling collector returned {len(rolling_results)}/"
+                    f"{total_episodes} requested episodes"
+                )
+            result_by_episode = {
+                result.episode_id: result for result in rolling_results
+            }
+            if len(result_by_episode) != total_episodes:
+                raise RuntimeError("rolling collector returned duplicate episodes")
+            rolling_batches = [
+                [
+                    result_by_episode[header.episode_id]
+                    for header in headers[
+                        wave_index * episodes:(wave_index + 1) * episodes
+                    ]
+                ]
+                for wave_index in range(collection_waves)
+            ]
+        try:
+            for wave_index in range(collection_waves):
+                start = wave_index * episodes
+                stop = start + episodes
+                wave_fixtures = fixtures[start:stop]
+                wave_headers = headers[start:stop]
+                if rolling_batches is None:
+                    specs = [
+                        _episode_spec(
+                            deps.episode_spec_type,
+                            env=env,
+                            fixture=fixture,
+                            header=header,
+                            learner_actor_sha256=initial_actor_sha256,
+                            opponent_actor_sha256=opponent_actor_sha256,
+                        )
+                        for env, fixture, header in zip(
+                            envs, wave_fixtures, wave_headers, strict=True
+                        )
+                    ]
+                    gameplay_started_at = time.monotonic()
+                    collected = collector.collect_batch(specs)
+                    gameplay_finished_at = time.monotonic()
+                else:
+                    collected = rolling_batches[wave_index]
+                    if wave_index == 0:
+                        gameplay_started_at = rolling_started_at
+                        gameplay_finished_at = rolling_finished_at
+                    else:
+                        gameplay_started_at = rolling_finished_at
+                        gameplay_finished_at = rolling_finished_at
+                if len(collected) != episodes:
+                    raise RuntimeError(
+                        f"collector returned {len(collected)}/{episodes} requested episodes"
+                    )
+
+                frozen_episodes: list[dict[str, Any]] = []
+                payloads_by_episode: dict[str, Sequence[Any]] = {}
+                for row in collected:
+                    frozen, step_payloads = _complete_episode(row)
+                    episode_id = str(frozen["header"]["episode_id"])
+                    if episode_id in seen_episode_ids:
+                        raise RuntimeError(
+                            f"collector returned duplicate episode: {episode_id}"
+                        )
+                    seen_episode_ids.add(episode_id)
+                    frozen_episodes.append(frozen)
+                    payloads_by_episode[episode_id] = step_payloads
+                    if not collect_only:
+                        chunks.extend(chunker.chunk(frozen, step_payloads=step_payloads))
+                if {str(row["header"]["episode_id"]) for row in frozen_episodes} != {
+                    header.episode_id for header in wave_headers
+                }:
+                    raise RuntimeError(
+                        "collector episode identities differ from scheduled wave"
+                    )
+                freeze_finished_at = time.monotonic()
+
+                write_arguments = {
+                    "writer": writer,
+                    "batch_manifest": batch_manifest,
+                    "wave_index": wave_index,
+                    "frozen_episodes": frozen_episodes,
+                    "payloads_by_episode": payloads_by_episode,
+                    "gameplay_started_at": gameplay_started_at,
+                    "gameplay_finished_at": gameplay_finished_at,
+                    "freeze_finished_at": freeze_finished_at,
+                }
+                if write_executor is None:
+                    pending_writes.append(_write_and_verify_wave(**write_arguments))
+                else:
+                    pending_writes.append(
+                        write_executor.submit(_write_and_verify_wave, **write_arguments)
+                    )
+                timing_totals["gameplay_seconds"] += (
+                    gameplay_finished_at - gameplay_started_at
+                )
+                timing_totals["freeze_and_prepare_seconds"] += (
+                    freeze_finished_at - gameplay_finished_at
+                )
+                for name, value in dict(
+                    getattr(collector, "last_profile", {})
+                ).items():
+                    if isinstance(value, (int, float)):
+                        profile_totals[name] = (
+                            profile_totals.get(name, 0.0) + float(value)
+                        )
+                journal.progress(
+                    "collecting",
+                    episodes_completed=(wave_index + 1) * episodes,
+                    episodes=total_episodes,
+                    waves_completed=wave_index + 1,
+                    collection_waves=collection_waves,
+                )
+        finally:
+            if write_executor is not None:
+                write_executor.shutdown(wait=True)
+
+        for pending in pending_writes:
+            shard_row, shard = pending.result() if async_shard_writes else pending
+            if async_shard_writes:
+                recorded = ledger.record_shard(
+                    batch_id,
+                    shard_uuid=f"shard-{int(shard_row['wave']):06d}",
+                    content_sha256=shard.content_sha256,
+                )
+                if not recorded:
+                    raise RuntimeError("fresh asynchronous shard was not recorded")
+            shard_rows.append(shard_row)
+            total_decisions += int(shard_row["decisions"])
+            total_chunks += int(shard_row["chunks"])
+            for name in ("write_queue_seconds", "write_seconds", "verify_seconds"):
+                timing_totals[name] += float(shard_row["timings"][name])
+            journal.event("collection_wave_complete", **shard_row)
+
+        expected_episode_ids = {header.episode_id for header in headers}
+        if seen_episode_ids != expected_episode_ids:
+            raise RuntimeError("collector did not cover all scheduled episodes")
+        ledger.close_collection(batch_id, minimum_shards=collection_waves)
+        collection_finished_at = time.monotonic()
+        overall_timings = {
+            **timing_totals,
+            "total_seconds": collection_finished_at - collection_started_at,
+        }
         journal.event(
             "collection_complete",
-            episodes=episodes,
-            chunks=len(chunks),
-            decisions=sum(len(row["decisions"]) for row in frozen_episodes),
-            shard_content_sha256=verified["content_sha256"],
+            episodes=total_episodes,
+            chunks=total_chunks,
+            decisions=total_decisions,
+            shards=len(shard_rows),
+            timings=overall_timings,
         )
 
         if actor_state_digest(loaded.actor) != initial_actor_sha256:
@@ -721,13 +1065,20 @@ def run(
                 "kind": "cr_native_expert_selfplay_stage1_collection_v1",
                 "status": "collected",
                 "run_id": run_id,
-                "episodes": episodes,
-                "decisions": sum(len(row["decisions"]) for row in frozen_episodes),
-                "chunks": len(chunks),
+                "episodes": total_episodes,
+                "episodes_per_wave": episodes,
+                "collection_waves": collection_waves,
+                "async_shard_writes": async_shard_writes,
+                "rolling_collection": rolling_collection,
+                "decisions": total_decisions,
+                "chunks": total_chunks,
                 "actor_sha256": initial_actor_sha256,
-                "shard": str(shard.directory),
-                "shard_content_sha256": shard.content_sha256,
+                "shard": shard_rows[0]["directory"],
+                "shard_content_sha256": shard_rows[0]["content_sha256"],
+                "shards": shard_rows,
                 "ledger_state": ledger.state(batch_id),
+                "collector_profile": profile_totals,
+                "timings": overall_timings,
             }
             if collection_result["ledger_state"] != "CLOSED":
                 raise RuntimeError("collect-only batch did not stop in CLOSED")
@@ -818,6 +1169,8 @@ def run(
     finally:
         if ledger is not None:
             ledger.close()
+        if policy_to_close is not None:
+            policy_to_close.close()
         for env in envs:
             env.close()
 

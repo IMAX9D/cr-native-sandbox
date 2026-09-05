@@ -7,10 +7,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 
 import torch
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from expert_v1.training_v1.model import ExpertPolicyConfig, RecurrentExpertPolicy, configure_position_precision
 from expert_selfplay_v1.stage2_training import EXPERT_INFERENCE_KIND, _state_digest

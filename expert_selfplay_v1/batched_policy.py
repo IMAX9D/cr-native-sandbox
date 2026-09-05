@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
-from typing import Hashable, Mapping, Sequence
+from typing import Callable, Hashable, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -207,8 +207,20 @@ def _module_device_dtype(
     return fallback, torch.float32
 
 
-def _pad_entities(values: Sequence[Tensor], *, name: str) -> Tensor:
+def _pad_entities(
+    values: Sequence[Tensor],
+    *,
+    name: str,
+    target_size: int | None = None,
+) -> Tensor:
     maximum = max(int(value.shape[1]) for value in values)
+    if target_size is not None:
+        if maximum > target_size:
+            raise ValueError(
+                f"Actor input {name} exceeds static entity capacity "
+                f"{maximum}>{target_size}"
+            )
+        maximum = target_size
     padded: list[Tensor] = []
     for value in values:
         if value.shape[1] == maximum:
@@ -255,6 +267,38 @@ def _masked_choice(
     return index, selected
 
 
+def _unchecked_masked_choice(
+    logits: Tensor,
+    mask: Tensor,
+    *,
+    deterministic: bool,
+    generator: torch.Generator,
+) -> tuple[Tensor, Tensor]:
+    """Choice primitive for masks/output already validated by the caller."""
+
+    masked = logits.float().masked_fill(~mask.bool(), -torch.inf)
+    logp = torch.log_softmax(masked, dim=-1)
+    if deterministic:
+        index = masked.argmax(dim=-1)
+    else:
+        index = torch.multinomial(
+            torch.softmax(masked, dim=-1),
+            1,
+            replacement=True,
+            generator=generator,
+        ).squeeze(-1)
+    return index, logp.gather(-1, index.unsqueeze(-1)).squeeze(-1)
+
+
+def _safe_mask(mask: Tensor) -> Tensor:
+    """Make inactive rows sample-safe without changing any active row."""
+
+    legal = mask.bool()
+    fallback = torch.zeros_like(legal)
+    fallback[..., 0] = ~legal.any(dim=-1)
+    return legal | fallback
+
+
 class BatchedPolicyService:
     """Synchronous micro-batch service for one or more immutable Actors.
 
@@ -270,6 +314,10 @@ class BatchedPolicyService:
         deterministic: bool = False,
         seed: int = 0,
         deterministic_event_threshold: float = 0.5,
+        compile_actors: bool = False,
+        compile_batch_size: int | None = None,
+        compile_entity_slots: int | None = None,
+        dense_sampling: bool = False,
     ) -> None:
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -278,7 +326,30 @@ class BatchedPolicyService:
             raise ValueError("deterministic_event_threshold must be in [0, 1]")
         self.deterministic = bool(deterministic)
         self.deterministic_event_threshold = float(deterministic_event_threshold)
+        self.compile_actors = bool(compile_actors)
+        self.compile_batch_size = (
+            None if compile_batch_size is None else int(compile_batch_size)
+        )
+        self.compile_entity_slots = (
+            None if compile_entity_slots is None else int(compile_entity_slots)
+        )
+        self.dense_sampling = bool(dense_sampling)
+        if self.compile_actors and self.device.type != "cuda":
+            raise ValueError("compiled Actors require a CUDA policy service")
+        if self.compile_actors and (
+            self.compile_batch_size is None or self.compile_entity_slots is None
+        ):
+            raise ValueError(
+                "compiled Actors require static batch and entity capacities"
+            )
+        if self.compile_batch_size is not None and self.compile_batch_size < 1:
+            raise ValueError("compile_batch_size must be positive")
+        if self.compile_entity_slots is not None and self.compile_entity_slots < 1:
+            raise ValueError("compile_entity_slots must be positive")
         self._actors: dict[str, RecurrentExpertPolicy] = {}
+        self._compiled_forwards: dict[
+            str, Callable[..., ExpertPolicyOutput]
+        ] = {}
         self._hidden: dict[tuple[str, Hashable, int], tuple[Tensor, Tensor]] = {}
         self._pre_action_hidden: dict[
             tuple[str, Hashable, int], tuple[Tensor, Tensor]
@@ -325,10 +396,19 @@ class BatchedPolicyService:
         if previous is not None and previous is not actor:
             raise ValueError("a different Actor is already registered under this hash")
         self._actors[content_hash] = actor
+        if self.compile_actors:
+            self._compiled_forwards[content_hash] = torch.compile(
+                actor.forward_sequence,
+                backend="inductor",
+                mode="reduce-overhead",
+                fullgraph=False,
+                dynamic=False,
+            )
         return content_hash
 
     def unregister_actor(self, actor_sha256: str) -> None:
         self._actors.pop(actor_sha256, None)
+        self._compiled_forwards.pop(actor_sha256, None)
         self.reset_hidden(actor_sha256=actor_sha256)
 
     def reset_hidden(
@@ -369,6 +449,31 @@ class BatchedPolicyService:
             raise KeyError(f"no pre-action recurrent state recorded for {key!r}")
         return tuple(value.detach().cpu().contiguous().clone() for value in hidden)  # type: ignore[return-value]
 
+    def last_pre_action_hidden_batch(
+        self, actions: Sequence[SampledPolicyAction]
+    ) -> list[tuple[Tensor, Tensor]]:
+        """Return recurrent anchors with one device-to-host copy per state tensor."""
+
+        rows = list(actions)
+        if not rows:
+            return []
+        hidden_rows = []
+        for action in rows:
+            key = (action.actor_sha256, action.worker_id, action.side)
+            hidden = self._pre_action_hidden.get(key)
+            if hidden is None:
+                raise KeyError(f"no pre-action recurrent state recorded for {key!r}")
+            hidden_rows.append(hidden)
+        host_h = torch.cat([value[0] for value in hidden_rows], dim=1).detach().cpu()
+        host_c = torch.cat([value[1] for value in hidden_rows], dim=1).detach().cpu()
+        return [
+            (
+                host_h[:, index:index + 1].contiguous().clone(),
+                host_c[:, index:index + 1].contiguous().clone(),
+            )
+            for index in range(len(rows))
+        ]
+
     def _batch_inputs(
         self,
         requests: Sequence[PolicyRequest],
@@ -403,7 +508,9 @@ class BatchedPolicyService:
                     value = value.to(device=device)
                 moved.append(value)
             if name in _ENTITY_KEYS:
-                output[name] = _pad_entities(moved, name=name)
+                output[name] = _pad_entities(
+                    moved, name=name, target_size=self.compile_entity_slots
+                )
             else:
                 shapes = {tuple(value.shape) for value in moved}
                 if len(shapes) != 1:
@@ -423,6 +530,59 @@ class BatchedPolicyService:
         output["delta_ticks"] = requested_delta
         return output
 
+    def _static_actor_batch(
+        self,
+        inputs: Mapping[str, Tensor | None],
+        hidden: tuple[Tensor, Tensor],
+        *,
+        actual_batch: int,
+    ) -> tuple[dict[str, Tensor | None], tuple[Tensor, Tensor]]:
+        target = self.compile_batch_size
+        if not self.compile_actors or target is None:
+            return dict(inputs), hidden
+        if actual_batch > target:
+            raise ValueError(
+                f"Actor request batch exceeds compile capacity "
+                f"{actual_batch}>{target}"
+            )
+        if actual_batch == target:
+            return dict(inputs), hidden
+        padding = target - actual_batch
+        padded: dict[str, Tensor | None] = {}
+        for name, value in inputs.items():
+            if value is None:
+                padded[name] = None
+                continue
+            shape = list(value.shape)
+            shape[0] = padding
+            padded[name] = torch.cat((value, value.new_zeros(shape)), dim=0)
+        hidden_shape = list(hidden[0].shape)
+        hidden_shape[1] = padding
+        return padded, (
+            torch.cat((hidden[0], hidden[0].new_zeros(hidden_shape)), dim=1),
+            torch.cat((hidden[1], hidden[1].new_zeros(hidden_shape)), dim=1),
+        )
+
+    @staticmethod
+    def _slice_actor_output(
+        output: ExpertPolicyOutput,
+        actual_batch: int,
+    ) -> ExpertPolicyOutput:
+        if output.rate_logits.shape[0] == actual_batch:
+            return output
+        return ExpertPolicyOutput(
+            output.rate_logits[:actual_batch],
+            output.action_kind_logits[:actual_batch],
+            output.card_logits[:actual_batch],
+            output.position_logits[:actual_batch],
+            output.ability_logits[:actual_batch],
+            output.ability_position_logits[:actual_batch],
+            (
+                output.hidden[0][:, :actual_batch],
+                output.hidden[1][:, :actual_batch],
+            ),
+        )
+
     @staticmethod
     def _batch_masks(requests: Sequence[PolicyRequest], device: torch.device) -> ExpertActionMasks:
         fields: dict[str, Tensor] = {}
@@ -434,8 +594,24 @@ class BatchedPolicyService:
             shapes = {tuple(value.shape) for value in values}
             if len(shapes) != 1:
                 raise ValueError(f"action mask {name} has incompatible shapes")
-            fields[name] = torch.stack(values, dim=0).to(device=device)
-        return ExpertActionMasks(**fields)
+            fields[name] = torch.stack(values, dim=0)
+        kinds = fields["action_kind"]
+        cards = fields["cards"]
+        positions = fields["positions"]
+        abilities = fields["abilities"]
+        ability_positions = fields["ability_positions"]
+        targeted = fields["ability_requires_target"]
+        if bool((kinds[:, 0] & ~cards.any(dim=-1)).any()):
+            raise ValueError("normal action kind is legal but every card is illegal")
+        if bool((cards & ~positions.any(dim=-1)).any()):
+            raise ValueError("a legal card has no legal placement cell")
+        if bool((kinds[:, 1] & ~abilities.any(dim=-1)).any()):
+            raise ValueError("ability action kind is legal but every ability is illegal")
+        if bool((abilities & targeted & ~ability_positions.any(dim=-1)).any()):
+            raise ValueError("a legal targeted ability has no legal target cell")
+        return ExpertActionMasks(**{
+            name: value.to(device=device) for name, value in fields.items()
+        })
 
     @staticmethod
     def _validate_output(output: ExpertPolicyOutput, batch_size: int) -> None:
@@ -485,15 +661,6 @@ class BatchedPolicyService:
         for name in expected:
             if actual[name] != expected[name]:
                 raise ValueError(f"action mask {name} does not match Actor output")
-        if bool((kinds[:, 0] & ~cards.any(dim=-1)).any()):
-            raise ValueError("normal action kind is legal but every card is illegal")
-        if bool((cards & ~positions.any(dim=-1)).any()):
-            raise ValueError("a legal card has no legal placement cell")
-        if bool((kinds[:, 1] & ~abilities.any(dim=-1)).any()):
-            raise ValueError("ability action kind is legal but every ability is illegal")
-        target_missing = abilities & targeted & ~ability_positions.any(dim=-1)
-        if bool(target_missing.any()):
-            raise ValueError("a legal targeted ability has no legal target cell")
 
     def _hidden_batch(
         self,
@@ -558,8 +725,15 @@ class BatchedPolicyService:
                 hidden[0][:, index:index + 1].detach(),
                 hidden[1][:, index:index + 1].detach(),
             )
+        model_inputs, model_hidden = self._static_actor_batch(
+            inputs, hidden, actual_batch=len(requests)
+        )
+        forward = self._compiled_forwards.get(
+            actor_sha256, actor.forward_sequence
+        )
         with torch.inference_mode():
-            output = actor.forward_sequence(**inputs, hidden=hidden)
+            output = forward(**model_inputs, hidden=model_hidden)
+        output = self._slice_actor_output(output, len(requests))
         self.forward_calls += 1
         self._validate_output(output, len(requests))
         self._store_hidden(actor_sha256, requests, output.hidden)
@@ -584,8 +758,6 @@ class BatchedPolicyService:
         exposure = rate * delta * float(config.native_tick_seconds)
         exposure = torch.where(can_act, exposure, torch.zeros_like(exposure))
         event_probability = -torch.expm1(-exposure)
-        if not bool(torch.isfinite(rate).all() and torch.isfinite(event_probability).all()):
-            raise FloatingPointError("non-finite marked-hazard rate/probability")
         if deterministic:
             event = can_act & (
                 event_probability >= self.deterministic_event_threshold
@@ -608,64 +780,143 @@ class BatchedPolicyService:
         logp_action_type = torch.zeros(batch, dtype=torch.float32, device=device)
         logp_slot = torch.zeros_like(logp_action_type)
         logp_position = torch.zeros_like(logp_action_type)
+        if self.dense_sampling:
+            rows = torch.arange(batch, device=device)
+            selected_kind, kind_logp = _unchecked_masked_choice(
+                kind_logits,
+                _safe_mask(masks.action_kind),
+                deterministic=deterministic,
+                generator=self._generator,
+            )
+            action_kind = torch.where(event, selected_kind, action_kind)
+            logp_action_type = torch.where(
+                event, kind_logp, logp_action_type
+            )
 
-        active = event.nonzero(as_tuple=True)[0]
-        if active.numel():
-            selected, selected_logp = _masked_choice(
-                kind_logits.index_select(0, active),
-                masks.action_kind.index_select(0, active),
+            selected_card, card_logp = _unchecked_masked_choice(
+                card_logits,
+                _safe_mask(masks.cards),
                 deterministic=deterministic,
                 generator=self._generator,
             )
-            action_kind[active] = selected
-            logp_action_type[active] = selected_logp
+            normal_mask = event & (action_kind == 0)
+            card_slot = torch.where(normal_mask, selected_card, card_slot)
+            chosen_position_logits = position_logits[rows, selected_card]
+            chosen_position_masks = masks.positions[rows, selected_card]
+            selected_position, selected_position_logp = _unchecked_masked_choice(
+                chosen_position_logits,
+                _safe_mask(chosen_position_masks),
+                deterministic=deterministic,
+                generator=self._generator,
+            )
+            position = torch.where(normal_mask, selected_position, position)
 
-        normal = (event & (action_kind == 0)).nonzero(as_tuple=True)[0]
-        if normal.numel():
-            selected, selected_logp = _masked_choice(
-                card_logits.index_select(0, normal),
-                masks.cards.index_select(0, normal),
+            selected_ability, ability_logp = _unchecked_masked_choice(
+                ability_logits,
+                _safe_mask(masks.abilities),
                 deterministic=deterministic,
                 generator=self._generator,
             )
-            card_slot[normal] = selected
-            logp_slot[normal] = selected_logp
-            chosen_logits = position_logits[normal, selected]
-            chosen_masks = masks.positions[normal, selected]
-            selected_position, selected_position_logp = _masked_choice(
-                chosen_logits,
-                chosen_masks,
+            ability_mask = event & (action_kind == 1)
+            ability_slot = torch.where(
+                ability_mask, selected_ability, ability_slot
+            )
+            selected_requires_target = masks.ability_requires_target[
+                rows, selected_ability
+            ]
+            ability_requires_target = ability_mask & selected_requires_target
+            chosen_ability_position_logits = ability_position_logits[
+                rows, selected_ability
+            ]
+            chosen_ability_position_masks = masks.ability_positions[
+                rows, selected_ability
+            ]
+            (
+                selected_ability_position,
+                selected_ability_position_logp,
+            ) = _unchecked_masked_choice(
+                chosen_ability_position_logits,
+                _safe_mask(chosen_ability_position_masks),
                 deterministic=deterministic,
                 generator=self._generator,
             )
-            position[normal] = selected_position
-            logp_position[normal] = selected_position_logp
+            ability_position = torch.where(
+                ability_requires_target,
+                selected_ability_position,
+                ability_position,
+            )
+            logp_slot = torch.where(
+                normal_mask,
+                card_logp,
+                torch.where(ability_mask, ability_logp, logp_slot),
+            )
+            logp_position = torch.where(
+                normal_mask,
+                selected_position_logp,
+                torch.where(
+                    ability_requires_target,
+                    selected_ability_position_logp,
+                    logp_position,
+                ),
+            )
+        else:
+            active = event.nonzero(as_tuple=True)[0]
+            if active.numel():
+                selected, selected_logp = _masked_choice(
+                    kind_logits.index_select(0, active),
+                    masks.action_kind.index_select(0, active),
+                    deterministic=deterministic,
+                    generator=self._generator,
+                )
+                action_kind[active] = selected
+                logp_action_type[active] = selected_logp
 
-        ability = (event & (action_kind == 1)).nonzero(as_tuple=True)[0]
-        if ability.numel():
-            selected, selected_logp = _masked_choice(
-                ability_logits.index_select(0, ability),
-                masks.abilities.index_select(0, ability),
-                deterministic=deterministic,
-                generator=self._generator,
-            )
-            ability_slot[ability] = selected
-            logp_slot[ability] = selected_logp
-            needs_target = masks.ability_requires_target[ability, selected]
-            ability_requires_target[ability] = needs_target
-            target_rows = ability[needs_target]
-            target_slots = selected[needs_target]
-            if target_rows.numel():
-                chosen_logits = ability_position_logits[target_rows, target_slots]
-                chosen_masks = masks.ability_positions[target_rows, target_slots]
+            normal = (event & (action_kind == 0)).nonzero(as_tuple=True)[0]
+            if normal.numel():
+                selected, selected_logp = _masked_choice(
+                    card_logits.index_select(0, normal),
+                    masks.cards.index_select(0, normal),
+                    deterministic=deterministic,
+                    generator=self._generator,
+                )
+                card_slot[normal] = selected
+                logp_slot[normal] = selected_logp
+                chosen_logits = position_logits[normal, selected]
+                chosen_masks = masks.positions[normal, selected]
                 selected_position, selected_position_logp = _masked_choice(
                     chosen_logits,
                     chosen_masks,
                     deterministic=deterministic,
                     generator=self._generator,
                 )
-                ability_position[target_rows] = selected_position
-                logp_position[target_rows] = selected_position_logp
+                position[normal] = selected_position
+                logp_position[normal] = selected_position_logp
+
+            ability = (event & (action_kind == 1)).nonzero(as_tuple=True)[0]
+            if ability.numel():
+                selected, selected_logp = _masked_choice(
+                    ability_logits.index_select(0, ability),
+                    masks.abilities.index_select(0, ability),
+                    deterministic=deterministic,
+                    generator=self._generator,
+                )
+                ability_slot[ability] = selected
+                logp_slot[ability] = selected_logp
+                needs_target = masks.ability_requires_target[ability, selected]
+                ability_requires_target[ability] = needs_target
+                target_rows = ability[needs_target]
+                target_slots = selected[needs_target]
+                if target_rows.numel():
+                    chosen_logits = ability_position_logits[target_rows, target_slots]
+                    chosen_masks = masks.ability_positions[target_rows, target_slots]
+                    selected_position, selected_position_logp = _masked_choice(
+                        chosen_logits,
+                        chosen_masks,
+                        deterministic=deterministic,
+                        generator=self._generator,
+                    )
+                    ability_position[target_rows] = selected_position
+                    logp_position[target_rows] = selected_position_logp
 
         logp_mark = logp_action_type + logp_slot + logp_position
         # Stable timing terms.  Impossible events are never sampled, and a
@@ -694,28 +945,54 @@ class BatchedPolicyService:
         if not bool(torch.isfinite(finite).all()):
             raise FloatingPointError("sampled marked-hazard action is non-finite")
 
+        # One packed device-to-host transfer avoids synchronizing CUDA once for
+        # every scalar ``.item()`` below.  All categorical indices are below
+        # 576 and therefore exactly representable in float32.
+        host_rows = torch.stack(
+            (
+                event.float(),
+                action_kind.float(),
+                card_slot.float(),
+                position.float(),
+                ability_slot.float(),
+                ability_position.float(),
+                ability_requires_target.float(),
+                rate.float(),
+                event_probability.float(),
+                logp_total.float(),
+                logp_timing.float(),
+                logp_action_type.float(),
+                logp_slot.float(),
+                logp_position.float(),
+                logp_mark.float(),
+            ),
+            dim=-1,
+        ).detach().cpu().tolist()
+
         answer: list[tuple[int, SampledPolicyAction]] = []
-        for row, (original_index, request) in enumerate(indexed_requests):
+        for values, (original_index, request) in zip(
+            host_rows, indexed_requests, strict=True
+        ):
             answer.append((original_index, SampledPolicyAction(
                 worker_id=request.worker_id,
                 side=request.side,
                 actor_sha256=actor_sha256,
                 delta_ticks=request.delta_ticks,
-                event_happened=bool(event[row].item()),
-                action_kind=int(action_kind[row].item()),
-                card_slot=int(card_slot[row].item()),
-                position=int(position[row].item()),
-                ability_slot=int(ability_slot[row].item()),
-                ability_position=int(ability_position[row].item()),
-                ability_requires_target=bool(ability_requires_target[row].item()),
-                lambda_per_second=float(rate[row].item()),
-                event_probability=float(event_probability[row].item()),
-                logp_total=float(logp_total[row].item()),
-                logp_timing=float(logp_timing[row].item()),
-                logp_action_type=float(logp_action_type[row].item()),
-                logp_slot=float(logp_slot[row].item()),
-                logp_position=float(logp_position[row].item()),
-                logp_mark=float(logp_mark[row].item()),
+                event_happened=bool(values[0]),
+                action_kind=int(values[1]),
+                card_slot=int(values[2]),
+                position=int(values[3]),
+                ability_slot=int(values[4]),
+                ability_position=int(values[5]),
+                ability_requires_target=bool(values[6]),
+                lambda_per_second=float(values[7]),
+                event_probability=float(values[8]),
+                logp_total=float(values[9]),
+                logp_timing=float(values[10]),
+                logp_action_type=float(values[11]),
+                logp_slot=float(values[12]),
+                logp_position=float(values[13]),
+                logp_mark=float(values[14]),
             )))
         return answer
 

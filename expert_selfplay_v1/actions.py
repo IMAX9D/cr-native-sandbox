@@ -127,35 +127,16 @@ def evaluate_expert_action(
         output.ability_logits, ability_mask
     )
 
-    card_position_entropy = []
-    card_position_logp = []
-    for slot in range(output.card_logits.shape[-1]):
-        position_mask = _conditional_mask(
-            masks.positions[..., slot, :], masks.cards[..., slot]
-        )
-        logp, _p, entropy = _distribution(
-            output.position_logits[..., slot, :], position_mask
-        )
-        card_position_logp.append(logp)
-        card_position_entropy.append(entropy)
-    card_position_logp_t = torch.stack(card_position_logp, dim=-2)
-    card_position_entropy_t = torch.stack(card_position_entropy, dim=-1)
-
-    ability_position_entropy = []
-    ability_position_logp = []
-    for slot in range(output.ability_logits.shape[-1]):
-        position_parent = masks.abilities[..., slot] & masks.ability_requires_target[..., slot]
-        position_mask = _conditional_mask(
-            masks.ability_positions[..., slot, :], position_parent
-        )
-        logp, _p, entropy = _distribution(
-            output.ability_position_logits[..., slot, :],
-            position_mask,
-        )
-        ability_position_logp.append(logp)
-        ability_position_entropy.append(entropy)
-    ability_position_logp_t = torch.stack(ability_position_logp, dim=-2)
-    ability_position_entropy_t = torch.stack(ability_position_entropy, dim=-1)
+    safe_position_masks = _conditional_mask(masks.positions, masks.cards)
+    card_position_logp_t, _card_position_p, card_position_entropy_t = _distribution(
+        output.position_logits, safe_position_masks
+    )
+    safe_ability_position_masks = _conditional_mask(
+        masks.ability_positions, masks.abilities & masks.ability_requires_target
+    )
+    ability_position_logp_t, _ability_position_p, ability_position_entropy_t = _distribution(
+        output.ability_position_logits, safe_ability_position_masks
+    )
 
     event = action.event_happened.bool()
     normal = action.action_kind.long() == 0
@@ -171,10 +152,6 @@ def evaluate_expert_action(
         -2,
         card_slot.unsqueeze(-1).unsqueeze(-1).expand(*prefix, 1, card_position_logp_t.shape[-1]),
     ).squeeze(-2)
-    safe_position_masks = torch.stack([
-        _conditional_mask(masks.positions[..., slot, :], masks.cards[..., slot])
-        for slot in range(masks.cards.shape[-1])
-    ], dim=-2)
     selected_card_position_mask = safe_position_masks.gather(
         -2,
         card_slot.unsqueeze(-1).unsqueeze(-1).expand(*prefix, 1, masks.positions.shape[-1]),
@@ -196,13 +173,6 @@ def evaluate_expert_action(
             *prefix, 1, ability_position_logp_t.shape[-1]
         ),
     ).squeeze(-2)
-    safe_ability_position_masks = torch.stack([
-        _conditional_mask(
-            masks.ability_positions[..., slot, :],
-            masks.abilities[..., slot] & masks.ability_requires_target[..., slot],
-        )
-        for slot in range(masks.abilities.shape[-1])
-    ], dim=-2)
     selected_ability_position_mask = safe_ability_position_masks.gather(
         -2,
         ability_slot.unsqueeze(-1).unsqueeze(-1).expand(
@@ -265,37 +235,22 @@ def expert_policy_kl(
     card_kl, card_probability = _categorical_kl(
         source.card_logits, target.card_logits, card_mask
     )
-    card_position_kl = []
-    for slot in range(source.card_logits.shape[-1]):
-        position_mask = _conditional_mask(
-            masks.positions[..., slot, :], masks.cards[..., slot]
-        )
-        value, _probability = _categorical_kl(
-            source.position_logits[..., slot, :],
-            target.position_logits[..., slot, :],
-            position_mask,
-        )
-        card_position_kl.append(value)
-    card_position = torch.stack(card_position_kl, dim=-1)
+    position_mask = _conditional_mask(masks.positions, masks.cards)
+    card_position, _probability = _categorical_kl(
+        source.position_logits, target.position_logits, position_mask
+    )
     normal_kl = card_kl + (card_probability * card_position).sum(dim=-1)
 
     ability_mask = _conditional_mask(masks.abilities, masks.action_kind[..., 1])
     ability_kl, ability_probability = _categorical_kl(
         source.ability_logits, target.ability_logits, ability_mask
     )
-    ability_position_kl = []
-    for slot in range(source.ability_logits.shape[-1]):
-        position_mask = _conditional_mask(
-            masks.ability_positions[..., slot, :],
-            masks.abilities[..., slot] & masks.ability_requires_target[..., slot],
-        )
-        value, _probability = _categorical_kl(
-            source.ability_position_logits[..., slot, :],
-            target.ability_position_logits[..., slot, :],
-            position_mask,
-        )
-        ability_position_kl.append(value)
-    ability_position = torch.stack(ability_position_kl, dim=-1)
+    position_mask = _conditional_mask(
+        masks.ability_positions, masks.abilities & masks.ability_requires_target
+    )
+    ability_position, _probability = _categorical_kl(
+        source.ability_position_logits, target.ability_position_logits, position_mask
+    )
     ability_kl = ability_kl + (
         ability_probability
         * masks.ability_requires_target.float()

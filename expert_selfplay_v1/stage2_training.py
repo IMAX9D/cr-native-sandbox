@@ -9,6 +9,8 @@ collector.  Only the named Stage-2 reaction groups are trainable.
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
@@ -18,6 +20,7 @@ from pathlib import Path
 import random
 import shutil
 import tempfile
+import time
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -58,6 +61,7 @@ from .critic_training import (
 from .hazard import lambda_from_logits
 from .losses import critic_loss
 from .ppo import recurrent_ppo_loss
+from .prepared_batches import PreparedBatchCache, batch_to_device, map_tensors
 from .rollout import DecisionRecord, EpisodeHeader, LearnerEpisodeBuffer
 from .rollout_storage import LearnerEpisodeChunker, verify_rollout_shard
 from .stages import configure_stage, stage_specs
@@ -81,10 +85,22 @@ class Stage2TrainingConfig:
     critic_auxiliary_coefficient: float = 0.10
     actor_grad_clip: float = 0.50
     critic_grad_clip: float = 1.00
-    chunk_batch_size: int = 2
+    chunk_batch_size: int = 8
+    preprocess_window_size: int = 256
+    preprocess_batch_size: int = 3
+    prepared_cache_gib: float = 4.0
+    training_precision: str = "float32"
+    fused_optimizer: bool = False
+    chunk_padding_multiple: int = 0
     retain_checkpoints: int = 3
 
     def validate(self) -> None:
+        if self.training_precision not in ("float32", "bfloat16", "float16"):
+            raise ValueError("training_precision must be float32, bfloat16 or float16")
+        if not isinstance(self.fused_optimizer, bool):
+            raise ValueError("fused_optimizer must be boolean")
+        if self.chunk_padding_multiple < 0:
+            raise ValueError("chunk_padding_multiple cannot be negative")
         positive = {
             "ppo_epochs": self.ppo_epochs,
             "clip_epsilon": self.clip_epsilon,
@@ -94,6 +110,8 @@ class Stage2TrainingConfig:
             "actor_grad_clip": self.actor_grad_clip,
             "critic_grad_clip": self.critic_grad_clip,
             "chunk_batch_size": self.chunk_batch_size,
+            "preprocess_window_size": self.preprocess_window_size,
+            "preprocess_batch_size": self.preprocess_batch_size,
             "retain_checkpoints": self.retain_checkpoints,
         }
         for name, value in positive.items():
@@ -102,6 +120,7 @@ class Stage2TrainingConfig:
         for name, value in (
             ("entropy_coefficient", self.entropy_coefficient),
             ("critic_auxiliary_coefficient", self.critic_auxiliary_coefficient),
+            ("prepared_cache_gib", self.prepared_cache_gib),
         ):
             if not math.isfinite(float(value)) or float(value) < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
@@ -150,7 +169,7 @@ def _finite(value: Any) -> bool:
 
 
 def _load_inference(path: Path) -> tuple[dict[str, Any], ExpertPolicyConfig]:
-    value = torch.load(path, map_location="cpu", weights_only=False)
+    value = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     if not isinstance(value, Mapping) or value.get("kind") != EXPERT_INFERENCE_KIND:
         raise RuntimeError("base checkpoint is not an expert inference artifact")
     if not isinstance(value.get("model_config"), Mapping) or not isinstance(
@@ -237,6 +256,10 @@ class Stage2PPOTrainer:
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is unavailable")
+        if self.config.training_precision != "float32" and self.device.type != "cuda":
+            raise ValueError("mixed-precision Stage-2 training requires a CUDA device")
+        if self.config.fused_optimizer and self.device.type != "cuda":
+            raise ValueError("fused Stage-2 optimizers require a CUDA device")
         self.base_path = base_inference_checkpoint.resolve(strict=True)
         self.continuation_path = continuation_checkpoint.resolve(strict=True)
         self.manifest_path = expert_manifest.resolve(strict=True)
@@ -278,7 +301,10 @@ class Stage2PPOTrainer:
         actor.load_state_dict(master_state, strict=True)
         actor.to(device=self.device, dtype=torch.float32)
         bc_actor = RecurrentExpertPolicy(actor_config)
-        bc_actor.load_state_dict(_float_state(self.base_payload["model_state"]), strict=True)
+        bc_master_state = _float_state(self.base_payload["model_state"])
+        bc_actor.load_state_dict(bc_master_state, strict=True)
+        self.bc_master_sha256 = _state_digest(bc_master_state)
+        del bc_master_state
         bc_actor.to(device=self.device, dtype=torch.float32).eval()
         for parameter in bc_actor.parameters():
             parameter.requires_grad_(False)
@@ -317,9 +343,12 @@ class Stage2PPOTrainer:
                 })
         if not actor_groups:
             raise RuntimeError("Stage-2 produced no trainable Actor parameter groups")
-        self.actor_optimizer = torch.optim.AdamW(actor_groups, eps=1e-5)
+        self.actor_optimizer = torch.optim.AdamW(
+            actor_groups, eps=1e-5, fused=self.config.fused_optimizer,
+        )
         self.critic_optimizer = torch.optim.AdamW(
-            self.model.critic.parameters(), lr=1e-4, weight_decay=1e-4, eps=1e-5
+            self.model.critic.parameters(), lr=1e-4, weight_decay=1e-4, eps=1e-5,
+            fused=self.config.fused_optimizer,
         )
         self.critic_optimizer.load_state_dict(critic_optimizer_state)
         for group in self.critic_optimizer.param_groups:
@@ -332,6 +361,17 @@ class Stage2PPOTrainer:
             if actor_optimizer_names != self.actor_optimizer_parameter_names:
                 raise RuntimeError("Actor optimizer parameter-name mapping changed")
             self.actor_optimizer.load_state_dict(actor_optimizer_state)
+        # Continuation param groups retain their old execution flags.  Override
+        # only the implementation choice, keeping names, moments and LR intact.
+        for optimizer in (self.actor_optimizer, self.critic_optimizer):
+            for group in optimizer.param_groups:
+                group["fused"] = self.config.fused_optimizer
+                if self.config.fused_optimizer:
+                    group["foreach"] = False
+            if self.config.fused_optimizer:
+                for state in optimizer.state.values():
+                    if isinstance(state.get("step"), Tensor):
+                        state["step"] = state["step"].to(self.device)
         self.critic_optimizer_parameter_names = _optimizer_parameter_names(
             self.critic_optimizer, named
         )
@@ -346,6 +386,19 @@ class Stage2PPOTrainer:
         self.stage_report = report
         self.base_checkpoint_sha256 = _file_sha256(self.base_path)
         self.continuation_sha256 = _file_sha256(self.continuation_path)
+        self._prepared_cache: PreparedBatchCache | None = None
+        self.last_actor_before_update: dict[str, Tensor] | None = None
+        self.grad_scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.config.training_precision == "float16", init_scale=4096.0
+        )
+        if self.grad_scaler.is_enabled() and continuation.get("grad_scaler"):
+            self.grad_scaler.load_state_dict(continuation["grad_scaler"])
+
+    def _training_autocast(self):
+        if self.config.training_precision != "float32":
+            dtype = torch.bfloat16 if self.config.training_precision == "bfloat16" else torch.float16
+            return torch.autocast(device_type="cuda", dtype=dtype)
+        return nullcontext()
 
     def _extract_episode(
         self, stored: Mapping[str, Any]
@@ -354,13 +407,28 @@ class Stage2PPOTrainer:
         header.validate()
         decisions: list[DecisionRecord] = []
         payloads: list[dict[str, Any]] = []
+        hidden_anchors: dict[int, tuple[Any, Any]] = {}
         expected_start = 0
         for chunk in stored.get("chunks", []):
             if int(chunk["loss_start"]) != expected_start:
                 raise RuntimeError("stored episode chunks have a coverage gap")
+            chunk_payloads = chunk.get("step_payloads")
+            if not isinstance(chunk_payloads, Sequence) or not chunk_payloads:
+                raise RuntimeError("stored episode chunk has no step payloads")
+            first_inputs = chunk_payloads[0].get("actor_inputs")
+            first_hidden = (
+                first_inputs.get("hidden")
+                if isinstance(first_inputs, Mapping)
+                else None
+            )
+            if not isinstance(first_hidden, (tuple, list)) or len(first_hidden) != 2:
+                raise RuntimeError("Stage-2 chunk lacks an exact recurrent hidden anchor")
+            hidden_anchors[int(chunk["sequence_start"])] = (
+                first_hidden[0], first_hidden[1]
+            )
             mask = chunk["loss_mask"].bool().tolist()
             for raw, payload, selected in zip(
-                chunk["decisions"], chunk["step_payloads"], mask, strict=True
+                chunk["decisions"], chunk_payloads, mask, strict=True
             ):
                 if selected:
                     decisions.append(DecisionRecord(**dict(raw)))
@@ -368,13 +436,17 @@ class Stage2PPOTrainer:
             expected_start = int(chunk["loss_end"])
         if expected_start != int(stored["decision_count"]) or len(decisions) != len(payloads):
             raise RuntimeError("stored episode reconstruction is incomplete")
-        for index, payload in enumerate(payloads):
-            actor_inputs = payload.get("actor_inputs")
-            hidden = actor_inputs.get("hidden") if isinstance(actor_inputs, Mapping) else None
-            if not isinstance(hidden, (tuple, list)) or len(hidden) != 2:
-                raise RuntimeError(
-                    f"Stage-2 rollout lacks exact pre-action hidden at decision {index}"
-                )
+        for index, hidden in hidden_anchors.items():
+            if not 0 <= index < len(payloads):
+                raise RuntimeError("Stage-2 hidden anchor is outside episode coverage")
+            actor_inputs = payloads[index].get("actor_inputs")
+            if not isinstance(actor_inputs, Mapping):
+                raise RuntimeError("Stage-2 rollout has malformed Actor inputs")
+            actor_inputs = dict(actor_inputs)
+            actor_inputs["hidden"] = hidden
+            payloads[index]["actor_inputs"] = actor_inputs
+        if 0 not in hidden_anchors:
+            raise RuntimeError("Stage-2 episode has no initial recurrent hidden anchor")
         return header, decisions, payloads
 
     def _full_episode_inputs(
@@ -409,9 +481,12 @@ class Stage2PPOTrainer:
         }
 
     @staticmethod
-    def _slice_bc_output(output: ExpertPolicyOutput, index: int) -> dict[str, Tensor]:
+    def _slice_bc_output(
+        output: ExpertPolicyOutput, index: int, *, batch_index: int = 0
+    ) -> dict[str, Tensor]:
         return {
-            name: getattr(output, name)[0, index].detach().cpu().to(torch.float16).clone()
+            name: getattr(output, name)[batch_index, index]
+            .detach().cpu().to(torch.float16)
             for name in (
                 "rate_logits", "action_kind_logits", "card_logits",
                 "position_logits", "ability_logits", "ability_position_logits",
@@ -423,7 +498,10 @@ class Stage2PPOTrainer:
     ) -> tuple[list[dict[str, Any]], BatchManifest, dict[str, Any]]:
         shard_directory = shard_directory.resolve(strict=True)
         verified = verify_rollout_shard(
-            shard_directory, return_payload=True, mmap=True
+            shard_directory,
+            return_payload=True,
+            mmap=True,
+            verify_semantic_digest=False,
         )
         payload = verified.pop("_payload")
         batch_manifest = BatchManifest(**dict(verified["batch_manifest"]))
@@ -433,41 +511,143 @@ class Stage2PPOTrainer:
         if batch_manifest.policy_version != self.policy_version:
             raise RuntimeError("rollout policy version is stale or from the future")
         episodes = payload.get("episodes")
-        if not isinstance(episodes, list) or len(episodes) != batch_manifest.episode_count:
-            raise RuntimeError("rollout episode count differs from its BatchManifest")
+        # A batch can span multiple immutable waves.  Whole-batch coverage is
+        # admitted once by the runner; this method prepares one verified shard.
+        if (
+            not isinstance(episodes, list) or not episodes
+            or len(episodes) > batch_manifest.episode_count
+            or len(episodes) != int(verified["episode_count"])
+        ):
+            raise RuntimeError("rollout episode count differs from its shard manifest")
 
         output_chunks: list[dict[str, Any]] = []
         prepared_decisions = 0
         self.model.eval()
         self.bc_actor.eval()
         with torch.no_grad():
+            episode_states: list[dict[str, Any]] = []
             for stored in episodes:
                 header, decisions, step_payloads = self._extract_episode(stored)
                 if header.curriculum_stage != "stage2_reaction":
                     raise RuntimeError("Stage-2 trainer rejected a non-Stage-2 episode")
-                actor_inputs, critic_inputs = self._full_episode_inputs(step_payloads)
-                current = self.model.actor.forward_with_features(**actor_inputs)
-                critic = self.model.critic(
-                    actor_latent=current.pre_head_latent.detach(), **critic_inputs
-                )
-                bc_output = self.bc_actor.forward_sequence(**actor_inputs)
-                if not _finite((current.output, critic, bc_output)):
-                    raise FloatingPointError("rollout value/BC preprocessing emitted NaN/Inf")
+                episode_states.append({
+                    "header": header,
+                    "decisions": decisions,
+                    "step_payloads": step_payloads,
+                    "cursor": 0,
+                    "actor_hidden": None,
+                    "bc_hidden": None,
+                    "critic_values": [],
+                    "bc_outputs": [],
+                })
+
+            while any(
+                state["cursor"] < len(state["step_payloads"])
+                for state in episode_states
+            ):
+                groups: dict[int, list[dict[str, Any]]] = {}
+                for state in episode_states:
+                    remaining = len(state["step_payloads"]) - state["cursor"]
+                    if remaining:
+                        length = min(self.config.preprocess_window_size, remaining)
+                        groups.setdefault(length, []).append(state)
+                for length in sorted(groups, reverse=True):
+                    states = groups[length]
+                    for offset in range(0, len(states), self.config.preprocess_batch_size):
+                        batch_states = states[
+                            offset:offset + self.config.preprocess_batch_size
+                        ]
+                        actor_rows = []
+                        critic_rows = []
+                        bc_rows = []
+                        for state in batch_states:
+                            start = int(state["cursor"])
+                            window = state["step_payloads"][start:start + length]
+                            actor_inputs, critic_inputs = self._full_episode_inputs(window)
+                            actor_inputs["hidden"] = state["actor_hidden"]
+                            bc_inputs = dict(actor_inputs)
+                            bc_inputs["hidden"] = state["bc_hidden"]
+                            actor_rows.append(actor_inputs)
+                            critic_rows.append(critic_inputs)
+                            bc_rows.append(bc_inputs)
+                        actor_inputs = _batch_input_mappings(actor_rows, kind="ActorPre")
+                        critic_inputs = _batch_input_mappings(critic_rows, kind="CriticPre")
+                        bc_inputs = _batch_input_mappings(bc_rows, kind="BCPre")
+                        current = self.model.actor.forward_with_features(**actor_inputs)
+                        critic_kwargs = {
+                            name: value for name, value in critic_inputs.items()
+                            if isinstance(value, Tensor)
+                        }
+                        if len(critic_kwargs) != len(critic_inputs):
+                            raise RuntimeError("batched Critic preprocessing is incomplete")
+                        critic = self.model.critic(
+                            actor_latent=current.pre_head_latent.detach(),
+                            **critic_kwargs,
+                        )
+                        bc_output = self.bc_actor.forward_sequence(**bc_inputs)
+                        if not _finite((current.output, critic, bc_output)):
+                            raise FloatingPointError(
+                                "rollout value/BC preprocessing emitted NaN/Inf"
+                            )
+                        # Move one contiguous window per output head instead of
+                        # issuing six CUDA-to-host copies for every time step.
+                        host_bc = ExpertPolicyOutput(
+                            *(getattr(bc_output, name).detach().to(
+                                device="cpu", dtype=torch.float16
+                            ) for name in (
+                                "rate_logits", "action_kind_logits", "card_logits",
+                                "position_logits", "ability_logits", "ability_position_logits",
+                            )),
+                            (torch.empty(0), torch.empty(0)),
+                        )
+                        host_values = critic.values.float().cpu()
+                        if not _finite(host_bc):
+                            raise FloatingPointError("FP16 BC targets contain NaN/Inf")
+                        for batch_index, state in enumerate(batch_states):
+                            state["actor_hidden"] = tuple(
+                                value[:, batch_index:batch_index + 1].detach()
+                                for value in current.output.hidden
+                            )
+                            state["bc_hidden"] = tuple(
+                                value[:, batch_index:batch_index + 1].detach()
+                                for value in bc_output.hidden
+                            )
+                            state["critic_values"].extend(
+                                float(value)
+                                for value in host_values[batch_index]
+                            )
+                            state["bc_outputs"].extend(
+                                self._slice_bc_output(
+                                    host_bc, index, batch_index=batch_index
+                                )
+                                for index in range(length)
+                            )
+                            state["cursor"] += length
+
+            for state in episode_states:
+                header = state["header"]
+                decisions = state["decisions"]
+                step_payloads = state["step_payloads"]
+                critic_values = state["critic_values"]
+                bc_outputs = state["bc_outputs"]
+                if len(critic_values) != len(decisions) or len(bc_outputs) != len(decisions):
+                    raise RuntimeError("windowed rollout preprocessing lost decisions")
                 rebuilt = LearnerEpisodeBuffer(header)
                 enriched_payloads: list[dict[str, Any]] = []
                 for index, (decision, step_payload) in enumerate(
                     zip(decisions, step_payloads, strict=True)
                 ):
                     rebuilt.append(replace(
-                        decision, value=float(critic.values[0, index].float().cpu())
+                        decision, value=critic_values[index]
                     ))
                     enriched = dict(step_payload)
-                    enriched["bc_output"] = self._slice_bc_output(bc_output, index)
+                    enriched["bc_output"] = bc_outputs[index]
                     enriched_payloads.append(enriched)
                 frozen = rebuilt.freeze()
                 output_chunks.extend(
                     LearnerEpisodeChunker().chunk(
-                        frozen, step_payloads=enriched_payloads
+                        frozen, step_payloads=enriched_payloads,
+                        validate_step_payloads=False,
                     )
                 )
                 prepared_decisions += len(decisions)
@@ -496,13 +676,16 @@ class Stage2PPOTrainer:
             result = result.to(floating_dtype)
         return result
 
-    def _prepare_chunk(self, chunk: Mapping[str, Any]) -> dict[str, Any]:
+    def _prepare_chunk(
+        self, chunk: Mapping[str, Any], *, device: torch.device | None = None,
+    ) -> dict[str, Any]:
+        target_device = self.device if device is None else device
         payloads = chunk.get("step_payloads")
         if not isinstance(payloads, Sequence) or not payloads:
             raise RuntimeError("Stage-2 chunk has no step payloads")
         actor_rows = [dict(payload["actor_inputs"]) for payload in payloads]
         hidden = _initial_hidden(
-            chunk, actor_rows, device=self.device, dtype=torch.float32
+            chunk, actor_rows, device=target_device, dtype=torch.float32
         )
         if hidden is None:
             raise RuntimeError("Stage-2 chunk has no exact recurrent hidden anchor")
@@ -513,7 +696,7 @@ class Stage2PPOTrainer:
             ],
             ranks=_ACTOR_INPUT_RANKS,
             ragged_groups=(_ACTOR_RAGGED,),
-            device=self.device,
+            device=target_device,
             floating_dtype=torch.float32,
             kind="Actor",
         )
@@ -522,7 +705,7 @@ class Stage2PPOTrainer:
             [dict(payload["critic_inputs"]) for payload in payloads],
             ranks=_CRITIC_INPUT_RANKS,
             ragged_groups=(_CRITIC_ENTITY_RAGGED,),
-            device=self.device,
+            device=target_device,
             floating_dtype=torch.float32,
             kind="Critic",
         )
@@ -532,32 +715,32 @@ class Stage2PPOTrainer:
         action_rows = [dict(payload["recorded_action"]) for payload in payloads]
         bc_rows = [dict(payload["bc_output"]) for payload in payloads]
         masks = ExpertActionMasks(**{
-            name: self._stack_rows(mask_rows, name, device=self.device).bool()
+            name: self._stack_rows(mask_rows, name, device=target_device).bool()
             for name in ExpertActionMasks.__dataclass_fields__
         })
         action = RecordedExpertAction(**{
-            name: self._stack_rows(action_rows, name, device=self.device)
+            name: self._stack_rows(action_rows, name, device=target_device)
             for name in RecordedExpertAction.__dataclass_fields__
         })
         bc_output = ExpertPolicyOutput(
             *(self._stack_rows(
-                bc_rows, name, device=self.device, floating_dtype=torch.float32
+                bc_rows, name, device=target_device, floating_dtype=torch.float32
             ) for name in (
                 "rate_logits", "action_kind_logits", "card_logits",
                 "position_logits", "ability_logits", "ability_position_logits",
             )),
-            (torch.empty(0, device=self.device), torch.empty(0, device=self.device)),
+            (torch.empty(0, device=target_device), torch.empty(0, device=target_device)),
         )
         decisions = chunk["decisions"]
         old_log_prob = torch.tensor(
             [[float(value["old_logp_total"]) for value in decisions]],
-            device=self.device,
+            device=target_device,
         )
-        advantages = torch.as_tensor(chunk["advantages"], device=self.device).float().unsqueeze(0)
-        returns = torch.as_tensor(chunk["returns"], device=self.device).float().unsqueeze(0)
-        loss_mask = torch.as_tensor(chunk["loss_mask"], device=self.device).bool().unsqueeze(0)
+        advantages = torch.as_tensor(chunk["advantages"], device=target_device).float().unsqueeze(0)
+        returns = torch.as_tensor(chunk["returns"], device=target_device).float().unsqueeze(0)
+        loss_mask = torch.as_tensor(chunk["loss_mask"], device=target_device).bool().unsqueeze(0)
         targets = _critic_targets(
-            chunk, payloads, steps=len(payloads), device=self.device
+            chunk, payloads, steps=len(payloads), device=target_device
         )
         return {
             "actor_inputs": actor_inputs,
@@ -584,7 +767,37 @@ class Stage2PPOTrainer:
         })
 
     def _combine(self, chunks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-        rows = [self._prepare_chunk(chunk) for chunk in chunks]
+        return batch_to_device(self._prepared_cpu(chunks), self.device)
+
+    def _prepared_cpu(self, chunks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        build = lambda: self._combine_cpu(chunks)
+        cache = getattr(self, "_prepared_cache", None)
+        prepared = build() if cache is None else cache.get(
+            tuple(id(chunk) for chunk in chunks), build
+        )
+        return prepared
+
+    def _iter_prepared(self, batches: Sequence[Sequence[Mapping[str, Any]]]):
+        if self.device.type != "cuda" or len(batches) < 2:
+            for chunks in batches:
+                yield self._combine(chunks)
+            return
+        # Only the producer touches the CPU cache.  Queue one batch ahead so
+        # host collation overlaps the current CUDA forward/backward pass.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="ppo-input") as pool:
+            pending = pool.submit(self._prepared_cpu, batches[0])
+            for index in range(len(batches)):
+                prepared = pending.result()
+                if index + 1 < len(batches):
+                    pending = pool.submit(self._prepared_cpu, batches[index + 1])
+                yield batch_to_device(prepared, self.device)
+
+    def _combine_cpu(self, chunks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        cpu = torch.device("cpu")
+        rows = [self._prepare_chunk(chunk, device=cpu) for chunk in chunks]
+        if self.config.chunk_padding_multiple:
+            maximum_steps = max(row["loss_mask"].shape[1] for row in rows)
+            rows = [self._pad_prepared(row, maximum_steps) for row in rows]
         bc_names = (
             "rate_logits", "action_kind_logits", "card_logits",
             "position_logits", "ability_logits", "ability_position_logits",
@@ -594,7 +807,7 @@ class Stage2PPOTrainer:
                 [getattr(row["bc_output"], name) for row in rows],
                 name=f"Stage2.bc.{name}",
             ) for name in bc_names),
-            (torch.empty(0, device=self.device), torch.empty(0, device=self.device)),
+            (torch.empty(0), torch.empty(0)),
         )
         return {
             "actor_inputs": _batch_input_mappings(
@@ -613,12 +826,39 @@ class Stage2PPOTrainer:
             "targets": _batch_targets([row["targets"] for row in rows]),
         }
 
+    @staticmethod
+    def _pad_prepared(row: dict[str, Any], maximum_steps: int) -> dict[str, Any]:
+        steps = int(row["loss_mask"].shape[1])
+        if steps == maximum_steps:
+            return row
+        if steps > maximum_steps:
+            raise ValueError("cannot shorten a prepared recurrent sequence")
+        copied = {**row, "actor_inputs": dict(row["actor_inputs"])}
+        hidden = copied["actor_inputs"].pop("hidden")
+
+        def pad(tensor: Tensor) -> Tensor:
+            if tensor.ndim < 2 or tensor.shape[0] != 1 or tensor.shape[1] != steps:
+                return tensor
+            shape = list(tensor.shape)
+            shape[1] = maximum_steps - steps
+            return torch.cat((tensor, tensor.new_zeros(shape)), dim=1)
+
+        padded = map_tensors(copied, pad)
+        padded["actor_inputs"]["hidden"] = hidden
+        # Padded rows never enter any loss, but hazard shape validation still
+        # requires a positive interval on those structurally present rows.
+        padded["actor_inputs"]["delta_ticks"][:, steps:] = 1
+        return padded
+
     def _chunk_batches(
         self, chunks: Sequence[Mapping[str, Any]]
     ) -> list[list[Mapping[str, Any]]]:
         groups: dict[int, list[Mapping[str, Any]]] = {}
         for chunk in chunks:
-            groups.setdefault(len(chunk["step_payloads"]), []).append(chunk)
+            length = len(chunk["step_payloads"])
+            multiple = self.config.chunk_padding_multiple
+            bucket = ((length + multiple - 1) // multiple) * multiple if multiple else length
+            groups.setdefault(bucket, []).append(chunk)
         result = []
         for length in sorted(groups, reverse=True):
             rows = groups[length]
@@ -650,8 +890,7 @@ class Stage2PPOTrainer:
         actual_events: list[Tensor] = []
         self.model.eval()
         with torch.no_grad():
-            for chunk_batch in batches:
-                batch = self._combine(chunk_batch)
+            for batch in self._iter_prepared(batches):
                 featured = self.model.actor.forward_with_features(**batch["actor_inputs"])
                 evaluated = evaluate_expert_action(
                     output=featured.output,
@@ -669,28 +908,32 @@ class Stage2PPOTrainer:
                 )
                 mask = batch["loss_mask"]
                 log_ratios.append(
-                    (evaluated.log_prob.total - batch["old_log_prob"])[mask].float().cpu()
+                    (evaluated.log_prob.total - batch["old_log_prob"])[mask].float()
                 )
-                bc_values.append(bc_kl[mask].float().cpu())
-                entropies.append(evaluated.entropy[mask].float().cpu())
+                bc_values.append(bc_kl[mask].float())
+                entropies.append(evaluated.entropy[mask].float())
                 rates.append(lambda_from_logits(
                     featured.output.rate_logits, self.model.actor.config.lambda_max
-                )[mask].float().cpu())
+                )[mask].float())
                 event_probabilities.append(
-                    evaluated.log_prob.event_probability[mask].float().cpu()
+                    evaluated.log_prob.event_probability[mask].float()
                 )
-                actual_events.append(batch["action"].event_happened[mask].float().cpu())
+                actual_events.append(batch["action"].event_happened[mask].float())
         self.model.train()
         log_ratio = torch.cat(log_ratios)
         ratio = torch.exp(log_ratio)
+        values = torch.stack((
+            ((ratio - 1.0) - log_ratio).mean(),
+            ((ratio - 1.0).abs() > clip_epsilon).float().mean(),
+            torch.cat(bc_values).mean(), torch.cat(entropies).mean(),
+            torch.cat(rates).mean(), torch.cat(event_probabilities).mean(),
+            torch.cat(actual_events).mean(),
+        )).cpu().tolist()
         return {
-            "approx_update_kl": float(((ratio - 1.0) - log_ratio).mean()),
-            "clip_fraction": float(((ratio - 1.0).abs() > clip_epsilon).float().mean()),
-            "bc_kl": float(torch.cat(bc_values).mean()),
-            "joint_entropy": float(torch.cat(entropies).mean()),
-            "rate_mean": float(torch.cat(rates).mean()),
-            "event_probability_mean": float(torch.cat(event_probabilities).mean()),
-            "actual_event_rate": float(torch.cat(actual_events).mean()),
+            **dict(zip((
+                "approx_update_kl", "clip_fraction", "bc_kl", "joint_entropy",
+                "rate_mean", "event_probability_mean", "actual_event_rate",
+            ), values, strict=True)),
             "evaluated_steps": int(log_ratio.numel()),
         }
 
@@ -701,13 +944,18 @@ class Stage2PPOTrainer:
             "actor_optimizer": _cpu_optimizer_state(self.actor_optimizer.state_dict()),
             "critic_optimizer": _cpu_optimizer_state(self.critic_optimizer.state_dict()),
             "rng": _capture_rng_state(),
+            "grad_scaler": deepcopy(self.grad_scaler.state_dict()),
         }
 
     def _restore_snapshot(self, value: Mapping[str, Any]) -> None:
         _restore_module_state(self.model.actor, value["actor"])
         _restore_module_state(self.model.critic, value["critic"])
-        self.actor_optimizer.load_state_dict(value["actor_optimizer"])
-        self.critic_optimizer.load_state_dict(value["critic_optimizer"])
+        # load_state_dict can reuse same-device optimizer tensors.  A retry
+        # must never mutate the snapshot that a later rollback depends on.
+        self.actor_optimizer.load_state_dict(deepcopy(value["actor_optimizer"]))
+        self.critic_optimizer.load_state_dict(deepcopy(value["critic_optimizer"]))
+        if self.grad_scaler.is_enabled() and value.get("grad_scaler"):
+            self.grad_scaler.load_state_dict(value["grad_scaler"])
         _restore_rng_state(value["rng"])
 
     def _run_attempt(
@@ -731,7 +979,9 @@ class Stage2PPOTrainer:
                 specs_by_name[group_name].learning_rate * actor_lr_multiplier
             )
         batches = self._chunk_batches(chunks)
+        before_started_at = time.perf_counter()
         before = self._policy_metrics(batches, clip_epsilon=self.config.clip_epsilon)
+        before_finished_at = time.perf_counter()
         if (
             abs(before["approx_update_kl"]) > 1e-4
             or before["clip_fraction"] > 0.001
@@ -742,26 +992,29 @@ class Stage2PPOTrainer:
                 f"clip_fraction={before['clip_fraction']:.6g}"
             )
         advantage_mean, advantage_std = self._advantage_statistics(chunks)
-        accumulators = {
-            "loss": 0.0,
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "entropy": 0.0,
-            "bc_kl_loss": 0.0,
-            "critic_auxiliary_loss": 0.0,
-        }
+        metric_names = (
+            "loss", "policy_loss", "value_loss", "entropy", "bc_kl_loss",
+            "critic_auxiliary_loss",
+        )
+        accumulators = torch.zeros(len(metric_names), dtype=torch.float64, device=self.device)
+        grad_norm_max = torch.zeros(2, dtype=torch.float64, device=self.device)
         minibatches = 0
-        actor_grad_norm_max = 0.0
-        critic_grad_norm_max = 0.0
+        actor_parameters = [p for p in self.model.actor.parameters() if p.requires_grad]
+        critic_parameters = [p for p in self.model.critic.parameters() if p.requires_grad]
         self.model.train()
+        optimize_started_at = time.perf_counter()
         for _epoch in range(ppo_epochs):
             order = list(range(len(batches)))
             random.shuffle(order)
-            for batch_index in order:
-                batch = self._combine(batches[batch_index])
+            for batch in self._iter_prepared([batches[index] for index in order]):
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
-                featured = self.model.actor.forward_with_features(**batch["actor_inputs"])
+                with self._training_autocast():
+                    featured = self.model.actor.forward_with_features(**batch["actor_inputs"])
+                    critic_output = self.model.critic(
+                        actor_latent=featured.pre_head_latent.detach(),
+                        **batch["critic_inputs"],
+                    )
                 evaluated = evaluate_expert_action(
                     output=featured.output,
                     config=self.model.actor.config,
@@ -775,10 +1028,6 @@ class Stage2PPOTrainer:
                     config=self.model.actor.config,
                     masks=batch["masks"],
                     delta_ticks=batch["actor_inputs"]["delta_ticks"],
-                )
-                critic_output = self.model.critic(
-                    actor_latent=featured.pre_head_latent.detach(),
-                    **batch["critic_inputs"],
                 )
                 normalized_advantages = (
                     batch["advantages"] - advantage_mean
@@ -806,15 +1055,9 @@ class Stage2PPOTrainer:
                 total = ppo.total + auxiliary.total
                 if not bool(torch.isfinite(total)):
                     raise FloatingPointError("Stage-2 PPO loss is NaN/Inf")
-                total.backward()
-                actor_parameters = [
-                    parameter for parameter in self.model.actor.parameters()
-                    if parameter.requires_grad
-                ]
-                critic_parameters = [
-                    parameter for parameter in self.model.critic.parameters()
-                    if parameter.requires_grad
-                ]
+                self.grad_scaler.scale(total).backward()
+                self.grad_scaler.unscale_(self.actor_optimizer)
+                self.grad_scaler.unscale_(self.critic_optimizer)
                 actor_norm = torch.nn.utils.clip_grad_norm_(
                     actor_parameters, self.config.actor_grad_clip,
                     error_if_nonfinite=True,
@@ -823,26 +1066,24 @@ class Stage2PPOTrainer:
                     critic_parameters, self.config.critic_grad_clip,
                     error_if_nonfinite=True,
                 )
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
-                actor_grad_norm_max = max(actor_grad_norm_max, float(actor_norm))
-                critic_grad_norm_max = max(critic_grad_norm_max, float(critic_norm))
-                for name, value in (
-                    ("loss", total),
-                    ("policy_loss", ppo.policy),
-                    ("value_loss", ppo.value),
-                    ("entropy", ppo.entropy),
-                    ("bc_kl_loss", ppo.bc_kl),
-                    ("critic_auxiliary_loss", auxiliary.total),
-                ):
-                    accumulators[name] += float(value.detach())
+                self.grad_scaler.step(self.actor_optimizer)
+                self.grad_scaler.step(self.critic_optimizer)
+                self.grad_scaler.update()
+                grad_norm_max = torch.maximum(
+                    grad_norm_max, torch.stack((actor_norm, critic_norm)).detach().double()
+                )
+                accumulators += torch.stack((
+                    total, ppo.policy, ppo.value, ppo.entropy,
+                    ppo.bc_kl, auxiliary.total,
+                )).detach().double()
                 minibatches += 1
         if minibatches < 1:
             raise RuntimeError("Stage-2 PPO produced no minibatches")
+        scalar_values = torch.cat((accumulators / minibatches, grad_norm_max)).cpu().tolist()
+        optimize_finished_at = time.perf_counter()
         after = self._policy_metrics(batches, clip_epsilon=self.config.clip_epsilon)
-        metrics = {
-            name: value / minibatches for name, value in accumulators.items()
-        }
+        after_finished_at = time.perf_counter()
+        metrics = dict(zip(metric_names, scalar_values[:len(metric_names)], strict=True))
         metrics.update({
             "approx_update_kl": after["approx_update_kl"],
             "clip_fraction": after["clip_fraction"],
@@ -855,13 +1096,19 @@ class Stage2PPOTrainer:
             "event_probability_before": before["event_probability_mean"],
             "event_probability_after": after["event_probability_mean"],
             "actual_event_rate": after["actual_event_rate"],
-            "actor_grad_norm_max": actor_grad_norm_max,
-            "critic_grad_norm_max": critic_grad_norm_max,
+            "actor_grad_norm_max": scalar_values[-2],
+            "critic_grad_norm_max": scalar_values[-1],
             "evaluated_steps": after["evaluated_steps"],
             "ppo_epochs": ppo_epochs,
             "minibatches": minibatches,
             "actor_lr_multiplier": actor_lr_multiplier,
             "bc_kl_coefficient": bc_kl_coefficient,
+            "behavior_audit_seconds": before_finished_at - before_started_at,
+            "ppo_optimize_seconds": optimize_finished_at - optimize_started_at,
+            "updated_policy_audit_seconds": after_finished_at - optimize_finished_at,
+            "training_bfloat16": int(self.config.training_precision == "bfloat16"),
+            "training_float16": int(self.config.training_precision == "float16"),
+            "fused_optimizer": int(self.config.fused_optimizer),
         })
         if not all(math.isfinite(float(value)) for value in metrics.values()):
             raise FloatingPointError("Stage-2 PPO metrics contain NaN/Inf")
@@ -870,11 +1117,29 @@ class Stage2PPOTrainer:
     def train_update(
         self, chunks: Sequence[Mapping[str, Any]]
     ) -> tuple[dict[str, float], UpdateGuardDecision, int]:
+        cache = PreparedBatchCache(
+            int(self.config.prepared_cache_gib * 1024**3),
+            pin_memory=self.device.type == "cuda",
+        )
+        self._prepared_cache = cache
+        try:
+            metrics, guard, retry = self._train_update(chunks)
+            metrics.update(cache.metrics())
+            return metrics, guard, retry
+        finally:
+            cache.clear()
+            self._prepared_cache = None
+
+    def _train_update(
+        self, chunks: Sequence[Mapping[str, Any]]
+    ) -> tuple[dict[str, float], UpdateGuardDecision, int]:
         if not chunks:
             raise ValueError("Stage-2 update requires recurrent chunks")
         snapshot = self._snapshot()
+        self.last_actor_before_update = snapshot["actor"]
         for attempt in range(2):
-            self._restore_snapshot(snapshot)
+            if attempt:
+                self._restore_snapshot(snapshot)
             metrics, _before = self._run_attempt(
                 chunks,
                 ppo_epochs=(self.config.ppo_epochs if attempt == 0 else 1),
@@ -915,15 +1180,26 @@ class Stage2PPOTrainer:
         guard: UpdateGuardDecision,
         retry_attempt: int,
         rollout: Mapping[str, Any],
+        actor_master_state: Mapping[str, Tensor] | None = None,
     ) -> tuple[Path, Path]:
         directory = directory.resolve()
         checkpoints = directory / "checkpoints"
         exports = directory / "exports"
         checkpoints.mkdir(parents=True, exist_ok=True)
         exports.mkdir(parents=True, exist_ok=True)
-        behavior_state = _half_state(self.model.actor)
+        master_state = (
+            _clone_state(self.model.actor, fp32=True)
+            if actor_master_state is None else dict(actor_master_state)
+        )
+        if any(tensor.device.type != "cpu" or tensor.dtype != torch.float32
+               for tensor in master_state.values()):
+            raise ValueError("prepared Actor master must contain FP32 CPU tensors")
+        behavior_state = {
+            name: tensor.to(torch.float16).contiguous()
+            for name, tensor in master_state.items()
+        }
         behavior_sha = _state_digest(behavior_state)
-        master_sha = actor_state_digest(self.model.actor)
+        master_sha = _state_digest(master_state)
         bundle = {
             "kind": STAGE2_KIND,
             "schema_version": SCHEMA_VERSION,
@@ -934,7 +1210,7 @@ class Stage2PPOTrainer:
             "base_inference_sha256": self.base_checkpoint_sha256,
             "continuation_checkpoint": str(self.continuation_path),
             "continuation_sha256": self.continuation_sha256,
-            "actor_master": _clone_state(self.model.actor, fp32=True),
+            "actor_master": master_state,
             "master_actor_sha256": master_sha,
             "actor_behavior_fp16": behavior_state,
             "behavior_actor_sha256": behavior_sha,
@@ -942,6 +1218,7 @@ class Stage2PPOTrainer:
             "critic": _clone_state(self.model.critic),
             "actor_optimizer": _cpu_optimizer_state(self.actor_optimizer.state_dict()),
             "critic_optimizer": _cpu_optimizer_state(self.critic_optimizer.state_dict()),
+            "grad_scaler": deepcopy(self.grad_scaler.state_dict()),
             "actor_optimizer_parameter_names": self.actor_optimizer_parameter_names,
             "critic_optimizer_parameter_names": self.critic_optimizer_parameter_names,
             "rng": _capture_rng_state(),
@@ -989,4 +1266,5 @@ class Stage2PPOTrainer:
             stale.unlink()
         self.behavior_actor_sha256 = behavior_sha
         self.master_actor_sha256 = master_sha
+        self.last_actor_before_update = None
         return checkpoint, export_path

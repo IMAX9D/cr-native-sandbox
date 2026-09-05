@@ -3,10 +3,24 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 import unittest
 
-from scripts.ensure_bionic_workers import BOOT_JARS, command, environment
+from scripts.ensure_bionic_workers import (
+    BOOT_JARS,
+    command,
+    environment,
+    port_bindable,
+)
 
 
 class EnsureBionicWorkersTests(unittest.TestCase):
+    def test_ephemeral_port_is_bindable(self) -> None:
+        import socket
+
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        self.assertTrue(port_bindable(port))
+
     def test_command_matches_headless_android_runtime_contract(self) -> None:
         direct = PurePosixPath("/data/local/tmp/cr-native-direct-7")
         value = command(direct, 39038)
@@ -18,6 +32,9 @@ class EnsureBionicWorkersTests(unittest.TestCase):
         self.assertTrue(any(
             str(direct / "lifecycle-probe.jar") in item for item in value
         ))
+        jit = command(direct, 39038, execution_mode="jit")
+        self.assertNotIn("-Xint", jit)
+        self.assertEqual(jit[-3:], [str(direct), "serve-direct", "39038"])
 
     def test_environment_is_binderless_and_worker_isolated(self) -> None:
         direct = PurePosixPath("/data/local/tmp/cr-native-direct-3")

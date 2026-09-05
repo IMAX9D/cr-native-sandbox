@@ -258,6 +258,27 @@ class BatchedPolicyServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "placement"):
             service.act([request(0, digest, action_masks=broken)])
 
+    def test_dense_sampling_matches_deterministic_conditional_policy(self):
+        digest = "2" * 64
+        services = (
+            BatchedPolicyService(device="cpu", deterministic=True),
+            BatchedPolicyService(
+                device="cpu", deterministic=True, dense_sampling=True
+            ),
+        )
+        answers = []
+        for service in services:
+            service.register_actor(CountingActor(), actor_sha256=digest)
+            answers.append(service.act([
+                request(0, digest, scalar=1.0,
+                        action_masks=masks(card=True, ability=False)),
+                request(1, digest, scalar=-1.0,
+                        action_masks=masks(card=False, ability=True)),
+                request(2, digest,
+                        action_masks=masks(card=False, ability=False)),
+            ]))
+        self.assertEqual(answers[0], answers[1])
+
 
 if __name__ == "__main__":
     unittest.main()

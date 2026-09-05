@@ -57,6 +57,10 @@ python -m pip install -e .
 python -m pip install -e ".[training,test]"
 ```
 
+Stage-2 云端效率测试使用 PyTorch 2.8 / CUDA 12.8；训练依赖下限为 PyTorch 2.8。
+请先安装与显卡兼容的 PyTorch CUDA 构建，再安装本包；仅安装依赖不代表
+Linux Bionic Runtime、CUDA MPS 或私有模型已准备完成。
+
 `third_party/Scroll` 只是历史架构参考，日常构建和运行不需要初始化该子模块。
 
 ### 3. 放置 Runtime
@@ -163,9 +167,29 @@ with NativeRoyaleEnv(port=37031) as env:
 当前实现说明：
 
 - [Expert Self-Play v1](docs/EXPERT_SELFPLAY_V1_IMPLEMENTATION.zh-CN.md)
+- [Stage-2 效率实测与限制](docs/STAGE2_EFFICIENCY_20260904.zh-CN.md)
 - [Expert Training v1](docs/EXPERT_TRAINING_V1.zh-CN.md)
 - [Self-Play v0.2 设计](docs/SELFPLAY_V0_2_CONTINUOUS_ACTION_RATE_DESIGN.zh-CN.md)
 - [训练系统](docs/training-system.md)
+
+### 当前 Stage-2 效率版本
+
+`scripts/start_expert_selfplay_stage2.py` 的 `throughput` 配置使用 96 个原生 Worker、
+6 个采集进程、每策略版本 2 波共 192 场，配合 BF16、批量输入缓存和准备流水线。
+每个策略版本结束后回收 CUDA 进程，避免跨轮显存残留；原生 Worker 继续复用。
+
+RTX 5090 D 上连续两次完整更新：384 场、506.10 秒，短测折算约 **6.56 万场/天**。
+该计时包含采集、准备、PPO、检查与保存，不包含尚未接入的 Elo 晋级；
+不是 24 小时耐久结果，也未达到 20 万场/天。历史 23.2 万场/天仅为纯采集短测。
+
+这套配置的决策窗口为 12 个原生 Tick（600 ms），chunk batch 为 32；
+相较保守配置，决策分辨率和 optimizer 更新频率也发生变化，不能只凭吞吐
+认定对战水平不变。当前 Stage-2 对手仍为冻结专家基模，40/40/20 league 尚未接入。
+
+首次运行所需文件、Canary、续训、监测与停机边界见
+[Stage-2 运行说明](docs/EXPERT_SELFPLAY_V1_IMPLEMENTATION.zh-CN.md#一键入口)。
+普通训练入口**不会自动关闭云实例**。编译推理、集中推理服务及滚动补位等
+实验开关默认关闭，不能把实验脚本的存在视为性能验收。
 
 ## MuMu 实时实验
 
@@ -184,11 +208,16 @@ with NativeRoyaleEnv(port=37031) as env:
 - `python -m pytest -q` 通过；
 - 对原生 Runtime 的声明只覆盖已证实的版本和 ABI。
 
+如只做 CPU 回归，可设置 `CUDA_VISIBLE_DEVICES=-1` 后运行测试；GPU 测试将跳过。
+这不替代实际 CUDA/原生对局验收。仅加载可信来源的 checkpoint 和 rollout，
+这些研究工具中的 PyTorch/pickle 反序列化不用于处理不可信文件。
+
 本仓库只提供研究与测试基础设施。使用者需要自行遵守游戏许可、平台条款及所在地
 法律。MIT 许可证仅覆盖本仓库原创代码，不覆盖 Supercell 或其他第三方资产。
 
 ## 文档导航
 
+- [2026-09-05 效率版本整理说明](docs/RELEASE_20260905.zh-CN.md)
 - [2026-09-03 发布整理说明](docs/RELEASE_20260903.zh-CN.md)
 - [主技术文档](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md)
 - [历史综合技术路线](docs/TECHNICAL_ROUTE.zh-CN.md)

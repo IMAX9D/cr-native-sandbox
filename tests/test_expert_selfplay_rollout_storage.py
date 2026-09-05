@@ -189,6 +189,33 @@ class RolloutStorageTests(unittest.TestCase):
             [(0, 0, 64), (48, 64, 128), (112, 128, 145)],
         )
         self.assertEqual([c["burn_in"] for c in chunks], [0, 16, 16])
+
+    def test_chunker_keeps_hidden_only_at_each_chunk_anchor(self):
+        payloads = [
+            {
+                "actor_inputs": {
+                    "hidden": (
+                        torch.full((2, 1, 8), float(index)),
+                        torch.full((2, 1, 8), float(-index)),
+                    )
+                }
+            }
+            for index in range(145)
+        ]
+        chunks = LearnerEpisodeChunker().chunk(
+            self._episode(), step_payloads=payloads
+        )
+        for chunk in chunks:
+            rows = chunk["step_payloads"]
+            self.assertIn("hidden", rows[0]["actor_inputs"])
+            self.assertTrue(all(
+                "hidden" not in row["actor_inputs"] for row in rows[1:]
+            ))
+            anchor = int(chunk["sequence_start"])
+            self.assertEqual(
+                float(rows[0]["actor_inputs"]["hidden"][0][0, 0, 0]),
+                float(anchor),
+            )
         self.assertEqual([c["unroll"] for c in chunks], [64, 64, 17])
         self.assertEqual(int(chunks[1]["loss_mask"].sum()), 64)
         self.assertFalse(bool(chunks[1]["loss_mask"][:16].any()))
