@@ -161,7 +161,7 @@ def behaviour_cloning_loss(
             if name == "card":
                 top3 = logits.topk(k=min(3, logits.shape[-1]), dim=-1).indices
                 metrics["card_top3"] = (
-                    float((top3[mask] == labels[mask, None]).any(-1).float().mean().item())
+                    float((top3[mask] == labels[mask].unsqueeze(-1)).any(-1).float().mean().item())
                     if bool(mask.any()) else 0.0
                 )
         metrics["timing_count"] = float(timing_mask.sum().item())
@@ -276,7 +276,7 @@ def _sequence_only_loss(
         top3 = card_logits.topk(k=min(3, card_logits.shape[-1]), dim=-1).indices
         metrics["card_top3"] = (
             float(
-                (top3[card_mask] == batch["card_slot"][card_mask, None])
+                (top3[card_mask] == batch["card_slot"][card_mask].unsqueeze(-1))
                 .any(-1)
                 .float()
                 .mean()
