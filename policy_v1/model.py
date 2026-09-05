@@ -47,8 +47,53 @@ class TimeEncoding(nn.Module):
         return torch.stack((x.sin(), x.cos()), -1).flatten(-2)
 
 
+class CompatibleEncoderLayer(nn.TransformerEncoderLayer):
+    """Keep standard weights but avoid the 2.0.0 fused mask-merging path.
+
+    Encoder and MHA inference fast paths in that release reshape per-batch
+    masks as a single square mask. Explicit pre-norm computation and distinct
+    Q/K/V views use the regular attention implementation (including SDPA where
+    available), without enabling dropout or gradients during evaluation.
+    """
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+        if is_causal and src_mask is None:
+            raise ValueError("causal attention requires an explicit mask")
+
+        def additive(mask, dtype):
+            if mask is None:
+                return None
+            if mask.dtype == torch.bool:
+                return torch.zeros_like(mask, dtype=dtype).masked_fill(
+                    mask, float("-inf")
+                )
+            return mask.to(dtype=dtype)
+
+        def attention(x):
+            value, _ = self.self_attn(
+                x,
+                x.view_as(x),
+                x.view_as(x),
+                attn_mask=additive(src_mask, x.dtype),
+                key_padding_mask=additive(src_key_padding_mask, x.dtype),
+                need_weights=False,
+            )
+            return self.dropout1(value)
+
+        def feedforward(x):
+            return self.dropout2(
+                self.linear2(self.dropout(self.activation(self.linear1(x))))
+            )
+
+        if self.norm_first:
+            x = src + attention(self.norm1(src))
+            return x + feedforward(self.norm2(x))
+        x = self.norm1(src + attention(src))
+        return self.norm2(x + feedforward(x))
+
+
 def encoder(c):
-    layer = nn.TransformerEncoderLayer(
+    layer = CompatibleEncoderLayer(
         c.width,
         c.heads,
         4 * c.width,
