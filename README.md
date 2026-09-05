@@ -28,6 +28,13 @@ JNI/函数 RVA/结构偏移、重建卡牌目录，并重新通过 DataTables、
 RNG、下牌、技能、reset、时间、圣水和终局证书。完整步骤见
 [版本升级流程](docs/SANDBOX_RUNTIME_TECHNICAL.zh-CN.md#27-版本升级流程)。
 
+## 独立离线 BC（不需要运行时）
+
+已有 `native-bc-v1` 编译数据时，可直接使用独立的 [Policy V1](policy_v1/README.zh-CN.md)：
+空间、近期帧和公开事件 Transformer，支持 Linux 单卡/双卡训练与断点恢复。
+仅安装 `python -m pip install -e ./policy_v1`，用 `cr-policy-smoke` 检查安装；
+不需要下面的 Android、APK 或 Runtime 配置，也不使用主项目的训练依赖版本要求。
+
 ## 快速开始
 
 ### 1. 前置条件

@@ -1,0 +1,7 @@
+/build/
+/dist/
+/.venv/
+/runs/
+/cache/
+/data/
+*.egg-info/

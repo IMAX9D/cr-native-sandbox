@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cr-policy-v1"
+version = "0.1.0"
+description = "Standalone offline spatial, temporal and event Transformer BC for compiled CR data"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.22,<2", "torch>=2.0"]
+
+[project.scripts]
+cr-policy-prepare = "policy_v1.data:main"
+cr-policy-train = "policy_v1.train:main"
+cr-policy-smoke = "policy_v1.smoke:main"
+
+[tool.setuptools]
+packages = ["policy_v1"]
+package-dir = {policy_v1 = "."}

@@ -1,0 +1,30 @@
+name: Standalone Policy V1
+on:
+  push:
+    paths: ['policy_v1/**', '.github/workflows/policy-v1.yml']
+  pull_request:
+    paths: ['policy_v1/**', '.github/workflows/policy-v1.yml']
+permissions:
+  contents: read
+jobs:
+  offline-bc:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - python: '3.8'
+            torch: '2.0.1'
+          - python: '3.11'
+            torch: '2.8.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install 'numpy>=1.22,<2'
+      - run: python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install --no-deps ./policy_v1
+      - run: python -m unittest discover -s policy_v1/tests -v
+      - name: Installed package works outside checkout
+        working-directory: /tmp
+        run: cr-policy-smoke
