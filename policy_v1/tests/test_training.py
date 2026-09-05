@@ -10,10 +10,41 @@ from policy_v1.data import prepare, Windows, collate
 from policy_v1.model import Policy, PolicyConfig
 from policy_v1.loss import bc_loss
 from policy_v1.smoke import create_fixture
-from policy_v1.train import parser, run, load_checkpoint
+from policy_v1.train import parser, run, load_checkpoint, optimizer_update
 
 
 class TrainingTests(unittest.TestCase):
+    @unittest.skipUnless(
+        hasattr(torch.amp, "GradScaler"), "CPU GradScaler requires newer PyTorch"
+    )
+    def test_overflow_skips_optimizer_then_recovers(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.01)
+        scaler = torch.amp.GradScaler("cpu", init_scale=8.0)
+        before = model.weight.detach().clone()
+        scaler.scale(model(torch.ones(1, 1)).sum()).backward()
+        model.weight.grad.fill_(float("inf"))
+        updated, old, new = optimizer_update(model, opt, scaler, 1.0)
+        self.assertFalse(updated)
+        self.assertEqual((old, new), (8.0, 4.0))
+        self.assertEqual(len(opt.state), 0)
+        torch.testing.assert_close(before, model.weight, rtol=0, atol=0)
+        scaler.scale(model(torch.ones(1, 1)).sum()).backward()
+        updated, _, _ = optimizer_update(model, opt, scaler, 1.0)
+        self.assertTrue(updated)
+        self.assertTrue(torch.isfinite(model.weight).all())
+        self.assertFalse(torch.equal(before, model.weight))
+
+    def test_unscaled_invalid_gradient_still_fails(self):
+        model = torch.nn.Linear(1, 1)
+        opt = torch.optim.AdamW(model.parameters())
+        scaler = torch.cuda.amp.GradScaler(enabled=False)
+        model(torch.ones(1, 1)).sum().backward()
+        model.weight.grad.fill_(float("nan"))
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            optimizer_update(model, opt, scaler, 1.0)
+        self.assertEqual(len(opt.state), 0)
+
     def test_resume_matches_uninterrupted_updates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -34,6 +34,38 @@ def move(batch, device):
     return {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
 
+def optimizer_update(model, optimizer, scaler, grad_clip, *, distributed=False):
+    """Skip overflowing scaled gradients without changing weights or Adam state.
+
+    Inspect the norm explicitly before allowing any optimizer step. In FP16,
+    clipping may itself find an overflowing norm even if individual gradients
+    were finite, so relying solely on GradScaler's elementwise check is unsafe.
+    Unscaled FP32/BF16 training retains the original hard failure.
+    """
+    scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), grad_clip, error_if_nonfinite=not scaler.is_enabled()
+    )
+    overflow = (~torch.isfinite(norm)).to(dtype=torch.int32)
+    if distributed:
+        dist.all_reduce(overflow, op=dist.ReduceOp.MAX)
+    scale_before = float(scaler.get_scale())
+    if bool(overflow):
+        if not scaler.is_enabled():
+            raise FloatingPointError("non-finite gradients without FP16 scaling")
+        scale_after = scale_before * scaler.get_backoff_factor()
+        if scale_after <= 0:
+            raise FloatingPointError("FP16 gradient scale underflow")
+        # update(new_scale=...) resets per-optimizer unscale state. Do not call
+        # optimizer.step or scaler.step on any rank for this batch.
+        scaler.update(new_scale=scale_after)
+        optimizer.zero_grad(set_to_none=True)
+        return False, scale_before, scale_after
+    scaler.step(optimizer)
+    scaler.update()
+    return True, scale_before, float(scaler.get_scale())
+
+
 def load_checkpoint(path):
     # Checkpoints contain optimizer/RNG state. Load only your own trusted files.
     try:
@@ -364,6 +396,7 @@ def run(args):
             dist.destroy_process_group()
         return
     start_time = time.monotonic()
+    consecutive_overflows = 0
     while epoch < args.epochs and (not args.max_steps or step < args.max_steps):
         sampler.set_epoch(epoch)
         parallel.train()
@@ -380,14 +413,31 @@ def run(args):
                 output = parallel(b)
             loss, stats = bc_loss(output, b, distributed=distributed)
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip, error_if_nonfinite=True
+            updated, scale_before, scale_after = optimizer_update(
+                model, optimizer, scaler, args.grad_clip, distributed=distributed
             )
-            scaler.step(optimizer)
-            scaler.update()
-            step += 1
             cursor = bi + 1
+            if not updated:
+                consecutive_overflows += 1
+                record(
+                    {
+                        "phase": "amp_overflow",
+                        "step": step,
+                        "epoch": epoch,
+                        "skipped_batch": bi,
+                        "scale_before": scale_before,
+                        "scale_after": scale_after,
+                        "consecutive_overflows": consecutive_overflows,
+                    }
+                )
+                if consecutive_overflows >= 32:
+                    raise FloatingPointError(
+                        "32 consecutive FP16 overflows; stopped without applying bad gradients. "
+                        "Use a new run with --precision fp32 to diagnose numerical instability."
+                    )
+                continue
+            consecutive_overflows = 0
+            step += 1
             for k, v in stats.items():
                 accumulated[k] += v
             if step % args.log_every == 0:

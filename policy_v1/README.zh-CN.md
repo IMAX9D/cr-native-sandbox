@@ -158,3 +158,8 @@ python -m unittest discover -s policy_v1/tests -v
 
 PyTorch 2.0.0 评估兼容：编码层显式执行标准注意力，绕过旧版 fused 路径对批次掩码的错误 reshape；
 保留因果/补齐掩码和原有权重名称，不需要升级 PyTorch。
+
+FP16 起始 loss scale 较大时可能出现梯度溢出。训练器会输出 `phase: amp_overflow`、
+降低 scale 并丢弃该批更新，不修改权重或优化器状态，也不增加成功更新的 `step`。
+连续 32 批仍溢出则停止，避免隐藏持续数值问题；可在新目录用 `--precision fp32` 对照排查。
+FP32/BF16 出现非有限梯度仍直接报错。CUDA 数值稳定性应在目标服务器验证。
