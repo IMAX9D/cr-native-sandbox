@@ -5309,16 +5309,20 @@ Java_royale_nativehost_JniHost_nativePumpManager(
   const std::array<uint8_t, 5>
       binderless_ui_locale_container_guard_expected = {
           0xE8, 0x46, 0x48, 0x63, 0x00};
-  const std::array<uint8_t, 5> binderless_ui_locale_container_guard_jump = {
-      0xE9, 0xBB, 0xF7, 0x35, 0x00};
+  const std::array<uint8_t, 5> binderless_ui_locale_container_guard_call = {
+      0xE8, 0xBB, 0xF7, 0x35, 0x00};
   std::array<uint8_t, 27> binderless_ui_locale_container_cave_expected{};
   binderless_ui_locale_container_cave_expected.fill(0xCC);
-  const std::array<uint8_t, 26> binderless_ui_locale_container_cave_code = {
-      0x48, 0x85, 0xFF, 0x74, 0x10,        // null container -> cleanup
-      0x48, 0x83, 0x3F, 0x00, 0x74, 0x0A,  // null registry -> cleanup
-      0xE8, 0x7B, 0x50, 0x2D, 0x00,        // call 0x1AE0270
-      0xE9, 0x30, 0x08, 0xCA, 0xFF,        // valid -> 0x14ABA2A
-      0xE9, 0x2B, 0x08, 0xCA, 0xFF};       // null -> 0x14ABA2A
+  // The protected dispatcher at 0x1AE0270 selects its target from the
+  // caller's return address. CALL the guard from the original site, then
+  // tail-jump to the dispatcher so it still sees 0x14ABA2A on the stack.
+  // Calling the dispatcher from the cave instead selected operator new with
+  // the container pointer as its allocation size (observed as ~127 TiB).
+  const std::array<uint8_t, 17> binderless_ui_locale_container_cave_code = {
+      0x48, 0x85, 0xFF, 0x74, 0x0B,        // null container -> ret
+      0x48, 0x83, 0x3F, 0x00, 0x74, 0x05,  // null registry -> ret
+      0xE9, 0x7B, 0x50, 0x2D, 0x00,        // tail-jump to 0x1AE0270
+      0xC3};                               // ret -> original cleanup
   static bool binderless_ui_locale_container_guard_installed = false;
   if (binderless_android) {
     std::array<uint8_t, 5> guard_original{};
@@ -5329,8 +5333,8 @@ Java_royale_nativehost_JniHost_nativePumpManager(
                 binderless_ui_locale_container_guard_cave,
                 cave_original.size());
     auto guard_installed = binderless_ui_locale_container_guard_expected;
-    std::copy(binderless_ui_locale_container_guard_jump.begin(),
-              binderless_ui_locale_container_guard_jump.end(),
+    std::copy(binderless_ui_locale_container_guard_call.begin(),
+              binderless_ui_locale_container_guard_call.end(),
               guard_installed.begin());
     auto cave_installed = binderless_ui_locale_container_cave_expected;
     std::copy(binderless_ui_locale_container_cave_code.begin(),
@@ -5349,7 +5353,7 @@ Java_royale_nativehost_JniHost_nativePumpManager(
         binderless_ui_locale_container_guard_expected.data() + 1);
     const uintptr_t cave_target = decode_ui_locale_target(
         kBinderlessUiLocaleContainerGuardRva, 5,
-        binderless_ui_locale_container_guard_jump.data() + 1);
+        binderless_ui_locale_container_guard_call.data() + 1);
     const uintptr_t cave_registration_target = decode_ui_locale_target(
         kBinderlessUiLocaleContainerGuardCaveRva + 11, 5,
         binderless_ui_locale_container_cave_code.data() + 12);
@@ -5359,12 +5363,7 @@ Java_royale_nativehost_JniHost_nativePumpManager(
     const uintptr_t null_branch1 =
         kBinderlessUiLocaleContainerGuardCaveRva + 11 +
         static_cast<int8_t>(binderless_ui_locale_container_cave_code[10]);
-    const uintptr_t valid_resume = decode_ui_locale_target(
-        kBinderlessUiLocaleContainerGuardCaveRva + 16, 5,
-        binderless_ui_locale_container_cave_code.data() + 17);
-    const uintptr_t null_target = decode_ui_locale_target(
-        kBinderlessUiLocaleContainerGuardCaveRva + 21, 5,
-        binderless_ui_locale_container_cave_code.data() + 22);
+    const uintptr_t original_return = kBinderlessUiLocaleContainerGuardRva + 5;
     if ((binderless_ui_locale_container_guard_installed
              ? (guard_original != guard_installed ||
                 cave_original != cave_installed)
@@ -5377,10 +5376,13 @@ Java_royale_nativehost_JniHost_nativePumpManager(
         cave_target != kBinderlessUiLocaleContainerGuardCaveRva ||
         cave_registration_target !=
             kBinderlessUiLocaleRegistrationTargetRva ||
-        null_branch0 != kBinderlessUiLocaleContainerGuardCaveRva + 21 ||
-        null_branch1 != kBinderlessUiLocaleContainerGuardCaveRva + 21 ||
-        null_target != kBinderlessUiLocaleContainerNullTargetRva ||
-        valid_resume != kBinderlessUiLocaleContainerValidResumeRva) {
+        null_branch0 != kBinderlessUiLocaleContainerGuardCaveRva + 16 ||
+        null_branch1 != kBinderlessUiLocaleContainerGuardCaveRva + 16 ||
+        binderless_ui_locale_container_guard_call[0] != 0xE8 ||
+        binderless_ui_locale_container_cave_code[11] != 0xE9 ||
+        binderless_ui_locale_container_cave_code[16] != 0xC3 ||
+        original_return != kBinderlessUiLocaleContainerNullTargetRva ||
+        original_return != kBinderlessUiLocaleContainerValidResumeRva) {
       dlclose(handle);
       throw_state(
           env, "binderless UI locale container guard rejected libg bytes");
@@ -5423,12 +5425,12 @@ Java_royale_nativehost_JniHost_nativePumpManager(
           reinterpret_cast<char*>(binderless_ui_locale_container_guard_cave +
                                   binderless_ui_locale_container_cave_code.size()));
       std::memcpy(binderless_ui_locale_container_guard,
-                  binderless_ui_locale_container_guard_jump.data(),
-                  binderless_ui_locale_container_guard_jump.size());
+                  binderless_ui_locale_container_guard_call.data(),
+                  binderless_ui_locale_container_guard_call.size());
       __builtin___clear_cache(
           reinterpret_cast<char*>(binderless_ui_locale_container_guard),
           reinterpret_cast<char*>(binderless_ui_locale_container_guard +
-                                  binderless_ui_locale_container_guard_jump.size()));
+                                  binderless_ui_locale_container_guard_call.size()));
       mprotect(reinterpret_cast<void*>(guard_page),
                static_cast<size_t>(locale_page_size), PROT_READ | PROT_EXEC);
       mprotect(reinterpret_cast<void*>(cave_page),
