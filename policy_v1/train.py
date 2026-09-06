@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from .data import Windows, collate
 from .loss import bc_loss, summarize
 from .model import Policy, PolicyConfig
+from .sampling import ResumableBatchSampler
 
 
 def seed_all(seed):
@@ -128,7 +129,10 @@ def parser():
     return p
 
 
-def run(args):
+def run(
+    args, *, model_factory=Policy, config_factory=None,
+    bc_loss=bc_loss, summarize=summarize,
+):
     if (
         min(
             args.epochs,
@@ -193,18 +197,21 @@ def run(args):
     if train_tags & val_tags:
         raise ValueError("training/validation battle overlap")
     dims = train.index["dimensions"]
-    config = PolicyConfig(
-        card_vocab_size=dims["card_vocab_size"],
-        ability_vocab_size=dims["ability_vocab_size"],
-        public_scalar_size=dims["public_scalar_size"],
-        entity_numeric_size=dims["entity_numeric_size"],
-        grid_channels=dims["grid_channels"],
-        width=args.width,
-        layers=args.layers,
-        heads=args.heads,
-        frame_window=args.frame_window,
-        event_window=args.event_window,
-    )
+    if config_factory is not None:
+        config = config_factory(args, dims)
+    else:
+        config = PolicyConfig(
+            card_vocab_size=dims["card_vocab_size"],
+            ability_vocab_size=dims["ability_vocab_size"],
+            public_scalar_size=dims["public_scalar_size"],
+            entity_numeric_size=dims["entity_numeric_size"],
+            grid_channels=dims["grid_channels"],
+            width=args.width,
+            layers=args.layers,
+            heads=args.heads,
+            frame_window=args.frame_window,
+            event_window=args.event_window,
+        )
     contract = {
         "manifest_sha256": train.index["manifest_sha256"],
         "train_split": args.train_split,
@@ -219,7 +226,7 @@ def run(args):
         "grad_clip": args.grad_clip,
         "event_contract": train.index["event_contract"],
     }
-    model = Policy(config).to(device)
+    model = model_factory(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
@@ -298,11 +305,11 @@ def run(args):
         seed=args.seed,
         drop_last=False,
     )
+    batch_sampler = ResumableBatchSampler(sampler, args.batch_size)
     generator = torch.Generator().manual_seed(args.seed + rank)
     loader = DataLoader(
         train,
-        batch_size=args.batch_size,
-        sampler=sampler,
+        batch_sampler=batch_sampler,
         num_workers=args.workers,
         collate_fn=collate,
         pin_memory=device.type == "cuda",
@@ -401,9 +408,8 @@ def run(args):
         sampler.set_epoch(epoch)
         parallel.train()
         accumulated = defaultdict(float)
-        for bi, batch in enumerate(loader):
-            if bi < cursor:
-                continue
+        batch_sampler.start_batch = cursor
+        for bi, batch in enumerate(loader, start=cursor):
             if pending_rng is not None:
                 restore_rng(pending_rng)
                 pending_rng = None
@@ -467,7 +473,7 @@ def run(args):
                 save("last.pt")
             if args.max_steps and step >= args.max_steps:
                 break
-        if cursor >= len(loader):
+        if cursor >= batch_sampler.total_batches:
             epoch += 1
             cursor = 0
         value = evaluate()

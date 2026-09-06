@@ -43,7 +43,7 @@ def parser():
     return p
 
 
-def run(args):
+def run(args, *, model_factory=Policy, config_factory=None):
     if (
         min(args.steps, args.batch_size, args.targets, args.cpu_threads, args.log_every)
         < 1
@@ -72,24 +72,27 @@ def run(args):
     )
     if dataset.index["smoke_only"] and not args.allow_smoke:
         raise ValueError("synthetic fixture requires --allow-smoke")
-    config = PolicyConfig(
-        **{
-            key: dataset.index["dimensions"][key]
-            for key in (
-                "card_vocab_size",
-                "ability_vocab_size",
-                "public_scalar_size",
-                "entity_numeric_size",
-                "grid_channels",
-            )
-        },
-        width=args.width,
-        layers=args.layers,
-        heads=args.heads,
-        frame_window=args.frame_window,
-        event_window=args.event_window,
-    )
-    model = Policy(config).to(device).train()
+    if config_factory is not None:
+        config = config_factory(args, dataset.index["dimensions"])
+    else:
+        config = PolicyConfig(
+            **{
+                key: dataset.index["dimensions"][key]
+                for key in (
+                    "card_vocab_size",
+                    "ability_vocab_size",
+                    "public_scalar_size",
+                    "entity_numeric_size",
+                    "grid_channels",
+                )
+            },
+            width=args.width,
+            layers=args.layers,
+            heads=args.heads,
+            frame_window=args.frame_window,
+            event_window=args.event_window,
+        )
+    model = model_factory(config).to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     scaler = (
         torch.amp.GradScaler("cuda", enabled=args.precision == "fp16")

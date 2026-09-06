@@ -30,6 +30,8 @@ RNG、下牌、技能、reset、时间、圣水和终局证书。完整步骤见
 
 ## 独立离线 BC（不需要运行时）
 
+另有独立的 [HoKoff 风格 LSTM BC 基线](hokoff_model/README.zh-CN.md)，复用同一数据集和缓存，可从仓库根目录直接运行。
+
 已有 `native-bc-v1` 编译数据时，可直接使用独立的 [Policy V1](policy_v1/README.zh-CN.md)：
 空间、近期帧和公开事件 Transformer，支持 Linux 单卡/双卡训练与断点恢复。
 仅安装 `python -m pip install -e ./policy_v1`，用 `cr-policy-smoke` 检查安装；
