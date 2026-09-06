@@ -247,3 +247,36 @@ python audit_alignment.py
 若数据和代码证据仍矛盾，需要原始 native tick/action transcript 进一步确认，不能从模型相关性自动修复标签。
 
 结果写入检查点目录的 `alignment-audit-时间戳.json`。请发送最后一条 `phase: alignment_summary`。
+
+
+## 当前帧与未来 0.5 秒时机监督对照
+
+在服务器仓库根目录执行：
+
+```bash
+python compare_horizon.py
+```
+
+自动创建 `hokoff-horizon-compare-*` 目录，依次从零训练两组各 2000 steps，
+然后在相同的 128 条 held-out actor sequences 上评估：
+
+- `point`：预测当前帧是否行动。
+- `forecast_500ms`：预测当前帧至未来 10 ticks（20 Hz 下 0.5 秒）内是否至少行动一次。
+
+两组均使用 width=256、hidden_size=512、batch=32、workers=8、FP32、正样本权重 1，
+保持初始化种子和训练样本顺序一致。沿用数据集的历史 split 命名：
+`validation` 用于训练，`train` 用于验证，`test` 不参与实验。
+未来动作仅用于标签，不作为模型输入；选牌、落点与技能仍按原始动作帧监督。
+两组时机监督使用共同有效帧集合：未来 10 ticks 不完整或包含无效标签时均排除，
+不会跨 actor sequence 读取未来标签。
+
+输出 `horizon_comparison_summary`，详细结果在各组 `horizon-eval.json`。
+每个模型都分别按当前帧标签和未来区间标签计算 AP；只在同一种标签定义下比较两组，
+不能把正样本比例不同的两种 AP 直接比较。事件评估采用一对一匹配，
+单列精确匹配与提前 0–500 ms 匹配，不把专家出牌后的反应算成成功预测。
+边界事件使用共同裁剪规则，并报告匹配到边界参考事件而忽略的预测数。
+阈值在验证集上选择，时间平移对照只是诊断，最终效果仍需独立验证。
+
+预测“未来 0.5 秒内行动”不等于“现在立即出牌”。这轮只判断监督粒度是否有帮助，
+不直接改变在线执行策略。旧的 `eval_hokoff.py` 会拒绝未来区间模型，避免误用评估口径。
+可用 `python compare_horizon.py --help` 查看路径与实验规模参数。

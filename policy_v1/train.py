@@ -131,7 +131,7 @@ def parser():
 
 def run(
     args, *, model_factory=Policy, config_factory=None,
-    bc_loss=bc_loss, summarize=summarize, contract_extra=None,
+    bc_loss=bc_loss, summarize=summarize, contract_extra=None, dataset_factory=Windows,
 ):
     if (
         min(
@@ -172,7 +172,7 @@ def run(
     if distributed:
         dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
     seed_all(args.seed + rank)
-    train = Windows(
+    train = dataset_factory(
         args.data,
         args.cache,
         args.train_split,
@@ -180,7 +180,7 @@ def run(
         frame_window=args.frame_window,
         event_window=args.event_window,
     )
-    valid = Windows(
+    valid = dataset_factory(
         args.data,
         args.cache,
         args.val_split,

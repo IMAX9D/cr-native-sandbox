@@ -115,6 +115,8 @@ def run(args):
     if saved["config"].get("architecture") != "hokoff_cr_lstm_v1":
         raise ValueError("requires a hokoff_cr_lstm_v1 checkpoint")
     contract = saved["contract"]
+    if contract.get("timing_horizon_ticks", 0):
+        raise ValueError("Forecast checkpoint: use the horizon comparison evaluator, not point-timing evaluation")
     split = contract["val_split"]
     if split == contract["train_split"] or split == "test":
         raise ValueError("timing diagnostics require a non-test held-out split")

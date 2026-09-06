@@ -5,6 +5,7 @@ from functools import partial
 from policy_v1.train import parser as base_parser, run as base_run
 from .model import Policy, config_from_args
 from .metrics import bc_loss, summarize
+from .horizon import HorizonWindows, TARGET_CONTRACT
 
 
 def adapt_parser(p):
@@ -25,6 +26,8 @@ def adapt_parser(p):
 def parser():
     p = adapt_parser(base_parser())
     p.add_argument("--timing-positive-weight", type=float, default=1.0)
+    p.add_argument("--timing-horizon-ticks", type=int, default=0)
+    p.add_argument("--timing-mask-horizon-ticks", type=int)
     return p
 
 
@@ -32,10 +35,20 @@ def run(args):
     weight = args.timing_positive_weight
     if not math.isfinite(weight) or weight <= 0:
         raise ValueError("timing-positive-weight must be finite and positive")
-    extra = {"timing_positive_weight": weight} if weight != 1.0 else None
+    horizon = args.timing_horizon_ticks
+    mask_horizon = horizon if args.timing_mask_horizon_ticks is None else args.timing_mask_horizon_ticks
+    if horizon < 0 or mask_horizon < horizon:
+        raise ValueError('mask horizon must cover target horizon')
+    extra = {"timing_positive_weight": weight} if weight != 1.0 else {}
+    if horizon or mask_horizon:
+        extra.update(timing_horizon_ticks=horizon, timing_mask_horizon_ticks=mask_horizon,
+                     timing_target_contract=TARGET_CONTRACT)
+    dataset = partial(HorizonWindows, timing_horizon_ticks=horizon,
+                      timing_mask_horizon_ticks=mask_horizon)
     return base_run(args, model_factory=Policy, config_factory=config_from_args,
                     bc_loss=partial(bc_loss, timing_positive_weight=weight),
-                    summarize=summarize, contract_extra=extra)
+                    summarize=partial(summarize, timing_horizon_ticks=horizon),
+                    contract_extra=extra, dataset_factory=dataset)
 
 
 def main():
