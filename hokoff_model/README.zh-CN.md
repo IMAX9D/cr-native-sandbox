@@ -24,6 +24,20 @@
 数据适配有边界：全量 manifest 约 97.1% 行来自有效截断前缀，状态未与真实客户端逐帧锚定，技能覆盖不完整。
 本版用于局部 BC 架构比较，未证明全局胜率，不把截断序列伪装为终局。等待/行动权重、采样与决策频率暂不改变。
 
+## AutoDL 一条命令短训
+
+在仓库根目录运行：
+
+```bash
+python train_hokoff.py
+```
+
+已预设当前服务器的数据/cache 路径、训练 split=validation、留出 split=train、FP16、
+编码宽度 256、LSTM 512、batch 32、workers 8。累计成功更新 1000 步后验证并保存。
+每次从零开始，检查点放入 `/root/autodl-tmp/runs/hokoff-lstm-check-时间戳/`，启动时打印实际路径。
+无需重新安装。可用 `python train_hokoff.py --dry-run` 只看配置，
+或 `python train_hokoff.py --workers 4` 覆盖单个参数。
+
 ## Linux 快速运行
 
 在仓库根目录运行 `python -m ...`，无需安装 hokoff_model 或克隆参考仓库。
