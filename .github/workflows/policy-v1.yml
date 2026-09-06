@@ -1,9 +1,9 @@
 name: Standalone Policy V1
 on:
   push:
-    paths: ['policy_v1/**', 'hokoff_model/**', 'train_hokoff.py', 'eval_hokoff.py', 'overfit_hokoff.py', 'compare_hokoff.py', '.github/workflows/policy-v1.yml']
+    paths: ['policy_v1/**', 'hokoff_model/**', 'train_hokoff.py', 'eval_hokoff.py', 'overfit_hokoff.py', 'compare_hokoff.py', 'diagnose_hokoff.py', '.github/workflows/policy-v1.yml']
   pull_request:
-    paths: ['policy_v1/**', 'hokoff_model/**', 'train_hokoff.py', 'eval_hokoff.py', 'overfit_hokoff.py', 'compare_hokoff.py', '.github/workflows/policy-v1.yml']
+    paths: ['policy_v1/**', 'hokoff_model/**', 'train_hokoff.py', 'eval_hokoff.py', 'overfit_hokoff.py', 'compare_hokoff.py', 'diagnose_hokoff.py', '.github/workflows/policy-v1.yml']
 permissions:
   contents: read
 jobs:

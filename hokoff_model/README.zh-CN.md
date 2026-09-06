@@ -179,3 +179,44 @@ python compare_hokoff.py
 
 通用入口也支持 `python train_hokoff.py --timing-positive-weight 32`。
 默认权重仍为 1，原 Transformer 训练目标不变；不同权重写入检查点契约，续训时不允许静默切换目标。
+
+## 权重对照仍弱时：可行动分层与时间容差
+
+```bash
+python diagnose_hokoff.py
+```
+
+自动读取最近一个已完成权重对照目录的 baseline/last.pt 和 weighted/last.pt；也可传
+`--comparison-dir /root/autodl-tmp/runs/hokoff-weight-compare-时间戳`。
+两模型必须具有相同模型/训练契约和步数（除 timing 正例权重），不接受训练集或 test 作为诊断留出集。
+可用 `--checkpoint /路径/last.pt` 只检查一个模型。
+
+默认在相同留出集随机选 128 个玩家序列（seed=123），读取其全部窗口，沿用训练时的有限历史窗口前向，
+拼接每个窗口的唯一目标帧。它不是改成无限历史 streaming 推理，不跨玩家、对局或无效 timing 区间匹配。
+所有执行为 FP32/no_grad，无优化器，不更新检查点。默认 batch=32、workers=4，可覆盖。
+结果保存在对照目录下 `timing-context-时间戳.json`；最后打印 `phase: timing_context_summary`。
+
+### 可行动掩码的限制
+
+编译器对某些动态卡牌只在卡牌监督时刻有精确合法掩码。因此全零 card/action 掩码不能证明“无费可下”。
+本脚本仅报告 `mask_confirms_any_action`、`mask_confirms_card_play` 和 `no_action_confirmed_by_mask`，
+不把最后一类强行标为 forced WAIT。掩码可受监督时刻覆盖影响，分层结果有选择偏差，不能据此直接过滤训练帧。
+同时保留全量 AP/AUC，并按公开圣水比例分层；圣水分层也不等于已知每张牌的真实可负担性。
+
+### 事件匹配口径
+
+- `every_frame`：每个超过阈值的有效帧都是一个触发，直接暴露反复触发问题。
+- `rising_edge`：仅从不超过阈值变为超过阈值时触发；连续高分平台只算一次。
+  在有效片段开始时若已超过阈值会触发一次。这是固定的因果诊断规则，不是已调好的游戏执行策略。
+- 每个触发最多匹配一个专家动作，每个专家动作也最多匹配一个触发；剩余触发为 FP，剩余动作为 FN。
+- 报告精确时刻、±5 tick/±10 tick（±0.25/±0.5 秒）、仅提前 5/10 tick。
+  偏差定义为预测 tick 减专家 tick；正数表示晚于专家。匹配按时间贪心最大化匹配数量，不保证最小时间偏差。
+- 不虚构序列边界外或 label-mask 无效区间的数据；边界上下文不足的动作数量单列为 boundary_limited_events。
+
+阈值网格由固定阈值与预测分数分位数组成。摘要的 best_event_f1_on_validation 是该留出样本内选出的最佳 F1，
+并不是独立测试成绩，也不能直接用作部署阈值。
+额外的 shift_control_best_f1 把每个连续有效片段的概率循环错位（seed=9187，长片段至少错开 11 tick），
+保留概率分布和大部分局部形状，在相同阈值网格中也取最佳 F1。很短的片段无法保证移出最大容差。
+这只是单次错位对照，不是统计显著性检验；宽时间容差本身会增加偶然匹配，不能只看容差后的召回变高。
+
+摘要发送最后一条 timing_context_summary 即可；各阈值完整结果、圣水分层、序列抽样位置在 JSON 文件中。
