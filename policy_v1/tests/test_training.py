@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -100,6 +101,24 @@ class TrainingTests(unittest.TestCase):
                     full["model"][key], resumed["model"][key], rtol=0, atol=0
                 )
             self.assertEqual(full["next_batch"], resumed["next_batch"])
+
+    def test_periodic_validation_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = create_fixture(root / 'data')
+            prepare(data, root / 'cache', allow_smoke=True)
+            args = parser().parse_args([
+                '--data', str(data), '--cache', str(root/'cache'), '--run-dir', str(root/'run'),
+                '--allow-smoke', '--device', 'cpu', '--width', '16', '--heads', '2',
+                '--layers', '1', '--frame-window', '4', '--event-window', '4',
+                '--targets', '4', '--batch-size', '2', '--workers', '0', '--cpu-threads', '1',
+                '--max-steps', '3', '--eval-every', '2', '--eval-batches', '1', '--eval-shuffle'])
+            with contextlib.redirect_stdout(io.StringIO()):
+                run(args)
+            rows = [json.loads(line) for line in (root/'run/metrics.jsonl').read_text().splitlines()]
+            self.assertEqual([r['step'] for r in rows if r['phase'] == 'validation'], [2, 3])
+            self.assertTrue((root/'run/best.pt').exists())
+            self.assertEqual(load_checkpoint(root/'run/last.pt')['step'], 3)
 
     def test_tiny_batch_can_learn_deployments_and_skills(self):
         with tempfile.TemporaryDirectory() as tmp:

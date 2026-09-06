@@ -118,6 +118,8 @@ def parser():
     p.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--save-every", type=int, default=1000)
+    p.add_argument("--eval-every", type=int, default=0, help="0 means epoch-end only")
+    p.add_argument("--eval-shuffle", action="store_true", help="fixed shuffled validation order")
     p.add_argument(
         "--eval-batches", type=int, default=100, help="0 means full held-out split"
     )
@@ -147,7 +149,7 @@ def run(
         raise ValueError(
             "positive epochs/batch/targets/threads/log/save intervals required"
         )
-    if min(args.workers, args.max_steps, args.eval_batches) < 0:
+    if min(args.workers, args.max_steps, args.eval_batches, args.eval_every) < 0:
         raise ValueError("negative argument")
     if args.train_split == args.val_split:
         raise ValueError("training and validation splits must differ")
@@ -321,10 +323,13 @@ def run(
         persistent_workers=args.workers > 0,
     )
     # Exact validation partition; no duplicated tail samples under DDP.
+    validation_indices = list(range(len(valid)))
+    if args.eval_shuffle:
+        random.Random(123).shuffle(validation_indices)
     validation = DataLoader(
         valid,
         batch_size=args.batch_size,
-        sampler=list(range(rank, len(valid), world)),
+        sampler=validation_indices[rank::world],
         num_workers=args.workers,
         collate_fn=collate,
         pin_memory=device.type == "cuda",
@@ -396,6 +401,7 @@ def run(
                 "step": step,
                 "epoch": epoch,
                 "max_batches_per_rank": args.eval_batches,
+                "sampling": "fixed_shuffled_windows_seed_123" if args.eval_shuffle else "sequential_windows",
                 **metrics,
             }
         )
@@ -473,6 +479,12 @@ def run(
                     }
                 )
                 accumulated.clear()
+            if args.eval_every and step % args.eval_every == 0:
+                value = evaluate()
+                if value < best:
+                    best = value
+                    save("best.pt")
+                parallel.train()
             if step % args.save_every == 0:
                 save("last.pt")
             if args.max_steps and step >= args.max_steps:

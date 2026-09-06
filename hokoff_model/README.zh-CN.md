@@ -311,3 +311,27 @@ python compare_decks.py
 最终输出 `deck_curve_summary`。相同对局数与更新数不保证相同窗口数或正样本数，
 日志会记录规模；训练集提高而验证集不提高提示泛化困难，不能单凭一次实验认定数据脏。
 这是一次小规模诊断，保留 test 不动，不用于挑选最终上线模型。
+
+## 全量一轮后台长训
+
+在仓库根目录更新代码后执行：
+
+```bash
+nohup python -u train_hokoff_long.py > /root/autodl-tmp/hokoff-long.log 2>&1 &
+```
+
+每次启动创建 `hokoff-lstm-long-*` 新目录；全量历史 `validation` split 训练、`train` split 验证。
+width=256、hidden_size=512、batch=32、workers=8、FP16、当前帧时机标签、正样本权重32。
+`epochs=1,max_steps=0`，不再沿用短测1000步上限。每1000个成功更新保存可恢复的
+`last.pt`（原子替换），每5000步及轮末验证，`best.pt` 按验证总loss最小值保存，
+不代表最佳时机AP或最佳实战策略。验证使用seed123固定打乱的至多6400个窗口。
+日志记录时机precision/recall和各输出头指标，AP可在训练后单独评估。
+每次重用上述日志路径会覆盖旧日志，但运行目录中的 `metrics.jsonl` 和权重保留。
+
+```bash
+tail -n 5 /root/autodl-tmp/hokoff-long.log
+```
+
+`python train_hokoff_long.py --dry-run` 只显示配置。
+续训须同时指定原 `--run-dir` 与原 `--resume .../last.pt`，并保持原训练参数；
+该脚本不会自动寻找或恢复历史实验。
