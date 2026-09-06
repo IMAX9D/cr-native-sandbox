@@ -1,10 +1,10 @@
-"""Additional unweighted action counts; unchanged BC optimization objective."""
+"""Unweighted action metrics with an optional timing positive-class weight."""
 import torch
 from policy_v1.loss import bc_loss as original_loss, summarize as original_summary
 
 
-def bc_loss(output, b, *, distributed=False):
-    loss, stats = original_loss(output,b,distributed=distributed)
+def bc_loss(output, b, *, distributed=False, timing_positive_weight=1.0):
+    loss, stats = original_loss(output,b,distributed=distributed, timing_positive_weight=timing_positive_weight)
     with torch.no_grad():
         valid = b['frame_mask'] & b['loss_mask'] & b['timing_label_mask']
         actual = b['play_now'][valid].bool()

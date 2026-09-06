@@ -1,12 +1,15 @@
 """Conditional BC; WAIT exposure is retained and masked labels never train."""
 
 from __future__ import annotations
+import math
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 
 
-def bc_loss(output, b, *, distributed=False):
+def bc_loss(output, b, *, distributed=False, timing_positive_weight=1.0):
+    if not math.isfinite(timing_positive_weight) or timing_positive_weight <= 0:
+        raise ValueError("timing_positive_weight must be finite and positive")
     base = b["loss_mask"] & b["frame_mask"]
     weights = b["sample_weight"].float()
     if not torch.isfinite(weights).all() or (weights < 0).any():
@@ -33,6 +36,11 @@ def bc_loss(output, b, *, distributed=False):
     timing = F.binary_cross_entropy_with_logits(
         output["timing"][mask].float(), b["play_now"][mask].float(), reduction="none"
     )
+    raw_timing = timing
+    timing = timing * torch.where(
+        b["play_now"][mask].bool(), timing_positive_weight, 1.0
+    )
+    stats["timing_unweighted_sum"] = float((raw_timing * weights[mask]).sum().detach())
     add("timing", timing, mask, (output["timing"][mask] > 0) == b["play_now"][mask])
     for name, label, labelmask, legal in [
         ("kind", "action_kind", "kind_label_mask", "action_kind_mask"),
@@ -83,6 +91,9 @@ def summarize(stats):
         out[name + "_loss"] = stats.get(name + "_sum", 0) / max(weight, 1)
         out[name + "_accuracy"] = stats.get(name + "_correct", 0) / max(count, 1)
         out[name + "_count"] = count
+    out["timing_unweighted_loss"] = stats.get(
+        "timing_unweighted_sum", stats.get("timing_sum", 0)
+    ) / max(stats.get("timing_weight", 0), 1)
     out["loss"] = sum(
         out[n + "_loss"]
         for n in ("timing", "kind", "card", "ability", "position", "ability_position")

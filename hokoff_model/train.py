@@ -1,4 +1,7 @@
 """Train the CR pooled-entity LSTM using the existing offline data/checkpoint engine."""
+import math
+from functools import partial
+
 from policy_v1.train import parser as base_parser, run as base_run
 from .model import Policy, config_from_args
 from .metrics import bc_loss, summarize
@@ -20,12 +23,19 @@ def adapt_parser(p):
 
 
 def parser():
-    return adapt_parser(base_parser())
+    p = adapt_parser(base_parser())
+    p.add_argument("--timing-positive-weight", type=float, default=1.0)
+    return p
 
 
 def run(args):
-    return base_run(args,model_factory=Policy,config_factory=config_from_args,
-                    bc_loss=bc_loss,summarize=summarize)
+    weight = args.timing_positive_weight
+    if not math.isfinite(weight) or weight <= 0:
+        raise ValueError("timing-positive-weight must be finite and positive")
+    extra = {"timing_positive_weight": weight} if weight != 1.0 else None
+    return base_run(args, model_factory=Policy, config_factory=config_from_args,
+                    bc_loss=partial(bc_loss, timing_positive_weight=weight),
+                    summarize=summarize, contract_extra=extra)
 
 
 def main():

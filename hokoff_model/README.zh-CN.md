@@ -138,3 +138,44 @@ python eval_hokoff.py
 指标不按 sample_weight 加权，与现有 accuracy 口径一致；没有预测行动时 precision=null，没有真实行动时 recall/AP=null。
 仅概率高低有所区分并不代表可直接部署一个更低阈值；20Hz 连续执行还需验证重复出牌、动作合法性与对局效果。
 阈值评估也不证明因果机制或全局策略能力。新脚本随机抽窗口，和此前验证首 100 批的样本不同，不能把指标变化全归因于模型。
+
+## 下一轮诊断：先固定小样本，再比较行动权重
+
+先执行：
+
+```bash
+python overfit_hokoff.py
+```
+
+默认从实际训练来源 `validation` 随机扫描窗口，固定选取 8 个含有效行动的窗口和 8 个纯等待窗口，
+整批保存在内存中，反复更新 1000 次。每个窗口仍保留所有有效等待帧及原标签，动作标签不作为输入。
+使用原 256/512 网络、FP32、行动正样本权重 32、原多头 BC，其余动作头损失不变。
+前后记录同一训练批的 AP、行动召回与未加权 timing loss，最后输出 `phase: overfit_summary`。
+
+这是带行动窗口富集的**记忆能力诊断**，其行动比例、AP 和准确率不能充当留出集表现。
+权重 32 是固定对照值，并非已调好的最优值；小样本不收敛可能需要更多更新或排查输入/标签/优化过程，不能直接判定数据无用。
+窗口来源和索引保存到 `selected-windows.json`，只有训练分片被使用；不读取 test。
+`diagnostic.pt` 故意与正式训练检查点区分，不能用来替代通用 BC 模型或交给 eval_hokoff.py。
+
+把最后一条 overfit_summary 发回分析，再决定是否进行第二项：
+
+```bash
+python compare_hokoff.py
+```
+
+第二项按顺序从零训练 baseline（权重 1）和 weighted（权重 32），各 2000 次成功更新。
+两组均为 FP32、相同初始化种子/样本顺序、batch 32、workers 8、原始自然数据比例；只改变 timing 正例权重。
+使用 FP32 是为了避免两组 FP16 溢出跳过不同样本，不能直接把本轮速度与旧 FP16 结果相比。
+每组结束后自动用同样 seed=123 的随机留出窗口做时机评估，最后输出 `phase: comparison_summary`，无需另跑 eval_hokoff.py。
+对比的是相同步数的 last.pt；不按不同加权目标的 best.pt 比较。
+
+重点看留出集 AP/AUC，而非仅看 recall 或总 loss：提高正例权重本身就会抬高输出概率。
+加权后的概率不能未经校准直接解释为每帧真实行动概率，也不自动改变部署阈值。
+新日志 `timing_unweighted_loss` 保留相同口径的原 timing BCE；`timing_loss`/总 loss 在加权训练中是加权目标，跨权重不可直接比较。
+
+两项都会新建 `/root/autodl-tmp/runs/hokoff-overfit-时间戳/` 或 `hokoff-weight-compare-时间戳/`，不覆盖旧模型。
+支持覆盖 `--data`、`--cache`、`--run-dir`、`--device`、`--steps`、`--positive-weight` 等参数。
+本机只用合成小样本验证实现；真实数据实验由服务器执行。
+
+通用入口也支持 `python train_hokoff.py --timing-positive-weight 32`。
+默认权重仍为 1，原 Transformer 训练目标不变；不同权重写入检查点契约，续训时不允许静默切换目标。

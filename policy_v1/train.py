@@ -131,7 +131,7 @@ def parser():
 
 def run(
     args, *, model_factory=Policy, config_factory=None,
-    bc_loss=bc_loss, summarize=summarize,
+    bc_loss=bc_loss, summarize=summarize, contract_extra=None,
 ):
     if (
         min(
@@ -226,6 +226,10 @@ def run(
         "grad_clip": args.grad_clip,
         "event_contract": train.index["event_contract"],
     }
+    if contract_extra:
+        if contract.keys() & contract_extra.keys():
+            raise ValueError("extra contract cannot replace existing fields")
+        contract.update(contract_extra)
     model = model_factory(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
