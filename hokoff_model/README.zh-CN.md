@@ -280,3 +280,34 @@ python compare_horizon.py
 预测“未来 0.5 秒内行动”不等于“现在立即出牌”。这轮只判断监督粒度是否有帮助，
 不直接改变在线执行策略。旧的 `eval_hokoff.py` 会拒绝未来区间模型，避免误用评估口径。
 可用 `python compare_horizon.py --help` 查看路径与实验规模参数。
+
+
+## 混合卡组与固定卡组小数据学习曲线
+
+```bash
+python compare_decks.py
+```
+
+自动运行两组各 5000 steps：`mixed` 和 `fixed_deck`。两组均采用原始当前帧时机标签、
+正样本权重 32、FP32、width=256、hidden_size=512、batch=32、workers=8；
+不同时改变预测区间。每组固定 32 场训练、16 场验证，初始化种子相同。
+按 battle_tag 隔离训练与验证，每场只取一个 actor 的全部现有窗口；
+“全部”指数据实际保留的序列，截断前缀不会被假装成完整游戏。
+卡组按己方 8 个不同且非零的 card token 排序匹配，不固定敌方卡组、等级或游戏阶段。
+
+默认按随机 shard 顺序扫描每个 split 最多 8192 场，固定卡组仅按扫描到的训练对局频率选择，
+不根据验证性能或验证数量选择卡组。不是全数据集精确频率统计。
+若该卡组验证对局不足则停止并保留 `selection-audit.json`，不自动混入其他卡组或 test。
+可增加 `--scan-battles` 或显式减少 `--train-battles` / `--val-battles` 后创建新实验。
+默认沿用训练 split=`validation`、验证 split=`train` 的历史命名。
+
+在 step 0、每 500 steps 和最后一步计算训练与验证指标；每个集合固定随机选至多
+2048 个窗口，保留自然等待帧比例，避免每次更换评估样本。
+同时两组都评估同一批 `common_fixed_validation` 窗口，直接比较固定卡组泛化。
+各自的 validation 分布不同，不宜仅凭其 AP 高低宣称某组胜出。
+输出包括 AP、AP/正样本比例、ROC AUC，以及选牌、位置和行动 precision/recall。
+
+每组完整学习曲线保存为 `curve.jsonl`；`diagnostic.pt` 是诊断权重，不支持通用续训。
+最终输出 `deck_curve_summary`。相同对局数与更新数不保证相同窗口数或正样本数，
+日志会记录规模；训练集提高而验证集不提高提示泛化困难，不能单凭一次实验认定数据脏。
+这是一次小规模诊断，保留 test 不动，不用于挑选最终上线模型。
