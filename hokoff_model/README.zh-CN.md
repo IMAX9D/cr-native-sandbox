@@ -220,3 +220,30 @@ python diagnose_hokoff.py
 这只是单次错位对照，不是统计显著性检验；宽时间容差本身会增加偶然匹配，不能只看容差后的召回变高。
 
 摘要发送最后一条 timing_context_summary 即可；各阈值完整结果、圣水分层、序列抽样位置在 JSON 文件中。
+
+## 核对动作前/后状态与标签
+
+```bash
+python audit_alignment.py
+```
+
+默认选择最近权重对照的 baseline 模型，抽取同一留出集 64 个完整玩家序列，
+检查有效出牌标签前后各 10 tick（0.5 秒）的圣水、手牌和模型概率。
+可用 `--arm weighted` 看另一组，或 `--checkpoint /路径/last.pt` 指定模型。
+它不训练、不改数据、不移动标签。
+
+只统计完整有效邻域、且邻域内没有其他己方行动的出牌，排除数单列。
+比例差值定义为 offset=k 状态减去 offset=k-1 状态；圣水比例下降超过 0.02 记为一次明显下降，
+这是观测变化阈值，不是根据卡牌费用表验证了真实扣费。
+报告 label 当刻与下一 tick 的扣费/换牌比例，以及最大圣水下降、最近换牌、最大概率上升的相对 tick 分布。
+事件对齐概率曲线含每个 offset 的均值、中位数和相对 t-1 的变化。
+完整 JSON 还保存最多 8 个逐帧例子，含手牌 token、圣水、己方单位数和当前标签手牌 token 对应单位数。
+这项 token 身份来自标签手牌槽，不能独立验证原始源事件到底出了哪张牌；法术、部署延迟和其他单位死亡也会影响实体计数。
+
+代码意图：TickTraceAccumulator 保留边界的动作前状态，跳过后续 trace 同刻的动作后 initial_frame，
+编译器按 source tick + episode execution offset 写标签。
+因此若实际数组在 label+1 才出现换牌和圣水下降，与这一设计相容；不能为了让指标变好把标签移动到动作后帧。
+脚本会核对本机编译器/生成器文件是否匹配 manifest 中的哈希，但这两项哈希不能单独证明 trace 实现或真实客户端对齐。
+若数据和代码证据仍矛盾，需要原始 native tick/action transcript 进一步确认，不能从模型相关性自动修复标签。
+
+结果写入检查点目录的 `alignment-audit-时间戳.json`。请发送最后一条 `phase: alignment_summary`。
