@@ -110,3 +110,31 @@ CUDA/FP16 吞吐与稳定性需在目标服务器实测，本机没有可用 CUD
 
 本次验证结果：新增 7 项测试＋原有 16 项测试通过；合成 CPU 短训、独立测速（workers=0/2）、双进程 CPU/Gloo 训练评估与保存均通过。
 真实留出分片只做默认 473 万参数模型的只读前向检查，所有输出有限，没有在 test 数据上更新权重或调参。
+
+## 行动召回为零时：独立时机诊断
+
+先运行以下命令，不继续训练、不修改阈值或损失：
+
+```bash
+python eval_hokoff.py
+```
+
+自动选择 `/root/autodl-tmp/runs/hokoff-lstm-check*/last.pt` 中最近修改的检查点，启动时打印实际路径和 step。
+从检查点的 val_split 随机抽取最多 200 批窗口（seed=123、batch=32、workers=4），保留自然等待比例。
+它使用 FP32 前向，不创建优化器，不覆盖模型，结果保存为检查点目录下独立的 `timing-eval-时间戳.json`。
+
+可指定模型：`python eval_hokoff.py --checkpoint /路径/last.pt`。
+也可覆盖 `--data`、`--cache`、`--batches`、`--workers`；本地 CPU 使用 `--device cpu`。
+不允许用训练 split 或 test split 做这项阈值诊断。
+
+重点看：
+
+- `action_probabilities` / `wait_probabilities`：两类帧的平均概率和分位数。
+- `average_precision`：AP（阶梯 PR 曲线积分，正确合并并列分数）；越高表示越能将实际行动排在前面。
+- `constant_score_ap_baseline`：全报同一分数时的 AP，等于真实行动比例。`ap_lift_over_prevalence` 是两者比值，不是胜率。
+- `thresholds`：多个阈值对应的 precision、recall、误报率、预测行动比例以及 TP/FP/FN。
+- `mean_predicted_probability` 与 `actual_action_rate`：帮助检查平均概率是否偏离实际频率。
+
+指标不按 sample_weight 加权，与现有 accuracy 口径一致；没有预测行动时 precision=null，没有真实行动时 recall/AP=null。
+仅概率高低有所区分并不代表可直接部署一个更低阈值；20Hz 连续执行还需验证重复出牌、动作合法性与对局效果。
+阈值评估也不证明因果机制或全局策略能力。新脚本随机抽窗口，和此前验证首 100 批的样本不同，不能把指标变化全归因于模型。
