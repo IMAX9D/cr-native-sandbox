@@ -19,6 +19,8 @@ from policy_v1.data import (SCALARS, ROW_TOKENS, LABELS, MASKS, ENTITY_FIELDS,
 
 CONTRACT = 'bounded_observe_after_action_censored_v1'
 from .independent_data import CONTRACT as INDEPENDENT_CONTRACT, independent_indices
+from .fixed_data import CONTRACT as FIXED_CONTRACT, fixed_indices, check_mask_proof
+CONTRACTS = dict(legacy=CONTRACT, independent=INDEPENDENT_CONTRACT, fixed=FIXED_CONTRACT)
 READER_FIELDS = tuple(k for k in FIELDS if k not in (
     'sequence_offsets', 'delta_ticks', 'timing_exposure_ticks', 'replay_extent'))
 
@@ -69,7 +71,7 @@ def decision_indices(offsets, scalars, delta, exposure, actions, valid, max_dela
 
 def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
             verify_hashes=False, allow_smoke=False, sampling='legacy', sampling_seed=42,
-            auxiliary_split='validation', auxiliary_frame_window=17):
+            auxiliary_split='validation', auxiliary_frame_window=17, decision_period=4):
     root, cache = Path(root).resolve(), Path(cache).resolve()
     if root == cache or root in cache.parents:
         raise ValueError('decision cache must be outside source data')
@@ -88,16 +90,21 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
             or manifest['feature_schema']['entity_numeric'] != ['level_ratio', 'hp_ratio', 'log_max_hp']
             or manifest['dimensions']['grid_channels'] != 8):
         raise ValueError('unsupported observation schema')
+    if sampling == 'fixed':
+        check_mask_proof(manifest, allow_smoke)
     cache.mkdir(parents=True, exist_ok=True)
-    if sampling not in ('legacy','independent'):
+    if sampling not in CONTRACTS:
         raise ValueError('unknown observation sampling')
-    index = dict(version=1, decision_contract=CONTRACT if sampling=='legacy' else INDEPENDENT_CONTRACT, max_delay=max_delay,
+    index = dict(version=1, decision_contract=CONTRACTS[sampling], max_delay=max_delay,
                  manifest_sha256=digest(root/'manifest.json'), dimensions=manifest['dimensions'],
                  smoke_only=bool(manifest.get('smoke_only')), verified_source_hashes=verify_hashes,
                  max_shards_per_split=max_shards_per_split, event_contract='no_event_inputs_v1', splits={})
-    if sampling=='independent':
+    if sampling in ('independent', 'fixed'):
         index.update(sampling=sampling,sampling_seed=sampling_seed,auxiliary_split=auxiliary_split,
                      auxiliary_frame_window=auxiliary_frame_window)
+    if sampling == 'fixed':
+        index.update(decision_period=decision_period, target_window='[t,t+period)',
+                     mask_proof='audited_static_card_and_equal_crown_towers_v1')
     seen = set()
     for split in (splits or manifest['splits']):
         records = []
@@ -127,7 +134,11 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
                     seen.add(tag); tags.append(tag)
                 inputs=(offsets, arrays['public_scalars'], arrays['delta_ticks'],
                         arrays['timing_exposure_ticks'], arrays['play_now'], arrays['timing_label_mask'], max_delay)
-                if sampling=='independent':
+                audit = None
+                if sampling == 'fixed':
+                    packed, audit = fixed_indices(arrays, decision_period, auxiliary=split==auxiliary_split,
+                                                  frame_window=auxiliary_frame_window)
+                elif sampling=='independent':
                     seed=int.from_bytes(hashlib.sha256((str(sampling_seed)+':'+relative).encode()).digest()[:8],'little')
                     packed=independent_indices(*inputs,seed=seed,auxiliary=split==auxiliary_split,
                                                frame_window=auxiliary_frame_window)
@@ -146,7 +157,9 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
                                     source_rows=len(arrays['play_now']), valid_rows=int(arrays['timing_label_mask'].sum()),
                                     decision_rows=len(packed['rows']),
                                     actions=int((arrays['play_now'].astype(bool) & arrays['timing_label_mask'].astype(bool)).sum())))
-                if sampling=='independent':
+                if audit is not None:
+                    records[-1]['label_audit'] = audit
+                if sampling in ('independent', 'fixed'):
                     records[-1].update(segment_roles=packed['roles'].tolist(),
                         identity_layout='primary_segments_only',
                         primary_rows=int((packed['supervision']==1).sum()),
@@ -207,17 +220,19 @@ def collate_decisions(items):
 
 class DecisionWindows(Dataset):
     def __init__(self, root, cache, split, *, targets=32, frame_window=17,
-                 event_window=1, max_open=2, max_delay=8, sampling=None):
+                 event_window=1, max_open=2, max_delay=8, sampling=None, decision_period=None):
         self.root, self.cache = Path(root).resolve(), Path(cache).resolve()
         self.index = json.loads((self.cache/'index.json').read_text())
-        if (self.index.get('version') != 1 or self.index.get('decision_contract') not in (CONTRACT,INDEPENDENT_CONTRACT)
+        if (self.index.get('version') != 1 or self.index.get('decision_contract') not in CONTRACTS.values()
                 or self.index.get('max_delay') != max_delay):
             raise ValueError('decision cache contract/max delay differs')
-        if sampling not in (None,'legacy','independent'):
+        if sampling is not None and sampling not in CONTRACTS:
             raise ValueError('unknown observation sampling')
-        if sampling is not None and self.index.get('decision_contract') != (CONTRACT if sampling=='legacy' else INDEPENDENT_CONTRACT):
+        if sampling is not None and self.index.get('decision_contract') != CONTRACTS[sampling]:
             raise ValueError('requested observation sampling differs from cache')
-        if (self.index.get('decision_contract')==INDEPENDENT_CONTRACT and split==self.index['auxiliary_split']
+        if decision_period is not None and self.index.get('decision_period') != decision_period:
+            raise ValueError('fixed decision period differs from cache')
+        if (self.index.get('decision_contract') in (INDEPENDENT_CONTRACT, FIXED_CONTRACT) and split==self.index['auxiliary_split']
                 and frame_window>self.index['auxiliary_frame_window']):
             raise ValueError('auxiliary cache history is shorter than model history')
         if digest(self.root/'manifest.json') != self.index['manifest_sha256']:
@@ -318,12 +333,24 @@ class DecisionWindows(Dataset):
         b['delay_label_mask'] = torch.from_numpy(d['delay_mask'][start:stop].astype(bool, copy=True))
         b['frame_mask'] = torch.ones(T, dtype=torch.bool)
         b['loss_mask'] = torch.arange(T) >= target-start
+        label_rows = rows
+        if 'label_rows' in d:
+            label_rows = d['label_rows'][start:stop]
+            positive = label_rows >= 0
+            safe_rows = np.maximum(label_rows, 0)
+            for k in LABELS:
+                b[k] = torch.from_numpy(np.where(positive, a[k][safe_rows], -100).astype(np.int64))
+            for k in ('kind_label_mask', 'card_label_mask', 'position_label_mask',
+                      'ability_label_mask', 'ability_position_label_mask'):
+                b[k] = torch.from_numpy(np.asarray(a[k][safe_rows], dtype=bool) & positive)
+            b['play_now'] = torch.from_numpy(positive)
+            b['timing_label_mask'] = torch.from_numpy(d['timing_mask'][start:stop].copy())
         if 'supervision' in d:
             supervision=torch.from_numpy(d['supervision'][start:stop].copy())
             b['loss_mask'] &= supervision>0
             b['timing_label_mask'] &= supervision==1
-        b['position_mask'] = torch.from_numpy(selected_masks(a, 'selected_position_mask', rows))
-        b['ability_position_mask'] = torch.from_numpy(selected_masks(a, 'ability_position_mask', rows))
+        b['position_mask'] = torch.from_numpy(selected_masks(a, 'selected_position_mask', label_rows))
+        b['ability_position_mask'] = torch.from_numpy(selected_masks(a, 'ability_position_mask', label_rows))
         grid = np.zeros((T, 8*576), dtype=np.float32)
         grid_rows, _, grid_indices = ragged_indices(a['grid_offsets'], rows)
         grid[grid_rows, a['grid_indices'][grid_indices]] = a['grid_values'][grid_indices]/255.0
@@ -349,7 +376,8 @@ def main():
     p.add_argument('--data', type=Path, required=True)
     p.add_argument('--cache', type=Path, required=True)
     p.add_argument('--max-delay', type=int, default=8)
-    p.add_argument('--sampling', choices=['legacy','independent'], default='legacy')
+    p.add_argument('--sampling', choices=['legacy','independent','fixed'], default='legacy')
+    p.add_argument('--decision-period', type=int, default=4)
     p.add_argument('--sampling-seed', type=int, default=42)
     p.add_argument('--auxiliary-split', default='validation')
     p.add_argument('--auxiliary-frame-window', type=int, default=17)
@@ -362,7 +390,8 @@ def main():
                     max_shards_per_split=args.max_shards_per_split,
                     verify_hashes=args.verify_hashes, allow_smoke=args.allow_smoke,
                     sampling=args.sampling,sampling_seed=args.sampling_seed,
-                    auxiliary_split=args.auxiliary_split,auxiliary_frame_window=args.auxiliary_frame_window)
+                    auxiliary_split=args.auxiliary_split,auxiliary_frame_window=args.auxiliary_frame_window,
+                    decision_period=args.decision_period)
     print(json.dumps({s: {k: sum(r[k] for r in rr) for k in ('source_rows', 'valid_rows', 'decision_rows', 'actions')}
                       for s, rr in index['splits'].items()}, indent=2))
 

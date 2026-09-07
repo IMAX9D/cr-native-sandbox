@@ -413,6 +413,8 @@ def run(
         return
     start_time = time.monotonic()
     consecutive_overflows = 0
+    time_limit = getattr(args, "time_limit_seconds", 0)
+    time_limit_reached = False
     while epoch < args.epochs and (not args.max_steps or step < args.max_steps):
         sampler.set_epoch(epoch)
         parallel.train()
@@ -486,7 +488,12 @@ def run(
                 parallel.train()
             if step % args.save_every == 0:
                 save("last.pt")
-            if args.max_steps and step >= args.max_steps:
+            if time_limit:
+                reached = torch.tensor(int(rank == 0 and time.monotonic()-start_time >= time_limit), device=device)
+                if distributed:
+                    dist.broadcast(reached, src=0)
+                time_limit_reached = bool(reached.item())
+            if time_limit_reached or (args.max_steps and step >= args.max_steps):
                 break
         if cursor >= batch_sampler.total_batches:
             epoch += 1
@@ -496,6 +503,11 @@ def run(
             best = value
             save("best.pt")
         save("last.pt")
+        if time_limit_reached:
+            record({"phase": "stopped", "reason": "time_limit", "step": step,
+                    "epoch": epoch, "elapsed_seconds": time.monotonic()-start_time,
+                    "checkpoint": str(args.run / "last.pt")})
+            break
     if distributed:
         dist.destroy_process_group()
 
