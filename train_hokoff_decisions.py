@@ -39,9 +39,9 @@ def main(argv=None):
     if steps < 1:
         p.error('--steps must be positive')
     if args.cache is None:
-        args.cache = BASE/('hokoff-decision-cache-k%d' % args.max_delay)
+        args.cache = BASE/(('hokoff-independent-cache-k%d' if args.sampling=='independent' else 'hokoff-decision-cache-k%d') % args.max_delay)
     if args.run is None:
-        args.run = BASE/'runs'/('hokoff-decisions-k%d' % args.max_delay)
+        args.run = BASE/'runs'/(('hokoff-independent-k%d' if args.sampling=='independent' else 'hokoff-decisions-k%d') % args.max_delay)
     if args.device == 'auto':
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if args.precision is None:
@@ -82,7 +82,8 @@ def main(argv=None):
         print('Preparing full decision indices (no archive extraction):', args.cache, flush=True)
         prepare(args.data, args.cache, max_delay=args.max_delay,
                 splits=list(dict.fromkeys([args.train_split, args.val_split])),
-                allow_smoke=args.allow_smoke)
+                allow_smoke=args.allow_smoke,sampling=args.sampling,sampling_seed=args.seed,
+                auxiliary_split=args.train_split,auxiliary_frame_window=args.frame_window)
     run(args)
     return args
 

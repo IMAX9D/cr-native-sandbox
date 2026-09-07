@@ -4,6 +4,7 @@ Preparation reads labels; the policy only receives selected current observations
 Unknown timing regions split recurrent sequences and never become WAIT examples.
 """
 import argparse
+import hashlib
 from bisect import bisect_right
 from collections import OrderedDict
 import json
@@ -17,6 +18,7 @@ from policy_v1.data import (SCALARS, ROW_TOKENS, LABELS, MASKS, ENTITY_FIELDS,
                             EVENT_FIELDS, FIELDS, digest, within, open_arrays, close_arrays)
 
 CONTRACT = 'bounded_observe_after_action_censored_v1'
+from .independent_data import CONTRACT as INDEPENDENT_CONTRACT, independent_indices
 READER_FIELDS = tuple(k for k in FIELDS if k not in (
     'sequence_offsets', 'delta_ticks', 'timing_exposure_ticks', 'replay_extent'))
 
@@ -66,7 +68,8 @@ def decision_indices(offsets, scalars, delta, exposure, actions, valid, max_dela
 
 
 def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
-            verify_hashes=False, allow_smoke=False):
+            verify_hashes=False, allow_smoke=False, sampling='legacy', sampling_seed=42,
+            auxiliary_split='validation', auxiliary_frame_window=17):
     root, cache = Path(root).resolve(), Path(cache).resolve()
     if root == cache or root in cache.parents:
         raise ValueError('decision cache must be outside source data')
@@ -86,10 +89,15 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
             or manifest['dimensions']['grid_channels'] != 8):
         raise ValueError('unsupported observation schema')
     cache.mkdir(parents=True, exist_ok=True)
-    index = dict(version=1, decision_contract=CONTRACT, max_delay=max_delay,
+    if sampling not in ('legacy','independent'):
+        raise ValueError('unknown observation sampling')
+    index = dict(version=1, decision_contract=CONTRACT if sampling=='legacy' else INDEPENDENT_CONTRACT, max_delay=max_delay,
                  manifest_sha256=digest(root/'manifest.json'), dimensions=manifest['dimensions'],
                  smoke_only=bool(manifest.get('smoke_only')), verified_source_hashes=verify_hashes,
                  max_shards_per_split=max_shards_per_split, event_contract='no_event_inputs_v1', splits={})
+    if sampling=='independent':
+        index.update(sampling=sampling,sampling_seed=sampling_seed,auxiliary_split=auxiliary_split,
+                     auxiliary_frame_window=auxiliary_frame_window)
     seen = set()
     for split in (splits or manifest['splits']):
         records = []
@@ -117,9 +125,14 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
                     if left['actor_side'] != 0 or right['actor_side'] != 1 or tag != right['battle_tag'] or tag in seen:
                         raise ValueError('duplicate battle or invalid actor pairing')
                     seen.add(tag); tags.append(tag)
-                packed = decision_indices(offsets, arrays['public_scalars'], arrays['delta_ticks'],
-                                          arrays['timing_exposure_ticks'], arrays['play_now'],
-                                          arrays['timing_label_mask'], max_delay)
+                inputs=(offsets, arrays['public_scalars'], arrays['delta_ticks'],
+                        arrays['timing_exposure_ticks'], arrays['play_now'], arrays['timing_label_mask'], max_delay)
+                if sampling=='independent':
+                    seed=int.from_bytes(hashlib.sha256((str(sampling_seed)+':'+relative).encode()).digest()[:8],'little')
+                    packed=independent_indices(*inputs,seed=seed,auxiliary=split==auxiliary_split,
+                                               frame_window=auxiliary_frame_window)
+                else:
+                    packed=decision_indices(*inputs)
                 if np.any(arrays['kind_label_mask'] & ~arrays['play_now']):
                     raise ValueError('conditional kind label without action')
                 name = '%s-%05d-decisions.npz' % (split, len(records))
@@ -128,10 +141,16 @@ def prepare(root, cache, *, max_delay=8, splits=None, max_shards_per_split=None,
                 (cache/(name+'.partial')).replace(cache/name)
                 records.append(dict(path=relative, metadata_sha256=metadata_sha, indices=name,
                                     indices_sha256=digest(cache/name), offsets=packed['offsets'].tolist(),
-                                    identities=[identities[int(j)] for j in packed['owners']], battle_tags=tags,
+                                    identities=[identities[int(j)] for j in (packed['owners'] if sampling=='legacy'
+                                        else packed['owners'][packed['roles']==0])], battle_tags=tags,
                                     source_rows=len(arrays['play_now']), valid_rows=int(arrays['timing_label_mask'].sum()),
                                     decision_rows=len(packed['rows']),
                                     actions=int((arrays['play_now'].astype(bool) & arrays['timing_label_mask'].astype(bool)).sum())))
+                if sampling=='independent':
+                    records[-1].update(segment_roles=packed['roles'].tolist(),
+                        identity_layout='primary_segments_only',
+                        primary_rows=int((packed['supervision']==1).sum()),
+                        auxiliary_actions=int((packed['supervision']==2).sum()))
             finally:
                 close_arrays(arrays)
             if len(records) % 100 == 0:
@@ -188,12 +207,19 @@ def collate_decisions(items):
 
 class DecisionWindows(Dataset):
     def __init__(self, root, cache, split, *, targets=32, frame_window=17,
-                 event_window=1, max_open=2, max_delay=8):
+                 event_window=1, max_open=2, max_delay=8, sampling=None):
         self.root, self.cache = Path(root).resolve(), Path(cache).resolve()
         self.index = json.loads((self.cache/'index.json').read_text())
-        if (self.index.get('version') != 1 or self.index.get('decision_contract') != CONTRACT
+        if (self.index.get('version') != 1 or self.index.get('decision_contract') not in (CONTRACT,INDEPENDENT_CONTRACT)
                 or self.index.get('max_delay') != max_delay):
             raise ValueError('decision cache contract/max delay differs')
+        if sampling not in (None,'legacy','independent'):
+            raise ValueError('unknown observation sampling')
+        if sampling is not None and self.index.get('decision_contract') != (CONTRACT if sampling=='legacy' else INDEPENDENT_CONTRACT):
+            raise ValueError('requested observation sampling differs from cache')
+        if (self.index.get('decision_contract')==INDEPENDENT_CONTRACT and split==self.index['auxiliary_split']
+                and frame_window>self.index['auxiliary_frame_window']):
+            raise ValueError('auxiliary cache history is shorter than model history')
         if digest(self.root/'manifest.json') != self.index['manifest_sha256']:
             raise ValueError('source manifest changed')
         if min(targets, frame_window, max_open) < 1:
@@ -214,7 +240,10 @@ class DecisionWindows(Dataset):
             if digest(index_path) != r['indices_sha256']:
                 raise ValueError('decision indices changed')
             lengths = np.diff(r['offsets'])
-            p = np.r_[0, np.cumsum((lengths+targets-1)//targets)]
+            counts=(lengths+targets-1)//targets
+            if 'segment_roles' in r:
+                counts=np.where(np.asarray(r['segment_roles'])==1,1,counts)
+            p = np.r_[0, np.cumsum(counts)]
             self.sequence_prefix.append(p); self.prefix.append(self.prefix[-1]+int(p[-1]))
 
     def __len__(self):
@@ -271,6 +300,9 @@ class DecisionWindows(Dataset):
         begin, end = self.records[sh]['offsets'][seq:seq+2]
         target = begin+(local-int(p[seq]))*self.targets
         start, stop = max(begin, target-self.frame_window+1), min(end, target+self.targets)
+        roles=self.records[sh].get('segment_roles')
+        if roles is not None and roles[seq]==1:
+            target=end-1;start=max(begin,end-self.frame_window);stop=end
         a, d = self._open(sh)
         rows = d['rows'][start:stop]
         T = len(rows)
@@ -286,6 +318,10 @@ class DecisionWindows(Dataset):
         b['delay_label_mask'] = torch.from_numpy(d['delay_mask'][start:stop].astype(bool, copy=True))
         b['frame_mask'] = torch.ones(T, dtype=torch.bool)
         b['loss_mask'] = torch.arange(T) >= target-start
+        if 'supervision' in d:
+            supervision=torch.from_numpy(d['supervision'][start:stop].copy())
+            b['loss_mask'] &= supervision>0
+            b['timing_label_mask'] &= supervision==1
         b['position_mask'] = torch.from_numpy(selected_masks(a, 'selected_position_mask', rows))
         b['ability_position_mask'] = torch.from_numpy(selected_masks(a, 'ability_position_mask', rows))
         grid = np.zeros((T, 8*576), dtype=np.float32)
@@ -313,6 +349,10 @@ def main():
     p.add_argument('--data', type=Path, required=True)
     p.add_argument('--cache', type=Path, required=True)
     p.add_argument('--max-delay', type=int, default=8)
+    p.add_argument('--sampling', choices=['legacy','independent'], default='legacy')
+    p.add_argument('--sampling-seed', type=int, default=42)
+    p.add_argument('--auxiliary-split', default='validation')
+    p.add_argument('--auxiliary-frame-window', type=int, default=17)
     p.add_argument('--splits', nargs='+', default=['validation', 'train'])
     p.add_argument('--max-shards-per-split', type=int)
     p.add_argument('--verify-hashes', action='store_true')
@@ -320,7 +360,9 @@ def main():
     args = p.parse_args()
     index = prepare(args.data, args.cache, max_delay=args.max_delay, splits=args.splits,
                     max_shards_per_split=args.max_shards_per_split,
-                    verify_hashes=args.verify_hashes, allow_smoke=args.allow_smoke)
+                    verify_hashes=args.verify_hashes, allow_smoke=args.allow_smoke,
+                    sampling=args.sampling,sampling_seed=args.sampling_seed,
+                    auxiliary_split=args.auxiliary_split,auxiliary_frame_window=args.auxiliary_frame_window)
     print(json.dumps({s: {k: sum(r[k] for r in rr) for k in ('source_rows', 'valid_rows', 'decision_rows', 'actions')}
                       for s, rr in index['splits'].items()}, indent=2))
 

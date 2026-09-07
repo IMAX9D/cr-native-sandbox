@@ -7,7 +7,7 @@ from pathlib import Path
 from policy_v1.data import digest
 from policy_v1.train import parser as base_parser, run as base_run, load_checkpoint
 from .train import adapt_parser
-from .decision_data import collate_decisions, DecisionWindows, CONTRACT
+from .decision_data import collate_decisions, DecisionWindows, CONTRACT, INDEPENDENT_CONTRACT
 from .decision_model import DecisionPolicy, config_from_args
 from .decision_loss import bc_loss, summarize
 from .console_log import format_console
@@ -18,6 +18,7 @@ def parser():
     p.description = __doc__
     p.set_defaults(frame_window=17, targets=32, train_split='validation', val_split='train')
     p.add_argument('--max-delay', type=int, default=8)
+    p.add_argument('--sampling', choices=['legacy','independent'], default='legacy')
     p.add_argument('--delay-weight', type=float, default=1.0)
     p.add_argument('--delay-short-weight', type=float, default=1.0,
                    help='relative loss weight for exact delays below max-delay; 1 keeps the original objective')
@@ -45,7 +46,7 @@ def run(args):
         raise ValueError('--init-from and --resume are mutually exclusive')
     if args.init_from is not None and args.run.exists() and any(args.run.iterdir()):
         raise FileExistsError('--init-from requires an empty/new run directory')
-    contract = dict(decision_contract=CONTRACT, max_delay=args.max_delay,
+    contract = dict(decision_contract=CONTRACT if args.sampling=='legacy' else INDEPENDENT_CONTRACT, max_delay=args.max_delay,
                     decision_cache_sha256=digest(args.cache/'index.json'), delay_weight=args.delay_weight,
                     timing_positive_weight=args.timing_positive_weight, training_only=True)
     # Missing key historically means weight 1. Preserve exact resume compatibility.
@@ -54,7 +55,7 @@ def run(args):
     model_factory = DecisionPolicy if args.init_from is None else partial(initialize_policy, checkpoint=args.init_from)
     return base_run(args, model_factory=model_factory, config_factory=config_from_args,
                     collate_fn=collate_decisions,
-                    dataset_factory=partial(DecisionWindows, max_delay=args.max_delay),
+                    dataset_factory=partial(DecisionWindows, max_delay=args.max_delay,sampling=args.sampling),
                     bc_loss=partial(bc_loss, delay_weight=args.delay_weight, timing_positive_weight=args.timing_positive_weight,
                                     delay_short_weight=args.delay_short_weight),
                     summarize=summarize, console_formatter=format_console, contract_extra=contract)

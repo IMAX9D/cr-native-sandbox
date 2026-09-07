@@ -1,5 +1,7 @@
 # HoKoff 决策序列训练
 
+当前修正入口：`python train_hokoff_independent.py`。详见 [独立观测采样训练](INDEPENDENT_TRAINING.zh-CN.md)。下面保留旧事件采样实验的说明，用于历史复现；该采样存在已确认的时间间隔标签捷径。
+
 这一入口只改训练端：保留实体编码器、网格 CNN 和单层 LSTM，增加时间输入和等待时长分类。现有 `train_hokoff.py`、原 `Policy`、导出与游戏推理路径保持原样。新检查点标记 `training_only=true`，不能交给旧推理代码部署。
 
 
