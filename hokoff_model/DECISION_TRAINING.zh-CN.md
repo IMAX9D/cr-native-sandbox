@@ -206,3 +206,8 @@ python -m hokoff_model.benchmark_decisions \
 ```bash
 python train_hokoff_decisions.py --max-steps 0 --epochs 10
 ```
+
+
+## 无 UI 的观察调度评估
+
+见 [离线等待调度评估](DELAY_SCHEDULE_EVAL.zh-CN.md)：从原始逐 tick 状态测试固定间隔、模型自主跳帧和相同观测预算对照，无需启动游戏 UI。
