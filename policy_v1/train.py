@@ -134,7 +134,12 @@ def parser():
 def run(
     args, *, model_factory=Policy, config_factory=None,
     bc_loss=bc_loss, summarize=summarize, contract_extra=None, dataset_factory=Windows,
+    console_formatter=None, collate_fn=collate,
 ):
+    def print_console(payload):
+        text = console_formatter(payload) if console_formatter else json.dumps(payload, ensure_ascii=False)
+        print(text, flush=True)
+
     if (
         min(
             args.epochs,
@@ -268,20 +273,14 @@ def run(
         args.run.mkdir(parents=True, exist_ok=True)
         if (args.run / "last.pt").exists() and not args.resume:
             raise FileExistsError("run exists; use --resume or a new run")
-        print(
-            json.dumps(
-                {
-                    "parameters": sum(p.numel() for p in model.parameters()),
-                    "device": str(device),
-                    "world_size": world,
-                    "train_windows": len(train),
-                    "validation_windows": len(valid),
-                    "config": asdict(config),
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        print_console({
+            "parameters": sum(p.numel() for p in model.parameters()),
+            "device": str(device),
+            "world_size": world,
+            "train_windows": len(train),
+            "validation_windows": len(valid),
+            "config": asdict(config),
+        })
         (args.run / "config.json").write_text(
             json.dumps(
                 {
@@ -317,7 +316,7 @@ def run(
         train,
         batch_sampler=batch_sampler,
         num_workers=args.workers,
-        collate_fn=collate,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
         generator=generator,
         persistent_workers=args.workers > 0,
@@ -331,7 +330,7 @@ def run(
         batch_size=args.batch_size,
         sampler=validation_indices[rank::world],
         num_workers=args.workers,
-        collate_fn=collate,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
         generator=generator,
     )
@@ -346,7 +345,7 @@ def run(
 
     def record(payload):
         if rank == 0:
-            print(json.dumps(payload, ensure_ascii=False), flush=True)
+            print_console(payload)
             with (args.run / "metrics.jsonl").open("a") as f:
                 f.write(json.dumps(payload) + "\n")
 

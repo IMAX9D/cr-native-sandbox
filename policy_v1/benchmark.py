@@ -43,7 +43,7 @@ def parser():
     return p
 
 
-def run(args, *, model_factory=Policy, config_factory=None):
+def run(args, *, model_factory=Policy, config_factory=None, dataset_factory=Windows, loss_fn=bc_loss, collate_fn=collate):
     if (
         min(args.steps, args.batch_size, args.targets, args.cpu_threads, args.log_every)
         < 1
@@ -62,7 +62,7 @@ def run(args, *, model_factory=Policy, config_factory=None):
         raise ValueError("CPU benchmark requires fp32")
     torch.set_num_threads(args.cpu_threads)
     seed_all(args.seed)
-    dataset = Windows(
+    dataset = dataset_factory(
         args.data,
         args.cache,
         args.split,
@@ -107,7 +107,7 @@ def run(args, *, model_factory=Policy, config_factory=None):
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.workers,
-        collate_fn=collate,
+        collate_fn=collate_fn,
         pin_memory=device.type == "cuda",
         generator=torch.Generator().manual_seed(args.seed),
         persistent_workers=args.workers > 0,
@@ -147,7 +147,7 @@ def run(args, *, model_factory=Policy, config_factory=None):
             ):
                 output = model(b)
         with timer.stage("loss"):
-            loss, _ = bc_loss(output, b)
+            loss, _ = loss_fn(output, b)
         with timer.stage("backward"):
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()

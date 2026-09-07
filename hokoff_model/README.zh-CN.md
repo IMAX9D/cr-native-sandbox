@@ -1,5 +1,7 @@
 # HoKoff 风格的皇室战争 LSTM BC 基线
 
+新增训练入口：支持最长 8 tick 的可变观察间隔，保留原有推理路径。准备缓存、训练与验证命令见 [决策序列训练说明](DECISION_TRAINING.zh-CN.md)。
+
 这是 CR 专用实现，参考 [HoKoff 1v1 OneBaseModel](https://github.com/tencent-ailab/hokoff/blob/9b35f7e5891ad98df45a36e3a18f5192a31e72f4/hok1v1/offline_train/networkmodel/pytorch/module/OneBaseModel.py)
 的实体 MLP、池化、单层 LSTM 思路。没有复制其源文件或权重，不依赖 HoK 游戏内核，也不是 OpenAI Five 复现。
 上游仓库为 Tencent AI Lab 的 HoKoff（Apache-2.0），论文为 HoKoff: Real Game Dataset from Honor of Kings and its Offline Reinforcement Learning Benchmarks。
