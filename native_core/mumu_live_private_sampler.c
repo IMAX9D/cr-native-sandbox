@@ -24,6 +24,8 @@ enum {
   PLAYER_ELIXIR_RAW = 0x2F8,
   MAX_DISCOVERY_NODES = 20000,
   MAX_DISCOVERY_DEPTH = 5,
+  MAX_PATH_LENGTH = MAX_DISCOVERY_DEPTH + 2,
+  MAX_ENTITIES = 2048,
 };
 
 typedef struct {
@@ -44,7 +46,27 @@ typedef struct {
 typedef struct {
   uint64_t address;
   int depth;
+  uint16_t path[MAX_PATH_LENGTH];
 } DiscoveryNode;
+
+typedef struct {
+  uint64_t battle, player_state, last_discovery_us;
+  uint16_t path[MAX_PATH_LENGTH];
+  int path_length;
+} PlayerCache;
+
+typedef struct {
+  uint64_t address;
+  int32_t category, kind, side, x, y, card_id, level, hp, max_hp, behavior;
+} EntityFrame;
+
+typedef struct {
+  uint64_t root, context, battle, player_state, hp_state, registry, collection, data;
+  int32_t replay_tick, native_count, entity_count, filtered_count;
+  int discovery_nodes, discovery_budget_exhausted;
+  const char *failure;
+  EntityFrame entities[MAX_ENTITIES];
+} ChainFrame;
 
 static int read_exact(int fd, uint64_t address, void *output, size_t size) {
   uint8_t *cursor = (uint8_t *)output;
@@ -212,7 +234,8 @@ static int seen_insert(uint64_t *table, size_t capacity, uint64_t value) {
 }
 
 static uint64_t discover_player_state(int fd, uint64_t battle,
-                                      PlayerFrame players[2]) {
+                                      PlayerFrame players[2], PlayerCache *cache,
+                                      ChainFrame *frame) {
   enum { SEEN_CAPACITY = 32768 };
   DiscoveryNode *nodes = calloc(MAX_DISCOVERY_NODES, sizeof(*nodes));
   uint64_t *seen = calloc(SEEN_CAPACITY, sizeof(*seen));
@@ -222,11 +245,19 @@ static uint64_t discover_player_state(int fd, uint64_t battle,
     return 0;
   }
   int count = 1;
+  uint64_t started = monotonic_us();
   nodes[0].address = battle;
   seen_insert(seen, SEEN_CAPACITY, battle);
   for (int cursor = 0; cursor < count; ++cursor) {
+    if ((cursor & 63) == 0 && monotonic_us() - started > 20000) {
+      frame->discovery_budget_exhausted = 1;
+      break;
+    }
+    frame->discovery_nodes = cursor + 1;
     DiscoveryNode node = nodes[cursor];
     if (read_player_pair(fd, node.address, players)) {
+      cache->path_length = node.depth;
+      memcpy(cache->path, node.path, sizeof(cache->path));
       free(nodes);
       free(seen);
       return node.address;
@@ -235,6 +266,10 @@ static uint64_t discover_player_state(int fd, uint64_t battle,
     if (read_exact(fd, node.address + 0x10, &context, 8) && context &&
         read_exact(fd, context + 0x98, &indirect_state, 8) &&
         read_player_pair(fd, indirect_state, players)) {
+      cache->path_length = node.depth + 2;
+      memcpy(cache->path, node.path, sizeof(cache->path));
+      cache->path[node.depth] = 0x10;
+      cache->path[node.depth + 1] = 0x98;
       free(nodes);
       free(seen);
       return indirect_state;
@@ -248,12 +283,14 @@ static uint64_t discover_player_state(int fd, uint64_t battle,
          offset += sizeof(uint64_t)) {
       uint64_t child = 0, probe = 0;
       memcpy(&child, raw + offset, sizeof(child));
-      if (child < 0x100000000ull || (child & 7) ||
+      if (child < 0x10000ull || (child & 7) ||
           !seen_insert(seen, SEEN_CAPACITY, child) ||
           !read_exact(fd, child, &probe, sizeof(probe)))
         continue;
       nodes[count].address = child;
       nodes[count].depth = node.depth + 1;
+      memcpy(nodes[count].path, node.path, sizeof(node.path));
+      nodes[count].path[node.depth] = (uint16_t)offset;
       ++count;
     }
   }
@@ -262,37 +299,128 @@ static uint64_t discover_player_state(int fd, uint64_t battle,
   return 0;
 }
 
+static int read_entities(int fd, ChainFrame *frame) {
+  uint64_t addresses[MAX_ENTITIES];
+  if (!read_exact(fd, frame->battle + 0xA8, &frame->hp_state, 8) || !frame->hp_state ||
+      !read_exact(fd, frame->hp_state + 0x08, &frame->registry, 8) || !frame->registry ||
+      !read_exact(fd, frame->registry + 0x40, &frame->collection, 8) || !frame->collection ||
+      !read_exact(fd, frame->collection + 0x08, &frame->data, 8) ||
+      !read_exact(fd, frame->collection + 0x14, &frame->native_count, 4) ||
+      frame->native_count < 0 || frame->native_count > MAX_ENTITIES ||
+      (frame->native_count && (!frame->data || !read_exact(fd, frame->data, addresses,
+          (size_t)frame->native_count * sizeof(addresses[0]))))) return 0;
+  for (int i = 0; i < frame->native_count; ++i) {
+    uint8_t raw[0x124];
+    if (!addresses[i] || !read_exact(fd, addresses[i], raw, sizeof(raw))) return 0;
+    EntityFrame item = {.address = addresses[i], .hp = -1, .max_hp = -1};
+    memcpy(&item.category, raw + 0x08, 4);
+    memcpy(&item.kind, raw + 0x30, 4);
+    memcpy(&item.side, raw + 0x78, 4);
+    memcpy(&item.x, raw + 0x7C, 4);
+    memcpy(&item.y, raw + 0x80, 4);
+    memcpy(&item.card_id, raw + 0xAC, 4);
+    memcpy(&item.level, raw + 0x120, 4);
+    memcpy(&item.behavior, raw + 0x11C, 4);
+    if (item.category < 5000000 || item.category >= 6000000 ||
+        item.kind < 10 || item.kind > 20 || item.side < 0 || item.side > 1 ||
+        item.x < 0 || item.x > 18000 || item.y < 0 || item.y > 32000 ||
+        item.level < 0 || item.level > 16 ||
+        (item.card_id != -1 && (item.card_id < 20000000 || item.card_id >= 1000000000))) {
+      frame->filtered_count++;
+      continue;
+    }
+    item.level++;
+    uint64_t components = 0, hp = 0;
+    memcpy(&components, raw + 0x18, 8);
+    if (components && read_exact(fd, components + 0x10, &hp, 8) && hp) {
+      int32_t pair[2];
+      if (read_exact(fd, hp + 0x10, pair, sizeof(pair)) && pair[0] >= 0 &&
+          pair[1] >= pair[0] && pair[1] <= 100000) {
+        item.hp = pair[0]; item.max_hp = pair[1];
+      }
+    }
+    frame->entities[frame->entity_count++] = item;
+  }
+  return 1;
+}
+
 static int read_frame(int fd, uint64_t libg, uint64_t manager_rva,
                       uint64_t root_context_offset, int32_t *tick,
                       int *coherent, PlayerFrame players[2],
-                      uint64_t *cached_battle, uint64_t *cached_player_state,
-                      uint64_t *last_discovery_us) {
+                      PlayerCache *cache, ChainFrame *frame, int unified) {
   uint64_t root = 0, context = 0, battle = 0;
   int32_t before = -1, after = -1;
   *tick = -1;
   *coherent = 1;
+  memset(frame, 0, sizeof(*frame));
+  frame->replay_tick = -1;
+  frame->failure = "root_unresolved";
   if (!read_exact(fd, libg + manager_rva, &root, 8) || !root ||
       !read_exact(fd, root + root_context_offset, &context, 8) || !context ||
       !read_exact(fd, context + 0x90, &battle, 8) || !battle ||
       !read_exact(fd, battle + BATTLE_TICK, &before, 4) || before < 0)
     return 0;
-  if (*cached_battle != battle) {
-    *cached_battle = battle;
-    *cached_player_state = 0;
-    *last_discovery_us = 0;
+  frame->root = root; frame->context = context; frame->battle = battle;
+  frame->failure = "players_unresolved";
+  if (cache->battle != battle) {
+    memset(cache, 0, sizeof(*cache));
+    cache->battle = battle;
   }
-  if (!read_player_pair(fd, *cached_player_state, players)) {
-    *cached_player_state = 0;
+  if (!cache->player_state) {
+    uint64_t direct = 0;
+    if (read_exact(fd, battle + 0xA8, &direct, 8) && read_player_pair(fd, direct, players)) {
+      cache->player_state = direct;
+      cache->path_length = 1;
+      cache->path[0] = 0xA8;
+    }
+  }
+  uint64_t reached = battle;
+  for (int i = 0; i < cache->path_length; ++i) {
+    if (!reached || !read_exact(fd, reached + cache->path[i], &reached, 8)) { reached = 0; break; }
+  }
+  if (!cache->player_state || reached != cache->player_state ||
+      !read_player_pair(fd, cache->player_state, players)) {
+    cache->player_state = 0;
+    /* The version-pinned unified reader accepts only the measured +0xA8
+       path. Loading/menu state is not a reason to search unrelated objects. */
+    if (unified) return 0;
     uint64_t now = monotonic_us();
-    if (*last_discovery_us && now - *last_discovery_us < 500000) return 0;
-    *last_discovery_us = now;
-    *cached_player_state = discover_player_state(fd, battle, players);
-    if (!*cached_player_state) return 0;
+    if (cache->last_discovery_us && now - cache->last_discovery_us < 1000000) return 0;
+    cache->last_discovery_us = now;
+    cache->player_state = discover_player_state(fd, battle, players, cache, frame);
+    if (!cache->player_state) return 0;
   }
+  frame->player_state = cache->player_state;
+  frame->failure = "entities_unresolved";
+  if (unified && !read_entities(fd, frame)) return 0;
+  read_exact(fd, battle + 0x1BC, &frame->replay_tick, 4);
+  frame->failure = "incoherent_frame";
   if (!read_exact(fd, battle + BATTLE_TICK, &after, 4)) return 0;
+  uint64_t root_after = 0, context_after = 0, battle_after = 0;
+  if (!read_exact(fd, libg + manager_rva, &root_after, 8) || root_after != root ||
+      !read_exact(fd, root_after + root_context_offset, &context_after, 8) || context_after != context ||
+      !read_exact(fd, context_after + 0x90, &battle_after, 8) || battle_after != battle) {
+    *coherent = 0;
+    return 0;
+  }
   *tick = after;
   *coherent = before == after;
+  if (*coherent) frame->failure = "none";
   return 1;
+}
+
+static void emit_chain(const ChainFrame *f, const PlayerCache *cache, uint64_t libg) {
+  printf(",\"chain\":{\"libg_base\":\"0x%" PRIx64 "\",\"root\":\"0x%" PRIx64
+         "\",\"context\":\"0x%" PRIx64 "\",\"battle\":\"0x%" PRIx64
+         "\",\"player_state\":\"0x%" PRIx64 "\",\"hp_state\":\"0x%" PRIx64
+         "\",\"registry\":\"0x%" PRIx64 "\",\"collection\":\"0x%" PRIx64
+         "\",\"data\":\"0x%" PRIx64 "\",\"player_state_path\":[",
+         libg, f->root, f->context, f->battle, f->player_state, f->hp_state, f->registry, f->collection, f->data);
+  for (int i = 0; i < cache->path_length; ++i) { if (i) putchar(','); printf("%u", cache->path[i]); }
+  printf("]},\"failure\":\"%s\",\"applied_replay_tick\":%d,\"native_object_count\":%d,"
+         "\"decoded_entity_count\":%d,\"filtered_object_count\":%d,\"discovery_nodes\":%d,"
+         "\"discovery_budget_exhausted\":%s", f->failure, f->replay_tick, f->native_count,
+         f->entity_count, f->filtered_count, f->discovery_nodes, f->discovery_budget_exhausted ? "true" : "false");
 }
 
 static void emit_player(const PlayerFrame *player, int side) {
@@ -325,16 +453,19 @@ static void emit_player(const PlayerFrame *player, int side) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 5) {
+  if (argc != 5 && argc != 7) {
     fprintf(stderr,
             "usage: mumu-live-private PID INTERVAL_MS MANAGER_RVA "
-            "ROOT_CONTEXT_OFFSET\n");
+            "ROOT_CONTEXT_OFFSET [--unified MAX_FRAMES(0=unlimited)]\n");
     return 2;
   }
   int pid = atoi(argv[1]);
   int interval_ms = atoi(argv[2]);
   uint64_t manager_rva = strtoull(argv[3], NULL, 0);
   uint64_t root_context_offset = strtoull(argv[4], NULL, 0);
+  int unified = argc == 7;
+  uint64_t max_frames = unified ? strtoull(argv[6], NULL, 10) : 0;
+  if (unified && strcmp(argv[5], "--unified")) return 2;
   if (pid <= 0 || interval_ms < 20 || interval_ms > 5000 || !manager_rva ||
       !root_context_offset)
     return 2;
@@ -346,35 +477,50 @@ int main(int argc, char **argv) {
   if (fd < 0) return 4;
   setvbuf(stdout, NULL, _IONBF, 0);
   uint64_t sequence = 0;
-  uint64_t cached_battle = 0, cached_player_state = 0;
-  uint64_t last_discovery_us = 0;
+  PlayerCache cache = {0};
+  ChainFrame *frame = calloc(1, sizeof(*frame));
+  if (!frame) { close(fd); return 5; }
   PlayerFrame players[2];
-  while (kill(pid, 0) == 0 || errno == EPERM) {
+  while ((!max_frames || sequence < max_frames) && (kill(pid, 0) == 0 || errno == EPERM)) {
     uint64_t started = monotonic_us();
     int32_t tick = -1;
     int coherent = 1;
     int active = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
       active = read_frame(fd, libg, manager_rva, root_context_offset, &tick,
-                          &coherent, players, &cached_battle,
-                          &cached_player_state, &last_discovery_us);
+                          &coherent, players, &cache, frame, unified);
       if (!active || coherent) break;
     }
-    printf("{\"event\":\"mumu_live_private\",\"sequence\":%" PRIu64
+    printf("{\"event\":\"%s\",\"schema_version\":2,\"pid\":%d,\"reader_pid\":%d,\"sequence\":%" PRIu64
            ",\"battle_active\":%s,\"coherent\":%s,\"game_tick\":%d,"
            "\"players\":[",
-           sequence++, active ? "true" : "false",
+           unified ? "mumu_live_frame" : "mumu_live_private", pid, getpid(), sequence++, active ? "true" : "false",
            coherent ? "true" : "false", tick);
     if (active) {
       emit_player(&players[0], 0);
       putchar(',');
       emit_player(&players[1], 1);
     }
-    printf("],\"read_us\":%" PRIu64 "}\n", monotonic_us() - started);
+    putchar(']');
+    emit_chain(frame, &cache, libg);
+    if (unified) {
+      printf(",\"entities\":[");
+      for (int i = 0; active && i < frame->entity_count; ++i) {
+        const EntityFrame *e = &frame->entities[i];
+        if (i) putchar(',');
+        printf("{\"address\":\"0x%" PRIx64 "\",\"category\":%d,\"kind\":%d,\"side\":%d,"
+               "\"x\":%d,\"y\":%d,\"card_id\":%d,\"level\":%d,\"hp\":%d,\"max_hp\":%d,"
+               "\"behavior_state_raw\":%d}", e->address, e->category, e->kind, e->side,
+               e->x, e->y, e->card_id, e->level, e->hp, e->max_hp, e->behavior);
+      }
+      putchar(']');
+    }
+    printf(",\"sample_monotonic_us\":%" PRIu64 ",\"read_us\":%" PRIu64 "}\n", started, monotonic_us() - started);
     uint64_t elapsed = monotonic_us() - started;
     uint64_t target = (uint64_t)interval_ms * 1000ULL;
     if (elapsed < target) usleep((useconds_t)(target - elapsed));
   }
   close(fd);
+  free(frame);
   return 0;
 }

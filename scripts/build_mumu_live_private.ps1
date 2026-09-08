@@ -1,12 +1,21 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$NdkRoot = '',
+    [string]$OutputDirectory = ''
+)
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-$Compiler = 'D:\Codex\toolchains\android-ndk-r27d\toolchains\llvm\prebuilt\windows-x86_64\bin\x86_64-linux-android24-clang.cmd'
+if (-not $NdkRoot) { $NdkRoot = $env:CR_SANDBOX_NDK }
+if (-not $NdkRoot) { $NdkRoot = $env:ANDROID_NDK_ROOT }
+if (-not $NdkRoot -and (Test-Path -LiteralPath 'D:\Codex\toolchains\android-ndk-r27d')) {
+    $NdkRoot = 'D:\Codex\toolchains\android-ndk-r27d'
+}
+if (-not $NdkRoot) { throw 'Set -NdkRoot, CR_SANDBOX_NDK or ANDROID_NDK_ROOT to an installed Android NDK.' }
+$Compiler = Join-Path $NdkRoot 'toolchains\llvm\prebuilt\windows-x86_64\bin\x86_64-linux-android24-clang.cmd'
 $Source = Join-Path $Root 'native_core\mumu_live_private_sampler.c'
-$OutputDirectory = Join-Path $Root 'artifacts\mumu-live'
-$Output = Join-Path $OutputDirectory 'mumu-live-private-x86_64'
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $Root 'artifacts\mumu-live' }
+$Output = Join-Path $OutputDirectory 'mumu-live-reader-v2-x86_64'
 
 foreach ($Path in @($Compiler, $Source)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -14,7 +23,7 @@ foreach ($Path in @($Compiler, $Source)) {
     }
 }
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
-& $Compiler '-O3' '-std=c17' '-fPIE' '-pie' '-s' '-o' $Output $Source
+& $Compiler '-O3' '-std=c17' '-Wall' '-Wextra' '-fPIE' '-pie' '-s' '-o' $Output $Source
 if ($LASTEXITCODE -ne 0) {
     throw "MuMu private sampler build failed: $LASTEXITCODE"
 }

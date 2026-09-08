@@ -1,4 +1,4 @@
-"""Auto-detect a live MuMu friendly battle and let an expert policy control it.
+"""Observe an existing MuMu live battle and optionally let an expert control it.
 
 The live game process is observed read-only through the already verified
 ``/proc/<pid>/mem`` samplers.  Actions are sent as ordinary Android touch
@@ -9,7 +9,6 @@ inside the online client.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
@@ -35,21 +34,23 @@ from .human_vs_ai import (
     _load_policy,
     _seed_everything,
 )
+from .mumu_live_protocol import (
+    BattleClockGuard, DEFAULT_READER, DEFAULT_LOG_ROOT, install_reader, start_reader,
+    stop_owned_reader, verify_runtime,
+)
+from .mumu_live_actions import ScreenLayout, UI_READY_MIN_TICK, card_receipt, send_card_taps
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CHECKPOINT = Path(
-    r"D:\AI_data\cr-native-core\expert-v1\downloaded\lr-ab-20260831"
-    r"\candidate-lr5e-5-step157674-fp16.pt"
-)
+_LOCAL_CHECKPOINT = Path(r'D:\AI_data\cr-native-core\expert-v1\downloaded\lr-ab-20260831\candidate-lr5e-5-step157674-fp16.pt')
+DEFAULT_CHECKPOINT = Path(os.environ.get('CR_EXPERT_CHECKPOINT') or str(
+    _LOCAL_CHECKPOINT if _LOCAL_CHECKPOINT.is_file() else PROJECT_ROOT / 'models/expert-fp16.pt'))
 DEFAULT_DECK = PROJECT_ROOT / "examples" / "user-selected-heavy-control.json"
 DEFAULT_ENTITY_HELPER = Path(
     r"D:\AI_data\worktrees\cr_re-formal\native\bin"
     r"\cr-live-sampler-x86_64"
 )
-DEFAULT_PRIVATE_HELPER = (
-    PROJECT_ROOT / "artifacts" / "mumu-live" / "mumu-live-private-x86_64"
-)
+DEFAULT_PRIVATE_HELPER = DEFAULT_READER
 DEFAULT_MUMU_CLI = Path(r"C:\Program Files\Netease\MuMu\nx_main\mumu-cli.exe")
 DEFAULT_ADB = Path(
     r"C:\Program Files\Netease\MuMu\nx_device\12.0\shell\adb.exe"
@@ -61,67 +62,13 @@ ROOT_CONTEXT_OFFSET = 0x28
 TERMINAL_GAME_TICK = 6150
 REMOTE_ENTITY = "/data/local/tmp/cr-live-sampler-expert"
 REMOTE_PRIVATE = "/data/local/tmp/mumu-live-private-expert"
-LOG_ROOT = Path(r"D:\AI_data\cr-native-core\mumu-live-expert")
+LOG_ROOT = DEFAULT_LOG_ROOT
 STATUS_PATH = LOG_ROOT / "controller-status.json"
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 class LiveControllerError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class ScreenLayout:
-    width: int
-    height: int
-    viewport_left: float
-    viewport_width: float
-    arena_left: float
-    arena_right: float
-    arena_top: float
-    arena_bottom: float
-    hand_y: float
-    hand_x: tuple[float, float, float, float]
-
-    @classmethod
-    def from_size(cls, width: int, height: int) -> "ScreenLayout":
-        if width <= 0 or height <= 0:
-            raise ValueError("invalid Android display size")
-        # Royale is portrait.  If Android reports a landscape framebuffer,
-        # use the centered 9:16 game viewport and leave side bars untouched.
-        viewport_width = float(width)
-        viewport_left = 0.0
-        if width / height > 0.8:
-            viewport_width = min(float(width), float(height) * 9.0 / 16.0)
-            viewport_left = (float(width) - viewport_width) / 2.0
-        return cls(
-            width=width,
-            height=height,
-            viewport_left=viewport_left,
-            viewport_width=viewport_width,
-            arena_left=viewport_left + viewport_width * 0.055,
-            arena_right=viewport_left + viewport_width * 0.945,
-            arena_top=height * 0.105,
-            arena_bottom=height * 0.790,
-            hand_y=height * 0.912,
-            hand_x=tuple(
-                viewport_left + viewport_width * value
-                for value in (0.275, 0.435, 0.595, 0.755)
-            ),
-        )
-
-    def deployment_point(self, canonical_position: int) -> tuple[int, int]:
-        row, column = divmod(int(canonical_position), 18)
-        x_fraction = (column + 0.5) / 18.0
-        y_fraction = (row + 0.5) / 32.0
-        x = self.arena_left + x_fraction * (self.arena_right - self.arena_left)
-        y = self.arena_bottom - y_fraction * (self.arena_bottom - self.arena_top)
-        return round(x), round(y)
-
-    def hand_point(self, slot: int) -> tuple[int, int]:
-        if slot not in range(4):
-            raise ValueError("hand slot must be 0..3")
-        return round(self.hand_x[slot]), round(self.hand_y)
 
 
 class JsonLineStream:
@@ -398,6 +345,11 @@ def _tower_rows(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _native_state(
     entity_frame: dict[str, Any], private_frame: dict[str, Any]
 ) -> dict[str, Any]:
+    if entity_frame.get('schema_version') == 2 or private_frame.get('schema_version') == 2:
+        left = (entity_frame.get('pid'), entity_frame.get('game_tick'), entity_frame.get('chain'))
+        right = (private_frame.get('pid'), private_frame.get('game_tick'), private_frame.get('chain'))
+        if left != right or not entity_frame.get('coherent') or not private_frame.get('coherent'):
+            raise LiveControllerError('Refusing to combine different battle identities/ticks')
     entities: list[dict[str, Any]] = []
     for raw in entity_frame.get("entities", []):
         if not isinstance(raw, dict):
@@ -568,6 +520,12 @@ class MuMuExpertController:
             "inference_error": 0,
         }
         self._last_status_publish = 0.0
+        self.actions_blocked = False
+        self.clock_guard = BattleClockGuard()
+        self.observation_health: dict[str, Any] = {'status': 'starting', 'can_control': False, 'epoch': 0}
+        self.battle_epoch = 0
+        self.game_pid: int | None = None
+        self.runtime_evidence: dict[str, Any] = {}
 
     def _status_payload(self) -> dict[str, Any]:
         return {
@@ -600,6 +558,9 @@ class MuMuExpertController:
                 if self.layout is not None else None
             ),
             "serial": self.serial,
+            "observation_health": self.observation_health,
+            "actions_blocked": self.actions_blocked,
+            "runtime_evidence": self.runtime_evidence,
         }
 
     def _publish_status(self, *, force: bool = False) -> None:
@@ -642,46 +603,23 @@ class MuMuExpertController:
         self._publish_status(force=True)
 
     def _start_streams(self, pid: int) -> None:
-        entity_command = (
-            f"{REMOTE_ENTITY} {pid} 50 {hex(MANAGER_GLOBAL_RVA)} "
-            f"{hex(ROOT_CONTEXT_OFFSET)} 0"
-        )
-        private_command = (
-            f"{REMOTE_PRIVATE} {pid} 50 {hex(MANAGER_GLOBAL_RVA)} "
-            f"{hex(ROOT_CONTEXT_OFFSET)}"
-        )
-        self.entity_stream = _start_root_stream(
-            self.cli, self.args.vmindex, entity_command, "cr_live_snapshot"
-        )
-        self.private_stream = _start_root_stream(
-            self.cli, self.args.vmindex, private_command, "mumu_live_private"
-        )
+        process = start_reader(self.adb, self.serial, pid, interval_ms=50)
+        self.entity_stream = JsonLineStream(process, 'mumu_live_frame')
+        self.private_stream = self.entity_stream
 
     def prepare(self) -> None:
-        for required in (self.cli, self.adb, self.args.checkpoint, self.args.deck,
-                         self.args.entity_helper, self.args.private_helper):
+        if self.args.vmindex != 1:
+            raise LiveControllerError('--vmindex switching is retired; choose the existing target explicitly with --serial')
+        for required in (self.adb, self.args.checkpoint, self.args.deck,
+                         self.args.private_helper):
             if not Path(required).is_file():
                 raise FileNotFoundError(required)
-        _ensure_mumu(self.cli, self.args.vmindex)
-        info = _mumu_info(self.cli, self.args.vmindex)
-        adb_host = str(info.get("adb_host_ip") or "127.0.0.1")
-        adb_port = int(info.get("adb_port") or 0)
-        if adb_port > 0:
-            self.serial = f"{adb_host}:{adb_port}"
+        # Use only the explicitly selected existing serial. No implicit AVD,
+        # game launch, side switch, window show or NemuShell polling.
         _connect_adb(self.adb, self.serial)
-        pid = _ensure_game(
-            self.cli, self.adb, self.serial, self.args.vmindex
-        )
-        _verify_game_runtime(self.cli, self.args.vmindex, pid)
-        _stop_remote_helpers(self.cli, self.args.vmindex)
-        _push_helpers(
-            self.cli,
-            self.adb,
-            self.serial,
-            self.args.vmindex,
-            self.args.entity_helper.resolve(),
-            self.args.private_helper.resolve(),
-        )
+        self.runtime_evidence = verify_runtime(self.adb, self.serial)
+        pid = self.game_pid = int(self.runtime_evidence['pid'])
+        self.runtime_evidence['reader_sha256'] = install_reader(self.adb, self.serial, self.args.private_helper.resolve())
         width, height = _screen_size(self.adb, self.serial)
         self.layout = ScreenLayout.from_size(width, height)
         LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -704,14 +642,14 @@ class MuMuExpertController:
     def _fresh_frames(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert self.entity_stream and self.private_stream
         entity, entity_time = self.entity_stream.snapshot()
-        private, private_time = self.private_stream.snapshot()
         now = time.monotonic()
-        if now - entity_time > 1.0 or now - private_time > 1.0:
+        if now - entity_time > 1.0:
             return None, None
-        return entity, private
+        return entity, entity
 
     def _stable_active(self, entity: dict[str, Any] | None,
                        private: dict[str, Any] | None) -> bool:
+        self.observation_health = self.clock_guard.observe(entity)
         entity_tick = entity.get("game_tick") if entity else None
         private_tick = private.get("game_tick") if private else None
         return bool(
@@ -723,11 +661,12 @@ class MuMuExpertController:
             and private.get("coherent", True)
             and isinstance(entity_tick, int)
             and isinstance(private_tick, int)
-            and 0 <= int(entity_tick) < TERMINAL_GAME_TICK
-            and 0 <= int(private_tick) < TERMINAL_GAME_TICK
+            and UI_READY_MIN_TICK <= int(entity_tick) < TERMINAL_GAME_TICK
+            and UI_READY_MIN_TICK <= int(private_tick) < TERMINAL_GAME_TICK
             and abs(int(entity_tick) - int(private_tick)) <= 2
             and len(private.get("players", [])) == 2
             and self._visible_local_side(private) is not None
+            and self.observation_health.get('can_control', False)
         )
 
     @staticmethod
@@ -782,6 +721,7 @@ class MuMuExpertController:
         self.policy.expert_revealed_enemy_tokens = []
         self.pending = None
         self.last_tick = -1
+        self.actions_blocked = False
 
     def _begin_battle(self, tick: int, private: dict[str, Any]) -> None:
         if not self._select_local_side(private):
@@ -789,6 +729,7 @@ class MuMuExpertController:
         self.in_battle = True
         self.lifecycle = "controlling"
         self.battle_number += 1
+        self.battle_epoch = self.observation_health['epoch']
         self.inactive_streak = 0
         self._reset_policy()
         self.log(
@@ -808,31 +749,9 @@ class MuMuExpertController:
 
     def _touch(self, slot: int, position: int) -> None:
         assert self.layout is not None
-        start = self.layout.hand_point(slot)
-        target = self.layout.deployment_point(position)
         if self.args.dry_run:
             return
-        _adb(
-            self.adb,
-            self.serial,
-            "shell",
-            "input",
-            "tap",
-            str(start[0]),
-            str(start[1]),
-            timeout=5,
-        )
-        time.sleep(0.05)
-        _adb(
-            self.adb,
-            self.serial,
-            "shell",
-            "input",
-            "tap",
-            str(target[0]),
-            str(target[1]),
-            timeout=5,
-        )
+        send_card_taps(self.adb, self.serial, self.layout, slot, position, side=self.local_side)
 
     def _retry_touch(self, slot: int, position: int) -> None:
         assert self.layout is not None
@@ -862,34 +781,23 @@ class MuMuExpertController:
             timeout=5,
         )
 
-    def _update_pending(self, hand: list[int], now: float) -> bool:
+    def _update_pending(self, hand: list[int], now: float, frame: dict[str, Any]) -> bool:
         if self.pending is None:
             return False
-        if hand != self.pending["hand_before"]:
+        receipt = card_receipt(self.pending['before_frame'], frame, side=self.local_side,
+            slot=int(self.pending['slot']), card_id=int(self.pending['card_id']))
+        if receipt['accepted']:
             self.log(
                 "touch_accepted",
                 battle=self.battle_number,
                 tick=self.pending["tick"],
                 slot=self.pending["slot"],
                 latency_ms=round((now - self.pending["sent_at"]) * 1000, 1),
+                receipt=receipt,
             )
             self.pending = None
             return False
         if now - self.pending["sent_at"] >= 1.8:
-            if not self.args.dry_run and not self.pending.get("retried", False):
-                self._retry_touch(
-                    int(self.pending["slot"]), int(self.pending["position"])
-                )
-                self.pending["retried"] = True
-                self.pending["sent_at"] = time.monotonic()
-                self.log(
-                    "touch_retry",
-                    battle=self.battle_number,
-                    tick=self.pending["tick"],
-                    slot=self.pending["slot"],
-                    position=self.pending["position"],
-                )
-                return True
             self.log(
                 "touch_not_confirmed",
                 battle=self.battle_number,
@@ -897,6 +805,7 @@ class MuMuExpertController:
                 slot=self.pending["slot"],
             )
             self.pending = None
+            self.actions_blocked = True
             return False
         return True
 
@@ -931,7 +840,10 @@ class MuMuExpertController:
             "refill_timer": int(player.get("refill_timer", 0)),
         }
         now = time.monotonic()
-        pending = self._update_pending(hand, now)
+        pending = self._update_pending(hand, now, entity)
+        if self.actions_blocked:
+            self.last_tick = entity_tick
+            return
         self._reveal_enemy(state)
         self.policy.state = state
         card_mask, positions = _position_masks(
@@ -958,6 +870,7 @@ class MuMuExpertController:
         if deck_index not in range(8):
             self.log("invalid_model_slot", tick=entity_tick, slot=slot, hand=hand)
             return
+        sent_at = time.monotonic()
         self._touch(slot, int(position))
         if not self.args.dry_run:
             self.pending = {
@@ -966,7 +879,9 @@ class MuMuExpertController:
                 "deck_index": deck_index,
                 "position": int(position),
                 "hand_before": list(hand),
-                "sent_at": time.monotonic(),
+                "before_frame": entity,
+                "card_id": int(self.decks[self.local_side][deck_index]['card_id']),
+                "sent_at": sent_at,
                 "retried": False,
             }
         self.last_action = {
@@ -1004,6 +919,8 @@ class MuMuExpertController:
                     )
                 entity, private = self._fresh_frames()
                 active = self._stable_active(entity, private)
+                if self.in_battle and self.observation_health.get('epoch') != self.battle_epoch:
+                    self._end_battle()
                 if not self.in_battle:
                     self.active_streak = self.active_streak + 1 if active else 0
                     if self.active_streak >= 3:
@@ -1041,7 +958,9 @@ class MuMuExpertController:
             self._publish_status(force=True)
             raise
         finally:
-            _stop_remote_helpers(self.cli, self.args.vmindex)
+            latest, _ = self.entity_stream.snapshot()
+            if latest and self.game_pid is not None:
+                stop_owned_reader(self.adb, self.serial, latest.get('reader_pid'), self.game_pid)
             self.entity_stream.stop()
             self.private_stream.stop()
             if self.lifecycle != "error":
@@ -1055,12 +974,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--expert-dataset-root", type=Path, default=DEFAULT_EXPERT_DATASET)
     parser.add_argument("--deck", type=Path, default=DEFAULT_DECK)
-    parser.add_argument("--entity-helper", type=Path, default=DEFAULT_ENTITY_HELPER)
+    parser.add_argument("--entity-helper", type=Path, default=DEFAULT_ENTITY_HELPER, help='legacy unused option; the unified private-helper provides entities')
     parser.add_argument("--private-helper", type=Path, default=DEFAULT_PRIVATE_HELPER)
     parser.add_argument("--mumu-cli", type=Path, default=DEFAULT_MUMU_CLI)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     parser.add_argument("--serial", default=DEFAULT_SERIAL)
-    parser.add_argument("--vmindex", type=int, default=1)
+    parser.add_argument("--vmindex", type=int, default=1, help='legacy compatibility only (1); use --serial to select another existing device')
     parser.add_argument("--local-side", type=int, choices=(0, 1), default=1)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--policy-seed", type=int, default=20260901)

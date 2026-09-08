@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "validation": "mumu_live_deployment_20260908",
+  "version_code": 160402002,
+  "abi": "arm64-v8a",
+  "libg_sha256": "d2c8efcfe8f77e21d6a5e219999e938a42daefd7ab32f546375fb91c01f9ca97",
+  "resource_version": "16.402.7",
+  "reader_sha256": "00adf36be83080fb51b8bdcbadd7bb9db1189cc7d95c9e441d90bd4bdbf7521f",
+  "sent": 6,
+  "confirmed": 6,
+  "stopped_after_battle": true,
+  "passed": true,
+  "model_loaded": false,
+  "memory_written": false,
+  "deployment_receipts": [
+    {
+      "card_id": 27000000,
+      "slot": 3,
+      "canonical_cell": 170,
+      "tick_before": 150,
+      "tick_after": 177,
+      "elixir_decrease_raw": 25194,
+      "latency_ms": 1297,
+      "observed_entities": [
+        {
+          "card_id": 27000000,
+          "side": 1,
+          "x": 9500,
+          "y": 22500,
+          "hp": 1316
+        }
+      ]
+    },
+    {
+      "card_id": 26000021,
+      "slot": 1,
+      "canonical_cell": 265,
+      "tick_before": 190,
+      "tick_after": 215,
+      "elixir_decrease_raw": 35550,
+      "latency_ms": 1250,
+      "observed_entities": [
+        {
+          "card_id": 26000021,
+          "side": 1,
+          "x": 4499,
+          "y": 17499,
+          "hp": 2711
+        }
+      ]
+    },
+    {
+      "card_id": 26000010,
+      "slot": 0,
+      "canonical_cell": 150,
+      "tick_before": 230,
+      "tick_after": 256,
+      "elixir_decrease_raw": 5372,
+      "latency_ms": 1250,
+      "observed_entities": [
+        {
+          "card_id": 26000010,
+          "side": 1,
+          "x": 11500,
+          "y": 22692,
+          "hp": 130
+        },
+        {
+          "card_id": 26000010,
+          "side": 1,
+          "x": 12199,
+          "y": 23902,
+          "hp": 130
+        },
+        {
+          "card_id": 26000010,
+          "side": 1,
+          "x": 10801,
+          "y": 23902,
+          "hp": 130
+        }
+      ]
+    },
+    {
+      "card_id": 28000011,
+      "slot": 3,
+      "canonical_cell": 155,
+      "tick_before": 271,
+      "tick_after": 297,
+      "elixir_decrease_raw": 15372,
+      "latency_ms": 1297,
+      "observed_entities": []
+    },
+    {
+      "card_id": 26000030,
+      "slot": 3,
+      "canonical_cell": 150,
+      "tick_before": 311,
+      "tick_after": 337,
+      "elixir_decrease_raw": 5372,
+      "latency_ms": 1344,
+      "observed_entities": [
+        {
+          "card_id": 26000030,
+          "side": 1,
+          "x": 11500,
+          "y": 23499,
+          "hp": 312
+        }
+      ]
+    },
+    {
+      "card_id": 27000000,
+      "slot": 3,
+      "canonical_cell": 173,
+      "tick_before": 450,
+      "tick_after": 476,
+      "elixir_decrease_raw": 25372,
+      "latency_ms": 1297,
+      "observed_entities": [
+        {
+          "card_id": 27000000,
+          "side": 1,
+          "x": 6500,
+          "y": 22500,
+          "hp": 1316
+        }
+      ]
+    }
+  ]
+}

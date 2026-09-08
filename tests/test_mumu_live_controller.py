@@ -6,6 +6,7 @@ import os
 import numpy as np
 
 from native_core.mumu_live_controller import (
+    MuMuExpertController,
     ScreenLayout,
     _native_state,
     _position_masks,
@@ -19,7 +20,7 @@ class MuMuLiveControllerTests(unittest.TestCase):
 
     def test_portrait_layout_keeps_touches_inside_game_view(self) -> None:
         layout = ScreenLayout.from_size(1080, 1920)
-        self.assertEqual(layout.hand_point(0), (297, 1751))
+        self.assertEqual(layout.hand_point(0), (335, 1709))
         for position in (0, 17, 558, 575):
             x, y = layout.deployment_point(position)
             self.assertGreaterEqual(x, 0)
@@ -77,6 +78,30 @@ class MuMuLiveControllerTests(unittest.TestCase):
         self.assertEqual(len(state["players"]), 2)
         self.assertEqual(len(state["episode"]["crown_towers"]), 2)
         self.assertEqual(state["entities"][2]["card_id"], 26000021)
+
+    def test_unified_frames_from_different_ticks_or_battles_are_not_combined(self) -> None:
+        source = {'schema_version': 2, 'coherent': True, 'pid': 123,
+                  'game_tick': 100, 'chain': {'battle': '0x1'}, 'entities': [], 'players': []}
+        for changes in ({'game_tick': 101}, {'chain': {'battle': '0x2'}}, {'coherent': False}):
+            with self.assertRaises(RuntimeError):
+                _native_state(source, {**source, **changes})
+
+    def test_unconfirmed_deployment_blocks_further_actions_without_retry(self) -> None:
+        controller = object.__new__(MuMuExpertController)
+        source = {'pid': 123, 'coherent': True, 'game_tick': 200,
+                  'chain': {'battle': '0x1', 'player_state': '0x2'}, 'entities': [],
+                  'players': [{'side': 0, 'elixir_raw': 50000, 'hand_deck_indices': [0,1,2,3]}]}
+        controller.pending = {'before_frame': source, 'slot': 0, 'card_id': 27000000,
+                              'sent_at': 0, 'tick': 200}
+        controller.local_side = 0
+        controller.battle_number = 1
+        controller.actions_blocked = False
+        events = []
+        controller.log = lambda event, **data: events.append(event)
+        self.assertFalse(controller._update_pending([0,1,2,3], 2.1, {**source, 'game_tick': 220}))
+        self.assertTrue(controller.actions_blocked)
+        self.assertIsNone(controller.pending)
+        self.assertEqual(events, ['touch_not_confirmed'])
 
 
 if __name__ == "__main__":

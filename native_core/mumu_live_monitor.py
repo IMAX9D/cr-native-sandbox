@@ -13,14 +13,13 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any
+from .mumu_live_protocol import DEFAULT_LOG_ROOT
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-STATUS_PATH = Path(
-    r"D:\AI_data\cr-native-core\mumu-live-expert\controller-status.json"
-)
-RUNTIME_ROOT = Path(r"D:\AI_data\runtime")
-MUMU_CLI = Path(r"C:\Program Files\Netease\MuMu\nx_main\mumu-cli.exe")
+STATUS_PATH = DEFAULT_LOG_ROOT / 'controller-status.json'
+RUNTIME_ROOT = DEFAULT_LOG_ROOT / 'launcher'
+MUMU_CLI = Path(os.environ.get('CR_MUMU_CLI') or r'C:\Program Files\Netease\MuMu\nx_main\mumu-cli.exe')
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 CARD_ZH = {
@@ -43,7 +42,7 @@ CARD_ZH = {
 }
 EVENT_ZH = {
     "controller_ready": "控制器就绪",
-    "waiting_for_friendly_battle": "等待友谊战",
+    "waiting_for_friendly_battle": "等待可控对局",
     "battle_detected": "检测到对局，开始接管",
     "touch_sent": "模型执行下牌",
     "touch_retry": "下牌补发",
@@ -127,7 +126,7 @@ def _load_live_deck(raw: Any) -> list[str] | None:
 class Monitor(tk.Tk):
     COLORS = {
         "starting": ("正在启动", "#eab308"),
-        "waiting": ("等待友谊战", "#3b82f6"),
+        "waiting": ("等待可控对局", "#3b82f6"),
         "controlling": ("AI 正在接管", "#22c55e"),
         "error": ("异常 · 已停止触屏", "#ef4444"),
         "stopped": ("已停止", "#94a3b8"),
