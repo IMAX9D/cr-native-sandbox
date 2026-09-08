@@ -32,7 +32,7 @@ python -m pip install -e .
 ```
 
 也可设置 `CR_SANDBOX_NDK` 或 `ANDROID_NDK_ROOT`。输出为 `artifacts/mumu-live/mumu-live-reader-v2-x86_64`。
-如从配套 Release 下载预编译工具包，解压到仓库根目录并核对工具包校验和后，可跳过 NDK 构建。
+也可从 [预编译读取器 Release](https://github.com/IMAX9D/cr-native-sandbox/releases/tag/mumu-live-160402002-20260908) 下载工具包，解压到仓库根目录并核对校验和后，跳过 NDK 构建。
 
 ## 2. 只读检查
 
