@@ -45,7 +45,10 @@ class Policy(nn.Module):
         self.positions = nn.Embedding(577, d, padding_idx=576)
         self.sides = nn.Embedding(2, d)
         self.entity = nn.Sequential(nn.Linear(3*d+c.entity_numeric_size, d), nn.ReLU(), nn.Linear(d, d), nn.ReLU())
-        self.grid = nn.Sequential(nn.Conv2d(c.grid_channels, 16, 3, stride=2, padding=1), nn.ReLU(),
+        self.spatial_type_dim = getattr(c, 'spatial_type_dim', 0)
+        if self.spatial_type_dim:
+            self.spatial_types = nn.Embedding(c.card_vocab_size, self.spatial_type_dim, padding_idx=0)
+        self.grid = nn.Sequential(nn.Conv2d(c.grid_channels + 2*self.spatial_type_dim, 16, 3, stride=2, padding=1), nn.ReLU(),
                                   nn.Conv2d(16, 16, 3, stride=2, padding=1), nn.ReLU(),
                                   nn.Flatten(), nn.Linear(16*8*5, d), nn.ReLU())
         # two side pools, ordered hand slots, deck, revealed cards, next card, grid
@@ -63,6 +66,34 @@ class Policy(nn.Module):
         valid = tokens.ne(0).unsqueeze(-1)
         return (self.cards(tokens)*valid).sum(-2)/valid.sum(-2).clamp_min(1)
 
+    def spatial_type_grid(self, b):
+        """Sum public card embeddings per side/cell; padding contributes nothing.
+
+        Same 1/16 scale as the existing occupancy channels, without clipping or
+        averaging away multiplicity. No action labels or future frames are read.
+        """
+        tokens = b['entity_tokens']
+        B, T, N = tokens.shape
+        valid = b['entity_mask'] & tokens.ne(0)
+        # Replace masked indices before lookup/scatter: padding may use sentinels.
+        tokens = tokens.masked_fill(~valid, 0)
+        cells = b['entity_positions'].masked_fill(~valid, 0)
+        sides = b['entity_relations'].masked_fill(~valid, 0)
+        values = self.spatial_types(tokens) * valid.unsqueeze(-1) / 16.0
+        indices = (sides*576 + cells).reshape(B*T, 1, N)
+        values = values.reshape(B*T, N, self.spatial_type_dim).transpose(1, 2)
+        result = values.new_zeros(B*T, self.spatial_type_dim, 2*576)
+        result = result.scatter_add(2, indices.expand(-1, self.spatial_type_dim, -1), values)
+        return result.reshape(B*T, self.spatial_type_dim, 2, 32, 18).permute(
+            0, 2, 1, 3, 4).reshape(B, T, 2*self.spatial_type_dim, 32, 18)
+
+    def encode_grid(self, b):
+        grid = b['grid']
+        B, T = grid.shape[:2]
+        if self.spatial_type_dim:
+            grid = torch.cat((grid, self.spatial_type_grid(b).to(grid.dtype)), dim=2)
+        return self.grid(grid.reshape(B*T, -1, 32, 18)).reshape(B, T, -1)
+
     def encode(self, b):
         B,T,N = b['entity_tokens'].shape
         units = self.entity(torch.cat((self.cards(b['entity_tokens']), self.positions(b['entity_positions']),
@@ -75,7 +106,7 @@ class Policy(nn.Module):
             pools.append(torch.cat((masked, units.new_zeros(B,T,1,self.config.width)), -2).max(-2).values)
         return self.scene(torch.cat((*pools, self.cards(b['hand_tokens']).flatten(-2),
             self.mean_cards(b['own_deck_tokens']), self.mean_cards(b['revealed_enemy_tokens']),
-            self.cards(b['next_card_token']), self.grid(b['grid'].reshape(B*T,self.config.grid_channels,32,18)).reshape(B,T,-1),
+            self.cards(b['next_card_token']), self.encode_grid(b),
             b['public_scalars']), -1))
 
     def recurrent(self, x, lengths, state=None):

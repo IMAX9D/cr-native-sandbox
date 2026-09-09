@@ -253,7 +253,12 @@ def run(
     pending_rng = None
     if args.resume:
         saved = load_checkpoint(args.resume)
-        if saved["config"] != asdict(config) or saved["contract"] != contract:
+        saved_config = dict(saved["config"])
+        # Old fixed-policy checkpoints predate the optional spatial branch.
+        if (saved_config.get("architecture", "").startswith("hokoff_cr_lstm_fixed")
+                and getattr(config, "spatial_type_dim", None) == 0):
+            saved_config.setdefault("spatial_type_dim", 0)
+        if saved_config != asdict(config) or saved["contract"] != contract:
             raise ValueError(
                 "checkpoint model/data/training contract differs; use the original arguments"
             )

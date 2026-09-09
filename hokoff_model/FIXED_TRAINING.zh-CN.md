@@ -45,3 +45,9 @@ python -m hokoff_model.evaluate_fixed \
 ## PPO 与 IL 保持
 
 `python train_hokoff_ppo.py` 启动保守的 fixed4 PPO 短训，冻结 IL 参考与编码器/LSTM，并对 KL 超限更新回滚。默认1轮2局，详见 [PPO 训练说明](PPO_TRAINING.zh-CN.md)。
+
+## 空间类别输入对照
+
+`--spatial-type-dim 8` 在原网格上添加敌我各 8 个单位类别通道，复用原数据和缓存。
+默认 0 保持旧模型；请使用新运行目录从零训练。命令、计算方式和对照建议见
+[空间类别说明](SPATIAL_TYPES.zh-CN.md)。

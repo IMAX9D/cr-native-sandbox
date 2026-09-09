@@ -46,6 +46,7 @@ def initialize_from_source(config,*,checkpoint):
     if saved['config'].get('architecture')!=FixedConfig.architecture:
         raise ValueError('capacity comparison starts from the original fixed-policy architecture')
     before=dict(saved['config']);after=asdict(config)
+    before.setdefault('spatial_type_dim', 0)
     for key in ('architecture','timing_hidden_size'):
         before.pop(key,None);after.pop(key,None)
     if before!=after:raise ValueError('source and target model dimensions/period differ')

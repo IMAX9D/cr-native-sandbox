@@ -20,9 +20,12 @@ from .console_log import format_console
 class FixedConfig(DecisionConfig):
     architecture: str = 'hokoff_cr_lstm_fixed_period_v1'
     decision_period: int = 4
+    spatial_type_dim: int = 0
 
     def __post_init__(self):
         super().__post_init__()
+        if self.spatial_type_dim < 0:
+            raise ValueError("spatial_type_dim must be nonnegative")
         if not 1 <= self.decision_period <= 32767:
             raise ValueError('invalid fixed decision period')
 
@@ -46,7 +49,7 @@ def config_from_args(args, dims):
     return FixedConfig(**{k: dims[k] for k in ('card_vocab_size', 'ability_vocab_size',
         'public_scalar_size', 'entity_numeric_size', 'grid_channels')}, width=args.width,
         hidden_size=args.hidden_size, frame_window=args.frame_window, max_delay=args.max_delay,
-        decision_period=args.decision_period)
+        decision_period=args.decision_period, spatial_type_dim=args.spatial_type_dim)
 
 
 def initialize_policy(config, *, checkpoint):
@@ -54,6 +57,7 @@ def initialize_policy(config, *, checkpoint):
     old = dict(saved['config']); new = asdict(config)
     if old.get('architecture') not in ('hokoff_cr_lstm_decisions_v1', config.architecture):
         raise ValueError('initial checkpoint must be a decision/fixed model')
+    old.setdefault('spatial_type_dim', 0)
     for key in ('architecture', 'decision_period'):
         old.pop(key, None); new.pop(key, None)
     if old != new:
@@ -71,6 +75,8 @@ def parser():
     p.description = __doc__
     p.set_defaults(frame_window=17, targets=32, train_split='validation', val_split='train')
     p.add_argument('--hours', type=float, default=0.0, help='stop and save after this many training hours; 0 disables the time limit')
+    p.add_argument('--spatial-type-dim', type=int, default=0,
+                   help='public card embedding channels per side in the grid; 0 disables, 8 recommended for comparison')
     p.add_argument('--decision-period', type=int, default=4)
     p.add_argument('--max-delay', type=int, default=8, help='pretrained time-feature normalization only')
     p.add_argument('--timing-positive-weight', type=float, default=32.0)
