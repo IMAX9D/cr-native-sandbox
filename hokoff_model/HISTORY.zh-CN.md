@@ -36,8 +36,11 @@ python diagnose_hokoff_fixed.py \
 ## 数据与因果性
 
 复用已解压 native-bc-v1 和 fixed4 决策缓存；无需原始 tick 文件或重放。
-每个打开的 shard 在内存构建紧凑事件索引，随已有 LRU 一起释放；不存储逐帧稠密历史，
-不修改源文件。随机访问重新打开 shard 时会重新建立小索引，实际加载吞吐仍需测量。
+首次访问 shard 时构建紧凑事件索引，原子写入决策缓存的 `public-history-v1/`。
+缓存键绑定历史语义、源 manifest、shard 路径和 metadata 哈希，后续访问/续训直接读取，
+避免随机取样反复扫描全 shard。支持多个数据 worker 同时构建；不存储逐帧稠密历史，
+不修改源文件。历史查询按帧批量计算，模型、监督、采样顺序和旧 checkpoint 均不改变。
+首次访问尚无缓存的 shard 仍有构建开销；需要重启训练进程使用新代码，可按原命令续训。
 
 从原始逐 tick play_now 及动作前 hand_tokens 提取出牌，使用真实源 tick，绝不从
 fixed4 提前对齐的 label_rows 构造历史。查询严格要求 event_tick < query_tick。

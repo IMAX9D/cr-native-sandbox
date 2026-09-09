@@ -273,10 +273,20 @@ class DecisionWindows(Dataset):
                 indices = {k: z[k].copy() for k in z.files}
             source = self._open_source(i)
             if self.history_length:
-                from .history import HistoryIndex
+                from .history import HistoryIndex, CONTRACT as HISTORY_CONTRACT
+                # Content-keyed sidecar survives the tiny source-shard LRU. Random
+                # sampling otherwise rebuilds a whole shard for almost every window.
+                identity = json.dumps([HISTORY_CONTRACT, self.index['manifest_sha256'],
+                                       record['path'], record['metadata_sha256']])
+                key = hashlib.sha256(identity.encode()).hexdigest()
+                path = self.cache/'public-history-v1'/(key+'.npz')
                 try:
-                    offsets = np.load(self.shard_paths[i]/'sequence_offsets.npy', allow_pickle=False)
-                    source['_history'] = HistoryIndex(source, offsets)
+                    if path.is_file():
+                        source['_history'] = HistoryIndex.load(path)
+                    else:
+                        offsets = np.load(self.shard_paths[i]/'sequence_offsets.npy', allow_pickle=False)
+                        source['_history'] = HistoryIndex(source, offsets)
+                        source['_history'].save(path)
                 except Exception:
                     close_arrays(source)
                     raise

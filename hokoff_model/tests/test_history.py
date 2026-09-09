@@ -103,5 +103,56 @@ class HistoryTests(unittest.TestCase):
                 '--device','cpu','--workers','0','--batches','1','--batch-size','2'])
         self.assertIn('timing_ranking',result)
 
+    def test_vector_queries_match_simple_reference(self):
+        h = HistoryIndex(self.a, self.a['sequence_offsets'])
+        # Deliberately include an unknown event and multiple plays at one tick.
+        h.events[0] = np.array([[102,1,200,1],[106,0,0,0],[106,2,300,1],[150,3,400,1]])
+        h.events[1] = np.array([[103,2,100,1],[140,4,500,1]])
+        for owner in (0,1):
+            rows = owner*81 + np.arange(81)
+            ticks = 100 + np.arange(81)
+            for length in (1,4,16):
+                actual = h.query(rows,ticks,length)
+                expected = {k:torch.zeros_like(v) for k,v in actual.items()}
+                for relation,seq in enumerate((owner,owner^1)):
+                    for t,tick in enumerate(ticks):
+                        events = h.events[seq]
+                        past = events[events[:,0]<tick][-length:][::-1]
+                        for j,(at,card,pos,known) in enumerate(past):
+                            expected['history_card'][t,relation,j] = int(card)
+                            expected['history_position'][t,relation,j] = int(575-pos if relation and known else pos)
+                            expected['history_age'][t,relation,j] = float((tick-at)/20)
+                            expected['history_mask'][t,relation,j] = True
+                            expected['history_known'][t,relation,j] = bool(known)
+                for key in HISTORY_FIELDS:torch.testing.assert_close(actual[key],expected[key],rtol=0,atol=0)
+
+    def test_cache_reuses_index_after_source_eviction(self):
+        from unittest.mock import patch
+        ds = self.prepare()
+        first = ds[0]
+        files = list((self.root/'cache/public-history-v1').glob('*.npz'))
+        self.assertEqual(len(files),1)
+        ds.close()
+        with patch.object(HistoryIndex,'__init__',side_effect=AssertionError('unexpected source rescan')):
+            second = ds[0]
+        for key in first:torch.testing.assert_close(first[key],second[key],rtol=0,atol=0)
+        ds.close()
+        # Metadata identity changes select a new sidecar, never a stale index.
+        ds.records[0]['metadata_sha256'] = 'different-content-key'
+        ds[0]
+        self.assertEqual(len(list((self.root/'cache/public-history-v1').glob('*.npz'))),2)
+        ds.close()
+
+    def test_cache_atomic_concurrent_publish(self):
+        from concurrent.futures import ThreadPoolExecutor
+        h = HistoryIndex(self.a,self.a['sequence_offsets'])
+        path = self.root/'history/index.npz'
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _:h.save(path),range(8)))
+        loaded = HistoryIndex.load(path)
+        np.testing.assert_array_equal(h.offsets,loaded.offsets)
+        for a,b in zip(h.events,loaded.events):np.testing.assert_array_equal(a,b)
+        self.assertFalse(list(path.parent.glob('*.partial')))
+
 
 if __name__ == '__main__': unittest.main()
