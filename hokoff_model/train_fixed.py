@@ -37,6 +37,10 @@ class FixedPolicy(DecisionPolicy):
     def heads(self, recurrent, b):
         return Policy.heads(self, recurrent, b)
 
+    def forward_stream(self, b, state=None, reset=None):
+        # Same encoder/time features and heads as BC; independent state per actor.
+        return Policy.forward_stream(self, b, state=state, reset=reset)
+
 
 def config_from_args(args, dims):
     return FixedConfig(**{k: dims[k] for k in ('card_vocab_size', 'ability_vocab_size',

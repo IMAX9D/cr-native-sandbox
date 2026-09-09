@@ -35,3 +35,13 @@ python -m hokoff_model.evaluate_fixed \
 ```
 
 会输出 timing AP、阈值曲线、联合动作准确率、标签排除统计和可复查预测。输出目录须不存在。无需 UI；这是专家轨迹上的离线模仿评估，尚未验证模型实际出牌后的对局行为或胜率。
+
+训练后的 AP 与共享梯度诊断可一起运行：`python diagnose_hokoff_fixed.py`。默认自动保存 checkpoint 快照并依次执行两项只读诊断，详见 [诊断说明](FIXED_DIAGNOSTICS.zh-CN.md)。
+
+## 在线 BC 对战
+
+已接通 fixed4 正式模型与 Linux Bionic Worker。仓库根目录运行 `python run_hokoff_fixed.py`。启动参数、验证结果及与 PPO 的边界见 [在线推理说明](LIVE_INFERENCE.zh-CN.md)。
+
+## PPO 与 IL 保持
+
+`python train_hokoff_ppo.py` 启动保守的 fixed4 PPO 短训，冻结 IL 参考与编码器/LSTM，并对 KL 超限更新回滚。默认1轮2局，详见 [PPO 训练说明](PPO_TRAINING.zh-CN.md)。
