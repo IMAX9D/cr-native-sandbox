@@ -24,9 +24,12 @@ class FixedConfig(DecisionConfig):
     decision_period: int = 4
     spatial_type_dim: int = 0
     history_length: int = 0
+    spatial_skip_channels: int = 0
 
     def __post_init__(self):
         super().__post_init__()
+        if not 0 <= self.spatial_skip_channels <= 64:
+            raise ValueError("spatial_skip_channels must be between 0 and 64")
         if not 0 <= self.history_length <= 16:
             raise ValueError("history_length must be between 0 and 16")
         if self.spatial_type_dim < 0:
@@ -47,6 +50,11 @@ class FixedPolicy(DecisionPolicy):
                 nn.Linear(2*config.history_length*21, 64), nn.ReLU(),
                 nn.Linear(64, config.hidden_size))
 
+        if config.spatial_skip_channels:
+            from .spatial_position import SpatialPositionHead
+            self.position_skip = SpatialPositionHead(config.grid_channels+2*config.spatial_type_dim,
+                                                     config.width, config.spatial_skip_channels)
+
     def encode(self, b):
         x = super().encode(b)
         if self.config.history_length:
@@ -63,7 +71,26 @@ class FixedPolicy(DecisionPolicy):
         return x
 
     def heads(self, recurrent, b):
-        return Policy.heads(self, recurrent, b)
+        out = Policy.heads(self, recurrent, b)
+        if self.config.spatial_skip_channels:
+            B, T = b['frame_mask'].shape
+            valid = b['frame_mask']
+            # BC burn-in and padding do not need position logits or spatial graphs.
+            if 'loss_mask' in b: valid = valid & b['loss_mask']
+            flat = valid.reshape(-1)
+            if flat.any():
+                grid = b['grid'].reshape(B*T, self.config.grid_channels, 32, 18)[flat]
+                if self.config.spatial_type_dim:
+                    selected = {k: b[k].reshape(B*T, *b[k].shape[2:])[flat].unsqueeze(1)
+                                for k in ('entity_tokens', 'entity_positions', 'entity_relations', 'entity_mask')}
+                    grid = torch.cat((grid, self.spatial_type_grid(selected)[:, 0].to(grid)), 1)
+                context = out['context'].reshape(B*T, -1)[flat]
+                hand = self.cards(b['hand_tokens'].reshape(B*T, 4)[flat])
+                correction = self.position_skip(grid, context, hand)
+                baseline = out['position'].reshape(B*T, 4, 576)
+                out['position'] = baseline.index_add(0, flat.nonzero().flatten(),
+                                                     correction.to(baseline.dtype)).reshape(B, T, 4, 576)
+        return out
 
     def forward_stream(self, b, state=None, reset=None):
         if self.config.history_length:
@@ -76,7 +103,7 @@ def config_from_args(args, dims):
     return FixedConfig(**{k: dims[k] for k in ('card_vocab_size', 'ability_vocab_size',
         'public_scalar_size', 'entity_numeric_size', 'grid_channels')}, width=args.width,
         hidden_size=args.hidden_size, frame_window=args.frame_window, max_delay=args.max_delay,
-        decision_period=args.decision_period, spatial_type_dim=args.spatial_type_dim, history_length=args.history_length)
+        decision_period=args.decision_period, spatial_type_dim=args.spatial_type_dim, history_length=args.history_length, spatial_skip_channels=args.spatial_skip_channels)
 
 
 def initialize_policy(config, *, checkpoint):
@@ -86,6 +113,7 @@ def initialize_policy(config, *, checkpoint):
         raise ValueError('initial checkpoint must be a decision/fixed model')
     old.setdefault('spatial_type_dim', 0)
     old.setdefault('history_length', 0)
+    old.setdefault('spatial_skip_channels', 0)
     for key in ('architecture', 'decision_period'):
         old.pop(key, None); new.pop(key, None)
     if old != new:
@@ -103,6 +131,7 @@ def parser():
     p.description = __doc__
     p.set_defaults(frame_window=17, targets=32, train_split='validation', val_split='train')
     p.add_argument('--hours', type=float, default=0.0, help='stop and save after this many training hours; 0 disables the time limit')
+    p.add_argument('--spatial-skip-channels', type=int, default=0, help='full-resolution position skip channels; 0 disables, 16 recommended')
     p.add_argument('--history-length', type=int, default=0, help='BC-only recent plays per side; 0 disables, 4 recommended')
     p.add_argument('--spatial-type-dim', type=int, default=0,
                    help='public card embedding channels per side in the grid; 0 disables, 8 recommended for comparison')

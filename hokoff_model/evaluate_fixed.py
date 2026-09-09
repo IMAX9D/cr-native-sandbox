@@ -59,6 +59,7 @@ def main(argv=None):
     loader = DataLoader(ds,batch_size=args.batch_size,sampler=ids,num_workers=args.workers,
                        collate_fn=collate_decisions,pin_memory=device.type=='cuda')
     stats=defaultdict(float); probability=[]; actual=[]; joint=Counter(); started=time.monotonic()
+    position_by_card = defaultdict(Counter)
     try:
         for bi,b in enumerate(loader):
             b=move(b,device)
@@ -78,6 +79,19 @@ def main(argv=None):
                 slot=b['card_slot'].clamp_min(0)
                 pos=out['position'].gather(2,slot[...,None,None].expand(*slot.shape,1,576)).squeeze(2)
                 position=pos.float().masked_fill(~b['position_mask'],-1e9).argmax(-1)
+                # Conditional location quality: independent of predicted timing/card.
+                legal_logits = pos.float().masked_fill(~b['position_mask'], -torch.inf)
+                top5 = legal_logits.topk(5, dim=-1).indices
+                exact = position == b['position']
+                hit5 = (top5 == b['position'][..., None]).any(-1)
+                distance = ((position % 18 - b['position'] % 18).float().square()
+                            + (position // 18 - b['position'] // 18).float().square()).sqrt()
+                token = b['hand_tokens'].gather(-1, slot[..., None]).squeeze(-1)
+                rows = torch.stack((token[deploy].float(), exact[deploy].float(),
+                                    hit5[deploy].float(), distance[deploy]), -1).cpu().tolist()
+                for card_token, hit, hit_top5, dist in rows:
+                    counts = position_by_card[str(int(card_token))]
+                    counts.update(count=1, exact=hit, top5=hit_top5, distance_sum=dist)
                 correct=(kind==0) & (card==b['card_slot']) & (position==b['position'])
                 joint['deploy_count']+=int(deploy.sum())
                 joint['deploy_joint_correct']+=int((deploy & correct).sum())
@@ -88,10 +102,19 @@ def main(argv=None):
         audit=Counter()
         for record in ds.records: audit.update(record['label_audit'])
         ranking, curve = timing_diagnostics(prob, truth)
+        position_total = Counter()
+        for counts in position_by_card.values(): position_total.update(counts)
+        def location_metrics(counts):
+            n = counts['count']
+            return dict(count=n, accuracy=counts['exact']/max(n,1),
+                        top5_accuracy=counts['top5']/max(n,1),
+                        mean_grid_distance=counts['distance_sum']/max(n,1))
         result=dict(checkpoint=str(args.checkpoint),checkpoint_sha256=checkpoint_sha,
             checkpoint_step=saved['step'],cache_sha256=digest(args.cache/'index.json'),
             sampling='fixed_shuffled_windows_seed_123',windows=len(ids),period_ticks=config.decision_period,
             observations_per_6000_ticks=(6000+config.decision_period-1)//config.decision_period,
+            conditional_position=location_metrics(position_total),
+            conditional_position_by_card_token={k:location_metrics(v) for k,v in position_by_card.items()},
             metrics=summarize(stats),metrics_timing_positive_weight=1.0,timing_ranking=ranking,
             deploy_joint_accuracy=joint['deploy_joint_correct']/max(joint['deploy_count'],1),
             deploy_with_timing_accuracy=joint['deploy_with_timing_correct']/max(joint['deploy_count'],1),

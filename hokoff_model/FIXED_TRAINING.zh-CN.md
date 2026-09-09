@@ -56,3 +56,8 @@ python -m hokoff_model.evaluate_fixed \
 
 `--history-length 4` 为双方各增加最近 4 次出牌摘要，默认 0。复用原数据和缓存，
 仅接入 BC 训练及离线评估，尚不支持在线推理。见[历史训练说明](HISTORY.zh-CN.md)。
+
+## 空间直连落点头
+
+`--spatial-skip-channels 16` 添加全分辨率空间路径，只修正普通出牌位置 logits。
+默认 0，历史开关保持独立。训练命令与按卡牌落点评估见[落点头说明](POSITION_SKIP.zh-CN.md)。
