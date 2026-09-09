@@ -18,7 +18,8 @@ from .console_log import format_console
 
 TASK_MASKS = dict(timing='timing_label_mask', kind='kind_label_mask', card='card_label_mask',
     position='position_label_mask', ability='ability_label_mask', ability_position='ability_position_label_mask')
-ENCODER_MODULES = ('cards', 'positions', 'sides', 'entity', 'grid', 'scene', 'time_projection')
+ENCODER_MODULES = ('cards', 'positions', 'sides', 'entity', 'grid', 'scene', 'time_projection',
+                   'spatial_types', 'history_cards', 'history_summary')
 
 
 def shared_parameters(model):
@@ -111,7 +112,7 @@ def main(argv=None):
     # batch-normalization, so this preserves its evaluation-time computation.
     model.train()
     split=contract['train_split' if args.split=='training' else 'val_split']
-    ds=DecisionWindows(args.data,args.cache,split,targets=contract['targets'],frame_window=config.frame_window,
+    ds=DecisionWindows(args.data,args.cache,split,history_length=config.history_length,targets=contract['targets'],frame_window=config.frame_window,
                        max_delay=config.max_delay,sampling='fixed',decision_period=config.decision_period)
     ids=torch.randperm(len(ds),generator=torch.Generator().manual_seed(args.seed))[:args.batches*batch_size].tolist()
     if not ids: ds.close(); raise ValueError('empty diagnostic dataset')

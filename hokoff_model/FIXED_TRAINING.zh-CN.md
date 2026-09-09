@@ -51,3 +51,8 @@ python -m hokoff_model.evaluate_fixed \
 `--spatial-type-dim 8` 在原网格上添加敌我各 8 个单位类别通道，复用原数据和缓存。
 默认 0 保持旧模型；请使用新运行目录从零训练。命令、计算方式和对照建议见
 [空间类别说明](SPATIAL_TYPES.zh-CN.md)。
+
+## BC 双方出牌历史
+
+`--history-length 4` 为双方各增加最近 4 次出牌摘要，默认 0。复用原数据和缓存，
+仅接入 BC 训练及离线评估，尚不支持在线推理。见[历史训练说明](HISTORY.zh-CN.md)。

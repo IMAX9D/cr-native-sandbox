@@ -52,6 +52,9 @@ class DecisionPolicy(Policy):
         fields = ('entity_tokens', 'entity_positions', 'entity_relations', 'entity_numeric',
                   'entity_mask', 'hand_tokens', 'own_deck_tokens', 'revealed_enemy_tokens',
                   'next_card_token', 'grid', 'public_scalars', 'frame_ticks', 'prev_elapsed_ticks')
+        if getattr(self.config, 'history_length', 0):
+            from .history import HISTORY_FIELDS
+            fields += HISTORY_FIELDS
         # Encode only selected, non-padding observations. Burn-in encoding has no autograd graph.
         def encode_rows(mask):
             selected = {k: b[k].reshape(B*T, *b[k].shape[2:])[mask.reshape(-1)].unsqueeze(1)

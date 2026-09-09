@@ -258,6 +258,9 @@ def run(
         if (saved_config.get("architecture", "").startswith("hokoff_cr_lstm_fixed")
                 and getattr(config, "spatial_type_dim", None) == 0):
             saved_config.setdefault("spatial_type_dim", 0)
+        if (saved_config.get("architecture", "").startswith("hokoff_cr_lstm_fixed")
+                and getattr(config, "history_length", None) == 0):
+            saved_config.setdefault("history_length", 0)
         if saved_config != asdict(config) or saved["contract"] != contract:
             raise ValueError(
                 "checkpoint model/data/training contract differs; use the original arguments"

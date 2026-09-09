@@ -220,7 +220,9 @@ def collate_decisions(items):
 
 class DecisionWindows(Dataset):
     def __init__(self, root, cache, split, *, targets=32, frame_window=17,
-                 event_window=1, max_open=2, max_delay=8, sampling=None, decision_period=None):
+                 event_window=1, max_open=2, max_delay=8, sampling=None, decision_period=None, history_length=0):
+        self.history_length = history_length
+        if history_length < 0: raise ValueError("negative history length")
         self.root, self.cache = Path(root).resolve(), Path(cache).resolve()
         self.index = json.loads((self.cache/'index.json').read_text())
         if (self.index.get('version') != 1 or self.index.get('decision_contract') not in CONTRACTS.values()
@@ -269,7 +271,16 @@ class DecisionWindows(Dataset):
             record = self.records[i]
             with np.load(self.index_paths[i], allow_pickle=False) as z:
                 indices = {k: z[k].copy() for k in z.files}
-            self.opened[i] = (self._open_source(i), indices)
+            source = self._open_source(i)
+            if self.history_length:
+                from .history import HistoryIndex
+                try:
+                    offsets = np.load(self.shard_paths[i]/'sequence_offsets.npy', allow_pickle=False)
+                    source['_history'] = HistoryIndex(source, offsets)
+                except Exception:
+                    close_arrays(source)
+                    raise
+            self.opened[i] = (source, indices)
             while len(self.opened) > self.max_open:
                 _, (old, _) = self.opened.popitem(last=False)
                 close_arrays(old)
@@ -365,6 +376,8 @@ class DecisionWindows(Dataset):
         entity_mask = np.zeros((T, N), dtype=bool)
         entity_mask[entity_rows, columns] = True
         b['entity_mask'] = torch.from_numpy(entity_mask)
+        if self.history_length:
+            b.update(a['_history'].query(rows, b['frame_ticks'].numpy(), self.history_length))
         # Shared collate expects event fields. HoKoff never consumes event history.
         for k in EVENT_FIELDS:
             b[k] = torch.empty(0, dtype=torch.bool if k == 'event_mask' else torch.long)

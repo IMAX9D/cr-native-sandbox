@@ -50,7 +50,7 @@ def main(argv=None):
     device = torch.device(args.device)
     model = model.to(device); model.load_state_dict(saved['model']); model.eval()
     ds = DecisionWindows(args.data,args.cache,evaluation_contract['val_split'],
-        targets=evaluation_contract['targets'],frame_window=config.frame_window,
+        history_length=config.history_length,targets=evaluation_contract['targets'],frame_window=config.frame_window,
         max_delay=config.max_delay,sampling='fixed',decision_period=config.decision_period)
     if any(any(r.get('segment_roles',[])) for r in ds.records):
         raise ValueError('evaluation requires primary-only held-out sequences')
