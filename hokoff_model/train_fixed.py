@@ -25,9 +25,16 @@ class FixedConfig(DecisionConfig):
     spatial_type_dim: int = 0
     history_length: int = 0
     spatial_skip_channels: int = 0
+    combat_features: list | None = None
 
     def __post_init__(self):
         super().__post_init__()
+        if self.combat_features is not None:
+            if (len(self.combat_features) != self.card_vocab_size
+                    or any(len(row) != 20 for row in self.combat_features)
+                    or any(not math.isfinite(v) for row in self.combat_features for v in row)
+                    or any(self.combat_features[0])):
+                raise ValueError('invalid static combat feature table')
         if not 0 <= self.spatial_skip_channels <= 64:
             raise ValueError("spatial_skip_channels must be between 0 and 64")
         if not 0 <= self.history_length <= 16:
@@ -100,10 +107,20 @@ class FixedPolicy(DecisionPolicy):
 
 
 def config_from_args(args, dims):
+    combat = None
+    if args.combat_features_file is not None:
+        import json
+        table = json.loads(args.combat_features_file.read_text())
+        manifest = json.loads((args.data/'manifest.json').read_text())
+        if (table.get('schema') != 'cr_nominal_static_combat_v1'
+                or table.get('game_version') != '15.535.29'
+                or table['card_vocabulary'] != manifest['card_vocabulary']):
+            raise ValueError('static combat table schema/version/vocabulary mismatch')
+        combat = table['features']
     return FixedConfig(**{k: dims[k] for k in ('card_vocab_size', 'ability_vocab_size',
         'public_scalar_size', 'entity_numeric_size', 'grid_channels')}, width=args.width,
         hidden_size=args.hidden_size, frame_window=args.frame_window, max_delay=args.max_delay,
-        decision_period=args.decision_period, spatial_type_dim=args.spatial_type_dim, history_length=args.history_length, spatial_skip_channels=args.spatial_skip_channels)
+        decision_period=args.decision_period, spatial_type_dim=args.spatial_type_dim, history_length=args.history_length, spatial_skip_channels=args.spatial_skip_channels, combat_features=combat)
 
 
 def initialize_policy(config, *, checkpoint):
@@ -114,6 +131,7 @@ def initialize_policy(config, *, checkpoint):
     old.setdefault('spatial_type_dim', 0)
     old.setdefault('history_length', 0)
     old.setdefault('spatial_skip_channels', 0)
+    old.setdefault('combat_features', None)
     for key in ('architecture', 'decision_period'):
         old.pop(key, None); new.pop(key, None)
     if old != new:
@@ -131,6 +149,7 @@ def parser():
     p.description = __doc__
     p.set_defaults(frame_window=17, targets=32, train_split='validation', val_split='train')
     p.add_argument('--hours', type=float, default=0.0, help='stop and save after this many training hours; 0 disables the time limit')
+    p.add_argument('--combat-features-file', type=Path, help='versioned static combat table; use dedicated migration launcher for old weights')
     p.add_argument('--spatial-skip-channels', type=int, default=0, help='full-resolution position skip channels; 0 disables, 16 recommended')
     p.add_argument('--history-length', type=int, default=0, help='BC-only recent plays per side; 0 disables, 4 recommended')
     p.add_argument('--spatial-type-dim', type=int, default=0,

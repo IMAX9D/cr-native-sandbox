@@ -264,6 +264,9 @@ def run(
         if (saved_config.get("architecture", "").startswith("hokoff_cr_lstm_fixed")
                 and getattr(config, "spatial_skip_channels", None) == 0):
             saved_config.setdefault("spatial_skip_channels", 0)
+        if (saved_config.get("architecture", "").startswith("hokoff_cr_lstm_fixed")
+                and getattr(config, "combat_features", None) is None):
+            saved_config.setdefault("combat_features", None)
         if saved_config != asdict(config) or saved["contract"] != contract:
             raise ValueError(
                 "checkpoint model/data/training contract differs; use the original arguments"

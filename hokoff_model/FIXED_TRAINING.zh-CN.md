@@ -61,3 +61,8 @@ python -m hokoff_model.evaluate_fixed \
 
 `--spatial-skip-channels 16` 添加全分辨率空间路径，只修正普通出牌位置 logits。
 默认 0，历史开关保持独立。训练命令与按卡牌落点评估见[落点头说明](POSITION_SKIP.zh-CN.md)。
+
+## 显式静态战斗属性
+
+`python train_hokoff_combat.py --hours 15` 将当前空间直连历史模型迁移到独立目录，
+保留优化器和进度，新增属性权重零初始化。见[15 小时训练说明](COMBAT.zh-CN.md)。

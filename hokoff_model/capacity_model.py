@@ -49,6 +49,7 @@ def initialize_from_source(config,*,checkpoint):
     before.setdefault('spatial_type_dim', 0)
     before.setdefault('history_length', 0)
     before.setdefault('spatial_skip_channels', 0)
+    before.setdefault('combat_features', None)
     for key in ('architecture','timing_hidden_size'):
         before.pop(key,None);after.pop(key,None)
     if before!=after:raise ValueError('source and target model dimensions/period differ')

@@ -44,7 +44,11 @@ class Policy(nn.Module):
         self.abilities = nn.Embedding(c.ability_vocab_size, d, padding_idx=0)
         self.positions = nn.Embedding(577, d, padding_idx=576)
         self.sides = nn.Embedding(2, d)
-        self.entity = nn.Sequential(nn.Linear(3*d+c.entity_numeric_size, d), nn.ReLU(), nn.Linear(d, d), nn.ReLU())
+        combat = getattr(c, 'combat_features', None)
+        combat_dim = len(combat[0]) if combat is not None else 0
+        if combat is not None:
+            self.register_buffer('combat_features', torch.tensor(combat, dtype=torch.float32))
+        self.entity = nn.Sequential(nn.Linear(3*d+c.entity_numeric_size+combat_dim, d), nn.ReLU(), nn.Linear(d, d), nn.ReLU())
         self.spatial_type_dim = getattr(c, 'spatial_type_dim', 0)
         if self.spatial_type_dim:
             self.spatial_types = nn.Embedding(c.card_vocab_size, self.spatial_type_dim, padding_idx=0)
@@ -96,8 +100,11 @@ class Policy(nn.Module):
 
     def encode(self, b):
         B,T,N = b['entity_tokens'].shape
-        units = self.entity(torch.cat((self.cards(b['entity_tokens']), self.positions(b['entity_positions']),
-                                      self.sides(b['entity_relations']), b['entity_numeric']), -1))
+        features = [self.cards(b['entity_tokens']), self.positions(b['entity_positions']),
+                    self.sides(b['entity_relations']), b['entity_numeric']]
+        if hasattr(self, 'combat_features'):
+            features.append(self.combat_features[b['entity_tokens']].to(b['entity_numeric'].dtype))
+        units = self.entity(torch.cat(features, -1))
         pools = []
         for side in (0,1):
             valid = b['entity_mask'] & (b['entity_relations'] == side)
