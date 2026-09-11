@@ -157,6 +157,8 @@ def parser():
     p.add_argument('--decision-period', type=int, default=4)
     p.add_argument('--max-delay', type=int, default=8, help='pretrained time-feature normalization only')
     p.add_argument('--timing-positive-weight', type=float, default=32.0)
+    p.add_argument('--init-weights', type=Path, help='retain all fixed-policy weights; start fresh optimizer and local step counter')
+    p.add_argument('--weights-contract', type=Path, default=Path(__file__).with_name('match_encoder_contract.json'))
     p.add_argument('--init-from', type=Path, help='copy body/action weights; reset timing head and optimizer')
     return p
 
@@ -171,7 +173,19 @@ def run(args):
         raise ValueError('--init-from and --resume are mutually exclusive')
     if args.init_from is not None and args.run.exists() and any(args.run.iterdir()):
         raise FileExistsError('--init-from requires a new/empty run directory')
-    factory = FixedPolicy if args.init_from is None else partial(initialize_policy, checkpoint=args.init_from)
+    from .weights_restart import prepare_restart, initialize_weights
+    provenance = {}
+    if args.init_weights is not None:
+        if args.init_from is not None or args.resume is not None:
+            raise ValueError('--init-weights, --init-from and --resume are mutually exclusive')
+        if args.run.exists() and any(args.run.iterdir()):
+            raise FileExistsError('--init-weights requires a new/empty run directory')
+        saved, provenance = prepare_restart(args.init_weights, args.weights_contract, args.data)
+        factory = partial(initialize_weights, saved=saved)
+    else:
+        factory = FixedPolicy if args.init_from is None else partial(initialize_policy, checkpoint=args.init_from)
+        if args.resume is not None:
+            provenance = load_checkpoint(args.resume)['contract'].get('weights_restart', {})
     return base_run(args, model_factory=factory, config_factory=config_from_args,
         dataset_factory=partial(DecisionWindows, sampling='fixed', max_delay=args.max_delay,
                                 decision_period=args.decision_period, history_length=args.history_length), collate_fn=collate_decisions,
@@ -179,6 +193,7 @@ def run(args):
         console_formatter=format_console, contract_extra=dict(decision_contract=CONTRACT,
             decision_period=args.decision_period, decision_cache_sha256=digest(args.cache/'index.json'),
             timing_positive_weight=args.timing_positive_weight, training_only=True, delay_enabled=False,
+            **(dict(weights_restart=provenance) if provenance else {}),
             **(dict(history_contract=HISTORY_CONTRACT) if args.history_length else {})))
 
 

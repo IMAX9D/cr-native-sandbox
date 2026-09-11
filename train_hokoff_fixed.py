@@ -39,6 +39,15 @@ def main(argv=None):
     del args.dry_run, args.steps
     if steps < 1:
         p.error('--steps must be positive')
+    if args.init_weights is not None:
+        from hokoff_model.weights_restart import prepare_restart
+        saved, _ = prepare_restart(args.init_weights, args.weights_contract, args.data)
+        config = saved['config']
+        for key in ('width', 'hidden_size', 'frame_window', 'max_delay', 'decision_period',
+                    'spatial_type_dim', 'history_length', 'spatial_skip_channels'):
+            setattr(args, key, config[key])
+        if config.get('combat_features') is not None:
+            args.combat_features_file = Path(__file__).resolve().parent/'hokoff_model/combat_features.json'
     if args.cache is None:
         args.cache = BASE/('hokoff-fixed-cache-p%d' % args.decision_period)
     if args.run is None:
@@ -51,11 +60,15 @@ def main(argv=None):
         args.batch_size = 32 if args.device == 'cuda' else 8
     if args.workers is None:
         args.workers = 4 if args.device == 'cuda' else 0
+    if sum(x is not None for x in (args.init_from, args.init_weights, args.resume)) > 1:
+        p.error('--init-weights, --init-from and --resume are mutually exclusive')
+    if args.init_weights is not None and args.run.exists() and any(args.run.iterdir()):
+        p.error('--init-weights requires an empty/new --run directory')
     if args.init_from is not None and args.resume is not None:
         p.error('--init-from and --resume are mutually exclusive')
     if args.init_from is not None and args.run.exists() and any(args.run.iterdir()):
         p.error('--init-from requires an empty/new --run directory')
-    if args.init_from is None and args.resume is None and (args.run/'last.pt').is_file():
+    if args.init_weights is None and args.init_from is None and args.resume is None and (args.run/'last.pt').is_file():
         args.resume = args.run/'last.pt'
     completed_step = 0
     if args.resume is not None:
