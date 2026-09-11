@@ -1,5 +1,9 @@
 # CR Native Core
 
+## BC Release 人机对局盒子
+
+新增独立入口 `HOKOFF_MATCH_BOX.cmd`：人类蓝方对阵1037042步BC红方，使用真实原生状态与已确认出牌历史。窗口默认暂停，旧专家入口保留。安装、Linux已有worker连接和验证范围见 [使用说明](hokoff_model/MATCH_BOX.zh-CN.md)。
+
 基于原版 Android x86_64 `libg.so` 的无界面《皇室战争》标准 1v1
 运行内核，并包含 Self-Play、专家模仿训练和可选的 MuMu 实时实验工具。
 

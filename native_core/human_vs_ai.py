@@ -97,6 +97,8 @@ def _native_action(action: dict[str, Any]) -> dict[str, Any]:
 
 def _policy_label(model_meta: dict[str, Any]) -> str:
     version = str(model_meta.get("policy_version", "v0.1"))
+    if version == "hokoff-fixed-bc":
+        return f"BC {int(model_meta['training_step']):,}步"
     if version in EXPERT_POLICY_VERSIONS:
         step = int(model_meta.get("training_step", model_meta.get("native_ticks", 0)))
         epoch = int(model_meta.get("iteration", 0))

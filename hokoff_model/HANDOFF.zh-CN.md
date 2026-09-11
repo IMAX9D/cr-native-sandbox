@@ -1,5 +1,9 @@
 # BC 工作交接（2026-09-11）
 
+## 后续补充：独立人机对局盒子
+
+新增 [BC Release对局盒子](MATCH_BOX.zh-CN.md)，在受控原生对局中补齐已确认出牌历史，支持1037042步纯权重。旧`FixedPolicy.forward_stream`保护不变，旧PPO和MuMu入口仍未接在线历史；下文保留原交接时的状态。Windows入口为仓库根目录`HOKOFF_MATCH_BOX.cmd`。
+
 ## 仓库与修改记录
 
 工作仓库为 https://github.com/IMAX9D/cr-native-sandbox ，分支 `feature/policy-v1-offline-bc`。不要把 `cr-native-linux-bionic` 的 main 当作 BC 工作分支。

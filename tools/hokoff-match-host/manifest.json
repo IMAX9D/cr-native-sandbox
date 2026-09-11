@@ -1,0 +1,46 @@
+{
+  "kind": "hokoff_match_host_overlay_v1",
+  "runtime_version": "150535029",
+  "abi": "x86_64",
+  "libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+  "files": [
+    {
+      "source": "lifecycle-probe.jar",
+      "destination": "lifecycle-probe.jar",
+      "sha256": "73759a809158c6a2b8a18a5d67a0f0e7190090d3e75f5d3fa0d4b5d8beed40fb",
+      "size": 30033
+    },
+    {
+      "source": "libnative_host_bridge.so",
+      "destination": "libnative_core_probe.so",
+      "sha256": "33ceda90393c5f4da3c0b0b1bd3634b2f09caf3989984fafeed849d43dc8d527",
+      "size": 222568
+    }
+  ],
+  "source_hashes": {
+    "android_probe/java/com/supercell/titan/NativeHTTPClientManager.java": "af504190465c8a5b888788cbf959bdca74ab59fcd9550f3d890e9324de3238d2",
+    "android_probe/java/com/supercell/titan/zendesk/ZendeskKt.java": "d9bce733ec528dff82fa92bb33a8c82b0ad38421039f6a42a4a148ec87af0fbd",
+    "android_probe/java/com/supercell/titan/usercentrics/UsercentricsSDK.java": "931860b5fea3d0c1b4e7135515e801c6bae8d7502c1c6ac9e325ce586eeca391",
+    "android_probe/java/com/supercell/titan/usercentrics/UsercentricsSDKKt.java": "6f553738cf9f8882159e7d9b69fd744e8f62c4b88d8b00b91fbb0f366b44c844",
+    "android_probe/java/com/supercell/titan/PushMessageService.java": "7ebdf840e3d877bd53c77b264e8c2e86b1be5c0c0bba5253a4a2c3fe0c6cf0b3",
+    "android_probe/java/com/supercell/titan/ThermalMonitor.java": "1db85ec8faaf0a3a39d6fc11a4538dc70cb46c6aa46a180d32d9b1e238f07965",
+    "android_probe/java/com/supercell/titan/zendesk/IMessagingSdkInitCallback.java": "0b0566dc8271dcce828a9753f0a95723def268ecf5348387858b60b9731bd515",
+    "android_probe/java/com/supercell/titan/ApplicationUtilBase.java": "83f1bd3d3ee5ba6d658ad3da1cf3b82463a9653e6a7efd97eadbb37c2670907d",
+    "android_probe/java/royale/nativehost/HeadlessActivity.java": "8d4c49cf124b6ec374ccec98af80e5553c8d9c90a724230b16d3afc9ff321a88",
+    "android_probe/java/com/supercell/titan/BatteryMonitor.java": "08abb72403926ab29caf2a44abe56c2292cf6c3ee14d31030f298383b37a1b07",
+    "android_probe/java/royale/nativehost/HeadlessApplication.java": "64c5835c8d956b8298b92865734693b1392a08bc68dcba473f0350a39afe436a",
+    "android_probe/java/com/supercell/titan/QuagoManager.java": "c9dd31730c09f9601655dbb9970e1e0f0eb83c4d9de9eea121ec798bf7646fd4",
+    "android_probe/java/com/supercell/titan/GameApp.java": "ed236fb1576d2a4170e13e9b45f7b72f67920db86896436fd50e1539a9008d6b",
+    "android_probe/java/com/supercell/titan/RequestPermissionListener.java": "55f51da7bfc9a7cdd722b0b63e4cf3efd8a19193dee8830382870bbfadd6766b",
+    "android_probe/java/royale/nativehost/BinderlessContext.java": "cbd3b8d93ec4157ceea2281b4a2c04e391477ebd9d879762f7b61d0a8314d538",
+    "android_probe/java/royale/nativehost/JniHost.java": "6ef43ef0bec37d1190dfb14481e549789582ea74a458e1c7308b4752efd048ee",
+    "android_probe/java/com/supercell/titan/zendesk/IMessagingSdkLoginCallback.java": "3e93d5e88e74f47f51ec6b9a53087d3a6763bdc93339504e6fa01fb089490eb2",
+    "android_probe/java/royale/nativehost/BinderlessPackageManager.java": "a0ceda129bd6d00351a25693d29b3603f1794c7cfee096eb7c646f4e70be2164",
+    "android_probe/java/com/supercell/titan/TitanApplication.java": "f86f9b2cd9e797e7ee181f31201493c8b723e77782dac8416352aee9d48d14da",
+    "android_probe/java/com/supercell/titan/NativeDialogManager.java": "6795c1d977da9a68684446a0739ef0585938839d137fc6e0e250647f68247f3e",
+    "android_probe/native/jni_bridge.cpp": "5a82dafc2479acada12b4e61e71776c547ba3f9ca4ca1e690d85ed0326a085ff",
+    "android_probe/java/com/supercell/titan/SnowplowTitan.java": "9c40465a62dbc45a74060daf8ec45b6eddab19f687494495b81082e8f3457f5a"
+  },
+  "contains_game_assets": false,
+  "contains_model_weights": false
+}

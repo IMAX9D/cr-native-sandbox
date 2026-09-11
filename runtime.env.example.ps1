@@ -40,3 +40,9 @@ $env:CR_SANDBOX_ASSETS         = "$Root\runtime\extracted-assets"
 
 # --- Writable outputs (kept outside the repository) -----------------------
 $env:CR_SANDBOX_DATA           = "$env:LOCALAPPDATA\cr-native-sandbox\data"
+
+# Optional: BC match-box cold start. Keep this overlay outside Git; it contains
+# legally obtained game resources, not source code. See hokoff_model/MATCH_BOX.zh-CN.md.
+# $env:CR_SANDBOX_BOOT_RESOURCES = "C:\cr-runtime\complete-worker-template"
+# $env:CR_SANDBOX_BINDERLESS_BOOT = "1"
+# $env:CR_MATCH_PYTHON = "C:\cr-env\Scripts\python.exe"

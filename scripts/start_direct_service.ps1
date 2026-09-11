@@ -7,6 +7,7 @@ param(
     [string]$BaseApk = $(if ($env:CR_SANDBOX_BASE_APK) { $env:CR_SANDBOX_BASE_APK } else { throw "Missing CR_SANDBOX_BASE_APK; dot-source runtime.env.ps1 first" }),
     [string]$AssetDirectory = $(if ($env:CR_SANDBOX_ASSETS) { $env:CR_SANDBOX_ASSETS } else { throw "Missing CR_SANDBOX_ASSETS; dot-source runtime.env.ps1 first" }),
     [string]$AssetPackApk = $(if ($env:CR_SANDBOX_ASSET_PACK_APK) { $env:CR_SANDBOX_ASSET_PACK_APK } else { throw "Missing CR_SANDBOX_ASSET_PACK_APK; dot-source runtime.env.ps1 first" }),
+    [string]$BootResourceDirectory = $env:CR_SANDBOX_BOOT_RESOURCES,
     [string]$BootstrapReplayJson = "",
     [string]$DataRoot = $(if ($env:CR_SANDBOX_DATA) { $env:CR_SANDBOX_DATA } else { throw "Missing CR_SANDBOX_DATA; dot-source runtime.env.ps1 first" }),
     [ValidateRange(30, 900)] [int]$ReadyTimeoutSeconds = 300
@@ -119,6 +120,27 @@ Invoke-Adb @(
     "mkdir -p '$RemoteRoot/assets' && tar -xf '$RemoteRoot/runtime-assets.tar' -C '$RemoteRoot/assets'"
 ) | Out-Null
 
+# Optional complete, version-pinned logic-resource overlay. A table-only
+# extracted-assets folder is not sufficient for a clean native cold start.
+if ($BootResourceDirectory) {
+    $BootFiles = @{
+        'asset-pack.apk' = 'aba08a49a079167c1b917be6c138cf399dfa4c2eae06c3ff04deb8fac65e41d1'
+        'assets/assets.scdb' = '4b99bfd5d5fb52fe79bba74cd1990ce08fc4f46064d905c64cb5c281b6474e7b'
+        'data/update/data_manifest.toml' = '7ae620bacd6c31ef139d03fde805284ad31695144c3d489fb157dbd9913820ba'
+    }
+    foreach ($Relative in $BootFiles.Keys) {
+        $LocalFile = Join-Path $BootResourceDirectory $Relative
+        if (-not (Test-Path -LiteralPath $LocalFile -PathType Leaf)) { throw "Missing cold-start resource: $LocalFile" }
+        if ((Get-FileHash -LiteralPath $LocalFile -Algorithm SHA256).Hash.ToLowerInvariant() -ne $BootFiles[$Relative]) {
+            throw "Cold-start resource version/hash mismatch: $Relative"
+        }
+    }
+    Invoke-Adb @("shell", "mkdir -p '$RemoteRoot/assets' '$RemoteRoot/data/update'") | Out-Null
+    foreach ($Relative in $BootFiles.Keys) {
+        Push-Verified (Join-Path $BootResourceDirectory $Relative) "$RemoteRoot/$Relative"
+    }
+}
+
 function Get-ServicePids {
     $ProcessLines = Invoke-Adb -AllowFailure -CommandArguments @(
         "shell", "ps -A -o PID,ARGS"
@@ -142,12 +164,19 @@ Invoke-Adb -AllowFailure @("forward", "--remove", "tcp:$Port") | Out-Null
 Invoke-Adb @("forward", "tcp:$Port", "tcp:$Port") | Out-Null
 
 $ClassPath = "$RemoteRoot/lifecycle-probe.jar`:$RemoteRoot/base.apk"
-$LaunchCommand = "cd '$RemoteRoot' && exec env CLASSPATH='$ClassPath' LD_LIBRARY_PATH='$RemoteRoot' app_process /system/bin royale.nativehost.JniHost '$RemoteRoot' serve-direct '$Port'"
+$HeadlessEnvironment = ""
+if ($env:CR_SANDBOX_BINDERLESS_BOOT -eq "1") {
+    $ClassPath = "/system/framework/android.test.base.jar`:/system/framework/android.test.mock.jar`:$ClassPath"
+    # app_process already registered Android JNI, unlike bare ART on Linux.
+    $HeadlessEnvironment = "CR_BINDERLESS_ANDROID=1 CR_BINDERLESS_SKIP_FRAMEWORK_REGISTRATION=1 CR_BINDERLESS_NATIVE_CONFIG_GETTERS=1 CR_BINDERLESS_NATIVE_CONFIG_POSTPROCESS=1 CR_BINDERLESS_PRELOAD_CORE_DATA=0 CR_BINDERLESS_DEFER_NULL_DEPENDENCIES=0 CR_BINDERLESS_DEFER_OPTIONAL_CLIENT_GLOBALS=0 CR_NATIVE_LOADING_INITIAL_SETTLE_MS=0 CR_NATIVE_LOADING_MAX_FRAMES=10000 CR_NATIVE_LOADING_TIMEOUT_MS=30000 CR_NATIVE_LOADING_SLEEP_MS=5 "
+}
+$LaunchCommand = "cd '$RemoteRoot' && exec env $HeadlessEnvironment CLASSPATH='$ClassPath' LD_LIBRARY_PATH='$RemoteRoot' app_process /system/bin royale.nativehost.JniHost '$RemoteRoot' serve-direct '$Port'"
 $Launch = "nohup sh -c `"$LaunchCommand`" >'$RemoteRoot/service.log' 2>&1 </dev/null &"
 Invoke-Adb @("shell", $Launch) | Out-Null
 
 $Deadline = [DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
 $LastError = ""
+$NextFailureCheck = [DateTime]::UtcNow.AddSeconds(5)
 while ([DateTime]::UtcNow -lt $Deadline) {
     try {
         $Response = Invoke-JsonRequest $Port @{op = "ping"}
@@ -168,6 +197,16 @@ while ([DateTime]::UtcNow -lt $Deadline) {
         }
     } catch {
         $LastError = $_.Exception.Message
+    }
+    if ([DateTime]::UtcNow -ge $NextFailureCheck) {
+        $LastLogLine = (Invoke-Adb -AllowFailure @("shell", "tail -n 20 '$RemoteRoot/service.log'") | Out-String)
+        if ($LastLogLine.Contains('"status":"blocked_data_tables"')) {
+            throw "Native cold start blocked: DataTables not ready. Check complete frozen boot resources and the explicit headless boot profile; see service.log."
+        }
+        if ($LastLogLine.Contains('NATIVE_STAGE_FAILED') -or $LastLogLine.Contains('SYSTEM_LOAD_FAILED')) {
+            throw "Native startup failed; see service.log. $LastLogLine"
+        }
+        $NextFailureCheck = [DateTime]::UtcNow.AddSeconds(5)
     }
     Start-Sleep -Milliseconds 250
 }

@@ -17,11 +17,24 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class JniHost {
     private JniHost() {}
+
+    private static String sha256File(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[65536];
+        try (FileInputStream input = new FileInputStream(file)) {
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte value : digest.digest()) hex.append(String.format("%02x", value & 255));
+        return hex.toString();
+    }
 
     private static final int TRACE_SCHEMA_VERSION = 1;
     private static final int MAX_TRACE_STEPS = 64;
@@ -99,7 +112,7 @@ public final class JniHost {
         // invoking this class.  The cloud-native runner deliberately starts ART
         // without app_process so it does not require /dev/binder; register the
         // same table explicitly only for that opt-in runtime.
-        if (binderlessAndroid) {
+        if (binderlessAndroid && !"1".equals(System.getenv("CR_BINDERLESS_SKIP_FRAMEWORK_REGISTRATION"))) {
             System.out.println(nativeRegisterAndroidRuntime());
             System.out.flush();
         }
@@ -844,7 +857,12 @@ public final class JniHost {
                         response.put("schema_version", 1);
                         response.put("ok", true);
                         response.put("op", op);
-                        if ("status".equals(op)) {
+                        if ("runtime_identity_v1".equals(op)) {
+                            JSONObject identity = new JSONObject();
+                            identity.put("libg_sha256", sha256File(new File(root, "libg.so")));
+                            identity.put("host_sha256", sha256File(new File(root, "lifecycle-probe.jar")));
+                            response.put("identity", identity);
+                        } else if ("status".equals(op)) {
                             response.put(
                                 "state", new JSONObject(nativeProbeRuntime(root + "/libg.so"))
                             );

@@ -36,7 +36,10 @@ include = [
   "selfplay_v2*",
   "expert_v1*",
   "expert_selfplay_v1*",
+  "hokoff_model*",
+  "policy_v1*",
 ]
 
 [tool.setuptools.package-data]
 native_core = ["data/*.json"]
+hokoff_model = ["*.json", "fixtures/*.json"]
