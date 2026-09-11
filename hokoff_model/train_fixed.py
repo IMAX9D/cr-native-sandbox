@@ -1,4 +1,6 @@
 """Fixed-period action baseline. Reuses the recurrent engine without a delay loss."""
+from __future__ import annotations
+
 from dataclasses import dataclass, asdict
 from functools import partial
 import math
