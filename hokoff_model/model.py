@@ -3,12 +3,29 @@
 Independent implementation inspired by HoKoff 1v1 (see README). No HoK runtime
 or upstream Python imports. Recurrent state order follows PyTorch: (hidden, cell).
 """
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+
+@contextmanager
+def no_grad_burn_in():
+    """Do not populate/reuse AMP's weight cache with detached burn-in casts.
+
+    Burn-in and gradient-bearing target frames run in one outer autocast scope.
+    A cast cached under no_grad can otherwise silently detach target encoders.
+    """
+    previous = torch.is_autocast_cache_enabled()
+    try:
+        torch.set_autocast_cache_enabled(False)
+        with torch.no_grad():
+            yield
+    finally:
+        torch.set_autocast_cache_enabled(previous)
 
 
 @dataclass
@@ -145,7 +162,7 @@ class Policy(nn.Module):
         lengths = b['frame_mask'].sum(-1)
         # loss_mask is window metadata, not an expert action label.
         burn = (b['frame_mask'] & ~b['loss_mask']).sum(-1)
-        with torch.no_grad():
+        with no_grad_burn_in():
             _, state = self.recurrent(x.detach(), burn)
         offsets = torch.arange(T,device=x.device)[None,:] + burn[:,None]
         target_x = x.gather(1, offsets.clamp_max(T-1).unsqueeze(-1).expand(-1,-1,H))

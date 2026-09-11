@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from .model import Config, Policy
+from .model import Config, Policy, no_grad_burn_in
 
 
 @dataclass
@@ -62,7 +62,7 @@ class DecisionPolicy(Policy):
             return self.encode(selected).squeeze(1)
         x = self.scene[0].weight.new_zeros(B*T, self.config.hidden_size)
         if burn_mask.any():
-            with torch.no_grad():
+            with no_grad_burn_in():
                 encoded = encode_rows(burn_mask)
             x = x.index_copy(0, burn_mask.reshape(-1).nonzero().flatten(), encoded.to(x.dtype))
         if target_mask.any():
@@ -71,7 +71,7 @@ class DecisionPolicy(Policy):
         x = x.reshape(B, T, -1)
         burn = burn_mask.sum(-1)
         lengths = valid.sum(-1)
-        with torch.no_grad():
+        with no_grad_burn_in():
             _, state = self.recurrent(x.detach(), burn)
         offsets = torch.arange(T, device=x.device)[None, :]+burn[:, None]
         target_x = x.gather(1, offsets.clamp_max(T-1).unsqueeze(-1).expand(-1, -1, x.shape[-1]))
