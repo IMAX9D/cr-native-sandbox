@@ -32,9 +32,11 @@
 
 最新本地 last.pt 为1037042步，best.pt为1026000步。详细指标与判断见 [训练记录](TRAINING_PROGRESS.zh-CN.md)。进步仍在，但最近3小时收益已缩小；暂未实施新的Transformer或关系特征。
 
-已经发布的模型只有 [785157步权重](https://github.com/IMAX9D/cr-native-sandbox/releases/tag/bc-weights-step785157-20260911)，为AMP修复前快照，包含模型和配置，不含优化器。误发的786000步冒烟Release已删除。原合作者的Release和Latest未改动。
+旧版模型为 [785157步权重](https://github.com/IMAX9D/cr-native-sandbox/releases/tag/bc-weights-step785157-20260911)，为AMP修复前快照，包含模型和配置，不含优化器。误发的786000步冒烟Release已删除。原合作者的Release和Latest未改动。
 
-**按用户要求，本次只推送修改记录和代码，不上传训练日志、额外权重或数据。1037042步完整checkpoint、1026000步best、专家数据和缓存仍是本地文件；仅clone仓库不能从最新步数继续训练。**
+已另行发布 [1037042步最新权重](https://github.com/IMAX9D/cr-native-sandbox/releases/tag/bc-weights-step1037042-20260911)，为AMP修复后模型，仅含模型参数、配置及步数，不含优化器。
+
+**修改记录、代码及最新纯权重已上传；训练日志和数据未上传。1037042步完整checkpoint、1026000步best、专家数据和缓存仍是本地文件；仅clone仓库或下载纯权重不能恢复完整优化器状态继续训练。**
 
 旧机本地路径（非远程下载地址）：
 
