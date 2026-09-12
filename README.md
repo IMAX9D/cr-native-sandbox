@@ -15,6 +15,12 @@
 仓库不包含游戏 APK、`libg.so`、付费/私有数据集、模型权重或训练产物。
 这些文件必须由使用者合法取得，并放入 Git 忽略目录。
 
+## 最新 Linux 多局驻留实验
+
+2026-09-12 的[四局驻留实验源码与性能报告](experiments/resident_linux_20260912/README.md)
+已单独归档：包含同并发对照、连续补位、CPU/GPU 分项测量和失败方案。
+这是冻结策略采集压测，不含 PPO 学习更新；暂不替换默认宿主，复现需准备匹配的资源和模型配套工程。
+
 ## 版本兼容性
 
 | 路线 | 已验证版本 | 状态 |
@@ -151,6 +157,13 @@ with NativeRoyaleEnv(port=37031) as env:
 - [Android 生命周期探针](android_probe/README.md)
 
 ## 训练与 Expert Self-Play
+
+下一代链路的最新设计基线见
+[FirstLight方法适配 R0：批判性复审后的架构（2026-09-07）](docs/TRAINING_CHAIN_REDESIGN_20260907.zh-CN.md)。
+完整链路仍在实施中，不代表下列历史训练入口已完成模型、短序列异步和联赛迁移。
+
+首批独立代码现位于 `training_r0/`，已提供CPU合成smoke与分段PPO内核；
+真实原生采集/正式训练尚未接通，见 [R0实现范围](docs/TRAINING_R0_IMPLEMENTATION.zh-CN.md)。
 
 仓库包含三层训练代码：
 

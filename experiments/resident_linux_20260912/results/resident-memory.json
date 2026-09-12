@@ -1,0 +1,131 @@
+{
+  "pid": 4527,
+  "rows": [
+    {
+      "slots": 0,
+      "memory_kib": {
+        "Rss": 336972,
+        "Pss": 336394,
+        "Pss_Anon": 186952,
+        "Pss_File": 147878,
+        "Pss_Shmem": 1564,
+        "Shared_Clean": 640,
+        "Shared_Dirty": 512,
+        "Private_Clean": 147560,
+        "Private_Dirty": 188260,
+        "Referenced": 336972,
+        "Anonymous": 186952,
+        "LazyFree": 0,
+        "AnonHugePages": 0,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 0,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    },
+    {
+      "slots": 1,
+      "memory_kib": {
+        "Rss": 337520,
+        "Pss": 336942,
+        "Pss_Anon": 187500,
+        "Pss_File": 147878,
+        "Pss_Shmem": 1564,
+        "Shared_Clean": 640,
+        "Shared_Dirty": 512,
+        "Private_Clean": 147560,
+        "Private_Dirty": 188808,
+        "Referenced": 337520,
+        "Anonymous": 187500,
+        "LazyFree": 0,
+        "AnonHugePages": 0,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 0,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    },
+    {
+      "slots": 2,
+      "memory_kib": {
+        "Rss": 338140,
+        "Pss": 337562,
+        "Pss_Anon": 188120,
+        "Pss_File": 147878,
+        "Pss_Shmem": 1564,
+        "Shared_Clean": 640,
+        "Shared_Dirty": 512,
+        "Private_Clean": 147560,
+        "Private_Dirty": 189428,
+        "Referenced": 338140,
+        "Anonymous": 188120,
+        "LazyFree": 0,
+        "AnonHugePages": 0,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 0,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    },
+    {
+      "slots": 3,
+      "memory_kib": {
+        "Rss": 338756,
+        "Pss": 338178,
+        "Pss_Anon": 188736,
+        "Pss_File": 147878,
+        "Pss_Shmem": 1564,
+        "Shared_Clean": 640,
+        "Shared_Dirty": 512,
+        "Private_Clean": 147560,
+        "Private_Dirty": 190044,
+        "Referenced": 338756,
+        "Anonymous": 188736,
+        "LazyFree": 0,
+        "AnonHugePages": 0,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 0,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    },
+    {
+      "slots": 4,
+      "memory_kib": {
+        "Rss": 338052,
+        "Pss": 337474,
+        "Pss_Anon": 188032,
+        "Pss_File": 147878,
+        "Pss_Shmem": 1564,
+        "Shared_Clean": 640,
+        "Shared_Dirty": 512,
+        "Private_Clean": 147560,
+        "Private_Dirty": 189340,
+        "Referenced": 338052,
+        "Anonymous": 188032,
+        "LazyFree": 0,
+        "AnonHugePages": 0,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 0,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    }
+  ],
+  "includes_bootstrap_world": true
+}

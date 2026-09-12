@@ -67,6 +67,9 @@ class PolicyRequest:
     masks: ExpertActionMasks
     delta_ticks: int = 1
     reset_hidden: bool = False
+    # Recurrent dynamics always advance. Only transfer/capture of the exact
+    # pre-action state is optional (PPO needs it at sequence anchors only).
+    capture_pre_action_hidden: bool = True
 
     def validate_identity(self) -> None:
         if not _valid_sha256(self.actor_sha256):
@@ -83,6 +86,33 @@ class PolicyRequest:
 
 # A descriptive alias for callers that prefer the service name in type hints.
 BatchedPolicyRequest = PolicyRequest
+
+
+@dataclass(frozen=True)
+class PolicyIdentity:
+    """Small per-row identity; tensors live in a PolicyTensorBatch, not here."""
+    worker_id: Hashable
+    side: int
+    actor_sha256: str
+    delta_ticks: int = 1
+    reset_hidden: bool = False
+    capture_pre_action_hidden: bool = True
+
+    def validate_identity(self) -> None:
+        PolicyRequest.validate_identity(self)
+
+
+@dataclass(frozen=True)
+class PolicyTensorBatch:
+    """Already batched columns belonging to a single immutable Actor.
+
+    indices refer to the original request order, not processing order. Inputs
+    have [B,1,...] and masks [B,...]. No row tensors need to be reconstructed.
+    """
+    indices: tuple[int, ...]
+    rows: tuple[PolicyIdentity, ...]
+    actor_inputs: Mapping[str, Tensor | None]
+    masks: ExpertActionMasks
 
 
 @dataclass(frozen=True)
@@ -318,6 +348,7 @@ class BatchedPolicyService:
         compile_batch_size: int | None = None,
         compile_entity_slots: int | None = None,
         dense_sampling: bool = False,
+        collate_before_transfer: bool = False,
     ) -> None:
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -334,6 +365,7 @@ class BatchedPolicyService:
             None if compile_entity_slots is None else int(compile_entity_slots)
         )
         self.dense_sampling = bool(dense_sampling)
+        self.collate_before_transfer = bool(collate_before_transfer)
         if self.compile_actors and self.device.type != "cuda":
             raise ValueError("compiled Actors require a CUDA policy service")
         if self.compile_actors and (
@@ -488,6 +520,11 @@ class BatchedPolicyService:
         if unknown:
             raise ValueError(f"unknown Actor input fields: {sorted(unknown)}")
         output: dict[str, Tensor | None] = {}
+        host_collation = self.collate_before_transfer and all(
+            value is None or value.device.type == "cpu"
+            for request in requests for value in request.actor_inputs.values()
+        )
+        collation_device = torch.device("cpu") if host_collation else device
         for name in key_sets[0]:
             raw_values = [request.actor_inputs[name] for request in requests]
             if all(value is None for value in raw_values):
@@ -503,9 +540,9 @@ class BatchedPolicyService:
             moved: list[Tensor] = []
             for value in tensors:
                 if value.is_floating_point():
-                    value = value.to(device=device, dtype=floating_dtype)
+                    value = value.to(device=collation_device, dtype=floating_dtype)
                 else:
-                    value = value.to(device=device)
+                    value = value.to(device=collation_device)
                 moved.append(value)
             if name in _ENTITY_KEYS:
                 output[name] = _pad_entities(
@@ -519,7 +556,7 @@ class BatchedPolicyService:
 
         requested_delta = torch.tensor(
             [request.delta_ticks for request in requests],
-            device=device,
+            device=collation_device,
             dtype=floating_dtype,
         ).unsqueeze(-1)
         existing = output.get("delta_ticks")
@@ -528,6 +565,11 @@ class BatchedPolicyService:
         ):
             raise ValueError("actor_inputs delta_ticks differs from request delta_ticks")
         output["delta_ticks"] = requested_delta
+        if host_collation:
+            # Collate and pad CPU requests first: one H2D copy per field,
+            # instead of one synchronous copy per field * per actor row.
+            output = {name: None if value is None else value.to(device=device)
+                      for name, value in output.items()}
         return output
 
     def _static_actor_batch(
@@ -595,12 +637,26 @@ class BatchedPolicyService:
             if len(shapes) != 1:
                 raise ValueError(f"action mask {name} has incompatible shapes")
             fields[name] = torch.stack(values, dim=0)
+        BatchedPolicyService._validate_mask_hierarchy(fields)
+        return ExpertActionMasks(**{
+            name: value.to(device=device) for name, value in fields.items()
+        })
+
+    @staticmethod
+    def _validate_mask_hierarchy(fields: Mapping[str, Tensor]) -> None:
         kinds = fields["action_kind"]
         cards = fields["cards"]
         positions = fields["positions"]
         abilities = fields["abilities"]
         ability_positions = fields["ability_positions"]
         targeted = fields["ability_requires_target"]
+        batch = kinds.shape[0]
+        if (tuple(kinds.shape) != (batch, 2) or tuple(cards.shape) != (batch, 4)
+                or tuple(positions.shape) != (batch, 4, 576)
+                or abilities.ndim != 2 or abilities.shape[0] != batch
+                or tuple(ability_positions.shape) != (batch, abilities.shape[1], 576)
+                or tuple(targeted.shape) != tuple(abilities.shape)):
+            raise ValueError("action mask dimensions do not match the CR action schema")
         if bool((kinds[:, 0] & ~cards.any(dim=-1)).any()):
             raise ValueError("normal action kind is legal but every card is illegal")
         if bool((cards & ~positions.any(dim=-1)).any()):
@@ -609,8 +665,78 @@ class BatchedPolicyService:
             raise ValueError("ability action kind is legal but every ability is illegal")
         if bool((abilities & targeted & ~ability_positions.any(dim=-1)).any()):
             raise ValueError("a legal targeted ability has no legal target cell")
-        return ExpertActionMasks(**{
-            name: value.to(device=device) for name, value in fields.items()
+
+    def _prepare_tensor_batches(
+        self, pieces: Sequence[PolicyTensorBatch], actor: RecurrentExpertPolicy,
+    ) -> tuple[list[tuple[int, PolicyIdentity]], dict[str, Tensor | None], ExpertActionMasks]:
+        """Merge whole CPU columns, preserving entity padding and row order."""
+        device, dtype = _module_device_dtype(actor, self.device)
+        key_sets = [set(piece.actor_inputs) for piece in pieces]
+        if any(keys != key_sets[0] for keys in key_sets[1:]) or key_sets[0] - set(_INPUT_RANKS):
+            raise ValueError("prebatched Actor input fields differ or are unknown")
+        indexed = [(index, row) for piece in pieces for index, row in zip(piece.indices, piece.rows, strict=True)]
+        order = sorted(range(len(indexed)), key=lambda i: indexed[i][0])
+        permutation = None if order == list(range(len(order))) else torch.tensor(order, dtype=torch.long)
+
+        def merge(values: list[Tensor], *, entity: bool = False) -> Tensor:
+            if any(value.device.type != "cpu" for value in values):
+                raise ValueError("prebatched transport requires CPU columns")
+            if len({value.dtype for value in values}) != 1:
+                raise ValueError("prebatched column dtypes differ")
+            if entity:
+                maximum = max(value.shape[2] for value in values)
+                if self.compile_entity_slots is not None:
+                    if maximum > self.compile_entity_slots:
+                        raise ValueError("entity column exceeds static capacity")
+                    maximum = self.compile_entity_slots
+                padded = []
+                for value in values:
+                    if value.shape[2] != maximum:
+                        shape = list(value.shape)
+                        shape[2] = maximum - value.shape[2]
+                        value = torch.cat((value, value.new_zeros(shape)), dim=2)
+                    padded.append(value)
+                values = padded
+            if len({tuple(value.shape[1:]) for value in values}) != 1:
+                raise ValueError("prebatched columns have incompatible shapes")
+            result = values[0] if len(values) == 1 else torch.cat(values, dim=0)
+            return result if permutation is None else result.index_select(0, permutation)
+
+        inputs: dict[str, Tensor | None] = {}
+        for name in sorted(key_sets[0]):
+            values = [piece.actor_inputs[name] for piece in pieces]
+            if all(value is None for value in values):
+                inputs[name] = None
+                continue
+            if any(value is None for value in values):
+                raise ValueError("Actor column is None for only part of a batch")
+            for piece, value in zip(pieces, values, strict=True):
+                if (not isinstance(value, Tensor) or value.ndim != _INPUT_RANKS[name] + 1
+                        or value.shape[0] != len(piece.rows) or value.shape[1] != 1):
+                    raise ValueError(f"invalid prebatched Actor column: {name}")
+            combined = merge(values, entity=name in _ENTITY_KEYS)
+            if combined.is_floating_point():
+                combined = combined.to(dtype=dtype)
+            inputs[name] = combined
+        indexed = [indexed[i] for i in order]
+        delta = torch.tensor([row.delta_ticks for _, row in indexed], dtype=dtype).unsqueeze(-1)
+        existing = inputs.get("delta_ticks")
+        if existing is not None and not torch.equal(existing.float(), delta.float()):
+            raise ValueError("actor_inputs delta_ticks differs from request delta_ticks")
+        inputs["delta_ticks"] = delta
+        fields = {}
+        for name, rank in _MASK_RANKS.items():
+            values = [getattr(piece.masks, name) for piece in pieces]
+            for piece, value in zip(pieces, values, strict=True):
+                if (not isinstance(value, Tensor) or value.ndim != rank + 1
+                        or value.shape[0] != len(piece.rows) or value.dtype != torch.bool):
+                    raise ValueError(f"invalid prebatched action mask: {name}")
+            fields[name] = merge(values)
+        self._validate_mask_hierarchy(fields)
+        if fields["abilities"].shape[1] != actor.config.max_ability_slots:
+            raise ValueError("action mask ability capacity differs from Actor configuration")
+        return indexed, {name: None if value is None else value.to(device) for name, value in inputs.items()}, ExpertActionMasks(**{
+            name: value.to(device) for name, value in fields.items()
         })
 
     @staticmethod
@@ -626,12 +752,16 @@ class BatchedPolicyService:
         for value in tensors:
             if value.shape[0] != batch_size or value.shape[1] != 1:
                 raise ValueError("Actor output must preserve [batch, one-time-step]")
-            if not bool(torch.isfinite(value).all()):
-                raise FloatingPointError("Actor emitted NaN or Inf")
         hidden = output.hidden
-        if len(hidden) != 2 or hidden[0].shape[1] != batch_size:
+        if (len(hidden) != 2 or hidden[0].ndim != 3
+                or hidden[0].shape[1] != batch_size or hidden[1].shape != hidden[0].shape):
             raise ValueError("Actor returned malformed recurrent hidden state")
-        if not bool(torch.isfinite(hidden[0]).all() and torch.isfinite(hidden[1]).all()):
+        # Keep every finite check, but transfer the small verdict vector once
+        # instead of forcing a CUDA synchronization for each output head.
+        finite = torch.stack([torch.isfinite(value).all() for value in (*tensors, *hidden)]).cpu().tolist()
+        if not all(finite[:len(tensors)]):
+            raise FloatingPointError("Actor emitted NaN or Inf")
+        if not all(finite[len(tensors):]):
             raise FloatingPointError("Actor emitted non-finite recurrent state")
 
     @staticmethod
@@ -666,7 +796,7 @@ class BatchedPolicyService:
         self,
         actor_sha256: str,
         actor: RecurrentExpertPolicy,
-        requests: Sequence[PolicyRequest],
+        requests: Sequence[PolicyRequest | PolicyIdentity],
         device: torch.device,
         floating_dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
@@ -690,7 +820,7 @@ class BatchedPolicyService:
     def _store_hidden(
         self,
         actor_sha256: str,
-        requests: Sequence[PolicyRequest],
+        requests: Sequence[PolicyRequest | PolicyIdentity],
         hidden: tuple[Tensor, Tensor],
     ) -> None:
         for index, request in enumerate(requests):
@@ -703,19 +833,21 @@ class BatchedPolicyService:
     def _sample_group(
         self,
         actor_sha256: str,
-        indexed_requests: Sequence[tuple[int, PolicyRequest]],
+        indexed_requests: Sequence[tuple[int, PolicyRequest | PolicyIdentity]],
         *,
         deterministic: bool,
+        prepared: tuple[dict[str, Tensor | None], ExpertActionMasks] | None = None,
     ) -> list[tuple[int, SampledPolicyAction]]:
         actor = self._actors.get(actor_sha256)
         if actor is None:
             raise KeyError(f"unregistered Actor content hash: {actor_sha256}")
         requests = [request for _index, request in indexed_requests]
         device, floating_dtype = _module_device_dtype(actor, self.device)
-        inputs = self._batch_inputs(
-            requests, device=device, floating_dtype=floating_dtype
-        )
-        masks = self._batch_masks(requests, device)
+        if prepared is None:
+            inputs = self._batch_inputs(requests, device=device, floating_dtype=floating_dtype)
+            masks = self._batch_masks(requests, device)
+        else:
+            inputs, masks = prepared
         hidden = self._hidden_batch(
             actor_sha256, actor, requests, device, floating_dtype
         )
@@ -1036,10 +1168,55 @@ class BatchedPolicyService:
     infer_batch = act
     sample_batch = act
 
+    def act_tensor_batches(
+        self, batches: Sequence[PolicyTensorBatch], *, deterministic: bool | None = None,
+    ) -> list[SampledPolicyAction]:
+        """Consume prebatched columns without rebuilding per-row Tensor trees."""
+        pieces = list(batches)
+        if not pieces:
+            return []
+        count = sum(len(piece.rows) for piece in pieces)
+        indices, identities = set(), set()
+        for piece in pieces:
+            if not piece.rows or len(piece.indices) != len(piece.rows):
+                raise ValueError("empty or malformed tensor batch")
+            hashes = set()
+            for index, row in zip(piece.indices, piece.rows, strict=True):
+                row.validate_identity()
+                identity = (row.actor_sha256, row.worker_id, row.side)
+                if (type(index) is not int or not 0 <= index < count or index in indices
+                        or identity in identities):
+                    raise ValueError("duplicate/invalid batch index or sequential Actor identity")
+                indices.add(index)
+                identities.add(identity)
+                hashes.add(row.actor_sha256)
+            if len(hashes) != 1:
+                raise ValueError("one tensor batch cannot mix Actor hashes")
+        grouped: OrderedDict[str, list[PolicyTensorBatch]] = OrderedDict()
+        for piece in sorted(pieces, key=lambda p: min(p.indices)):
+            grouped.setdefault(piece.rows[0].actor_sha256, []).append(piece)
+        prepared_groups = []
+        for digest, group in grouped.items():
+            actor = self._actors.get(digest)
+            if actor is None:
+                raise KeyError(f"unregistered Actor content hash: {digest}")
+            rows, inputs, masks = self._prepare_tensor_batches(group, actor)
+            prepared_groups.append((digest, rows, inputs, masks))
+        sampled = [None] * count
+        mode = self.deterministic if deterministic is None else bool(deterministic)
+        for digest, rows, inputs, masks in prepared_groups:
+            for index, action in self._sample_group(digest, rows, deterministic=mode, prepared=(inputs, masks)):
+                sampled[index] = action
+        if any(value is None for value in sampled):
+            raise RuntimeError("prebatched-policy result loss")
+        return sampled
+
 
 __all__ = [
     "BatchedPolicyRequest",
     "BatchedPolicyService",
     "PolicyRequest",
+    "PolicyIdentity",
+    "PolicyTensorBatch",
     "SampledPolicyAction",
 ]

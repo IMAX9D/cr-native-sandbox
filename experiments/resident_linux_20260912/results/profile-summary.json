@@ -1,0 +1,262 @@
+{
+  "identity": {
+    "policy_version": "hokoff-fixed-bc",
+    "training_step": 319051,
+    "path": "/root/autodl-tmp/resident-linux-20260912/model319051/inference.pt",
+    "model_digest": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "checkpoint_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "encoder_contract_sha256": "81b520a8830e64d6320eb3f6ae8ca4f8566e3fca570a36f0e3d4753939d72346",
+    "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+    "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+    "decision_ticks": 4,
+    "history_length": 4,
+    "parameters": 4804205,
+    "mode": "greedy-masked-fixed4",
+    "timing_threshold": 0.5
+  },
+  "trace": true,
+  "native_profile": true,
+  "iterations": 1536,
+  "ticks": 24442,
+  "wall_seconds": 51.757632178021595,
+  "actor_process_cpu_seconds": 39.625381357,
+  "profiler_step_wall_seconds": 8.38325533689931,
+  "exclusive_phases": {
+    "observation_encode": {
+      "calls": 1536,
+      "wall_ns": 9904672424,
+      "cpu_ns": 9904866725
+    },
+    "batch_collate": {
+      "calls": 1536,
+      "wall_ns": 875314495,
+      "cpu_ns": 875546778
+    },
+    "hidden_gather": {
+      "calls": 1536,
+      "wall_ns": 370664483,
+      "cpu_ns": 370798105
+    },
+    "h2d": {
+      "calls": 1536,
+      "wall_ns": 748610827,
+      "cpu_ns": 749044973
+    },
+    "model_forward": {
+      "calls": 1536,
+      "wall_ns": 8396199448,
+      "cpu_ns": 8396218055
+    },
+    "gpu_guard_pack": {
+      "calls": 1536,
+      "wall_ns": 1276379493,
+      "cpu_ns": 1276704569
+    },
+    "d2h": {
+      "calls": 1536,
+      "wall_ns": 245911238,
+      "cpu_ns": 246273700
+    },
+    "prediction_split": {
+      "calls": 1536,
+      "wall_ns": 853366016,
+      "cpu_ns": 853830162
+    },
+    "cuda_sync_wait": {
+      "calls": 1536,
+      "wall_ns": 62624452,
+      "cpu_ns": 62768487
+    },
+    "action_decode": {
+      "calls": 1536,
+      "wall_ns": 2326924988,
+      "cpu_ns": 2328071398
+    },
+    "request_prepare": {
+      "calls": 1536,
+      "wall_ns": 38321395,
+      "cpu_ns": 38389240
+    },
+    "simulation_rpc": {
+      "calls": 1537,
+      "wall_ns": 13610434289,
+      "cpu_ns": 1497825133
+    },
+    "history_and_enrichment": {
+      "calls": 1536,
+      "wall_ns": 3576633435,
+      "cpu_ns": 3576023183
+    },
+    "legality_rpc": {
+      "calls": 64,
+      "wall_ns": 66119947,
+      "cpu_ns": 10688889
+    }
+  },
+  "rpc": {
+    "rpc_attempts": 1600.0,
+    "rpc_calls": 1600.0,
+    "rpc_serialize_cpu_seconds": 0.04909648099988306,
+    "rpc_send_cpu_seconds": 0.06319585099997482,
+    "rpc_receive_cpu_seconds": 0.2705294360000279,
+    "rpc_parse_cpu_seconds": 1.0749488920000592,
+    "rpc_request_bytes": 379057.0,
+    "rpc_response_bytes": 81145955.0,
+    "rpc_serialize_seconds": 0.04960743058472872,
+    "rpc_connect_seconds": 0.0,
+    "rpc_send_seconds": 0.06303904356900603,
+    "rpc_receive_seconds": 12.437996009597555,
+    "rpc_parse_seconds": 1.0754592737648636,
+    "rpc_total_seconds": 13.634634864283726,
+    "rpc_reconnects": 0.0
+  },
+  "cuda_stream_span_ms": {
+    "hidden_gather": 193.4615679010749,
+    "h2d": 676.0041916370392,
+    "model_forward": 8322.252470493317,
+    "gpu_guard_pack": 1160.338336199522,
+    "d2h": 163.28435218334198,
+    "prediction_split": 786.9793281853199
+  },
+  "native_delta": {
+    "schema_version": 0,
+    "ok": true,
+    "op": "profile_stats",
+    "native": {
+      "enabled": true,
+      "metrics": {
+        "step_total": {
+          "calls": 6113,
+          "wall_ns": 4599944955,
+          "cpu_ns": 4587837618
+        },
+        "engine_update": {
+          "calls": 24442,
+          "wall_ns": 1845423538,
+          "cpu_ns": 1826670752
+        },
+        "capture_step": {
+          "calls": 30555,
+          "wall_ns": 1904175971,
+          "cpu_ns": 1883027479
+        },
+        "observe_total": {
+          "calls": 6113,
+          "wall_ns": 2902703305,
+          "cpu_ns": 2891052094
+        },
+        "capture_observe": {
+          "calls": 6113,
+          "wall_ns": 368688353,
+          "cpu_ns": 364376349
+        },
+        "episode_json_step": {
+          "calls": 6113,
+          "wall_ns": 85310305,
+          "cpu_ns": 81502580
+        },
+        "episode_json_observe": {
+          "calls": 6113,
+          "wall_ns": 69852570,
+          "cpu_ns": 65651449
+        },
+        "action": {
+          "calls": 756,
+          "wall_ns": 232913070,
+          "cpu_ns": 231302263
+        },
+        "legality_grid": {
+          "calls": 64,
+          "wall_ns": 15271463,
+          "cpu_ns": 14789008
+        },
+        "bind_unbind": {
+          "calls": 24580,
+          "wall_ns": 3075406209,
+          "cpu_ns": 3040990340
+        },
+        "create": {
+          "calls": 0,
+          "wall_ns": 0,
+          "cpu_ns": 0
+        },
+        "capture_other": {
+          "calls": 0,
+          "wall_ns": 0,
+          "cpu_ns": 0
+        }
+      }
+    },
+    "java": {
+      "request_parse": {
+        "calls": 1601,
+        "wall_ns": 60053299,
+        "cpu_ns": 57449452
+      },
+      "handler_total": {
+        "calls": 1601,
+        "wall_ns": 11705062400,
+        "cpu_ns": 11669060867
+      },
+      "response_serialize": {
+        "calls": 1601,
+        "wall_ns": 4870766,
+        "cpu_ns": 4638071
+      },
+      "socket_write": {
+        "calls": 1601,
+        "wall_ns": 514634469,
+        "cpu_ns": 512692612
+      }
+    }
+  },
+  "finals": {
+    "2": {
+      "tick": 6090,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 192,
+      "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+    },
+    "3": {
+      "tick": 6117,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 188,
+      "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+    },
+    "1": {
+      "tick": 6130,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 186,
+      "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+    },
+    "0": {
+      "tick": 6153,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 190,
+      "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+    }
+  },
+  "traces": [
+    "/root/autodl-tmp/resident-linux-20260912/cpu-gpu-profile/trace-0.json",
+    "/root/autodl-tmp/resident-linux-20260912/cpu-gpu-profile/trace-1.json",
+    "/root/autodl-tmp/resident-linux-20260912/cpu-gpu-profile/trace-2.json"
+  ],
+  "torch_gpu_allocated_peak": 45458432,
+  "torch_gpu_reserved_peak": 71303168
+}

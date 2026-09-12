@@ -52,6 +52,7 @@ public final class JniHost {
         String externalFilesDir
     );
     private static native String nativeRegisterAndroidRuntime();
+    private static native String nativeMemoryReadStats();
     private static native String nativeProbeRuntime(String libgPath);
     private static native String nativeProbePrerequisites(String libgPath);
     private static native String nativeInitGameMain(String libgPath);
@@ -833,6 +834,7 @@ public final class JniHost {
                             break;
                         }
                         JSONObject response = new JSONObject();
+                        String fastTrainingResponse = null;
                         try {
                         if (line.length() > 32 * 1024 * 1024) {
                             throw new IllegalArgumentException("invalid JSON line length");
@@ -844,7 +846,9 @@ public final class JniHost {
                         response.put("schema_version", 1);
                         response.put("ok", true);
                         response.put("op", op);
-                        if ("status".equals(op)) {
+                        if ("memory_read_stats".equals(op)) {
+                            response.put("result", new JSONObject(nativeMemoryReadStats()));
+                        } else if ("status".equals(op)) {
                             response.put(
                                 "state", new JSONObject(nativeProbeRuntime(root + "/libg.so"))
                             );
@@ -1003,6 +1007,27 @@ public final class JniHost {
                                     root, request.getJSONArray("actions")
                                 )
                             );
+                        } else if ("joint_training_transition_fast_v1".equals(op)) {
+                            if (request.optBoolean("profile_native", false)) {
+                                throw new IllegalArgumentException(
+                                    "fast transition uses external timing; inline profiling is unsupported"
+                                );
+                            }
+                            JSONObject jointAction = executeJointActions(
+                                root, request.getJSONArray("actions")
+                            );
+                            JSONObject stepResult = new JSONObject(nativeStep(
+                                root + "/libg.so", request.optInt("steps", 1)
+                            ));
+                            JSONObject episode = stepResult.getJSONObject("episode");
+                            terminalEpisodeLatched = episode.optBoolean("terminated", false);
+                            String stateJson = null;
+                            if (!terminalEpisodeLatched && !episode.optBoolean("truncated", false)) {
+                                stateJson = nativeObserveTrain(root + "/libg.so");
+                            }
+                            fastTrainingResponse = TrainingTransitionResponse.encode(
+                                jointAction.toString(), episode.toString(), stateJson
+                            );
                         } else if ("joint_training_transition_v1".equals(op)) {
                             boolean profileNative = request.optBoolean(
                                 "profile_native", false
@@ -1096,6 +1121,7 @@ public final class JniHost {
                             throw new IllegalArgumentException("unknown op: " + op);
                         }
                         } catch (Throwable error) {
+                        fastTrainingResponse = null;
                         response = new JSONObject();
                         response.put("schema_version", 1);
                         response.put("ok", false);
@@ -1113,7 +1139,8 @@ public final class JniHost {
                             System.nanoTime() - serializationStartedNanos
                         );
                     }
-                    writer.write(response.toString());
+                    writer.write(fastTrainingResponse == null
+                        ? response.toString() : fastTrainingResponse);
                     writer.newLine();
                     writer.flush();
                     }

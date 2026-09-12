@@ -1,0 +1,160 @@
+{
+  "identity": {
+    "policy_version": "hokoff-fixed-bc",
+    "training_step": 319051,
+    "path": "/root/autodl-tmp/resident-linux-20260912/model319051/inference.pt",
+    "model_digest": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "checkpoint_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "encoder_contract_sha256": "81b520a8830e64d6320eb3f6ae8ca4f8566e3fca570a36f0e3d4753939d72346",
+    "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+    "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+    "decision_ticks": 4,
+    "history_length": 4,
+    "parameters": 4804205,
+    "mode": "greedy-masked-fixed4",
+    "timing_threshold": 0.5
+  },
+  "trace": false,
+  "native_profile": false,
+  "iterations": 1536,
+  "ticks": 24442,
+  "wall_seconds": 41.25696085509844,
+  "actor_process_cpu_seconds": 29.743295109,
+  "profiler_step_wall_seconds": 0.0,
+  "exclusive_phases": {
+    "observation_encode": {
+      "calls": 1536,
+      "wall_ns": 10858214664,
+      "cpu_ns": 10859574656
+    },
+    "batch_collate": {
+      "calls": 1536,
+      "wall_ns": 914824289,
+      "cpu_ns": 915524377
+    },
+    "hidden_gather": {
+      "calls": 1536,
+      "wall_ns": 194631094,
+      "cpu_ns": 194911963
+    },
+    "h2d": {
+      "calls": 1536,
+      "wall_ns": 578907481,
+      "cpu_ns": 579367375
+    },
+    "model_forward": {
+      "calls": 1536,
+      "wall_ns": 7137308517,
+      "cpu_ns": 7140834305
+    },
+    "gpu_guard_pack": {
+      "calls": 1536,
+      "wall_ns": 903260555,
+      "cpu_ns": 904055011
+    },
+    "d2h": {
+      "calls": 1536,
+      "wall_ns": 129212712,
+      "cpu_ns": 129445855
+    },
+    "prediction_split": {
+      "calls": 1536,
+      "wall_ns": 660689314,
+      "cpu_ns": 661206534
+    },
+    "cuda_sync_wait": {
+      "calls": 1536,
+      "wall_ns": 72457274,
+      "cpu_ns": 72625945
+    },
+    "action_decode": {
+      "calls": 1536,
+      "wall_ns": 2465168745,
+      "cpu_ns": 2466454796
+    },
+    "request_prepare": {
+      "calls": 1536,
+      "wall_ns": 15381959,
+      "cpu_ns": 15426942
+    },
+    "simulation_rpc": {
+      "calls": 1536,
+      "wall_ns": 13057076966,
+      "cpu_ns": 1559915263
+    },
+    "history_and_enrichment": {
+      "calls": 1536,
+      "wall_ns": 3697864671,
+      "cpu_ns": 3698419426
+    },
+    "legality_rpc": {
+      "calls": 64,
+      "wall_ns": 56700874,
+      "cpu_ns": 7721438
+    }
+  },
+  "rpc": {
+    "rpc_attempts": 1600.0,
+    "rpc_calls": 1600.0,
+    "rpc_serialize_cpu_seconds": 0.04925040199991848,
+    "rpc_send_cpu_seconds": 0.07142253499990714,
+    "rpc_receive_cpu_seconds": 0.262562147000057,
+    "rpc_parse_cpu_seconds": 1.1491585949999794,
+    "rpc_request_bytes": 379057.0,
+    "rpc_response_bytes": 81145955.0,
+    "rpc_serialize_seconds": 0.049676488735713065,
+    "rpc_connect_seconds": 0.0,
+    "rpc_send_seconds": 0.07128507900051773,
+    "rpc_receive_seconds": 11.808587200706825,
+    "rpc_parse_seconds": 1.1494277589954436,
+    "rpc_total_seconds": 13.087753131054342,
+    "rpc_reconnects": 0.0
+  },
+  "cuda_stream_span_ms": {},
+  "native_delta": null,
+  "finals": {
+    "2": {
+      "tick": 6090,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 192,
+      "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+    },
+    "3": {
+      "tick": 6117,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 188,
+      "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+    },
+    "1": {
+      "tick": 6130,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 186,
+      "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+    },
+    "0": {
+      "tick": 6153,
+      "outcome": "side1_win",
+      "crowns": [
+        0,
+        1
+      ],
+      "plays": 190,
+      "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+    }
+  },
+  "traces": [],
+  "torch_gpu_allocated_peak": 45458432,
+  "torch_gpu_reserved_peak": 71303168
+}

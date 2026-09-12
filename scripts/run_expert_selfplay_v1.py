@@ -484,6 +484,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="local Unix socket for one shared policy process (collect-only)",
     )
     parser.add_argument("--cpu-threads", type=int, default=16)
+    parser.add_argument("--policy-wire-format", choices=("rows-v1", "columns-v2"), default="rows-v1",
+                        help="versioned local policy transport; columnar requests stay batched through inference")
+    parser.add_argument("--profile-native", action="store_true",
+                        help="enable intrusive inline native profiling (diagnostics only)")
+    parser.add_argument("--transition-mode", choices=("legacy", "fast-json"), default="legacy")
+    parser.add_argument("--sparse-hidden-transfer", action="store_true",
+                        help="transfer recurrent states only at learner sequence anchors")
+    parser.add_argument("--ready-group-size", type=int, default=0,
+                        help="independent groups sharing a remote policy server; 0 keeps legacy barrier")
+    parser.add_argument("--max-ready-groups", type=int, default=8)
     parser.add_argument("--compile-actor", action="store_true")
     parser.add_argument("--compile-batch-size", type=int)
     parser.add_argument("--compile-entity-slots", type=int)
@@ -578,6 +588,14 @@ def run(
         raise ValueError("compile capacities require --compile-actor")
     if compile_actor and getattr(args, "policy_server_address", None):
         raise ValueError("--compile-actor applies only to in-process policy service")
+    ready_group_size = int(getattr(args, "ready_group_size", 0))
+    if ready_group_size < 0:
+        raise ValueError("--ready-group-size cannot be negative")
+    if ready_group_size and (not collect_only or not getattr(args, "policy_server_address", None)):
+        raise ValueError("ready groups require --collect-only and --policy-server-address")
+    policy_wire_format = str(getattr(args, "policy_wire_format", "rows-v1"))
+    if policy_wire_format != "rows-v1" and not getattr(args, "policy_server_address", None):
+        raise ValueError("columnar transport requires --policy-server-address")
 
     run_dir = args.run_dir.resolve()
     if run_dir.exists():
@@ -626,8 +644,15 @@ def run(
         )
         fixtures = scheduler.build_batch(episode_count=total_episodes, seed=args.seed)
 
+        env_options: dict[str, Any] = {
+            "host": args.host, "timeout": args.timeout,
+            "profile_native": bool(getattr(args, "profile_native", False)),
+        }
+        transition_mode = str(getattr(args, "transition_mode", "legacy"))
+        if transition_mode != "legacy":
+            env_options["transition_mode"] = transition_mode
         envs = [
-            env_type(host=args.host, port=port, timeout=args.timeout, profile_native=True)
+            env_type(port=port, **env_options)
             for port in ports[:episodes]
         ]
         with ThreadPoolExecutor(max_workers=len(envs)) as executor:
@@ -643,6 +668,7 @@ def run(
             policy = RemotePolicyClient(
                 policy_server_address,
                 expected_actor_hashes=expected_hashes,
+                wire_format=policy_wire_format,
             )
             policy_to_close = policy
         else:
@@ -684,9 +710,29 @@ def run(
         }
         if idle_step_ticks is not None:
             collector_options["idle_step_ticks"] = idle_step_ticks
+        if bool(getattr(args, "sparse_hidden_transfer", False)):
+            collector_options["sparse_hidden_transfer"] = True
         collector = deps.collector_type(
             **collector_options,
         )
+        if ready_group_size:
+            from copy import deepcopy
+            from expert_selfplay_v1.ready_groups import ReadyGroupCollector
+
+            def group_factory(_group_index, cancel_event):
+                options = dict(collector_options)
+                client = RemotePolicyClient(policy_server_address, expected_actor_hashes=expected_hashes,
+                                            wire_format=policy_wire_format)
+                try:
+                    options.update(encoder=deepcopy(loaded.encoder), policy_service=client,
+                                   rpc_workers=ready_group_size, cancel_event=cancel_event)
+                    return deps.collector_type(**options)
+                except BaseException:
+                    client.close()
+                    raise
+
+            collector = ReadyGroupCollector(group_factory, group_size=ready_group_size,
+                                           max_groups=int(getattr(args, "max_ready_groups", 8)))
         trainer = None
         if not collect_only:
             critic_config = PrivilegedCriticConfig(
@@ -764,6 +810,7 @@ def run(
             "real_native_rollouts_only": True,
             "collection_only": collect_only,
             "worker_process_management": False,
+            "policy_wire_format": policy_wire_format,
             "host": args.host,
             "ports": ports[:episodes],
             "episodes": total_episodes,

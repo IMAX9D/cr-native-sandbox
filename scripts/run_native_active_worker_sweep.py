@@ -186,6 +186,9 @@ class ResourceSampler:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._previous_cpu: tuple[float, int] | None = None
+        self._previous_worker_cpu: dict[int, tuple[float, float, float]] = {}
+        self._process_memory_sample: dict[str, Any] = {}
+        self._last_process_memory_sample = -math.inf
         self.memory_events_before = self._memory_events()
 
     def _memory_events(self) -> dict[str, int]:
@@ -197,21 +200,69 @@ class ResourceSampler:
 
             rss = threads = alive = 0
             cpu = 0.0
+            cpu_samples_valid = 0
+            now = time.perf_counter()
+            seen: set[int] = set()
+            sample_details = now - self._last_process_memory_sample >= 10.0
+            pss = private_dirty = memory_covered = 0
             for pid in self.worker_pids:
                 try:
                     process = psutil.Process(pid)
                     rss += int(process.memory_info().rss)
                     threads += int(process.num_threads())
-                    cpu += float(process.cpu_percent(interval=None))
+                    # cpu_percent(None) on a freshly constructed Process always
+                    # yields a first sample. Compare cumulative counters instead.
+                    created = float(process.create_time())
+                    times = process.cpu_times()
+                    total = float(times.user + times.system)
+                    previous = self._previous_worker_cpu.get(pid)
+                    if previous is not None:
+                        then, old_created, old_total = previous
+                        if created == old_created and now > then and total >= old_total:
+                            cpu += (total - old_total) / (now - then) * 100.0
+                            cpu_samples_valid += 1
+                    self._previous_worker_cpu[pid] = (now, created, total)
+                    seen.add(pid)
+                    if sample_details:
+                        try:
+                            detail = {}
+                            for line in Path(f"/proc/{pid}/smaps_rollup").read_text(
+                                encoding="ascii"
+                            ).splitlines():
+                                fields = line.split()
+                                if fields and fields[0] in ("Pss:", "Private_Dirty:"):
+                                    detail[fields[0]] = int(fields[1]) * 1024
+                            if len(detail) == 2:
+                                pss += detail["Pss:"]
+                                private_dirty += detail["Private_Dirty:"]
+                                memory_covered += 1
+                        except (OSError, ValueError, IndexError):
+                            pass
                     alive += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
-            return {
+            self._previous_worker_cpu = {
+                pid: value for pid, value in self._previous_worker_cpu.items()
+                if pid in seen
+            }
+            if sample_details:
+                self._process_memory_sample = {
+                    "worker_pss_bytes": pss,
+                    "worker_private_dirty_bytes": private_dirty,
+                    "worker_memory_detail_covered_pids": memory_covered,
+                }
+                self._last_process_memory_sample = now
+            result = {
                 "worker_processes_alive": alive,
                 "worker_rss_bytes": rss,
                 "worker_threads": threads,
-                "worker_cpu_percent": cpu,
+                "worker_cpu_samples_valid": cpu_samples_valid,
+                "worker_memory_detail_age_seconds": now - self._last_process_memory_sample,
+                **self._process_memory_sample,
             }
+            if cpu_samples_valid == alive and alive > 0:
+                result["worker_cpu_percent"] = cpu
+            return result
         except ImportError:
             return {}
 
@@ -248,14 +299,21 @@ class ResourceSampler:
             return {}
 
     def sample(self) -> dict[str, Any]:
-        now = time.time()
-        value: dict[str, Any] = {"timestamp": now}
+        now = time.perf_counter()
+        value: dict[str, Any] = {"timestamp": time.time()}
         if self.root:
             memory_current = _read_number(self.root / "memory.current")
             memory_max = _read_number(self.root / "memory.max")
             pids_current = _read_number(self.root / "pids.current")
             pids_max = _read_number(self.root / "pids.max")
             cpu_stat = _read_key_values(self.root / "cpu.stat")
+            for key in ("nr_periods", "nr_throttled", "throttled_usec"):
+                if key in cpu_stat:
+                    value[f"cgroup_cpu_{key}"] = cpu_stat[key]
+            memory_stat = _read_key_values(self.root / "memory.stat")
+            for key in ("anon", "file", "kernel", "shmem", "file_dirty", "file_writeback"):
+                if key in memory_stat:
+                    value[f"cgroup_memory_{key}_bytes"] = memory_stat[key]
             cpu_capacity: float | None = None
             try:
                 quota_raw, period_raw = (self.root / "cpu.max").read_text(
@@ -332,6 +390,10 @@ class ResourceSampler:
             if values:
                 result[f"{key}_mean"] = statistics.fmean(values)
                 result[f"{key}_peak"] = max(values)
+        for key in ("cgroup_cpu_nr_periods", "cgroup_cpu_nr_throttled", "cgroup_cpu_throttled_usec"):
+            values = [int(row[key]) for row in self.samples if key in row]
+            if len(values) >= 2:
+                result[f"{key}_delta"] = values[-1] - values[0]
         return result
 
 
@@ -543,10 +605,13 @@ def make_slots(
     timeout: float,
     replay: Mapping[str, Any],
     seed_base: int,
+    profile_native: bool = False,
+    transition_mode: str = "legacy",
 ) -> list[WorkerSlot]:
     envs = [
         NativeRoyaleEnv(
-            host=host, port=port, timeout=timeout, profile_native=True
+            host=host, port=port, timeout=timeout, profile_native=profile_native,
+            transition_mode=transition_mode,
         )
         for port in ports
     ]
@@ -750,6 +815,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=120_000)
     parser.add_argument("--resource-interval", type=float, default=2.0)
+    parser.add_argument("--profile-native", action="store_true",
+                        help="Detailed instrumented run; omit for throughput A/B")
+    parser.add_argument("--transition-mode", choices=("legacy", "fast-json"), default="legacy")
     parser.add_argument("--output-interval", type=float, default=10.0)
     parser.add_argument("--worker-pids", default="")
     parser.add_argument("--max-memory-fraction", type=float, default=0.80)
@@ -757,6 +825,8 @@ def main() -> None:
     parser.add_argument("--max-unexpected-rejections", type=int, default=0)
     parser.add_argument("--max-rpc-p99-ms", type=float, default=0.0)
     args = parser.parse_args()
+    if args.profile_native and args.transition_mode == "fast-json":
+        raise ValueError("fast-json uses external timing; disable --profile-native")
 
     ports = load_ports(args.ports, args.ports_file)
     tiers = parse_integer_set(args.tiers, label="tier")
@@ -792,7 +862,8 @@ def main() -> None:
             "measure_seconds": args.measure_seconds,
             "decision_ticks": args.decision_ticks,
             "action_mode": args.action_mode,
-            "profile_native": True,
+            "profile_native": args.profile_native,
+            "transition_mode": args.transition_mode,
             "replay": str(args.replay.resolve()),
         },
         "tiers": [],
@@ -803,6 +874,8 @@ def main() -> None:
             slots = make_slots(
                 ports=ports[:tier], host=args.host, timeout=args.timeout,
                 replay=replay, seed_base=args.seed + tier_index * 1_000_000,
+                profile_native=args.profile_native,
+                transition_mode=args.transition_mode,
             )
             try:
                 if args.warmup_seconds:

@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 import math
+import threading
 import time
 from typing import Any
 
@@ -300,6 +301,8 @@ class OnlineSelfPlayCollector:
         critic_scalar_size: int = 32,
         critic_private_slot_count: int = 32,
         lean_step_payloads: bool = False,
+        sparse_hidden_transfer: bool = False,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         self.encoder = encoder
         self.policy_service = policy_service
@@ -313,6 +316,8 @@ class OnlineSelfPlayCollector:
         self.critic_scalar_size = int(critic_scalar_size)
         self.critic_private_slot_count = int(critic_private_slot_count)
         self.lean_step_payloads = bool(lean_step_payloads)
+        self.sparse_hidden_transfer = bool(sparse_hidden_transfer)
+        self.cancel_event = cancel_event
         self.last_profile: dict[str, float] = {}
         if self.max_decisions < 1 or self.critic_scalar_size < 1:
             raise ValueError("collector limits must be positive")
@@ -1019,6 +1024,8 @@ class OnlineSelfPlayCollector:
                 cursors.extend(active)
                 profile["start_seconds"] += time.perf_counter() - stage_started
                 while active:
+                    if self.cancel_event is not None and self.cancel_event.is_set():
+                        raise OnlineCollectorContractError("collection cancelled after another group failed")
                     profile["scheduler_turns"] += 1.0
                     requested_steps = {
                         id(cursor): self._requested_step_ticks(cursor)
@@ -1081,6 +1088,11 @@ class OnlineSelfPlayCollector:
                             masks=masks,
                             delta_ticks=requested_steps[id(cursor)],
                             reset_hidden=False,
+                            capture_pre_action_hidden=(
+                                not self.sparse_hidden_transfer
+                                or (side == cursor.spec.header.learner_side
+                                    and self._needs_hidden_anchor(len(cursor.episode.decisions)))
+                            ),
                         ))
                         request_rows.append({
                             "cursor": cursor, "side": side, "masks": masks,

@@ -6,15 +6,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <new>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <vector>
+
+#include "entity_pointer_snapshot.h"
+#include "scoped_read_cache.h"
 
 namespace {
 
@@ -254,10 +259,56 @@ using AbilityComponentAtSlot = void* (*)(void*, int32_t);
 using PlayerElixir = int32_t (*)(void*);
 using NextDeckIndex = int32_t (*)(void*);
 
+bool batch_entity_pointers_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("CR_NATIVE_BATCH_ENTITY_POINTERS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+bool memory_read_profile_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("CR_NATIVE_PROFILE_MEMORY_READS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+bool episode_read_cache_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("CR_NATIVE_EPISODE_READ_CACHE");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+  }();
+  return enabled;
+}
+
+struct MemoryReadCounters {
+  std::atomic<uint64_t> calls{0}, requested_bytes{0}, short_or_failed{0};
+  std::atomic<uint64_t> episode_captures{0}, pointer_tables{0};
+  std::atomic<uint64_t> bulk_attempts{0}, bulk_fallbacks{0};
+  std::atomic<uint64_t> snapshot_hits{0}, snapshot_fills{0}, snapshot_fallbacks{0}, snapshot_epochs{0};
+};
+MemoryReadCounters g_memory_read_counters;
+
+void record_memory_read(std::size_t size, bool complete) {
+  if (!memory_read_profile_enabled()) return;
+  g_memory_read_counters.calls.fetch_add(1, std::memory_order_relaxed);
+  g_memory_read_counters.requested_bytes.fetch_add(size, std::memory_order_relaxed);
+  if (!complete) g_memory_read_counters.short_or_failed.fetch_add(1, std::memory_order_relaxed);
+}
+
 class SafeMemoryReader {
  public:
-  SafeMemoryReader() : fd_(open("/proc/self/mem", O_RDONLY | O_CLOEXEC)) {}
+  SafeMemoryReader() : fd_(open("/proc/self/mem", O_RDONLY | O_CLOEXEC)),
+      cache_(episode_read_cache_enabled() ? new (std::nothrow) cr_native::ScopedReadCache<>() : nullptr) {}
   ~SafeMemoryReader() {
+    if (cache_ && memory_read_profile_enabled()) {
+      g_memory_read_counters.snapshot_hits.fetch_add(cache_->hits, std::memory_order_relaxed);
+      g_memory_read_counters.snapshot_fills.fetch_add(cache_->fills, std::memory_order_relaxed);
+      g_memory_read_counters.snapshot_fallbacks.fetch_add(cache_->fallbacks, std::memory_order_relaxed);
+      g_memory_read_counters.snapshot_epochs.fetch_add(cache_->epochs, std::memory_order_relaxed);
+    }
     if (fd_ >= 0) {
       close(fd_);
     }
@@ -268,21 +319,75 @@ class SafeMemoryReader {
     if (fd_ < 0 || address == 0 || value == nullptr) {
       return false;
     }
-    return pread(fd_, value, sizeof(T), static_cast<off_t>(address)) ==
-           static_cast<ssize_t>(sizeof(T));
+    return read_bytes(address, value, sizeof(T));
   }
 
   bool read_bytes(uintptr_t address, void* output, size_t size) const {
     if (fd_ < 0 || address == 0 || output == nullptr || size == 0) {
       return false;
     }
-    return pread(fd_, output, size, static_cast<off_t>(address)) ==
-           static_cast<ssize_t>(size);
+    if (cache_) return cache_->read(address, output, size,
+        [this](uintptr_t source, void* dest, std::size_t count) { return direct_read(source, dest, count); });
+    return direct_read(address, output, size);
   }
 
+  class SnapshotScope {
+   public:
+    explicit SnapshotScope(const SafeMemoryReader& reader) : reader_(reader),
+        entered_(reader.cache_ && reader.cache_->begin()) {}
+    ~SnapshotScope() { if (entered_) reader_.cache_->end(); }
+    SnapshotScope(const SnapshotScope&) = delete;
+    SnapshotScope& operator=(const SnapshotScope&) = delete;
+   private:
+    const SafeMemoryReader& reader_;
+    bool entered_;
+  };
+
  private:
+  bool direct_read(uintptr_t address, void* output, std::size_t size) const {
+    const bool complete = pread(fd_, output, size, static_cast<off_t>(address)) ==
+                          static_cast<ssize_t>(size);
+    record_memory_read(size, complete);
+    return complete;
+  }
+
   int fd_;
+  std::unique_ptr<cr_native::ScopedReadCache<>> cache_;
 };
+
+using EntityPointerSnapshot = cr_native::EntityPointerSnapshot<SafeMemoryReader, kMaxObservedEntities>;
+
+void record_pointer_table(const EntityPointerSnapshot& table) {
+  if (!memory_read_profile_enabled()) return;
+  g_memory_read_counters.pointer_tables.fetch_add(1, std::memory_order_relaxed);
+  if (table.bulk_attempted()) {
+    g_memory_read_counters.bulk_attempts.fetch_add(1, std::memory_order_relaxed);
+    if (!table.bulk_copied()) g_memory_read_counters.bulk_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+std::string memory_read_stats_json() {
+  char buffer[1024];
+  std::snprintf(buffer, sizeof(buffer),
+      "{\"schema_version\":1,\"batch_entity_pointers\":%s,\"profiling\":%s,"
+      "\"pread_calls\":%llu,\"requested_bytes\":%llu,\"short_or_failed_reads\":%llu,"
+      "\"episode_captures\":%llu,\"pointer_tables\":%llu,\"bulk_attempts\":%llu,\"bulk_fallbacks\":%llu,"
+      "\"episode_read_cache\":%s,\"snapshot_hits\":%llu,\"snapshot_fills\":%llu,\"snapshot_fallbacks\":%llu,\"snapshot_epochs\":%llu}",
+      batch_entity_pointers_enabled() ? "true" : "false", memory_read_profile_enabled() ? "true" : "false",
+      static_cast<unsigned long long>(g_memory_read_counters.calls.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.requested_bytes.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.short_or_failed.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.episode_captures.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.pointer_tables.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.bulk_attempts.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.bulk_fallbacks.load()),
+      episode_read_cache_enabled() ? "true" : "false",
+      static_cast<unsigned long long>(g_memory_read_counters.snapshot_hits.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.snapshot_fills.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.snapshot_fallbacks.load()),
+      static_cast<unsigned long long>(g_memory_read_counters.snapshot_epochs.load()));
+  return buffer;
+}
 
 int32_t build_deployment_selection(
     uintptr_t base, const SafeMemoryReader& memory, void* output,
@@ -400,6 +505,7 @@ bool read_entity_hp(const SafeMemoryReader& memory,
 
 bool capture_episode_state(
     const SafeMemoryReader& memory, uintptr_t base, uint64_t battle) {
+  if (memory_read_profile_enabled()) g_memory_read_counters.episode_captures.fetch_add(1, std::memory_order_relaxed);
   uint64_t logic = 0, registry = 0, collection = 0, data = 0;
   int32_t tick = -1, count = -1;
   if (battle == 0 || !memory.read(battle + 0x60, &tick) ||
@@ -424,6 +530,9 @@ bool capture_episode_state(
       reinterpret_cast<void*>(logic))
       ? 3
       : (command_gate(reinterpret_cast<void*>(logic)) ? 4 : 0);
+  // From here to return this function only reads native memory. The snapshot
+  // dies before either core_update/state_update or an action can mutate it.
+  SafeMemoryReader::SnapshotScope snapshot(memory);
   memory.read(battle + 0x24, &g_episode.battle_phase);
   memory.read(logic + 0x18, &g_episode.logic_state);
   unsigned char flag_1e9 = 0;
@@ -437,10 +546,12 @@ bool capture_episode_state(
   for (size_t index = 0; index < g_episode.tower_count; ++index) {
     g_episode.towers[index].seen_now = false;
   }
+  EntityPointerSnapshot entity_pointers(memory, data, count, batch_entity_pointers_enabled());
+  record_pointer_table(entity_pointers);
   for (int32_t index = 0; index < count; ++index) {
     uint64_t entity = 0;
     unsigned char raw[0x124] = {};
-    if (!memory.read(data + static_cast<uintptr_t>(index) * 8, &entity) ||
+    if (!entity_pointers.read(index, &entity) ||
         entity == 0 || !memory.read_bytes(entity, raw, sizeof(raw))) {
       continue;
     }
@@ -645,6 +756,12 @@ void throw_state(JNIEnv* env, const std::string& message) {
 }
 
 }  // namespace
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeMemoryReadStats(JNIEnv* env, jclass) {
+  const std::string result = memory_read_stats_json();
+  return env->NewStringUTF(result.c_str());
+}
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativeRegisterAndroidRuntime(
@@ -1579,10 +1696,12 @@ static jstring observe_state_json(
   auto observer_ability_component =
       reinterpret_cast<AbilityComponentAtSlot>(
           base + kAbilityComponentAtSlotRva);
+  EntityPointerSnapshot entity_pointers(memory, data, count, batch_entity_pointers_enabled());
+  record_pointer_table(entity_pointers);
   for (int32_t index = 0; index < count; ++index) {
     uint64_t entity = 0;
     unsigned char raw[0x128] = {};
-    if (!memory.read(data + static_cast<uintptr_t>(index) * 8, &entity) ||
+    if (!entity_pointers.read(index, &entity) ||
         entity == 0 || !memory.read_bytes(entity, raw, sizeof(raw))) {
       continue;
     }

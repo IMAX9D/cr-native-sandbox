@@ -175,6 +175,13 @@ def collector_command(
     policy_server_address = getattr(args, "policy_server_address", None)
     if policy_server_address:
         command.extend(("--policy-server-address", str(policy_server_address)))
+    for name in ("transition_mode", "ready_group_size", "max_ready_groups", "runtime_manifest", "policy_wire_format"):
+        value = getattr(args, name, None)
+        if value is not None:
+            command.extend(("--" + name.replace("_", "-"), str(value)))
+    for name in ("sparse_hidden_transfer", "profile_native"):
+        if bool(getattr(args, name, False)):
+            command.append("--" + name.replace("_", "-"))
     return command
 
 

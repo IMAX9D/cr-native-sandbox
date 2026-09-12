@@ -40,3 +40,4 @@ include = [
 
 [tool.setuptools.package-data]
 native_core = ["data/*.json"]
+training = ["*.html"]

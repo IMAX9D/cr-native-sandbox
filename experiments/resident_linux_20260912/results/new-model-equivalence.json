@@ -1,0 +1,44 @@
+{
+  "identity": {
+    "policy_version": "hokoff-fixed-bc",
+    "training_step": 319051,
+    "path": "/root/autodl-tmp/resident-linux-20260912/model319051/inference.pt",
+    "model_digest": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "checkpoint_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "encoder_contract_sha256": "81b520a8830e64d6320eb3f6ae8ca4f8566e3fca570a36f0e3d4753939d72346",
+    "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+    "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+    "decision_ticks": 4,
+    "history_length": 4,
+    "parameters": 4804205,
+    "mode": "greedy-masked-fixed4",
+    "timing_threshold": 0.5
+  },
+  "rows": [
+    {
+      "device": "cuda",
+      "mode": "packed",
+      "raw_response": true,
+      "slots": 4,
+      "seed": 424242,
+      "seconds": 11.345472110901028,
+      "ticks": 2000,
+      "tps": 176.28177835617325,
+      "plays": 32,
+      "decisions": 1000,
+      "model_calls": 125,
+      "verified_decisions": 1000,
+      "max_logit_error": 0.00010561943054199219,
+      "times": {
+        "encode": 0.4778565982123837,
+        "forward": 1.1235485528595746,
+        "decode": 8.188438029494137,
+        "native": 1.5365321997087449
+      },
+      "finals": {},
+      "complete": false,
+      "peak_entities": 16,
+      "action_digest": "f7c715f9d40d42bf2ec37cdf4a8d9c5188010ab26f2932a55dfc215da9fee7d2"
+    }
+  ]
+}

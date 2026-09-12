@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import tempfile
 import time
 import unittest
+import sys
 from unittest.mock import patch
 
 from training.schema import ActionMaskCache, CARD_COSTS
@@ -16,6 +17,7 @@ from scripts.run_native_active_worker_sweep import (
     parse_integer_set,
     recommended_tier,
     run_phase,
+    ResourceSampler,
     summarize_tier,
     validate_transition,
     workload_name,
@@ -46,6 +48,28 @@ class _SummaryResources:
 
 
 class NativeActiveWorkerSweepTests(unittest.TestCase):
+    def test_cpu_uses_cumulative_counters_and_rejects_pid_reuse(self) -> None:
+        sampler = ResourceSampler(ports=[], interval=1.0, worker_pids=[123])
+        process = SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=1024),
+            num_threads=lambda: 2,
+            create_time=lambda: 100.0,
+            cpu_times=lambda: SimpleNamespace(user=1.0, system=0.0),
+        )
+        fake = SimpleNamespace(Process=lambda pid: process,
+                               NoSuchProcess=ProcessLookupError, AccessDenied=PermissionError)
+        with patch.dict(sys.modules, {"psutil": fake}), patch(
+            "scripts.run_native_active_worker_sweep.time.perf_counter", side_effect=[10.0, 12.0, 14.0]
+        ):
+            first = sampler._sample_processes()
+            self.assertNotIn("worker_cpu_percent", first)
+            process.cpu_times = lambda: SimpleNamespace(user=2.0, system=0.0)
+            second = sampler._sample_processes()
+            self.assertEqual(second["worker_cpu_percent"], 50.0)
+            process.create_time = lambda: 101.0
+            third = sampler._sample_processes()
+            self.assertNotIn("worker_cpu_percent", third)
+
     def test_port_sources_and_ranges_are_explicit(self) -> None:
         self.assertEqual(parse_integer_set("38031-38033,38040", label="port"), [38031, 38032, 38033, 38040])
         with tempfile.TemporaryDirectory() as raw:

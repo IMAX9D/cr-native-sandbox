@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "platform": "Linux/Bionic x86_64",
+  "slots": 4,
+  "interval": 4,
+  "observations_compared": 6152,
+  "accepted_actions": 604,
+  "live_reset_cycles": 30,
+  "other_slots_unchanged": true,
+  "seconds": 23.102665096521378
+}

@@ -1,0 +1,2 @@
+# Preserve benchmark source/evidence bytes so SOURCE_MANIFEST hashes survive checkout.
+* -text

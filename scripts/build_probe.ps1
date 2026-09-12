@@ -1,13 +1,16 @@
 param(
     [string]$JdkRoot = $(if ($env:CR_SANDBOX_JDK) { $env:CR_SANDBOX_JDK } else { throw "Missing CR_SANDBOX_JDK; copy and dot-source runtime.env.ps1 first" }),
     [string]$AndroidCommandLineTools = $(if ($env:CR_SANDBOX_ANDROID_TOOLS) { $env:CR_SANDBOX_ANDROID_TOOLS } else { throw "Missing CR_SANDBOX_ANDROID_TOOLS; copy and dot-source runtime.env.ps1 first" }),
-    [string]$AndroidJar = $(if ($env:CR_SANDBOX_ANDROID_JAR) { $env:CR_SANDBOX_ANDROID_JAR } else { throw "Missing CR_SANDBOX_ANDROID_JAR; copy and dot-source runtime.env.ps1 first" })
+    [string]$AndroidJar = $(if ($env:CR_SANDBOX_ANDROID_JAR) { $env:CR_SANDBOX_ANDROID_JAR } else { throw "Missing CR_SANDBOX_ANDROID_JAR; copy and dot-source runtime.env.ps1 first" }),
+    [string]$ArtifactRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $SourceRoot = Join-Path $ProjectRoot "android_probe\java"
-$ArtifactRoot = Join-Path $ProjectRoot "artifacts"
+if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+    $ArtifactRoot = Join-Path $ProjectRoot "artifacts"
+}
 $Classes = Join-Path $ArtifactRoot "probe-classes"
 $Output = Join-Path $ArtifactRoot "lifecycle-probe.jar"
 $Javac = Join-Path $JdkRoot "bin\javac.exe"

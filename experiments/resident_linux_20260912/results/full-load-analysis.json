@@ -1,0 +1,40 @@
+[
+  {
+    "workers": 12,
+    "slots_per_worker": 4,
+    "resident_games": 48,
+    "model_copies": 12,
+    "rounds": 2,
+    "complete_games": 96,
+    "wall_seconds": 106.9863582829712,
+    "ticks": 544650,
+    "plays": 15863,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5090.835960220648,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w12-1789195434",
+    "mean_cpu_cores": 12.273862794781115,
+    "max_cgroup_gib": 17.371318817138672,
+    "mean_gpu_util": 94.66666666666667,
+    "max_gpu_mib": 8446.0,
+    "oom_delta": 0
+  },
+  {
+    "workers": 16,
+    "slots_per_worker": 4,
+    "resident_games": 64,
+    "model_copies": 16,
+    "rounds": 2,
+    "complete_games": 128,
+    "wall_seconds": 132.73854162101634,
+    "ticks": 726192,
+    "plays": 21136,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5470.84509993609,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w16-1789195590",
+    "mean_cpu_cores": 16.321062837092114,
+    "max_cgroup_gib": 22.089183807373047,
+    "mean_gpu_util": 95.6984126984127,
+    "max_gpu_mib": 11260.0,
+    "oom_delta": 0
+  }
+]

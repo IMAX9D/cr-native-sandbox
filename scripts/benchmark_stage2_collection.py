@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -176,6 +177,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> int:
+    def stop_requested(_signum, _frame):
+        # Let run() terminate its explicitly owned collector children before
+        # exiting. A default SIGTERM would orphan their independent sessions.
+        raise KeyboardInterrupt("benchmark stop requested")
+
+    signal.signal(signal.SIGTERM, stop_requested)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-opponent-checkpoint", type=Path, required=True)
     parser.add_argument("--behavior-checkpoint", type=Path, required=True)
@@ -204,6 +211,14 @@ def main() -> int:
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--collector-cpu-threads", type=int, default=2)
     parser.add_argument("--policy-server-address")
+    parser.add_argument("--policy-wire-format", choices=("rows-v1", "columns-v2"), default="rows-v1")
+    parser.add_argument("--transition-mode", choices=("legacy", "fast-json"), default="legacy")
+    parser.add_argument("--sparse-hidden-transfer", action="store_true")
+    parser.add_argument("--ready-group-size", type=int, default=0)
+    parser.add_argument("--max-ready-groups", type=int, default=8)
+    parser.add_argument("--profile-native", action="store_true")
+    parser.add_argument("--runtime-manifest", type=Path,
+                        default=PROJECT_ROOT / "bindings/runtime-150535029-x86_64.json")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument(
         "--collect-script",

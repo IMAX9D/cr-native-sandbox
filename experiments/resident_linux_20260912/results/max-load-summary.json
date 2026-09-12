@@ -1,0 +1,16 @@
+[
+  {
+    "workers": 24,
+    "slots_per_worker": 4,
+    "resident_games": 96,
+    "model_copies": 24,
+    "rounds": 2,
+    "complete_games": 192,
+    "wall_seconds": 194.1818021319341,
+    "ticks": 1092539,
+    "plays": 31847,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5626.371719723199,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w24-1789196174"
+  }
+]

@@ -29,14 +29,31 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20905000)
     parser.add_argument("--microbatch-ms", type=float, default=2.0)
     parser.add_argument("--max-actor-rows", type=int, default=256)
+    parser.add_argument("--max-pending-requests", type=int, default=64)
+    parser.add_argument("--cpu-threads", type=int, default=2)
+    parser.add_argument("--deterministic", action="store_true",
+                        help="deterministic action selection for controlled benchmarks")
+    parser.add_argument("--dense-policy-sampling", action="store_true")
+    parser.add_argument("--collate-before-transfer", action="store_true")
+    parser.add_argument("--compile-actor", action="store_true")
+    parser.add_argument("--compile-batch-size", type=int)
+    parser.add_argument("--compile-entity-slots", type=int)
     parser.add_argument("--result", type=Path)
     args = parser.parse_args()
+    if args.cpu_threads < 1:
+        raise ValueError("--cpu-threads must be positive")
+    torch.set_num_threads(args.cpu_threads)
     device = torch.device(args.device)
     loaded = load_base(args.checkpoint, args.expert_manifest, device=device)
     opponent = load_base(
         args.opponent_checkpoint, args.expert_manifest, device=device
     )
-    service = BatchedPolicyService(device=device, seed=args.seed)
+    service = BatchedPolicyService(
+        device=device, seed=args.seed, deterministic=args.deterministic,
+        dense_sampling=args.dense_policy_sampling, compile_actors=args.compile_actor,
+        collate_before_transfer=args.collate_before_transfer,
+        compile_batch_size=args.compile_batch_size, compile_entity_slots=args.compile_entity_slots,
+    )
     service.register_actor(
         loaded.actor, actor_sha256=loaded.actor_sha256, verify_content=True
     )
@@ -51,6 +68,7 @@ def main() -> int:
         args.address,
         microbatch_seconds=args.microbatch_ms / 1000.0,
         max_actor_rows=args.max_actor_rows,
+        max_pending_requests=args.max_pending_requests,
     )
     metrics = server.serve_forever()
     if args.result is not None:

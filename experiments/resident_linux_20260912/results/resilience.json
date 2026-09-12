@@ -1,0 +1,9 @@
+{
+  "passed": true,
+  "failed_process_exit": 1,
+  "peer_complete_games": 4,
+  "recovered_complete_games": 4,
+  "peer_action_sequence_unchanged": true,
+  "recovered_fresh_state_matches": true,
+  "scope": "native CPU worker termination only; incomplete victim matches discarded"
+}

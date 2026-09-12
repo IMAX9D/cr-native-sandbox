@@ -279,6 +279,30 @@ class BatchedPolicyServiceTests(unittest.TestCase):
             ]))
         self.assertEqual(answers[0], answers[1])
 
+    def test_cpu_collation_preserves_padding_inputs_actions_and_hidden(self):
+        digest = "3" * 64
+        rows = [request(index, digest, extra_inputs={
+            "entity_tokens": torch.arange(1, index + 3),
+            "entity_positions": torch.arange(1, index + 3),
+            "entity_relations": torch.zeros(index + 2, dtype=torch.long),
+            "entity_numeric": torch.ones(index + 2, 3),
+            "entity_mask": torch.ones(index + 2, dtype=torch.bool),
+        }) for index in range(2)]
+        services = [BatchedPolicyService(device="cpu", deterministic=True,
+                                        collate_before_transfer=enabled) for enabled in (False, True)]
+        answers, inputs, hidden = [], [], []
+        for service in services:
+            service.register_actor(CountingActor(), actor_sha256=digest)
+            inputs.append(service._batch_inputs(rows, device=torch.device("cpu"), floating_dtype=torch.float32))
+            answers.append(service.act(rows))
+            hidden.append(service.last_pre_action_hidden_batch(answers[-1]))
+        self.assertEqual(answers[0], answers[1])
+        for name in inputs[0]:
+            torch.testing.assert_close(inputs[0][name], inputs[1][name])
+        for first, second in zip(hidden[0], hidden[1], strict=True):
+            for a, b in zip(first, second, strict=True):
+                torch.testing.assert_close(a, b)
+
 
 if __name__ == "__main__":
     unittest.main()

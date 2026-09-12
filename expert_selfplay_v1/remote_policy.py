@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Connection, Listener
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 import queue
 import threading
@@ -20,8 +21,10 @@ from .actions import ExpertActionMasks
 from .batched_policy import (
     BatchedPolicyService,
     PolicyRequest,
+    PolicyIdentity,
     SampledPolicyAction,
 )
+from .policy_columns import MAX_TENSOR_BYTES, decode_columns, encode_columns
 
 
 PROTOCOL_KIND = "cr_native_remote_policy_v1"
@@ -39,6 +42,8 @@ class _Pending:
     event: threading.Event = field(default_factory=threading.Event)
     result: Any = None
     error: dict[str, str] | None = None
+    queued_at: float = field(default_factory=time.perf_counter)
+    delivered: threading.Event = field(default_factory=threading.Event)
 
 
 def _request_to_wire(request: PolicyRequest) -> dict[str, Any]:
@@ -61,6 +66,7 @@ def _request_to_wire(request: PolicyRequest) -> dict[str, Any]:
         },
         "delta_ticks": request.delta_ticks,
         "reset_hidden": request.reset_hidden,
+        "capture_pre_action_hidden": request.capture_pre_action_hidden,
     }
 
 
@@ -87,6 +93,7 @@ def _request_from_wire(value: Any) -> PolicyRequest:
         }),
         delta_ticks=int(value["delta_ticks"]),
         reset_hidden=bool(value["reset_hidden"]),
+        capture_pre_action_hidden=bool(value.get("capture_pre_action_hidden", True)),
     )
 
 
@@ -99,10 +106,17 @@ class RemotePolicyClient:
         *,
         authkey: bytes = DEFAULT_AUTHKEY,
         expected_actor_hashes: Sequence[str] = (),
+        wire_format: str = "rows-v1",
+        connection_family: str = "AF_UNIX",
     ) -> None:
+        if wire_format not in ("rows-v1", "columns-v2"):
+            raise ValueError("unknown policy wire format")
+        if connection_family not in ("AF_UNIX", "AF_PIPE"):
+            raise ValueError("policy IPC must use a local socket or named pipe")
         self.address = str(address)
+        self.wire_format = wire_format
         self._connection = Client(
-            self.address, family="AF_UNIX", authkey=authkey
+            self.address, family=connection_family, authkey=authkey
         )
         self._lock = threading.Lock()
         self._hidden: dict[
@@ -110,6 +124,9 @@ class RemotePolicyClient:
         ] = {}
         self.forward_calls = 0
         status = self._request("status")
+        if wire_format == "columns-v2" and wire_format not in status.get("wire_formats", ()):
+            self.close()
+            raise RemotePolicyError("server does not support columnar requests; no action was sent")
         hashes = tuple(str(value) for value in status["actor_hashes"])
         expected = tuple(expected_actor_hashes)
         if expected and set(hashes) != set(expected):
@@ -154,13 +171,15 @@ class RemotePolicyClient:
         deterministic: bool | None = None,
     ) -> list[SampledPolicyAction]:
         rows = list(requests)
-        result = self._request(
-            "act",
-            requests=[_request_to_wire(request) for request in rows],
-            deterministic=deterministic,
-        )
+        if getattr(self, "wire_format", "rows-v1") == "columns-v2":
+            result = self._request("act_columns_v2", packet=encode_columns(rows), deterministic=deterministic)
+        else:
+            result = self._request(
+                "act", requests=[_request_to_wire(request) for request in rows], deterministic=deterministic,
+            )
         actions = list(result["actions"])
         hidden = [
+            None if state is None else
             tuple(
                 torch.from_numpy(np.asarray(item)).contiguous().clone()
                 for item in state
@@ -171,14 +190,22 @@ class RemotePolicyClient:
             raise RemotePolicyError("remote policy dropped an action or hidden state")
         if not all(isinstance(value, SampledPolicyAction) for value in actions):
             raise RemotePolicyError("remote policy returned an invalid action type")
-        for action, state in zip(actions, hidden, strict=True):
+        for request, action, state in zip(rows, actions, hidden, strict=True):
+            key = (action.actor_sha256, action.worker_id, action.side)
+            if key != (request.actor_sha256, request.worker_id, request.side):
+                raise RemotePolicyError("remote policy reordered action identities")
+            if state is None:
+                self._hidden.pop(key, None)
+                if request.capture_pre_action_hidden:
+                    raise RemotePolicyError("remote policy dropped a requested recurrent anchor")
+                continue
             if not (
                 isinstance(state, tuple)
                 and len(state) == 2
                 and all(isinstance(value, Tensor) for value in state)
             ):
                 raise RemotePolicyError("remote policy returned invalid hidden state")
-            self._hidden[(action.actor_sha256, action.worker_id, action.side)] = state
+            self._hidden[key] = state
         self.forward_calls += len({request.actor_sha256 for request in rows})
         return actions
 
@@ -239,32 +266,53 @@ class RemotePolicyServer:
         authkey: bytes = DEFAULT_AUTHKEY,
         microbatch_seconds: float = 0.002,
         max_actor_rows: int = 256,
+        max_pending_requests: int = 64,
+        connection_family: str = "AF_UNIX",
     ) -> None:
-        if microbatch_seconds < 0 or max_actor_rows < 1:
+        if microbatch_seconds < 0 or max_actor_rows < 1 or max_pending_requests < 1:
             raise ValueError("remote policy batching limits are invalid")
         self.service = service
+        if connection_family not in ("AF_UNIX", "AF_PIPE"):
+            raise ValueError("policy IPC must use a local socket or named pipe")
+        self.connection_family = connection_family
         self.address = Path(address)
         self.authkey = authkey
         self.microbatch_seconds = float(microbatch_seconds)
         self.max_actor_rows = int(max_actor_rows)
-        self._queue: queue.Queue[_Pending] = queue.Queue()
+        self._queue: queue.Queue[_Pending] = queue.Queue(maxsize=max_pending_requests)
         self._stop = threading.Event()
+        self.ready_event = threading.Event()
         self._listener: Listener | None = None
+        self._io_lock = threading.Lock()
+        self._io_metrics = {"request_wire_bytes": 0.0, "response_wire_bytes": 0.0,
+                            "request_unpickle_seconds": 0.0, "response_pickle_seconds": 0.0}
         self.metrics: dict[str, float] = {
             "client_act_calls": 0.0,
             "microbatches": 0.0,
             "actor_rows": 0.0,
             "policy_seconds": 0.0,
             "max_microbatch_rows": 0.0,
+            "hidden_rows_transferred": 0.0,
+            "hidden_bytes_transferred": 0.0,
+            "columnar_client_act_calls": 0.0,
+            "request_schema_decode_seconds": 0.0,
+            "inference_seconds": 0.0,
+            "recurrent_export_seconds": 0.0,
+            "queue_wait_seconds": 0.0,
         }
 
     def _handler(self, connection: Connection) -> None:
         try:
             while not self._stop.is_set():
                 try:
-                    message = connection.recv()
+                    wire = connection.recv_bytes(MAX_TENSOR_BYTES + 1024 * 1024)
                 except EOFError:
                     break
+                decoded_at = time.perf_counter()
+                message = ForkingPickler.loads(wire)
+                with self._io_lock:
+                    self._io_metrics["request_wire_bytes"] += len(wire)
+                    self._io_metrics["request_unpickle_seconds"] += time.perf_counter() - decoded_at
                 if not isinstance(message, dict) or message.get("kind") != PROTOCOL_KIND:
                     connection.send({
                         "kind": PROTOCOL_KIND,
@@ -276,8 +324,19 @@ class RemotePolicyServer:
                 pending = _Pending(
                     str(message.get("operation", "")), dict(message)
                 )
-                self._queue.put(pending)
-                pending.event.wait()
+                while not self._stop.is_set():
+                    try:
+                        self._queue.put(pending, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    break
+                while not pending.event.wait(timeout=0.1):
+                    if self._stop.is_set():
+                        break
+                if not pending.event.is_set():
+                    break
                 if pending.error is None:
                     response = {
                         "kind": PROTOCOL_KIND,
@@ -290,7 +349,15 @@ class RemotePolicyServer:
                         "ok": False,
                         **pending.error,
                     }
-                connection.send(response)
+                encoded_at = time.perf_counter()
+                wire = ForkingPickler.dumps(response)
+                with self._io_lock:
+                    self._io_metrics["response_pickle_seconds"] += time.perf_counter() - encoded_at
+                    self._io_metrics["response_wire_bytes"] += len(wire)
+                try:
+                    connection.send_bytes(wire)
+                finally:
+                    pending.delivered.set()
                 if pending.operation in ("close_client", "shutdown"):
                     break
         except (BrokenPipeError, ConnectionResetError, EOFError, OSError):
@@ -319,24 +386,53 @@ class RemotePolicyServer:
         pending.event.set()
 
     def _act(self, pending_rows: list[_Pending]) -> None:
-        flattened: list[PolicyRequest] = []
+        decode_started = time.perf_counter()
+        columnar = pending_rows[0].operation == "act_columns_v2"
+        if any((pending.operation == "act_columns_v2") != columnar for pending in pending_rows):
+            raise ValueError("one microbatch cannot mix wire formats")
+        if sum(self._row_count(pending) for pending in pending_rows) > self.max_actor_rows:
+            raise ValueError("policy microbatch exceeds row capacity")
+        flattened: list[PolicyRequest | PolicyIdentity] = []
+        tensor_batches = []
         lengths = []
         for pending in pending_rows:
-            requests = [
-                _request_from_wire(value)
-                for value in pending.payload.get("requests", ())
-            ]
+            if columnar:
+                batches, requests = decode_columns(pending.payload.get("packet"), offset=len(flattened))
+                tensor_batches.extend(batches)
+            else:
+                requests = [_request_from_wire(value) for value in pending.payload.get("requests", ())]
             flattened.extend(requests)
             lengths.append(len(requests))
+        if len(flattened) > self.max_actor_rows:
+            raise ValueError("policy microbatch exceeds row capacity")
         modes = {pending.payload.get("deterministic") for pending in pending_rows}
         if len(modes) != 1:
             raise ValueError("one remote microbatch cannot mix sampling modes")
         started = time.perf_counter()
-        actions = self.service.act(
-            flattened, deterministic=next(iter(modes))
+        self.metrics["request_schema_decode_seconds"] += started - decode_started
+        self.metrics["queue_wait_seconds"] += sum(max(0.0, decode_started - p.queued_at) for p in pending_rows)
+        if columnar:
+            actions = self.service.act_tensor_batches(tensor_batches, deterministic=next(iter(modes)))
+            self.metrics["columnar_client_act_calls"] += len(pending_rows)
+        else:
+            actions = self.service.act(flattened, deterministic=next(iter(modes)))
+        export_started = time.perf_counter()
+        self.metrics["inference_seconds"] += export_started - started
+        if len(actions) != len(flattened):
+            raise ValueError("policy service dropped an action")
+        captures = [i for i, request in enumerate(flattened) if request.capture_pre_action_hidden]
+        captured = self.service.last_pre_action_hidden_batch([actions[i] for i in captures])
+        if len(captured) != len(captures):
+            raise ValueError("policy service dropped a recurrent anchor")
+        hidden: list[Any] = [None] * len(actions)
+        for index, state in zip(captures, captured, strict=True):
+            hidden[index] = tuple(value.contiguous().numpy() for value in state)
+        self.metrics["hidden_rows_transferred"] += len(captures)
+        self.metrics["hidden_bytes_transferred"] += sum(
+            value.nbytes for state in hidden if state is not None for value in state
         )
-        hidden = self.service.last_pre_action_hidden_batch(actions)
         elapsed = time.perf_counter() - started
+        self.metrics["recurrent_export_seconds"] += time.perf_counter() - export_started
         self.metrics["client_act_calls"] += float(len(pending_rows))
         self.metrics["microbatches"] += 1.0
         self.metrics["actor_rows"] += float(len(flattened))
@@ -348,16 +444,15 @@ class RemotePolicyServer:
         for pending, length in zip(pending_rows, lengths, strict=True):
             pending.result = {
                 "actions": actions[cursor:cursor + length],
-                "pre_action_hidden": [
-                    tuple(value.contiguous().numpy() for value in state)
-                    for state in hidden[cursor:cursor + length]
-                ],
+                "pre_action_hidden": hidden[cursor:cursor + length],
             }
             cursor += length
             pending.event.set()
 
     def _status(self) -> dict[str, Any]:
         metrics = dict(self.metrics)
+        with self._io_lock:
+            metrics.update(self._io_metrics)
         metrics["service_forward_calls"] = float(self.service.forward_calls)
         if metrics["microbatches"]:
             metrics["mean_microbatch_rows"] = (
@@ -368,23 +463,37 @@ class RemotePolicyServer:
         return {
             "actor_hashes": list(self.service.registered_actor_hashes),
             "metrics": metrics,
+            "wire_formats": ["rows-v1"] + (["columns-v2"] if callable(getattr(self.service, "act_tensor_batches", None)) else []),
+            "configuration": {
+                "dense_sampling": bool(getattr(self.service, "dense_sampling", False)),
+                "compile_actors": bool(getattr(self.service, "compile_actors", False)),
+                "collate_before_transfer": bool(getattr(self.service, "collate_before_transfer", False)),
+                "microbatch_seconds": self.microbatch_seconds,
+                "max_actor_rows": self.max_actor_rows,
+                "max_pending_requests": self._queue.maxsize,
+            },
         }
 
     def serve_forever(self) -> dict[str, Any]:
-        self.address.parent.mkdir(parents=True, exist_ok=True)
-        self.address.unlink(missing_ok=True)
+        if self.connection_family == "AF_UNIX":
+            self.address.parent.mkdir(parents=True, exist_ok=True)
+            if self.address.exists():
+                raise RemotePolicyError("policy socket already exists; verify and stop its owner first")
         self._listener = Listener(
-            str(self.address), family="AF_UNIX", authkey=self.authkey
+            str(self.address), family=self.connection_family, authkey=self.authkey
         )
+        if self.connection_family == "AF_UNIX":
+            self.address.chmod(0o600)
+        self.ready_event.set()
         threading.Thread(target=self._accept, daemon=True).start()
         backlog: deque[_Pending] = deque()
         try:
             while not self._stop.is_set():
                 pending = backlog.popleft() if backlog else self._queue.get()
                 try:
-                    if pending.operation == "act":
+                    if pending.operation in ("act", "act_columns_v2"):
                         batch = [pending]
-                        rows = len(pending.payload.get("requests", ()))
+                        rows = self._row_count(pending)
                         mode = pending.payload.get("deterministic")
                         deadline = time.perf_counter() + self.microbatch_seconds
                         while rows < self.max_actor_rows:
@@ -395,9 +504,9 @@ class RemotePolicyServer:
                                 candidate = self._queue.get(timeout=remaining)
                             except queue.Empty:
                                 break
-                            candidate_rows = len(candidate.payload.get("requests", ()))
+                            candidate_rows = self._row_count(candidate)
                             if (
-                                candidate.operation == "act"
+                                candidate.operation == pending.operation
                                 and candidate.payload.get("deterministic") == mode
                                 and rows + candidate_rows <= self.max_actor_rows
                             ):
@@ -425,6 +534,7 @@ class RemotePolicyServer:
                     elif pending.operation == "shutdown":
                         pending.result = self._status()["metrics"]
                         pending.event.set()
+                        pending.delivered.wait(timeout=2.0)
                         self._stop.set()
                     else:
                         raise ValueError(
@@ -436,8 +546,18 @@ class RemotePolicyServer:
             self._stop.set()
             if self._listener is not None:
                 self._listener.close()
-            self.address.unlink(missing_ok=True)
+            if self.connection_family == "AF_UNIX":
+                self.address.unlink(missing_ok=True)
         return self._status()["metrics"]
+
+    @staticmethod
+    def _row_count(pending: _Pending) -> int:
+        if pending.operation == "act_columns_v2":
+            packet = pending.payload.get("packet")
+            value = packet.get("row_count") if isinstance(packet, dict) else None
+            return value if type(value) is int and value >= 0 else 0
+        requests = pending.payload.get("requests", ())
+        return len(requests) if isinstance(requests, (list, tuple)) else 0
 
 
 __all__ = [

@@ -69,11 +69,17 @@ class NativeRoyaleEnv:
         port: int = 37031,
         timeout: float = 15.0,
         profile_native: bool = False,
+        transition_mode: str = "legacy",
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.profile_native = profile_native
+        if transition_mode not in ("legacy", "fast-json"):
+            raise ValueError("transition_mode must be legacy or fast-json")
+        if transition_mode == "fast-json" and profile_native:
+            raise ValueError("fast-json does not support inline native profiling")
+        self.transition_mode = transition_mode
         self.replay: dict[str, Any] | None = None
         self.decks: list[list[dict[str, int]]] = [[], []]
         self.accounts: list[tuple[int, int]] = [(1, 1), (2, 2)]
@@ -381,7 +387,9 @@ class NativeRoyaleEnv:
         payload = self._joint_payload(actions)
         raw = self._request(
             {
-                "op": "joint_training_transition_v1",
+                "op": ("joint_training_transition_fast_v1"
+                       if self.transition_mode == "fast-json"
+                       else "joint_training_transition_v1"),
                 "actions": payload,
                 "steps": steps,
                 "profile_native": self.profile_native,

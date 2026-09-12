@@ -1,0 +1,22 @@
+[
+  {
+    "workers": 12,
+    "resident_games": 48,
+    "model_copies": 12,
+    "policy_backend": "per_worker_gpu",
+    "rounds": 1,
+    "complete_games": 288,
+    "continuous_refill": true,
+    "wall_seconds": 307.397742403904,
+    "ticks": 1644455,
+    "plays": 47975,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5349.60012113321,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w12-1789196914",
+    "mean_cpu_cores": 12.116536261991776,
+    "max_cgroup_gib": 18.55858612060547,
+    "mean_gpu_util": 95.37671232876713,
+    "max_gpu_mib": 8446.0,
+    "oom_delta": 0
+  }
+]

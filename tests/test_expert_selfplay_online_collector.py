@@ -318,6 +318,27 @@ class OnlineCollectorTests(unittest.TestCase):
         ]
         self.assertEqual(anchors, [0, 48, 112])
 
+    def test_sparse_requests_exact_learner_anchors_without_skipping_decisions(self):
+        digest = "a" * 64
+        service = BatchedPolicyService(device="cpu", deterministic=True)
+        service.register_actor(ConstantActor(), actor_sha256=digest)
+        seen = []
+        original_act = service.act
+
+        def capture(requests, **kwargs):
+            seen.append([(row.side, row.capture_pre_action_hidden) for row in requests])
+            return original_act(requests, **kwargs)
+
+        service.act = capture
+        result = OnlineSelfPlayCollector(_encoder(), service, sparse_hidden_transfer=True).collect_episode(
+            env=FakeNativeEnv(terminal_after=114), fixture=_fixture(17, 0),
+            header=_header(17, 0, digest, digest), actor_hashes={0: digest, 1: digest},
+        )
+        self.assertEqual(len(result.episode.decisions), 114)
+        self.assertEqual(len(seen), 114)
+        self.assertEqual([i for i, rows in enumerate(seen) if (0, True) in rows], [0, 48, 112])
+        self.assertTrue(all((1, False) in rows for rows in seen))
+
     def test_rolling_replacement_reuses_worker_after_normal_terminal(self):
         digest = "a" * 64
         service = BatchedPolicyService(device="cpu", deterministic=True)

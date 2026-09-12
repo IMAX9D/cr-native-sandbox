@@ -1,0 +1,359 @@
+{
+  "affinity": {
+    "native_cpu": 5,
+    "policy_cpu": 7,
+    "sample_utilization": [
+      [
+        0.0,
+        5
+      ],
+      [
+        0.0,
+        7
+      ],
+      [
+        0.0,
+        9
+      ],
+      [
+        0.0,
+        10
+      ],
+      [
+        0.0,
+        14
+      ],
+      [
+        0.0,
+        18
+      ],
+      [
+        0.0,
+        20
+      ],
+      [
+        0.0,
+        26
+      ]
+    ],
+    "gpu_numa": 0
+  },
+  "cases": [
+    {
+      "identity": {
+        "policy_version": "hokoff-fixed-bc",
+        "training_step": 1037042,
+        "path": "/root/autodl-tmp/bc-cloud-bench-20260911/model.pt",
+        "model_digest": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "checkpoint_sha256": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "encoder_contract_sha256": "64fe55438512573aa67ce01de046c99ec6373f2140764746f2f30527df2cc49d",
+        "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+        "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+        "decision_ticks": 4,
+        "history_length": 4,
+        "parameters": 4804205,
+        "mode": "greedy-masked-fixed4",
+        "timing_threshold": 0.5
+      },
+      "rows": [
+        {
+          "device": "cuda",
+          "mode": "packed",
+          "raw_response": true,
+          "slots": 4,
+          "seed": 424242,
+          "seconds": 39.867852196097374,
+          "ticks": 20280,
+          "tps": 508.6805253578519,
+          "plays": 373,
+          "decisions": 10144,
+          "model_calls": 1534,
+          "verified_decisions": 0,
+          "max_logit_error": 0.0,
+          "times": {
+            "encode": 10.189715411514044,
+            "forward": 10.619729477912188,
+            "decode": 2.2232592441141605,
+            "native": 16.69051717221737
+          },
+          "finals": {
+            "3": {
+              "tick": 3681,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "2": {
+              "tick": 4378,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "0": {
+              "tick": 6122,
+              "outcome": "side0_win",
+              "crowns": [
+                1,
+                0
+              ]
+            },
+            "1": {
+              "tick": 6147,
+              "outcome": "draw",
+              "crowns": [
+                0,
+                0
+              ]
+            }
+          },
+          "complete": true,
+          "peak_entities": 22,
+          "action_digest": "52a307ad1a50dfa02db0b89cbea38039a22cd168f885bdec2205729d11b81b90"
+        }
+      ],
+      "tower_fast": false,
+      "case": "controlled-0-base"
+    },
+    {
+      "identity": {
+        "policy_version": "hokoff-fixed-bc",
+        "training_step": 1037042,
+        "path": "/root/autodl-tmp/bc-cloud-bench-20260911/model.pt",
+        "model_digest": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "checkpoint_sha256": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "encoder_contract_sha256": "64fe55438512573aa67ce01de046c99ec6373f2140764746f2f30527df2cc49d",
+        "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+        "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+        "decision_ticks": 4,
+        "history_length": 4,
+        "parameters": 4804205,
+        "mode": "greedy-masked-fixed4",
+        "timing_threshold": 0.5
+      },
+      "rows": [
+        {
+          "device": "cuda",
+          "mode": "packed",
+          "raw_response": true,
+          "slots": 4,
+          "seed": 424242,
+          "seconds": 40.52947674319148,
+          "ticks": 20280,
+          "tps": 500.3765562654796,
+          "plays": 373,
+          "decisions": 10144,
+          "model_calls": 1534,
+          "verified_decisions": 0,
+          "max_logit_error": 0.0,
+          "times": {
+            "encode": 10.343271512538195,
+            "forward": 10.749679956585169,
+            "decode": 2.286433659493923,
+            "native": 17.00929782539606
+          },
+          "finals": {
+            "3": {
+              "tick": 3681,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "2": {
+              "tick": 4378,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "0": {
+              "tick": 6122,
+              "outcome": "side0_win",
+              "crowns": [
+                1,
+                0
+              ]
+            },
+            "1": {
+              "tick": 6147,
+              "outcome": "draw",
+              "crowns": [
+                0,
+                0
+              ]
+            }
+          },
+          "complete": true,
+          "peak_entities": 22,
+          "action_digest": "52a307ad1a50dfa02db0b89cbea38039a22cd168f885bdec2205729d11b81b90"
+        }
+      ],
+      "tower_fast": true,
+      "case": "controlled-1-fast"
+    },
+    {
+      "identity": {
+        "policy_version": "hokoff-fixed-bc",
+        "training_step": 1037042,
+        "path": "/root/autodl-tmp/bc-cloud-bench-20260911/model.pt",
+        "model_digest": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "checkpoint_sha256": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "encoder_contract_sha256": "64fe55438512573aa67ce01de046c99ec6373f2140764746f2f30527df2cc49d",
+        "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+        "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+        "decision_ticks": 4,
+        "history_length": 4,
+        "parameters": 4804205,
+        "mode": "greedy-masked-fixed4",
+        "timing_threshold": 0.5
+      },
+      "rows": [
+        {
+          "device": "cuda",
+          "mode": "packed",
+          "raw_response": true,
+          "slots": 4,
+          "seed": 424242,
+          "seconds": 39.53994467109442,
+          "ticks": 20280,
+          "tps": 512.8990485114575,
+          "plays": 373,
+          "decisions": 10144,
+          "model_calls": 1534,
+          "verified_decisions": 0,
+          "max_logit_error": 0.0,
+          "times": {
+            "encode": 10.153340935707092,
+            "forward": 10.507480084896088,
+            "decode": 2.2219738885760307,
+            "native": 16.519021842628717
+          },
+          "finals": {
+            "3": {
+              "tick": 3681,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "2": {
+              "tick": 4378,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "0": {
+              "tick": 6122,
+              "outcome": "side0_win",
+              "crowns": [
+                1,
+                0
+              ]
+            },
+            "1": {
+              "tick": 6147,
+              "outcome": "draw",
+              "crowns": [
+                0,
+                0
+              ]
+            }
+          },
+          "complete": true,
+          "peak_entities": 22,
+          "action_digest": "52a307ad1a50dfa02db0b89cbea38039a22cd168f885bdec2205729d11b81b90"
+        }
+      ],
+      "tower_fast": true,
+      "case": "controlled-2-fast"
+    },
+    {
+      "identity": {
+        "policy_version": "hokoff-fixed-bc",
+        "training_step": 1037042,
+        "path": "/root/autodl-tmp/bc-cloud-bench-20260911/model.pt",
+        "model_digest": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "checkpoint_sha256": "ff1fe42b76dbec2f68f840fd289aa5dda15357d5ab7ac47d3a1db1cbe6f02eb9",
+        "encoder_contract_sha256": "64fe55438512573aa67ce01de046c99ec6373f2140764746f2f30527df2cc49d",
+        "source_manifest_sha256": "fa06f704398786735ef2b98cf3f076dcbbdd578b5eed71179bc40636fe132ddc",
+        "native_libg_sha256": "fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba",
+        "decision_ticks": 4,
+        "history_length": 4,
+        "parameters": 4804205,
+        "mode": "greedy-masked-fixed4",
+        "timing_threshold": 0.5
+      },
+      "rows": [
+        {
+          "device": "cuda",
+          "mode": "packed",
+          "raw_response": true,
+          "slots": 4,
+          "seed": 424242,
+          "seconds": 40.97980352118611,
+          "ticks": 20280,
+          "tps": 494.8779217429742,
+          "plays": 373,
+          "decisions": 10144,
+          "model_calls": 1534,
+          "verified_decisions": 0,
+          "max_logit_error": 0.0,
+          "times": {
+            "encode": 10.305630892515182,
+            "forward": 10.876403365284204,
+            "decode": 2.2695822529494762,
+            "native": 17.38733794540167
+          },
+          "finals": {
+            "3": {
+              "tick": 3681,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "2": {
+              "tick": 4378,
+              "outcome": "side1_win",
+              "crowns": [
+                0,
+                1
+              ]
+            },
+            "0": {
+              "tick": 6122,
+              "outcome": "side0_win",
+              "crowns": [
+                1,
+                0
+              ]
+            },
+            "1": {
+              "tick": 6147,
+              "outcome": "draw",
+              "crowns": [
+                0,
+                0
+              ]
+            }
+          },
+          "complete": true,
+          "peak_entities": 22,
+          "action_digest": "52a307ad1a50dfa02db0b89cbea38039a22cd168f885bdec2205729d11b81b90"
+        }
+      ],
+      "tower_fast": false,
+      "case": "controlled-3-base"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "wave": {
+    "workers": 12,
+    "slots_per_worker": 4,
+    "resident_games": 48,
+    "model_copies": 12,
+    "rounds": 6,
+    "complete_games": 288,
+    "wall_seconds": 320.4138378590578,
+    "ticks": 1644455,
+    "plays": 47975,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5132.284582301203,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w12-1789196543"
+  },
+  "continuous": {
+    "workers": 12,
+    "resident_games": 48,
+    "model_copies": 12,
+    "policy_backend": "per_worker_gpu",
+    "rounds": 1,
+    "complete_games": 288,
+    "continuous_refill": true,
+    "wall_seconds": 307.397742403904,
+    "ticks": 1644455,
+    "plays": 47975,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 5349.60012113321,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w12-1789196914"
+  },
+  "matched_games": 288,
+  "different_games": [],
+  "speed_ratio": 1.0423428466109275,
+  "completed": 1789197262.0921445
+}

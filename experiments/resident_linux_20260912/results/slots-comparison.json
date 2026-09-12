@@ -1,0 +1,33 @@
+{
+  "four_slots": {
+    "workers": 4,
+    "slots_per_worker": 4,
+    "resident_games": 16,
+    "model_copies": 4,
+    "rounds": 2,
+    "complete_games": 32,
+    "wall_seconds": 97.52968731895089,
+    "ticks": 180986,
+    "plays": 5264,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 1855.7016327564172,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w4-1789193108"
+  },
+  "one_slot": {
+    "workers": 16,
+    "slots_per_worker": 1,
+    "resident_games": 16,
+    "model_copies": 16,
+    "rounds": 2,
+    "complete_games": 32,
+    "wall_seconds": 117.76986276102252,
+    "ticks": 180986,
+    "plays": 5264,
+    "model_sha256": "637840a61b326e9c4b1bdd4dd8848ae80c1a81d2b5d5442991a45f06cdda5e2a",
+    "tps": 1536.7768608787042,
+    "source": "/root/autodl-tmp/resident-linux-20260912/scaling/w16-1789193225"
+  },
+  "matched_seed_count": 32,
+  "different_game_results": [],
+  "four_slot_speed_ratio": 1.2075283536579
+}

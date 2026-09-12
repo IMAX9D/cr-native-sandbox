@@ -1,6 +1,7 @@
 param(
     [string]$NdkRoot = $(if ($env:CR_SANDBOX_NDK) { $env:CR_SANDBOX_NDK } else { throw "Missing CR_SANDBOX_NDK; copy and dot-source runtime.env.ps1 first" }),
-    [int]$ApiLevel = 23
+    [int]$ApiLevel = 23,
+    [string]$ArtifactRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,7 +9,9 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $Compiler = Join-Path $NdkRoot "toolchains\llvm\prebuilt\windows-x86_64\bin\clang++.exe"
 $JniHeaders = Join-Path $NdkRoot "toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\include"
 $Source = Join-Path $ProjectRoot "android_probe\native\jni_bridge.cpp"
-$ArtifactRoot = Join-Path $ProjectRoot "artifacts"
+if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+    $ArtifactRoot = Join-Path $ProjectRoot "artifacts"
+}
 $Output = Join-Path $ArtifactRoot "libnative_core_probe.so"
 foreach ($Path in @($Compiler, $Source)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
