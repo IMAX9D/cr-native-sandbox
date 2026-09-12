@@ -1,0 +1,74 @@
+{
+  "segments": [
+    {
+      "id": 0,
+      "version": 0,
+      "start": 1789203468.8520386,
+      "end": 1789203470.4265392
+    },
+    {
+      "id": 1,
+      "version": 0,
+      "start": 1789203470.4457936,
+      "end": 1789203471.7419758
+    },
+    {
+      "id": 2,
+      "version": 1,
+      "start": 1789203471.7620041,
+      "end": 1789203473.01565
+    },
+    {
+      "id": 3,
+      "version": 2,
+      "start": 1789203473.0282242,
+      "end": 1789203474.2235806
+    },
+    {
+      "id": 4,
+      "version": 3,
+      "start": 1789203474.237185,
+      "end": 1789203475.2425284
+    },
+    {
+      "id": 5,
+      "version": 4,
+      "start": 1789203475.2573655,
+      "end": 1789203476.3638494
+    },
+    {
+      "id": 6,
+      "version": 5,
+      "start": 1789203476.379736,
+      "end": 1789203477.4201975
+    },
+    {
+      "id": 7,
+      "version": 6,
+      "start": 1789203477.452026,
+      "end": 1789203478.4180822
+    }
+  ],
+  "accepted_plays": 78,
+  "nonempty_frames": 1024,
+  "frames": 1024,
+  "queue_wait_seconds": 0.0019092559814453125,
+  "versions": [
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "new_entity_frames": 862,
+  "moving_entity_frames": 697,
+  "peak_new_entities": 12,
+  "behavior_mode": "stochastic_joint_fixed4_v1",
+  "opponent_mode": "greedy_fixed4",
+  "opponent_unchanged": true,
+  "backbone_unchanged": true,
+  "distinct_grid_frames": 607
+}

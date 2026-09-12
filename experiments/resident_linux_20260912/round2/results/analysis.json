@@ -1,0 +1,460 @@
+{
+  "single_worker": {
+    "baseline_mean_seconds": 38.861328673083335,
+    "optimized_mean_seconds": 27.6697454819805,
+    "throughput_ratio": 1.4044700446699514,
+    "all_games_equal": true
+  },
+  "profile_controls": {
+    "baseline_wall": 34.77088451408781,
+    "optimized_wall": 29.074526641052216,
+    "baseline_actor_cpu": 25.711399425000003,
+    "optimized_actor_cpu": 20.677374273999998,
+    "phases": {
+      "observation_encode": {
+        "baseline_wall_seconds": 9.1639188,
+        "optimized_wall_seconds": 5.297410992,
+        "baseline_cpu_seconds": 9.161977037,
+        "optimized_cpu_seconds": 5.298927272
+      },
+      "batch_collate": {
+        "baseline_wall_seconds": 0.785271694,
+        "optimized_wall_seconds": 0.877072116,
+        "baseline_cpu_seconds": 0.785572221,
+        "optimized_cpu_seconds": 0.877143781
+      },
+      "hidden_gather": {
+        "baseline_wall_seconds": 0.178059349,
+        "optimized_wall_seconds": 0.17532259,
+        "baseline_cpu_seconds": 0.178176388,
+        "optimized_cpu_seconds": 0.175558777
+      },
+      "h2d": {
+        "baseline_wall_seconds": 0.487947538,
+        "optimized_wall_seconds": 0.528772292,
+        "baseline_cpu_seconds": 0.487945719,
+        "optimized_cpu_seconds": 0.528918914
+      },
+      "model_forward": {
+        "baseline_wall_seconds": 6.45106711,
+        "optimized_wall_seconds": 5.650873158,
+        "baseline_cpu_seconds": 6.451776902,
+        "optimized_cpu_seconds": 5.654883806
+      },
+      "gpu_guard_pack": {
+        "baseline_wall_seconds": 0.767047509,
+        "optimized_wall_seconds": 0.900411199,
+        "baseline_cpu_seconds": 0.767437591,
+        "optimized_cpu_seconds": 0.901118988
+      },
+      "d2h": {
+        "baseline_wall_seconds": 0.114995042,
+        "optimized_wall_seconds": 0.146830512,
+        "baseline_cpu_seconds": 0.115115909,
+        "optimized_cpu_seconds": 0.147035624
+      },
+      "prediction_split": {
+        "baseline_wall_seconds": 0.558251053,
+        "optimized_wall_seconds": 0.627963924,
+        "baseline_cpu_seconds": 0.558332192,
+        "optimized_cpu_seconds": 0.62854922
+      },
+      "cuda_sync_wait": {
+        "baseline_wall_seconds": 0.076089931,
+        "optimized_wall_seconds": 0.0748228,
+        "baseline_cpu_seconds": 0.076186721,
+        "optimized_cpu_seconds": 0.074963281
+      },
+      "action_decode": {
+        "baseline_wall_seconds": 2.129633509,
+        "optimized_wall_seconds": 0.734056468,
+        "baseline_cpu_seconds": 2.130158936,
+        "optimized_cpu_seconds": 0.734704733
+      },
+      "request_prepare": {
+        "baseline_wall_seconds": 0.014108163,
+        "optimized_wall_seconds": 0.016074307,
+        "baseline_cpu_seconds": 0.01417666,
+        "optimized_cpu_seconds": 0.01619865
+      },
+      "simulation_rpc": {
+        "baseline_wall_seconds": 10.41602714,
+        "optimized_wall_seconds": 9.942975859,
+        "baseline_cpu_seconds": 1.375547558,
+        "optimized_cpu_seconds": 1.548475611
+      },
+      "history_and_enrichment": {
+        "baseline_wall_seconds": 3.110463403,
+        "optimized_wall_seconds": 3.554045218,
+        "baseline_cpu_seconds": 3.110024031,
+        "optimized_cpu_seconds": 3.554228024
+      },
+      "legality_rpc": {
+        "baseline_wall_seconds": 0.039893034,
+        "optimized_wall_seconds": 0.032136007,
+        "baseline_cpu_seconds": 0.006770375,
+        "optimized_cpu_seconds": 0.006721426
+      }
+    },
+    "optimized_native_profile": {
+      "schema_version": 0,
+      "ok": true,
+      "op": "profile_stats",
+      "native": {
+        "enabled": true,
+        "metrics": {
+          "step_total": {
+            "calls": 6113,
+            "wall_ns": 4539860883,
+            "cpu_ns": 4526795178
+          },
+          "engine_update": {
+            "calls": 24442,
+            "wall_ns": 1729874124,
+            "cpu_ns": 1713526949
+          },
+          "capture_step": {
+            "calls": 30555,
+            "wall_ns": 1848510654,
+            "cpu_ns": 1828775906
+          },
+          "observe_total": {
+            "calls": 6113,
+            "wall_ns": 2821429755,
+            "cpu_ns": 2808403564
+          },
+          "capture_observe": {
+            "calls": 6113,
+            "wall_ns": 357538273,
+            "cpu_ns": 353308939
+          },
+          "episode_json_step": {
+            "calls": 6113,
+            "wall_ns": 79720980,
+            "cpu_ns": 76184716
+          },
+          "episode_json_observe": {
+            "calls": 6113,
+            "wall_ns": 67420699,
+            "cpu_ns": 63413741
+          },
+          "action": {
+            "calls": 756,
+            "wall_ns": 222808363,
+            "cpu_ns": 221379265
+          },
+          "legality_grid": {
+            "calls": 64,
+            "wall_ns": 19203732,
+            "cpu_ns": 19120931
+          },
+          "bind_unbind": {
+            "calls": 24580,
+            "wall_ns": 55377037,
+            "cpu_ns": 40990796
+          },
+          "create": {
+            "calls": 0,
+            "wall_ns": 0,
+            "cpu_ns": 0
+          },
+          "capture_other": {
+            "calls": 0,
+            "wall_ns": 0,
+            "cpu_ns": 0
+          }
+        }
+      },
+      "java": {
+        "request_parse": {
+          "calls": 1601,
+          "wall_ns": 58049649,
+          "cpu_ns": 55954099
+        },
+        "handler_total": {
+          "calls": 1601,
+          "wall_ns": 8491626974,
+          "cpu_ns": 8470918245
+        },
+        "response_serialize": {
+          "calls": 1601,
+          "wall_ns": 5080630,
+          "cpu_ns": 4967633
+        },
+        "socket_write": {
+          "calls": 1601,
+          "wall_ns": 493313292,
+          "cpu_ns": 491341357
+        }
+      }
+    }
+  },
+  "gpu_trace": {
+    "cuda_activity_us": {
+      "kernel": 31296.59299999987,
+      "h2d": 866.1399999999871,
+      "d2h": 813.1669999999975,
+      "gpu_memcpy": 1383.7759999999807,
+      "gpu_memset": 26.083000000000016
+    },
+    "cuda_event_counts": {
+      "kernel": 18610,
+      "h2d": 1920,
+      "d2h": 480,
+      "gpu_memcpy": 1728,
+      "gpu_memset": 96
+    },
+    "sampled_step_wall_us": 2834260.9170000004,
+    "cuda_by_phase_us": {
+      "phase/hidden_gather/kernel": 171.97099999999995,
+      "phase/h2d/h2d": 866.1399999999871,
+      "phase/model_forward/kernel": 25737.360999999793,
+      "phase/model_forward/d2h": 99.77399999999983,
+      "phase/model_forward/gpu_memcpy": 156.89499999999984,
+      "phase/model_forward/gpu_memset": 26.083000000000016,
+      "phase/gpu_guard_pack/kernel": 5387.2609999999595,
+      "phase/gpu_guard_pack/d2h": 32.54300000000001,
+      "phase/d2h/d2h": 680.8499999999999,
+      "phase/prediction_split/gpu_memcpy": 1226.880999999982
+    },
+    "top_cuda_kernels_us": [
+      [
+        "void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_tn_align1>(cutlass_80_simt_sgemm_64x64_8x5_tn_align1::Params)",
+        4736.640000000007
+      ],
+      [
+        "void gemmSN_TN_kernel<float, 128, 16, 2, 4, 8, 9, false, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float> >(cublasGemmSmallNParams<cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float const>, cublasGemvTensorStridedBatched<float>, float>)",
+        4232.869999999994
+      ],
+      [
+        "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4, 4> >(at::native::ReduceOp<bool, at::native::func_wrapper_t<bool, at::native::and_kernel_cuda(at::TensorIterator&)::{lambda()#1}::operator()() const::{lambda()#12}::operator()() const::{lambda(bool, bool)#1}>, unsigned int, bool, 4, 4>)",
+        2254.5209999999956
+      ],
+      [
+        "void implicit_convolve_sgemm<float, float, 1024, 5, 5, 3, 3, 3, 1, false, false, true>(int, int, int, float const*, int, float*, float const*, kernel_conv_params, unsigned long long, int, float, float, int, float const*, float const*, bool, bool, int, int)",
+        1765.1290000000026
+      ],
+      [
+        "void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, true, false>(cublasLt::cublasSplitKParams<float>, float const*, float const*, float*, float*, float const*, float const*, float const*, float const*, float*, void*, long, float*, int*, float*, float*, float const*, float const*, float const*, float const*, float const*)",
+        1109.8060000000041
+      ],
+      [
+        "void at::native::vectorized_gather_kernel<16, long>(char*, char*, long*, int, long, long, long, long, bool)",
+        1034.9120000000014
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::launch_clamp_scalar(at::TensorIteratorBase&, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul> >(int, at::native::(anonymous namespace)::launch_clamp_scalar(at::TensorIteratorBase&, c10::Scalar, c10::Scalar, at::native::detail::ClampLimits)::{lambda()#1}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}, std::array<char*, 2ul>)",
+        961.6549999999984
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, std::array<char*, 3ul> >(int, at::native::BinaryFunctor<bool, bool, bool, at::native::binary_internal::MulFunctor<bool> >, std::array<char*, 3ul>)",
+        876.4180000000006
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 3ul> >(int, at::native::BinaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 3ul>)",
+        858.9900000000004
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul> >(int, at::native::AUnaryFunctor<float, float, bool, at::native::(anonymous namespace)::CompareEqFunctor<float> >, std::array<char*, 2ul>)",
+        852.5720000000007
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::AbsFunctor<float>, std::array<char*, 2ul> >(int, at::native::AbsFunctor<float>, std::array<char*, 2ul>)",
+        833.1700000000005
+      ],
+      [
+        "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::MaxOps<float>, unsigned int, float, 4, 4> >(at::native::ReduceOp<float, at::native::MaxOps<float>, unsigned int, float, 4, 4>)",
+        802.5159999999998
+      ],
+      [
+        "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> > const&)::{lambda(int)#1})",
+        790.3850000000004
+      ],
+      [
+        "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1}>(at::TensorIteratorBase&, at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()#7}::operator()() const::{lambda(float)#1} const&)::{lambda(int)#1})",
+        668.8419999999978
+      ],
+      [
+        "void at::native::vectorized_elementwise_kernel<4, at::native::BUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 2ul> >(int, at::native::BUnaryFunctor<float, float, float, at::native::binary_internal::MulFunctor<float> >, std::array<char*, 2ul>)",
+        511.7199999999975
+      ],
+      [
+        "void at::native::(anonymous namespace)::CatArrayBatchedCopy<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 4, 64, 64>(at::native::(anonymous namespace)::OpaqueType<4u>*, at::native::(anonymous namespace)::CatArrInputTensorMetadata<at::native::(anonymous namespace)::OpaqueType<4u>, unsigned int, 64, 64>, at::native::(anonymous namespace)::TensorSizeStride<unsigned int, 4u>, int, unsigned int)",
+        511.63199999999784
+      ],
+      [
+        "void cutlass::Kernel2<cutlass_80_simt_sgemm_32x128_8x5_tn_align1>(cutlass_80_simt_sgemm_32x128_8x5_tn_align1::Params)",
+        504.7480000000006
+      ],
+      [
+        "void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl<at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > >(at::TensorIteratorBase&, at::native::BinaryFunctor<float, float, float, at::native::binary_internal::DivFunctor<float> > const&)::{lambda(int)#1})",
+        476.67999999999944
+      ],
+      [
+        "void implicit_convolve_sgemm<float, float, 128, 5, 5, 3, 3, 3, 1, false, false, true>(int, int, int, float const*, int, float*, float const*, kernel_conv_params, unsigned long long, int, float, float, int, float const*, float const*, bool, bool, int, int)",
+        469.70799999999974
+      ],
+      [
+        "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1}>(int, at::native::gpu_kernel_impl_nocast<at::native::CUDAFunctor_add<float> >(at::TensorIteratorBase&, at::native::CUDAFunctor_add<float> const&)::{lambda(int)#1})",
+        448.5370000000006
+      ]
+    ],
+    "top_cpu_op_inclusive_us": [
+      [
+        "aten::linear",
+        102342.15300000008
+      ],
+      [
+        "aten::to",
+        83815.64100000114
+      ],
+      [
+        "aten::copy_",
+        76777.4660000002
+      ],
+      [
+        "aten::_to_copy",
+        75224.89500000025
+      ],
+      [
+        "aten::addmm",
+        74907.71300000002
+      ],
+      [
+        "aten::isfinite",
+        74001.04899999996
+      ],
+      [
+        "aten::cat",
+        54841.38499999996
+      ],
+      [
+        "aten::embedding",
+        53488.964999999975
+      ],
+      [
+        "aten::slice",
+        45704.469999999936
+      ],
+      [
+        "aten::index_select",
+        44123.69199999997
+      ],
+      [
+        "aten::abs",
+        38857.61800000003
+      ],
+      [
+        "aten::sum",
+        37076.037999999884
+      ],
+      [
+        "aten::clone",
+        36790.40799999998
+      ],
+      [
+        "aten::conv2d",
+        31033.423000000017
+      ],
+      [
+        "aten::convolution",
+        29334.783000000003
+      ],
+      [
+        "aten::lstm",
+        28962.960000000006
+      ],
+      [
+        "aten::_convolution",
+        27379.103999999992
+      ],
+      [
+        "aten::all",
+        24595.40600000002
+      ],
+      [
+        "aten::new_zeros",
+        23369.65400000007
+      ],
+      [
+        "aten::_cudnn_rnn",
+        23217.379999999994
+      ]
+    ],
+    "note": "CUDA activity durations may overlap; CPU ops are inclusive. Stream-span metrics are reported separately."
+  },
+  "load": {
+    "workers": 12,
+    "resident_games": 48,
+    "games_per_run": 96,
+    "runs": 4,
+    "all_games_equal": true,
+    "baseline_mean_seconds": 106.22953857347602,
+    "optimized_mean_seconds": 87.74995476251934,
+    "baseline_tps": 5127.105015365201,
+    "optimized_tps": 6206.8408066306665,
+    "throughput_ratio": 1.2105936562698933,
+    "cases": [
+      {
+        "variant": "baseline",
+        "workers": 12,
+        "resident_games": 48,
+        "completed_games": 96,
+        "ticks": 544650,
+        "plays": 15863,
+        "seconds": 106.48667578899767,
+        "tps": 5114.724410021201,
+        "mean_cpu_cores": 12.080538106068971,
+        "max_cgroup_gib": 18.347904205322266,
+        "mean_gpu_util": 91.53846153846153,
+        "max_gpu_mib": 8446.0,
+        "oom_delta": 0
+      },
+      {
+        "variant": "dense",
+        "workers": 12,
+        "resident_games": 48,
+        "completed_games": 96,
+        "ticks": 544650,
+        "plays": 15863,
+        "seconds": 87.64188663696405,
+        "tps": 6214.494243558275,
+        "mean_cpu_cores": 12.176432084081503,
+        "max_cgroup_gib": 19.517654418945312,
+        "mean_gpu_util": 91.97674418604652,
+        "max_gpu_mib": 8446.0,
+        "oom_delta": 0
+      },
+      {
+        "variant": "dense",
+        "workers": 12,
+        "resident_games": 48,
+        "completed_games": 96,
+        "ticks": 544650,
+        "plays": 15863,
+        "seconds": 87.85802288807463,
+        "tps": 6199.206197638302,
+        "mean_cpu_cores": 11.995492928383456,
+        "max_cgroup_gib": 19.514942169189453,
+        "mean_gpu_util": 90.13953488372093,
+        "max_gpu_mib": 8446.0,
+        "oom_delta": 0
+      },
+      {
+        "variant": "baseline",
+        "workers": 12,
+        "resident_games": 48,
+        "completed_games": 96,
+        "ticks": 544650,
+        "plays": 15863,
+        "seconds": 105.97240135795437,
+        "tps": 5139.545702661556,
+        "mean_cpu_cores": 12.113768516586779,
+        "max_cgroup_gib": 20.025638580322266,
+        "mean_gpu_util": 92.03846153846153,
+        "max_gpu_mib": 8446.0,
+        "oom_delta": 0
+      }
+    ]
+  }
+}

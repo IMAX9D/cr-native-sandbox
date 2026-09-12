@@ -1,0 +1,230 @@
+{
+  "single": {
+    "control": {
+      "runs": 2,
+      "mean_seconds": 26.27980793599272,
+      "aggregate_tps": 930.0676800808857
+    },
+    "vector": {
+      "runs": 1,
+      "mean_seconds": 27.098806085065007,
+      "aggregate_tps": 901.9585557856271
+    },
+    "buffers": {
+      "runs": 1,
+      "mean_seconds": 22.917672445997596,
+      "aggregate_tps": 1066.5131922796381
+    },
+    "graph": {
+      "runs": 2,
+      "mean_seconds": 26.29799400694901,
+      "aggregate_tps": 929.4245026271365
+    }
+  },
+  "binary": {
+    "vector": {
+      "runs": 2,
+      "mean_seconds": 28.473328099935316,
+      "aggregate_tps": 858.4173902753407
+    },
+    "binary": {
+      "runs": 2,
+      "mean_seconds": 44.41274561500177,
+      "aggregate_tps": 550.3375137371369
+    }
+  },
+  "compact": {
+    "vector": {
+      "runs": 2,
+      "mean_seconds": 24.339721905533224,
+      "aggregate_tps": 1004.2021061236334
+    },
+    "compact": {
+      "runs": 2,
+      "mean_seconds": 26.50710849801544,
+      "aggregate_tps": 922.0922758070707
+    },
+    "compact-binary": {
+      "runs": 2,
+      "mean_seconds": 33.41132288251538,
+      "aggregate_tps": 731.5484060881303
+    }
+  },
+  "load": {
+    "control": {
+      "runs": 2,
+      "mean_seconds": 44.88276800350286,
+      "aggregate_tps": 6227.846731248499,
+      "max_gpu_mib": 8446.0,
+      "mean_cpu_cores": 12.068461386310805
+    },
+    "buffers": {
+      "runs": 2,
+      "mean_seconds": 44.96946676552761,
+      "aggregate_tps": 6215.839770959322,
+      "max_gpu_mib": 11144.0,
+      "mean_cpu_cores": 12.131613361599427
+    },
+    "graph": {
+      "runs": 2,
+      "mean_seconds": 39.76906114502344,
+      "aggregate_tps": 7028.654736924271,
+      "max_gpu_mib": 11020.0,
+      "mean_cpu_cores": 12.232071132261353
+    }
+  },
+  "transport": {
+    "graph": {
+      "runs": 2,
+      "mean_seconds": 39.63352129247505,
+      "aggregate_tps": 7052.691531929845,
+      "max_gpu_mib": 11020.0,
+      "mean_cpu_cores": 12.292381995276228
+    },
+    "graph-compact": {
+      "runs": 2,
+      "mean_seconds": 39.92214313347358,
+      "aggregate_tps": 7001.70326691775,
+      "max_gpu_mib": 11020.0,
+      "mean_cpu_cores": 12.009716843200486
+    }
+  },
+  "compiled": {
+    "control": {
+      "runs": 2,
+      "mean_seconds": 27.54075892351102,
+      "aggregate_tps": 887.4846211712173
+    },
+    "compile": {
+      "runs": 2,
+      "mean_seconds": 55.297431344457436,
+      "aggregate_tps": 442.0096812046563
+    }
+  },
+  "compact_correctness": {
+    "passed": true,
+    "frames": 800,
+    "actor_views": 1600,
+    "accepted_actions": 52,
+    "full_json_bytes": 8059397,
+    "compact_json_bytes": 3391731,
+    "byte_ratio": 0.42084178258001187
+  },
+  "compiler": {
+    "passed": true,
+    "time": 1789203831.9747882
+  },
+  "learner": {
+    "passed": true,
+    "updates": 8,
+    "segments": 8,
+    "samples": 1024,
+    "accepted_plays": 78,
+    "nonempty_frames": 1024,
+    "frames": 1024,
+    "overlap_observed": true,
+    "collector_versions": [
+      0,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "dropped_segments": [],
+    "max_policy_lag": 1,
+    "head_changed": true,
+    "backbone_unchanged": true,
+    "opponent_unchanged": true,
+    "new_entity_frames": 862,
+    "moving_entity_frames": 697,
+    "peak_new_entities": 12,
+    "distinct_grid_frames": 607,
+    "behavior_mode": "stochastic_joint_fixed4_v1",
+    "opponent_mode": "greedy_fixed4"
+  },
+  "checkpoints": {
+    "passed": true,
+    "source_unchanged": true,
+    "checkpoints": [
+      {
+        "file": "update-001.pt",
+        "bytes": 6041141,
+        "sha256": "3bd11ee9c1ac7add3131efba94a56ea1c37328e29505914ce67fb9619a70cec2",
+        "version": 1
+      },
+      {
+        "file": "update-002.pt",
+        "bytes": 6041141,
+        "sha256": "c9fbec3632ec8a8923b53911ce01e8e572c978c2e3c413bf3d749d15ff62a3d2",
+        "version": 2
+      },
+      {
+        "file": "update-003.pt",
+        "bytes": 7097153,
+        "sha256": "62bd600cd95d5296b8c3c94cfba91b345adf3e785dcf2594e0c03f474b0cdded",
+        "version": 3
+      },
+      {
+        "file": "update-004.pt",
+        "bytes": 7097153,
+        "sha256": "e918721223fca7b7ae7077281df38e868654066b97141ecf2b7e19a112979349",
+        "version": 4
+      },
+      {
+        "file": "update-005.pt",
+        "bytes": 7097153,
+        "sha256": "0762b35c5557fa7921ceb6c1637eae5871a134791d602cf912eb4b22e526eb93",
+        "version": 5
+      },
+      {
+        "file": "update-006.pt",
+        "bytes": 7097153,
+        "sha256": "850da995831e2edd95df986e904be8d7c22214ac7f6d74e062e9c71996ba1e2a",
+        "version": 6
+      },
+      {
+        "file": "update-007.pt",
+        "bytes": 7097153,
+        "sha256": "b71bfd55c02432b160c4f0b0c142f4eb352ccb43ced6d827fe274e8ef6c69ecf",
+        "version": 7
+      },
+      {
+        "file": "update-008.pt",
+        "bytes": 7097153,
+        "sha256": "b7f928c0e24e715b2ad7267098084e4f0089c47df48e7de5f7cdcc6c4bf4bb07",
+        "version": 8
+      }
+    ]
+  },
+  "learner_timing": {
+    "trainable_parameters": 588582,
+    "update_seconds": [
+      1.1258177757263184,
+      0.43076634407043457,
+      0.2957611083984375,
+      0.3695237636566162,
+      0.3399801254272461,
+      0.36452150344848633,
+      0.3394355773925781,
+      0.2759716510772705
+    ],
+    "queue_age_seconds": [
+      0.024058103561401367,
+      0.021104097366333008,
+      0.01129770278930664,
+      0.014266729354858398,
+      0.01562190055847168,
+      0.01737213134765625,
+      0.029068470001220703,
+      0.027246952056884766
+    ],
+    "max_kl": 2.178829163312912e-06,
+    "total_reward_abs": 0.662195052485913,
+    "collection_samples_per_second": 107.04529909918016,
+    "accepted_training_samples_per_update_second": 289.1203354925413,
+    "queue_backpressure_seconds": 0.0019092559814453125
+  }
+}

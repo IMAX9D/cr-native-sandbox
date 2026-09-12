@@ -1,0 +1,31 @@
+{
+  "passed": true,
+  "updates": 8,
+  "segments": 8,
+  "samples": 1024,
+  "accepted_plays": 78,
+  "nonempty_frames": 1024,
+  "frames": 1024,
+  "overlap_observed": true,
+  "collector_versions": [
+    0,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "dropped_segments": [],
+  "max_policy_lag": 1,
+  "head_changed": true,
+  "backbone_unchanged": true,
+  "opponent_unchanged": true,
+  "new_entity_frames": 862,
+  "moving_entity_frames": 697,
+  "peak_new_entities": 12,
+  "distinct_grid_frames": 607,
+  "behavior_mode": "stochastic_joint_fixed4_v1",
+  "opponent_mode": "greedy_fixed4"
+}

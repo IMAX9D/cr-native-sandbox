@@ -1,0 +1,278 @@
+[
+  {
+    "variant": "control",
+    "result": {
+      "device": "cuda",
+      "mode": "packed",
+      "raw_response": true,
+      "slots": 4,
+      "seed": 424242,
+      "seconds": 28.880630612024106,
+      "ticks": 24442,
+      "tps": 846.3111601802719,
+      "plays": 756,
+      "decisions": 12226,
+      "model_calls": 1536,
+      "verified_decisions": 0,
+      "max_logit_error": 0.0,
+      "times": {
+        "encode": 5.311804469209164,
+        "forward": 8.964321159408428,
+        "decode": 0.7408557591261342,
+        "native": 13.640475383843295
+      },
+      "finals": {
+        "2": {
+          "tick": 6090,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 192,
+          "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+        },
+        "3": {
+          "tick": 6117,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 188,
+          "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+        },
+        "1": {
+          "tick": 6130,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 186,
+          "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+        },
+        "0": {
+          "tick": 6153,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 190,
+          "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+        }
+      },
+      "complete": true,
+      "peak_entities": 23,
+      "action_digest": "b409d62e1acd8cc1aef0bfff34d2d0e9b76583f2294c6b3882c547cb0ce51a1e"
+    }
+  },
+  {
+    "variant": "compile",
+    "result": {
+      "device": "cuda",
+      "mode": "packed",
+      "raw_response": true,
+      "slots": 4,
+      "seed": 424242,
+      "seconds": 61.668493571924046,
+      "ticks": 24442,
+      "tps": 396.34501484122137,
+      "plays": 756,
+      "decisions": 12226,
+      "model_calls": 1536,
+      "verified_decisions": 0,
+      "max_logit_error": 0.0,
+      "times": {
+        "encode": 6.140987427672371,
+        "forward": 43.67301782139111,
+        "decode": 0.8079540169565007,
+        "native": 10.745179796242155
+      },
+      "finals": {
+        "2": {
+          "tick": 6090,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 192,
+          "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+        },
+        "3": {
+          "tick": 6117,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 188,
+          "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+        },
+        "1": {
+          "tick": 6130,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 186,
+          "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+        },
+        "0": {
+          "tick": 6153,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 190,
+          "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+        }
+      },
+      "complete": true,
+      "peak_entities": 23,
+      "action_digest": "b409d62e1acd8cc1aef0bfff34d2d0e9b76583f2294c6b3882c547cb0ce51a1e"
+    }
+  },
+  {
+    "variant": "compile",
+    "result": {
+      "device": "cuda",
+      "mode": "packed",
+      "raw_response": true,
+      "slots": 4,
+      "seed": 424242,
+      "seconds": 48.92636911699083,
+      "ticks": 24442,
+      "tps": 499.56701143212246,
+      "plays": 756,
+      "decisions": 12226,
+      "model_calls": 1536,
+      "verified_decisions": 0,
+      "max_logit_error": 0.0,
+      "times": {
+        "encode": 5.971818339661695,
+        "forward": 30.419872302212752,
+        "decode": 0.7929461927851662,
+        "native": 11.510716045624577
+      },
+      "finals": {
+        "2": {
+          "tick": 6090,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 192,
+          "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+        },
+        "3": {
+          "tick": 6117,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 188,
+          "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+        },
+        "1": {
+          "tick": 6130,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 186,
+          "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+        },
+        "0": {
+          "tick": 6153,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 190,
+          "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+        }
+      },
+      "complete": true,
+      "peak_entities": 23,
+      "action_digest": "b409d62e1acd8cc1aef0bfff34d2d0e9b76583f2294c6b3882c547cb0ce51a1e"
+    }
+  },
+  {
+    "variant": "control",
+    "result": {
+      "device": "cuda",
+      "mode": "packed",
+      "raw_response": true,
+      "slots": 4,
+      "seed": 424242,
+      "seconds": 26.200887234997936,
+      "ticks": 24442,
+      "tps": 932.8691727412767,
+      "plays": 756,
+      "decisions": 12226,
+      "model_calls": 1536,
+      "verified_decisions": 0,
+      "max_logit_error": 0.0,
+      "times": {
+        "encode": 4.769508143886924,
+        "forward": 8.52372934401501,
+        "decode": 0.7252351451897994,
+        "native": 11.938241367926821
+      },
+      "finals": {
+        "2": {
+          "tick": 6090,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 192,
+          "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+        },
+        "3": {
+          "tick": 6117,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 188,
+          "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+        },
+        "1": {
+          "tick": 6130,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 186,
+          "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+        },
+        "0": {
+          "tick": 6153,
+          "outcome": "side1_win",
+          "crowns": [
+            0,
+            1
+          ],
+          "plays": 190,
+          "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+        }
+      },
+      "complete": true,
+      "peak_entities": 23,
+      "action_digest": "b409d62e1acd8cc1aef0bfff34d2d0e9b76583f2294c6b3882c547cb0ce51a1e"
+    }
+  }
+]

@@ -1,0 +1,2984 @@
+[
+  {
+    "variant": "control",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 45.74328997498378,
+    "tps": 6110.688587394267,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 11.931268365412164,
+    "max_cgroup_gib": 19.604167938232422,
+    "mean_gpu_util": 86.21739130434783,
+    "max_gpu_mib": 8446.0,
+    "oom_delta": 0
+  },
+  {
+    "variant": "buffers",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 44.90663142700214,
+    "tps": 6224.537248009304,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 12.179775516400335,
+    "max_cgroup_gib": 19.594730377197266,
+    "mean_gpu_util": 86.1304347826087,
+    "max_gpu_mib": 11144.0,
+    "oom_delta": 0
+  },
+  {
+    "variant": "graph",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 40.19474026910029,
+    "tps": 6954.21834122121,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 12.181819680695915,
+    "max_cgroup_gib": 19.6396484375,
+    "mean_gpu_util": 82.80952380952381,
+    "max_gpu_mib": 11020.0,
+    "oom_delta": 0
+  },
+  {
+    "variant": "graph",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 39.34338202094659,
+    "tps": 7104.701874668037,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 12.282322583826794,
+    "max_cgroup_gib": 19.647823333740234,
+    "mean_gpu_util": 88.25,
+    "max_gpu_mib": 11020.0,
+    "oom_delta": 0
+  },
+  {
+    "variant": "buffers",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 45.03230210405309,
+    "tps": 6207.166565771502,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 12.08345120679852,
+    "max_cgroup_gib": 19.597183227539062,
+    "mean_gpu_util": 86.08695652173913,
+    "max_gpu_mib": 11144.0,
+    "oom_delta": 0
+  },
+  {
+    "variant": "control",
+    "workers": 12,
+    "resident_games": 48,
+    "completed_games": 48,
+    "ticks": 279523,
+    "plays": 8251,
+    "seconds": 44.02224603202194,
+    "tps": 6349.585157392332,
+    "games": {
+      "424244": {
+        "tick": 6090,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "8dfacc4cf96105edff8aa8137a1f5c06230a5ebcbbe64100faadc801272625e0"
+      },
+      "424245": {
+        "tick": 6117,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "44566eb7d60ad7a36dbe49bf17c21877cc04f098d6803df60be17599fa99e3b4"
+      },
+      "424243": {
+        "tick": 6130,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 186,
+        "action_digest": "efc99558f9d9ece6a01514e0b811529c139e2ecb6b892b0df21ee00061fd92d9"
+      },
+      "424242": {
+        "tick": 6153,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 190,
+        "action_digest": "b458778e5200e07ccf9c3e35e5bed2bdf30b07b098da62561e9e875a5d149fef"
+      },
+      "424248": {
+        "tick": 4592,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 107,
+        "action_digest": "333f9e941e9b0c194d74117f41d06c9a81ba14e343a0a561780efac5d48c8025"
+      },
+      "424247": {
+        "tick": 6116,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "2f3f84c1c7d0cf44c45168527d0b1d9ceea719990f9b38eb5dbaf3885b17fc72"
+      },
+      "424249": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 180,
+        "action_digest": "b69db59e90d24ff60690473995ec86a5ec900149068e5703acc0287e70b21442"
+      },
+      "424246": {
+        "tick": 6151,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "626f580b4ad7129ec6f8d453d61f0d290c9980c68d72a7f849100a0bb9237b5e"
+      },
+      "424251": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "aa549bbdbbded54c515aa2de307ec561c52e5c11fc6b865b026febd6dbbd8316"
+      },
+      "424252": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "cfd5d7e0fe04fbae84db65b75c8b34e8c7d7033406cb737073a703c49202b2df"
+      },
+      "424250": {
+        "tick": 6126,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "ce5f36df25326c3586045e178579c4136847114c7e922fe48e163dfd5b4ec452"
+      },
+      "424253": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 191,
+        "action_digest": "f8d3b763a11104b9c45b87c5c91e7b7ba1b49adec1f5980444c5d389e70933cd"
+      },
+      "424256": {
+        "tick": 5658,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 163,
+        "action_digest": "1515175c13ed4345aa3d3e0d28d1fb28dad6badbd8c184cf23a7caf7a6a4e027"
+      },
+      "424254": {
+        "tick": 6124,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 192,
+        "action_digest": "2d024ddb1076649d88edd7485ccff207de67e3ae250e94fb0f75be6fdd46323d"
+      },
+      "424257": {
+        "tick": 6127,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "c340fa9078df78b635d8a1d9877afc75a1d17bc5df89f210cd1a961eb68f084e"
+      },
+      "424255": {
+        "tick": 6132,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 188,
+        "action_digest": "2d691cd3842ff10b0668e2ebf2cd83ebf22ce7edc3cb82139cb625d7a60072b9"
+      },
+      "424259": {
+        "tick": 3681,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 81,
+        "action_digest": "036c5fde62166fb334f819eac5eec18c5d3fef50a964893a6bd1de0c9371562f"
+      },
+      "424258": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "0dc3e8ed2d4741780c52ba84c3b96bd5f3a6d7a6a76f5f87a1b644c5defc66c6"
+      },
+      "424261": {
+        "tick": 6121,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "a7a4066e902c90a58eb2a2ee95ff811d259338aa442f5898eb0446149cee9ec0"
+      },
+      "424260": {
+        "tick": 6133,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 181,
+        "action_digest": "8ef16ade85fbf2d5f0599fa60b2acbd81d595aff2e3ad9450b755b23c53b4258"
+      },
+      "424265": {
+        "tick": 6109,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "eabb4683bf80dbd6177a14395a0fc77c2b0512771c3305bc5350863cbb124066"
+      },
+      "424262": {
+        "tick": 6125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 194,
+        "action_digest": "1b65c5dd4e6dfdfd90c357affe5d11e39e0ebaf7bb330a569fc117886097e046"
+      },
+      "424263": {
+        "tick": 6130,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 186,
+        "action_digest": "666f0772df19064d91c27c2c6d25e2ad9c8606cb985c2ecab71bd2dd3a48bea5"
+      },
+      "424264": {
+        "tick": 6140,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 189,
+        "action_digest": "f5569b5b44c57a3e3d4e5f5cce674dd13a9e4af3cf579e3ce6a81724fe83f797"
+      },
+      "424268": {
+        "tick": 4786,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 119,
+        "action_digest": "d5f8b0188e9f43dde6998a8e86768582d7ad7ae85dfa23d8322c2e9b67232f05"
+      },
+      "424266": {
+        "tick": 6123,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 184,
+        "action_digest": "a895c1abc09907d1506b2ddb3e96108a0e9167443771dc665ade3363d85bb37c"
+      },
+      "424269": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "948374dff014a8aee10df58538a84ee6a2e3d7cf283b596ff1d671c4064590d1"
+      },
+      "424267": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 188,
+        "action_digest": "065d10d932a880bfa561104cb2a6eadbec0d56dbb81bc4ce3cf79e82116532af"
+      },
+      "424271": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 185,
+        "action_digest": "fe637cb125271c4fd548b08097077622046d272280998e0feb0e79357aaa6bce"
+      },
+      "424272": {
+        "tick": 6129,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 177,
+        "action_digest": "e0ec80bdcf8d71c309db6bc0d9d4899968f22b124167dac2aba6540e3d3fdc19"
+      },
+      "424270": {
+        "tick": 6135,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 184,
+        "action_digest": "9da4c5a733b5767c0eb38dcab4de2054088c2ee10806aff50e6248d8bb3f72f7"
+      },
+      "424273": {
+        "tick": 6143,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 185,
+        "action_digest": "1893cab5b079fcfaba2badd197a3a9e1131d18c71374c1858ebac9c9a147348a"
+      },
+      "424275": {
+        "tick": 4929,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 122,
+        "action_digest": "915ffef326edab356f96ba83a135fa36823c8bd57c4b9ac9bd902dd56c07242b"
+      },
+      "424277": {
+        "tick": 6115,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 182,
+        "action_digest": "310ae689b075792071a2d2f47da5df77e220fe355aefdb0cf0079dd388e9ee2a"
+      },
+      "424274": {
+        "tick": 6126,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 179,
+        "action_digest": "90117d95c27a4948cac93fe91451d3c46b4ae2e12258c64cbc64388ccc69e08b"
+      },
+      "424276": {
+        "tick": 6125,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 192,
+        "action_digest": "3787eb9e0b9b053e83ca0060625d367ccba89749f627c8bd657a60470e8671a4"
+      },
+      "424278": {
+        "tick": 5125,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 134,
+        "action_digest": "5b8b3443a2ac8e26a4896b0e5f2224460b22a6e6ea7cc34c07543055735d62ad"
+      },
+      "424279": {
+        "tick": 6113,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 182,
+        "action_digest": "25bca1e8266b799e01168abb2dfbe8a42b1af7b7cb213356b91e7d3714ef3d7f"
+      },
+      "424281": {
+        "tick": 6118,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 183,
+        "action_digest": "9be8efe3ef7f8027990cf60f5628b34c32eff45895984e3a48cee57f61e19c93"
+      },
+      "424280": {
+        "tick": 6137,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 176,
+        "action_digest": "af1ea5eb464d056aa49dac4505dda1b4c384e2b2123fc5b43665e6a1da58dbb2"
+      },
+      "424284": {
+        "tick": 4930,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 123,
+        "action_digest": "d1001d9ed1032c36314389f9c99bad3e135933d12b07c737cdddee15b9f25430"
+      },
+      "424283": {
+        "tick": 6118,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 187,
+        "action_digest": "dcc57818d99f76a29a66d5930886d4cd6e3294ea22e5ff1c74e0fedcd86d9825"
+      },
+      "424285": {
+        "tick": 6120,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 190,
+        "action_digest": "85b2aa737bbeeec9a37d3864100e585b82defa5192fb9aa386b29cc0a57abceb"
+      },
+      "424282": {
+        "tick": 6142,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 183,
+        "action_digest": "919db4c8ddfaf9921d7f81ff6589de976edcada2ff8f3566bc62802befa1dbbc"
+      },
+      "424286": {
+        "tick": 4186,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 99,
+        "action_digest": "3fa4ac4a699f13b0a943f02bfe551738ddcf4f78b7d3b04e9ce8beb9e3b524b9"
+      },
+      "424287": {
+        "tick": 4621,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 114,
+        "action_digest": "8d144bc6dbee2660f0e86deb8a84a1cfd9f6d5964daa6f4d12c02ed2e596efb3"
+      },
+      "424289": {
+        "tick": 4776,
+        "outcome": "side0_win",
+        "crowns": [
+          1,
+          0
+        ],
+        "plays": 117,
+        "action_digest": "cf97281e874bd7127386c31159ef9d5e8c6003218ff78c785b1e6f75d0babb7f"
+      },
+      "424288": {
+        "tick": 6147,
+        "outcome": "side1_win",
+        "crowns": [
+          0,
+          1
+        ],
+        "plays": 191,
+        "action_digest": "5379478e27f7a7365bc06cc51e3c5e582e538bf3257fd63c8e1008116a93a3b4"
+      }
+    },
+    "mean_cpu_cores": 12.205654407209446,
+    "max_cgroup_gib": 19.572311401367188,
+    "mean_gpu_util": 89.5,
+    "max_gpu_mib": 8446.0,
+    "oom_delta": 0
+  }
+]

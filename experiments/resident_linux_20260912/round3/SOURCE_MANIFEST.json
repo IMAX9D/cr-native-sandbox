@@ -1,0 +1,230 @@
+{
+  "vector_encoder.py": {
+    "bytes": 32095,
+    "sha256": "99794703e1aaaad6b4c840917501680d041b92fa40492d45daca70355dbb35ce"
+  },
+  "owned_enrich.py": {
+    "bytes": 1837,
+    "sha256": "2b09c9a52740134a5e177e68af6559c6ac8e7a705542dccc4584d4824704b65a"
+  },
+  "cuda_graph.py": {
+    "bytes": 4416,
+    "sha256": "e7152df130a276219fd43c989f93680b891c07ba685a9ae75fc9c63956e8d48b"
+  },
+  "run_variant.py": {
+    "bytes": 5131,
+    "sha256": "6933fe21365a1bbb541491958823b7e25a4b7e87251c35d92e463c9fb29e48b2"
+  },
+  "binary_client.py": {
+    "bytes": 1984,
+    "sha256": "312b88e489afc7aac2e9fab6598be966ec2ceb5748ae554caa7c9191415616cc"
+  },
+  "launch_binary.py": {
+    "bytes": 402,
+    "sha256": "37f0744910bd74d197a2a24cbbdba17965cfdf31082500c765c79e29cde25984"
+  },
+  "verify_binary.py": {
+    "bytes": 1329,
+    "sha256": "b94cb5a761c6c21231f13cc5cea774534b191d1cb61c95897ef9af1c6a08d5f6"
+  },
+  "compact_verify.py": {
+    "bytes": 2553,
+    "sha256": "0af9160e955e62d55d9b91a6b508cc7bd58dd08a493d3af557db67b46ee33e90"
+  },
+  "suite.py": {
+    "bytes": 1409,
+    "sha256": "727327b1b80f2082940ed22147c8e9bf56ca6b7c443bbf02ebc14ac11c2450c3"
+  },
+  "extra_suite.py": {
+    "bytes": 2203,
+    "sha256": "28740a4c378745f946bacf5a5b9a9346662af68a14566f2e26b20ad776d7596d"
+  },
+  "compact_suite.py": {
+    "bytes": 1161,
+    "sha256": "63d22dd5fb7213a009996783f041f515aeecd40c3e175782827d8b2be225f319"
+  },
+  "compile_suite.py": {
+    "bytes": 2147,
+    "sha256": "9470578f077a16ce219dc12ffc08cc48e882704cf8fce8c4dab469ec00ecd4d8"
+  },
+  "load_candidates.py": {
+    "bytes": 5008,
+    "sha256": "e689d5b77afedf26323c1f307e5bcb8e624d56f6a414fe087b9df02291414c54"
+  },
+  "load_transport.py": {
+    "bytes": 4952,
+    "sha256": "ab3e0c311625ca68a348e0919dd4335e62fcaf04b40004df3e542cd9b94abfac"
+  },
+  "learner_canary.py": {
+    "bytes": 21420,
+    "sha256": "abade55a3141627642850025260ee5618b5e11cf68e420acd09ae921e5d4c2ac"
+  },
+  "verify_checkpoint.py": {
+    "bytes": 1896,
+    "sha256": "69f1bc43440213a80246cf255f5a73fad4944b4ab6b65da21cae8b0ad10263d5"
+  },
+  "test_binary.py": {
+    "bytes": 1453,
+    "sha256": "b4773b4cac44178e7dbc7230d770ff8d729ababa6e068a89ab37afad155b1f35"
+  },
+  "test_vector.py": {
+    "bytes": 921,
+    "sha256": "0ebef02ac9069b93b4633e90603aa7224615af7d2cbb24b2f3a1ad223ac90f0c"
+  },
+  "analyze_all.py": {
+    "bytes": 2238,
+    "sha256": "b20f83e37a36f021b646e57e7b526b47ef254e7be8b1b7f0a0a90702b4764c5b"
+  },
+  "README.md": {
+    "bytes": 4452,
+    "sha256": "c4ff833166f0997599ef94f350fa3d0eb2d6c51ee862551288996d8baea009d8"
+  },
+  "FULL_IMPLEMENTATION_REPORT.zh-CN.md": {
+    "bytes": 12157,
+    "sha256": "c7a88d6d9115658c3e13ec41acb3a01414a7e5a9b4f59871c3c2e410846d2603"
+  },
+  "harness/android_probe/java/com/supercell/titan/ApplicationUtilBase.java": {
+    "bytes": 2451,
+    "sha256": "24a62eeee98f301f5f811b84fd74569c122f352022d2d4f9d668c62d1e0c061e"
+  },
+  "harness/android_probe/java/com/supercell/titan/BatteryMonitor.java": {
+    "bytes": 1272,
+    "sha256": "b2208d51a1757d243b8f9a91274823200d88d903fcf5743e16ea194d280eee76"
+  },
+  "harness/android_probe/java/com/supercell/titan/GameApp.java": {
+    "bytes": 8528,
+    "sha256": "01dc95b0663e71bd847536eba5c27c69e128a69ec91925a6514880319910387b"
+  },
+  "harness/android_probe/java/com/supercell/titan/NativeDialogManager.java": {
+    "bytes": 1620,
+    "sha256": "4d8f3d81bd5551f95a12e6bf71c9cf1f9a4fd2c5516d5e4ffa852200549cb505"
+  },
+  "harness/android_probe/java/com/supercell/titan/NativeHTTPClientManager.java": {
+    "bytes": 1110,
+    "sha256": "e11fcc6c6511aba5dbaf3397de81e9655100cc29dcdfdaf1abc80f23c7a89c8b"
+  },
+  "harness/android_probe/java/com/supercell/titan/PushMessageService.java": {
+    "bytes": 761,
+    "sha256": "79b7399c723c84b507bb285c50f7c4400ffbadfbbf964527dbbb94fcd43b3f6b"
+  },
+  "harness/android_probe/java/com/supercell/titan/QuagoManager.java": {
+    "bytes": 1281,
+    "sha256": "7f9f61368065bcb716cb5f5d1974171cef09f5dddabbe79351f38dccd67b9bab"
+  },
+  "harness/android_probe/java/com/supercell/titan/RequestPermissionListener.java": {
+    "bytes": 128,
+    "sha256": "7eb748971d34a9e2ed8c3fd9362a6286417d5a432e69efd4a1ee29b61f2b8b8a"
+  },
+  "harness/android_probe/java/com/supercell/titan/SnowplowTitan.java": {
+    "bytes": 1062,
+    "sha256": "6a3f077980e69d8d60615d551957a665269342939d65d8aaa652c704b6d5ce31"
+  },
+  "harness/android_probe/java/com/supercell/titan/ThermalMonitor.java": {
+    "bytes": 1764,
+    "sha256": "fd10e096d74369b24533510c2a4c40b080a246dc6359c76aa1a6e166a296c368"
+  },
+  "harness/android_probe/java/com/supercell/titan/TitanApplication.java": {
+    "bytes": 584,
+    "sha256": "b6b69240081a0d9747594788c70d042287ed2c3e44e5460b6aa5f38cb6cbf5e7"
+  },
+  "harness/android_probe/java/com/supercell/titan/usercentrics/UsercentricsSDK.java": {
+    "bytes": 727,
+    "sha256": "33e4bd3682d9ec3a6c35ff6d924d7414957ffa3d05f1eb5049643a542d497649"
+  },
+  "harness/android_probe/java/com/supercell/titan/usercentrics/UsercentricsSDKKt.java": {
+    "bytes": 408,
+    "sha256": "24cfee18520ce166d2e2f8127fc18e90f7874b21711b7f91d95957c34d2d9ab4"
+  },
+  "harness/android_probe/java/com/supercell/titan/zendesk/IMessagingSdkInitCallback.java": {
+    "bytes": 135,
+    "sha256": "fbdb5e527e1d61ff20eeafe92c361ffa71d88d719034f6ba53943c24eae0de94"
+  },
+  "harness/android_probe/java/com/supercell/titan/zendesk/IMessagingSdkLoginCallback.java": {
+    "bytes": 136,
+    "sha256": "59c9cdd2ec784161f8e381923a897736cc276f9ddd50bf1069823a39ff8870ea"
+  },
+  "harness/android_probe/java/com/supercell/titan/zendesk/ZendeskKt.java": {
+    "bytes": 1422,
+    "sha256": "1041833252c768d96f96af5414bd12aa465286bc28cbf5ebf718424a6390a7ee"
+  },
+  "harness/android_probe/java/royale/nativehost/BinaryWire.java": {
+    "bytes": 3555,
+    "sha256": "08b54fe6beb97256e15ef8cada9b1990f463ffa198a17e3b7cf507dfdd05eae6"
+  },
+  "harness/android_probe/java/royale/nativehost/BinderlessContext.java": {
+    "bytes": 5418,
+    "sha256": "993c982e7c6c37845e2ffd7bd870f9407851ed9f01a3559d2918e674529340f3"
+  },
+  "harness/android_probe/java/royale/nativehost/BinderlessPackageManager.java": {
+    "bytes": 2208,
+    "sha256": "dba4641225ba030967ef6853d9f350549416ec5075bf516582dcca5d5019b2cc"
+  },
+  "harness/android_probe/java/royale/nativehost/HeadlessActivity.java": {
+    "bytes": 1818,
+    "sha256": "f3acbfd213f8894265eb469d8dde1c1cebad1876d40330a768cc141a0b4b7719"
+  },
+  "harness/android_probe/java/royale/nativehost/HeadlessApplication.java": {
+    "bytes": 354,
+    "sha256": "923ce2e7ae6da772a5df1082ef4394dfa3c1d27523207e6845c968cf75f5457f"
+  },
+  "harness/android_probe/java/royale/nativehost/JniHost.java": {
+    "bytes": 81468,
+    "sha256": "6c4b119ffdfe150a23660a77841a1490c1d491a5d4043b1e2f236a5dc7d1f0bf"
+  },
+  "harness/scripts/build_probe.ps1": {
+    "bytes": 2681,
+    "sha256": "88f5d13f4f85631984c96c1aae338e1bba5722acfacb3a58ac716fc00d9a8035"
+  },
+  "results/analysis.json": {
+    "bytes": 5810,
+    "sha256": "9001afb4793fe8c7489a9c8770703da110f6019ddb7985d2be20d04d600d295d"
+  },
+  "results/suite-summary.json": {
+    "bytes": 10819,
+    "sha256": "b7b162c56bc24f1ed984b17f1a8a356f9e37574a79fb63e71d409aaffa4275d3"
+  },
+  "results/wire-summary.json": {
+    "bytes": 7214,
+    "sha256": "a5e347e87e87028322c2c998a628312e6eb51e37ace2284bfc4bf5d778c85366"
+  },
+  "results/load-summary.json": {
+    "bytes": 74657,
+    "sha256": "b34d41b5741f7d79d7631a90648efc788600545ae6b8bfd861f490a176be8ee2"
+  },
+  "results/transport-summary.json": {
+    "bytes": 49756,
+    "sha256": "cc9a4a7bf4b459158fac6760e082ba5686d13fd193afe91b3aea932e57c1dd63"
+  },
+  "results/compact-summary.json": {
+    "bytes": 10841,
+    "sha256": "906b63ec0e4282c6f85289f7bba9351ec228e15d92152bdb866606a32fbf2d57"
+  },
+  "results/compact-verified.json": {
+    "bytes": 186,
+    "sha256": "68ab7689eab570db408682addad65a69286df79acf247e4d9ce1a55f3f6553fb"
+  },
+  "results/compiled-full-summary.json": {
+    "bytes": 7223,
+    "sha256": "0d5e964e2b8c2800dabbe6a40a6f8bf76afa0dc6df78b6590fbc2fc54f124d6d"
+  },
+  "results/compiled-full-done.json": {
+    "bytes": 44,
+    "sha256": "b3e7ca589f6a51d70206dc3345d629e12070cb064bdb1381ed8bc9ceac9d79a5"
+  },
+  "results/checkpoint-verified.json": {
+    "bytes": 1439,
+    "sha256": "301490b5c6b8b133bbd3bc4527d714a53e85fefd7574f5e59204d6cb66c2c4c6"
+  },
+  "results/learner-audited/result.json": {
+    "bytes": 590,
+    "sha256": "25c7e4dee7dd5d8f9912c6e4053a24144c860b279323b692e2030491ee5a217b"
+  },
+  "results/learner-audited/collector.json": {
+    "bytes": 1391,
+    "sha256": "8127de25a0e9a9d19d64ab9eee5d83a4b0296ba5dfa9dd2c46ddebb001ddc495"
+  },
+  "results/learner-audited/learner.json": {
+    "bytes": 5253,
+    "sha256": "2db8bebdc8e07e75b9c716fb0f28ced25bc5327cc4db2469b58cf11410931597"
+  }
+}

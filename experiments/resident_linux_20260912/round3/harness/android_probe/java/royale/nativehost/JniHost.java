@@ -1,0 +1,1574 @@
+package royale.nativehost;
+
+import com.supercell.titan.GameApp;
+import com.supercell.titan.TitanApplication;
+import android.graphics.SurfaceTexture;
+import android.view.Surface;
+import java.io.ByteArrayOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.lang.reflect.Method;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+public final class JniHost {
+    private static native String nativeResidentCode(String path,int rva,int size);
+    private static native String nativeResident(String path,int slot,int op,String replay,int steps);
+    private static native long nativeThreadCpuNanos();
+    private static native String nativeTimingStats();
+    private static final boolean PROFILE_TIMING = "1".equals(System.getenv("CR_NATIVE_PROFILE_TIMING"));
+    private static final long[][] profileCounters = new long[4][3];
+    private static void profileAdd(int id,long wall,long cpu) {
+        profileCounters[id][0]++;profileCounters[id][1]+=wall;profileCounters[id][2]+=cpu;
+    }
+    private static JSONObject profileSnapshot() throws Exception {
+        JSONObject out=new JSONObject();String[] names={"request_parse","handler_total","response_serialize","socket_write"};
+        for(int i=0;i<4;i++) {JSONObject item=new JSONObject();item.put("calls",profileCounters[i][0]);
+            item.put("wall_ns",profileCounters[i][1]);item.put("cpu_ns",profileCounters[i][2]);out.put(names[i],item);}
+        return out;
+    }
+    private static native String nativeMemoryReadStats();
+    private JniHost() {}
+
+    private static String sha256File(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[65536];
+        try (FileInputStream input = new FileInputStream(file)) {
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte value : digest.digest()) hex.append(String.format("%02x", value & 255));
+        return hex.toString();
+    }
+
+    private static final int TRACE_SCHEMA_VERSION = 1;
+    private static final int MAX_TRACE_STEPS = 64;
+    private static final int MIN_TRACE_RESPONSE_BYTES = 64 * 1024;
+    private static final int MAX_TRACE_RESPONSE_BYTES = 32 * 1024 * 1024;
+
+    private static String bootstrapReplayCanonical = null;
+    private static int bootstrapReplaySeed = Integer.MIN_VALUE;
+    private static boolean bootstrapReplayAvailable = false;
+    private static boolean terminalEpisodeLatched = false;
+    private static SurfaceTexture lifecycleSurfaceTexture = null;
+    private static Surface lifecycleSurface = null;
+
+    private static native String nativeCreateGameMain(
+        String libgPath,
+        Object assets,
+        Object activity,
+        String dataDir,
+        String cacheDir,
+        String externalCacheDir,
+        long availableBytes,
+        int width,
+        int height,
+        int densityDpi,
+        float xdpi,
+        float ydpi,
+        int graphicsApi,
+        String externalFilesDir
+    );
+    private static native String nativeRegisterAndroidRuntime();
+    private static native String nativeProbeRuntime(String libgPath);
+    private static native String nativeProbePrerequisites(String libgPath);
+    private static native String nativeInitGameMain(String libgPath);
+    private static native String nativePreloadCoreData(String libgPath);
+    private static native String nativeInitResources(String libgPath);
+    private static native String nativeInitManager(String libgPath);
+    private static native String nativePumpManager(String libgPath);
+    private static native String nativePumpDataTables(String libgPath);
+    private static native String nativeLoadReplay(String libgPath, String replayJson);
+    private static native String nativeRestartReplay(String libgPath, String replayJson);
+    private static native String nativeStep(String libgPath, int steps);
+    private static native String nativeStepTrace(
+        String libgPath, int steps, int traceSchemaVersion,
+        int maxResponseBytes
+    );
+    private static native String nativeStepTrainTrace(
+        String libgPath, int steps, int traceSchemaVersion,
+        int maxResponseBytes
+    );
+    private static native String nativeObserve(String libgPath);
+    private static native String nativeObserveTrain(String libgPath);
+    private static native String nativeAct(
+        String libgPath, int side, int deckIndex, int x, int y,
+        int accountHi, int accountLo, boolean dryRun
+    );
+    private static native String nativeUseAbility(
+        String libgPath, int side, int entityCategory,
+        int accountHi, int accountLo
+    );
+    private static native String nativeProbeGrid(
+        String libgPath, int side, int deckIndex, int accountHi, int accountLo
+    );
+
+    public static void main(String[] args) {
+        if (args.length < 1 || args.length > 3) {
+            System.err.println("usage: royale.nativehost.JniHost /absolute/runtime/root [load|context|create|lifecycle|replay|serve|serve-direct|probe-baseline|probe-detach-surface|probe-null-surface|probe-no-surface|probe-create-only|probe-minimal|probe-direct] [replay.json|port]");
+            System.exit(64);
+        }
+        String mode = args.length >= 2 ? args[1] : "load";
+        boolean binderlessAndroid =
+            "1".equals(System.getenv("CR_BINDERLESS_ANDROID"));
+        String path = args[0] + "/libg.so";
+        System.load(args[0] + "/libnative_host_bridge.so");
+        // A normal Android app_process registers the framework JNI table before
+        // invoking this class.  The cloud-native runner deliberately starts ART
+        // without app_process so it does not require /dev/binder; register the
+        // same table explicitly only for that opt-in runtime.
+        if (binderlessAndroid && !"1".equals(System.getenv("CR_BINDERLESS_SKIP_FRAMEWORK_REGISTRATION"))) {
+            System.out.println(nativeRegisterAndroidRuntime());
+            System.out.flush();
+        }
+        System.out.println(
+            "{\"schema_version\":1,\"stage\":\"jni_on_load\","
+                + "\"event\":\"before_system_load\",\"path\":\""
+                + path.replace("\\", "\\\\").replace("\"", "\\\"")
+                + "\"}"
+        );
+        System.out.flush();
+        try {
+            System.load(path);
+        } catch (Throwable error) {
+            System.err.println("SYSTEM_LOAD_FAILED type=" + error.getClass().getName());
+            error.printStackTrace(System.err);
+            System.err.flush();
+            System.exit(2);
+        }
+        System.out.println(
+            "{\"schema_version\":1,\"stage\":\"jni_on_load\","
+                + "\"event\":\"after_system_load\",\"ok\":true}"
+        );
+        System.out.flush();
+        if ("load".equals(mode)) {
+            emitRuntimeProbe(args[0], "after_system_load");
+            return;
+        }
+        try {
+            Object packageContext = createPackageContext(
+                args[0], "com.supercell.clashroyale"
+            );
+            Method getAssets = Class.forName("android.content.Context").getMethod("getAssets");
+            Object assets = getAssets.invoke(packageContext);
+            System.out.println(
+                "{\"schema_version\":1,\"stage\":\"package_context\","
+                    + "\"ok\":true,\"context_class\":\""
+                    + packageContext.getClass().getName()
+                    + "\",\"assets_class\":\""
+                    + assets.getClass().getName()
+                    + "\"}"
+            );
+            System.out.flush();
+            if ("context".equals(mode)) {
+                return;
+            }
+            if (!"create".equals(mode) && !"lifecycle".equals(mode)
+                && !"replay".equals(mode) && !"serve".equals(mode)
+                && !"serve-direct".equals(mode)
+                && !isProbeMode(mode)) {
+                throw new IllegalArgumentException("unknown mode: " + mode);
+            }
+            if (isLifecycleMode(mode)) {
+                TitanApplication.bindContext((android.content.Context) packageContext);
+                emitRuntimeProbe(args[0], "after_system_load");
+                emitStage("native_libraries_loaded", "before");
+                TitanApplication.nOnNativeLibrariesLoaded();
+                emitStage("native_libraries_loaded", "after");
+                emitRuntimeProbe(args[0], "after_native_libraries_loaded");
+                emitStage("application_create", "before");
+                GameApp.nOnApplicationCreate();
+                emitStage("application_create", "after");
+                emitRuntimeProbe(args[0], "after_application_create");
+            }
+            invokeCreateGameMain(args[0], assets, packageContext);
+            if (isLifecycleMode(mode)) {
+                emitRuntimeProbe(args[0], "after_create_game_main");
+                if (usesActivityCreate(mode)) {
+                    emitStage("activity_create", "before");
+                    GameApp.nOnCreate();
+                    emitStage("activity_create", "after");
+                    emitRuntimeProbe(args[0], "after_activity_create");
+                }
+                if (usesSurface(mode)) {
+                    emitStage("surface_create", "before");
+                    lifecycleSurfaceTexture = new SurfaceTexture(false);
+                    lifecycleSurfaceTexture.setDefaultBufferSize(1080, 2400);
+                    lifecycleSurface = new Surface(lifecycleSurfaceTexture);
+                    GameApp.nOnSurfaceCreated(lifecycleSurface);
+                    GameApp.nOnSurfaceChanged(lifecycleSurface, 1080, 2400);
+                    emitStage("surface_create", "after");
+                    emitRuntimeProbe(args[0], "after_surface_create");
+                }
+                if ("probe-null-surface".equals(mode)) {
+                    emitStage("null_surface_callback", "before");
+                    GameApp.nOnSurfaceCreated(null);
+                    GameApp.nOnSurfaceChanged(null, 1080, 2400);
+                    emitStage("null_surface_callback", "after");
+                    emitRuntimeProbe(args[0], "after_null_surface_callback");
+                }
+                if (usesStartResume(mode)) {
+                    emitStage("activity_start", "before");
+                    GameApp.nOnStart();
+                    emitStage("activity_start", "after");
+                    emitRuntimeProbe(args[0], "after_activity_start");
+                    emitStage("activity_resume", "before");
+                    GameApp.nOnResume();
+                    emitStage("activity_resume", "after");
+                    emitRuntimeProbe(args[0], "after_activity_resume");
+                }
+                emitStage("headless_hold", "before");
+                Thread.sleep(5000L);
+                emitStage("headless_hold", "after");
+                emitRuntimeProbe(args[0], "after_headless_hold");
+                System.out.println(
+                    "{\"schema_version\":1,\"stage\":\"prerequisite_probe\"," +
+                        "\"event\":\"after_headless_hold\",\"value\":" +
+                        nativeProbePrerequisites(args[0] + "/libg.so") + "}"
+                );
+                System.out.flush();
+                if ("probe-direct".equals(mode)
+                    || "serve-direct".equals(mode)) {
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_platform_init\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            nativeInitResources(args[0] + "/libg.so") + "}"
+                    );
+                    System.out.flush();
+                    String directCoreInit =
+                        nativeInitGameMain(args[0] + "/libg.so");
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_game_main_init\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            directCoreInit + "}"
+                    );
+                    System.out.flush();
+                    if (binderlessAndroid &&
+                        "1".equals(System.getenv("CR_BINDERLESS_HOLD_AFTER_GAMEMAIN"))) {
+                        emitStage("binderless_preflight_hold", "ready");
+                        Thread.sleep(600_000L);
+                        return;
+                    }
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_loading_state\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            nativePumpManager(args[0] + "/libg.so") + "}"
+                    );
+                    System.out.flush();
+                    String preloadCoreDataValue = System.getenv(
+                        "CR_BINDERLESS_PRELOAD_CORE_DATA"
+                    );
+                    if (binderlessAndroid && preloadCoreDataValue != null &&
+                        !preloadCoreDataValue.isEmpty() &&
+                        !"0".equals(preloadCoreDataValue) &&
+                        !"1".equals(preloadCoreDataValue)) {
+                        throw new IllegalArgumentException(
+                            "CR_BINDERLESS_PRELOAD_CORE_DATA must be " +
+                                "unset, 0, or 1"
+                        );
+                    }
+                    if (binderlessAndroid &&
+                        "1".equals(preloadCoreDataValue)) {
+                        JSONObject preloadResult = new JSONObject(
+                            nativePreloadCoreData(args[0] + "/libg.so")
+                        );
+                        System.out.println(
+                            "{\"schema_version\":1," +
+                                "\"stage\":\"direct_core_data_preload\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                preloadResult.toString() + "}"
+                        );
+                        System.out.flush();
+                        if (!preloadResult.optBoolean("success", false)) {
+                            throw new IllegalStateException(
+                                "native core data preload did not reach " +
+                                    "the loaded state"
+                            );
+                        }
+                    }
+                    int loadingMaxFrames = (int) readBoundedEnv(
+                        "CR_NATIVE_LOADING_MAX_FRAMES", 10_000L,
+                        1L, 10000L
+                    );
+                    long loadingTimeoutMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_TIMEOUT_MS", 30_000L,
+                        1_000L, 120_000L
+                    );
+                    long loadingSleepMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_SLEEP_MS", 5L, 0L, 100L
+                    );
+                    long loadingInitialSettleMillis = readBoundedEnv(
+                        "CR_NATIVE_LOADING_INITIAL_SETTLE_MS", 500L,
+                        0L, 30_000L
+                    );
+                    long loadingStartedNanos = System.nanoTime();
+                    JSONObject directLoadingFrame = null;
+                    JSONObject directLoadingReadiness = new JSONObject(
+                        nativeProbePrerequisites(args[0] + "/libg.so")
+                    );
+                    boolean applyInitialSettle =
+                        loadingInitialSettleMillis > 0L &&
+                        !directLoadingReadiness.optBoolean(
+                            "natural_data_tables_ready", false
+                        ) &&
+                        directLoadingReadiness.optInt(
+                            "current_state_type", -1
+                        ) == 1;
+                    JSONObject initialSettleBefore = new JSONObject();
+                    initialSettleBefore.put(
+                        "configured_ms", loadingInitialSettleMillis
+                    );
+                    initialSettleBefore.put("applied", applyInitialSettle);
+                    initialSettleBefore.put(
+                        "readiness", directLoadingReadiness
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1," +
+                            "\"stage\":\"direct_loading_initial_settle\"," +
+                            "\"event\":\"before\",\"value\":" +
+                            initialSettleBefore.toString() + "}"
+                    );
+                    System.out.flush();
+                    long initialSettleStartedNanos = System.nanoTime();
+                    if (applyInitialSettle) {
+                        Thread.sleep(loadingInitialSettleMillis);
+                    }
+                    directLoadingReadiness = new JSONObject(
+                        nativeProbePrerequisites(args[0] + "/libg.so")
+                    );
+                    JSONObject initialSettleAfter = new JSONObject();
+                    initialSettleAfter.put(
+                        "configured_ms", loadingInitialSettleMillis
+                    );
+                    initialSettleAfter.put("applied", applyInitialSettle);
+                    initialSettleAfter.put(
+                        "elapsed_ms",
+                        (System.nanoTime() - initialSettleStartedNanos) /
+                            1_000_000.0
+                    );
+                    initialSettleAfter.put(
+                        "readiness", directLoadingReadiness
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1," +
+                            "\"stage\":\"direct_loading_initial_settle\"," +
+                            "\"event\":\"after\",\"value\":" +
+                            initialSettleAfter.toString() + "}"
+                    );
+                    System.out.flush();
+                    int loadingFrames = 0;
+                    int previousLoadingPhase = directLoadingReadiness.optInt(
+                        "loading_phase", -1
+                    );
+                    boolean factorySetupObserved =
+                        previousLoadingPhase >= 3;
+                    boolean loadingPostprocessObserved =
+                        previousLoadingPhase == 5;
+                    boolean dataLoadCompleteObserved =
+                        directLoadingReadiness.optBoolean(
+                            "data_load_task_complete", false
+                        );
+                    boolean dataContentObserved = !"0x0".equals(
+                        directLoadingReadiness.optString(
+                            "battle_data_content", "0x0"
+                        )
+                    );
+                    while (loadingFrames < loadingMaxFrames &&
+                           !directLoadingReadiness.optBoolean(
+                               "natural_data_tables_ready", false
+                           ) &&
+                           directLoadingReadiness.optInt(
+                               "current_state_type", -1
+                           ) == 1 &&
+                           (System.nanoTime() - loadingStartedNanos) <
+                               loadingTimeoutMillis * 1_000_000L) {
+                        directLoadingFrame = new JSONObject(
+                            nativePumpManager(args[0] + "/libg.so")
+                        );
+                        ++loadingFrames;
+                        directLoadingReadiness = new JSONObject(
+                            nativeProbePrerequisites(args[0] + "/libg.so")
+                        );
+                        int loadingPhase = directLoadingReadiness.optInt(
+                            "loading_phase", -1
+                        );
+                        factorySetupObserved =
+                            factorySetupObserved || loadingPhase >= 3;
+                        loadingPostprocessObserved =
+                            loadingPostprocessObserved || loadingPhase == 5;
+                        dataLoadCompleteObserved =
+                            dataLoadCompleteObserved ||
+                            directLoadingReadiness.optBoolean(
+                                "data_load_task_complete", false
+                            );
+                        dataContentObserved =
+                            dataContentObserved || !"0x0".equals(
+                                directLoadingReadiness.optString(
+                                    "battle_data_content", "0x0"
+                                )
+                            );
+                        if (loadingPhase != previousLoadingPhase ||
+                            loadingFrames % 64 == 0 ||
+                            directLoadingReadiness.optBoolean(
+                                "natural_data_tables_ready", false
+                            )) {
+                            JSONObject progress = new JSONObject();
+                            progress.put("frame", loadingFrames);
+                            progress.put(
+                                "elapsed_ms",
+                                (System.nanoTime() - loadingStartedNanos) /
+                                    1_000_000.0
+                            );
+                            progress.put("readiness", directLoadingReadiness);
+                            System.out.println(
+                                "{\"schema_version\":1," +
+                                    "\"stage\":\"direct_loading_progress\"," +
+                                    "\"event\":\"checkpoint\",\"value\":" +
+                                    progress.toString() + "}"
+                            );
+                            System.out.flush();
+                            previousLoadingPhase = loadingPhase;
+                        }
+                        if (loadingSleepMillis > 0L &&
+                            !directLoadingReadiness.optBoolean(
+                                "natural_data_tables_ready", false
+                            )) {
+                            Thread.sleep(loadingSleepMillis);
+                        }
+                    }
+                    long loadingElapsedNanos =
+                        System.nanoTime() - loadingStartedNanos;
+                    boolean loadingTimedOut =
+                        !directLoadingReadiness.optBoolean(
+                            "natural_data_tables_ready", false
+                        ) &&
+                        (loadingFrames >= loadingMaxFrames ||
+                         loadingElapsedNanos >=
+                             loadingTimeoutMillis * 1_000_000L);
+                    JSONObject loadingSummary = new JSONObject();
+                    loadingSummary.put("frames", loadingFrames);
+                    loadingSummary.put(
+                        "elapsed_ms", loadingElapsedNanos / 1_000_000.0
+                    );
+                    loadingSummary.put("timed_out", loadingTimedOut);
+                    loadingSummary.put(
+                        "factory_setup_observed", factorySetupObserved
+                    );
+                    loadingSummary.put(
+                        "loading_postprocess_observed",
+                        loadingPostprocessObserved
+                    );
+                    loadingSummary.put(
+                        "data_load_complete_observed",
+                        dataLoadCompleteObserved
+                    );
+                    loadingSummary.put(
+                        "data_content_observed", dataContentObserved
+                    );
+                    loadingSummary.put(
+                        "manager",
+                        directLoadingFrame != null
+                            ? directLoadingFrame : JSONObject.NULL
+                    );
+                    loadingSummary.put(
+                        "readiness", directLoadingReadiness
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"direct_loading_frames\"," +
+                            "\"event\":\"after_call\",\"value\":" +
+                            loadingSummary.toString() + "}"
+                    );
+                    if (binderlessAndroid) {
+                        String settleMillisValue = System.getenv(
+                            "CR_BINDERLESS_RESOURCE_SETTLE_MS"
+                        );
+                        if (settleMillisValue != null &&
+                            !settleMillisValue.isEmpty()) {
+                            long settleMillis = Long.parseLong(settleMillisValue);
+                            if (settleMillis < 0L || settleMillis > 60_000L) {
+                                throw new IllegalArgumentException(
+                                    "CR_BINDERLESS_RESOURCE_SETTLE_MS must be in 0..60000"
+                                );
+                            }
+                            if (settleMillis > 0L) {
+                                System.out.println(
+                                    "{\"schema_version\":1," +
+                                        "\"stage\":\"binderless_resource_settle\"," +
+                                        "\"event\":\"before\",\"milliseconds\":" +
+                                        settleMillis + "}"
+                                );
+                                System.out.flush();
+                                Thread.sleep(settleMillis);
+                                emitStage("binderless_resource_settle", "after");
+                            }
+                        }
+                    }
+                    String preDataTablesJson =
+                        nativeProbePrerequisites(args[0] + "/libg.so");
+                    JSONObject preDataTables = new JSONObject(
+                        preDataTablesJson
+                    );
+                    // E74B40 is a generated full-range loader. Calling it here
+                    // before LoadingState has established native dependency
+                    // order can pass a null per-table dependency to 12960C0.
+                    // Keep the JNI entry point only as an explicitly unsafe
+                    // reverse-engineering diagnostic; production startup is
+                    // driven exclusively by manager updates.
+                    boolean manualDataTablesDiagnostic = "1".equals(
+                        System.getenv(
+                            "CR_NATIVE_UNSAFE_MANUAL_DATATABLE_PUMP"
+                        )
+                    );
+                    if (manualDataTablesDiagnostic &&
+                        preDataTables.optBoolean(
+                            "data_load_task_ready", false
+                        ) &&
+                        "0x0".equals(preDataTables.optString(
+                            "battle_data_content", "0x0")) &&
+                        !"0x0".equals(preDataTables.optString(
+                            "data_load_task", "0x0"))) {
+                        System.out.println(
+                            "{\"schema_version\":1,\"stage\":\"direct_data_tables\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                nativePumpDataTables(args[0] + "/libg.so") + "}"
+                        );
+                        JSONObject postDataTablesFrame = null;
+                        for (int finalizeFrame = 0; finalizeFrame < 4;
+                             ++finalizeFrame) {
+                            postDataTablesFrame = new JSONObject(
+                                nativePumpManager(args[0] + "/libg.so")
+                            );
+                        }
+                        System.out.println(
+                            "{\"schema_version\":1," +
+                                "\"stage\":\"direct_data_tables_finalize\"," +
+                                "\"event\":\"after_call\",\"value\":" +
+                                postDataTablesFrame.toString() + "}"
+                        );
+                    }
+                    System.out.flush();
+                    String directReadinessJson =
+                        nativeProbePrerequisites(args[0] + "/libg.so");
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"prerequisite_probe\"," +
+                            "\"event\":\"after_direct_resources\",\"value\":" +
+                            directReadinessJson + "}"
+                    );
+                    System.out.flush();
+                    emitRuntimeProbe(args[0], "after_direct_manager_init");
+                    JSONObject directReadiness = new JSONObject(
+                        directReadinessJson
+                    );
+                    if ("0x0".equals(
+                            directReadiness.optString(
+                                "battle_data_content", "0x0"
+                            ))) {
+                        JSONObject blocked = new JSONObject();
+                        blocked.put("profile", mode);
+                        blocked.put("status", "blocked_data_tables");
+                        blocked.put("game_main_initialized", true);
+                        blocked.put("manager_initialized", true);
+                        blocked.put("surface_created", false);
+                        blocked.put(
+                            "blocker",
+                            "native DataTables container exists but its table " +
+                                "array has not been populated"
+                        );
+                        blocked.put("readiness", directReadiness);
+                        System.out.println(
+                            "{\"schema_version\":1,\"stage\":\"probe_result\"," +
+                                "\"event\":\"blocked\",\"value\":" +
+                                blocked.toString() + "}"
+                        );
+                        System.out.flush();
+                        System.exit(0);
+                    }
+                }
+                if ("serve".equals(mode) || "serve-direct".equals(mode)) {
+                    String bootstrapReplay = readUtf8(
+                        new File(args[0], "bootstrap-replay.json")
+                    );
+                    JSONObject bootstrapReplayObject = new JSONObject(
+                        bootstrapReplay
+                    );
+                    bootstrapReplayCanonical = bootstrapReplayObject.toString();
+                    bootstrapReplaySeed = bootstrapReplayObject.optInt(
+                        "rndSeed", Integer.MIN_VALUE
+                    );
+                    emitStage("service_bootstrap", "before");
+                    nativeLoadReplay(args[0] + "/libg.so", bootstrapReplay);
+                    if ("serve-direct".equals(mode)) {
+                        nativePumpManager(args[0] + "/libg.so");
+                    }
+                    waitForBattle(args[0], 5000L, null, 0);
+                    emitStage("service_bootstrap", "after");
+                    if (!"serve-direct".equals(mode)) {
+                        GameApp.nOnPause();
+                        Thread.sleep(100L);
+                    }
+                    JSONObject bootstrapStep = new JSONObject(
+                        nativeStep(args[0] + "/libg.so", 10)
+                    );
+                    if (bootstrapStep.optInt("tick_after", -1) < 5) {
+                        throw new IllegalStateException(
+                            "controlled bootstrap did not reach tick 5: "
+                                + bootstrapStep.toString()
+                        );
+                    }
+                    bootstrapReplayAvailable = true;
+                    emitStage("controlled_clock", "paused");
+                }
+                if (isProbeMode(mode)) {
+                    if (args.length != 3) {
+                        throw new IllegalArgumentException(
+                            mode + " requires a replay JSON path"
+                        );
+                    }
+                    String replayJson = readUtf8(new File(args[2]));
+                    long startedNanos = System.nanoTime();
+                    JSONObject loadResult = new JSONObject(
+                        nativeLoadReplay(args[0] + "/libg.so", replayJson)
+                    );
+                    JSONObject pumpResult = null;
+                    if ("probe-direct".equals(mode)) {
+                        pumpResult = new JSONObject(
+                            nativePumpManager(args[0] + "/libg.so")
+                        );
+                    }
+                    JSONObject readyState = waitForBattle(
+                        args[0], 5000L, null, 0
+                    );
+                    if (usesStartResume(mode)) {
+                        GameApp.nOnPause();
+                        Thread.sleep(100L);
+                    }
+                    if ("probe-detach-surface".equals(mode)) {
+                        GameApp.nOnSurfaceDestroyed(lifecycleSurface);
+                        lifecycleSurface.release();
+                        lifecycleSurfaceTexture.release();
+                        lifecycleSurface = null;
+                        lifecycleSurfaceTexture = null;
+                        emitStage("surface_detached", "after");
+                    }
+                    JSONObject stepResult = new JSONObject(
+                        nativeStep(args[0] + "/libg.so", 100)
+                    );
+                    JSONObject finalState = new JSONObject(
+                        nativeObserve(args[0] + "/libg.so")
+                    );
+                    long elapsedNanos = System.nanoTime() - startedNanos;
+                    JSONObject result = new JSONObject();
+                    result.put("profile", mode);
+                    result.put("load", loadResult);
+                    if (pumpResult != null) {
+                        result.put("pump", pumpResult);
+                    }
+                    result.put("ready", readyState);
+                    result.put("step", stepResult);
+                    result.put("state", finalState);
+                    result.put("elapsed_ms", elapsedNanos / 1000000.0);
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"probe_result\"," +
+                            "\"event\":\"complete\",\"value\":" +
+                            result.toString() + "}"
+                    );
+                    System.out.flush();
+                } else if ("replay".equals(mode)) {
+                    if (args.length != 3) {
+                        throw new IllegalArgumentException("replay mode requires a JSON path");
+                    }
+                    String replayJson = readUtf8(new File(args[2]));
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"replay_input\","
+                            + "\"event\":\"after_call\",\"value\":"
+                            + nativeLoadReplay(args[0] + "/libg.so", replayJson) + "}"
+                    );
+                    System.out.flush();
+                    JSONObject readyState = waitForBattle(
+                        args[0], 3000L, null, 5
+                    );
+                    GameApp.nOnPause();
+                    Thread.sleep(100L);
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"controlled_clock\","
+                            + "\"event\":\"paused\",\"value\":"
+                            + readyState.toString() + "}"
+                    );
+                    System.out.println(
+                        "{\"schema_version\":1,\"stage\":\"controlled_step\","
+                            + "\"event\":\"after_call\",\"value\":"
+                            + nativeStep(args[0] + "/libg.so", 1) + "}"
+                    );
+                    System.out.flush();
+                    emitRuntimeProbe(args[0], "after_replay_input");
+                } else if ("serve".equals(mode)
+                    || "serve-direct".equals(mode)) {
+                    int port = args.length == 3 ? Integer.parseInt(args[2]) : 37031;
+                    serveJson(args[0], port);
+                }
+                emitStage("activity_destroy", "before");
+                if (usesStartResume(mode)) {
+                    GameApp.nOnPause();
+                    GameApp.nOnStop();
+                }
+                if (usesSurface(mode) && lifecycleSurface != null) {
+                    GameApp.nOnSurfaceDestroyed(lifecycleSurface);
+                    lifecycleSurface.release();
+                    lifecycleSurfaceTexture.release();
+                }
+                lifecycleSurface = null;
+                lifecycleSurfaceTexture = null;
+                if (usesActivityCreate(mode)) {
+                    GameApp.nOnDestroy();
+                }
+                emitStage("activity_destroy", "after");
+                System.exit(0);
+            }
+        } catch (Throwable error) {
+            System.err.println("NATIVE_STAGE_FAILED mode=" + mode + " type=" + error.getClass().getName());
+            error.printStackTrace(System.err);
+            System.err.flush();
+            System.exit(3);
+        }
+    }
+
+    private static JSONObject restartBattleLifecycle(
+        String root, String replay
+    ) throws Exception {
+        JSONObject current = new JSONObject(
+            nativeProbeRuntime(root + "/libg.so")
+        );
+        int currentTick = current.optInt("tick", -1);
+        if (currentTick < 0) {
+            throw new IllegalStateException(
+                "native replay restart requires an active BattleGameState"
+            );
+        }
+        JSONObject loaded = new JSONObject(
+            nativeRestartReplay(root + "/libg.so", replay)
+        );
+        nativePumpManager(root + "/libg.so");
+        // CE7810 synchronously constructs and enters the replacement native
+        // BattleGameState.  The service clock is already paused; resuming the
+        // Android lifecycle here creates a second manager and falls back to
+        // HomeState.  Keep the new battle under nativeStep control instead.
+        JSONObject readyState = waitForBattle(
+            root, 5000L, null, 0
+        );
+        JSONObject warmup = null;
+        for (int attempt = 0;
+             attempt < 4 && readyState.optInt("tick", -1) < 10;
+             ++attempt) {
+            int remaining = Math.max(
+                1, 10 - readyState.optInt("tick", 0)
+            );
+            warmup = new JSONObject(
+                nativeStep(root + "/libg.so", remaining)
+            );
+            readyState = new JSONObject(
+                nativeProbeRuntime(root + "/libg.so")
+            );
+        }
+        if (readyState.optInt("tick", -1) < 10) {
+            throw new IllegalStateException(
+                "lifecycle restart warmup failed: "
+                    + String.valueOf(warmup)
+            );
+        }
+        terminalEpisodeLatched = false;
+        bootstrapReplayAvailable = false;
+        JSONObject result = new JSONObject();
+        result.put("lifecycle_restarted", true);
+        result.put("load", loaded);
+        result.put("state", readyState);
+        return result;
+    }
+
+    private static void emitStage(String stage, String event) {
+        System.out.println(
+            "{\"schema_version\":1,\"stage\":\"" + stage
+                + "\",\"event\":\"" + event + "\"}"
+        );
+        System.out.flush();
+    }
+
+    private static boolean isLifecycleMode(String mode) {
+        return "lifecycle".equals(mode) || "replay".equals(mode)
+            || "serve".equals(mode) || "serve-direct".equals(mode)
+            || isProbeMode(mode);
+    }
+
+    private static boolean isProbeMode(String mode) {
+        return "probe-baseline".equals(mode)
+            || "probe-detach-surface".equals(mode)
+            || "probe-null-surface".equals(mode)
+            || "probe-no-surface".equals(mode)
+            || "probe-create-only".equals(mode)
+            || "probe-minimal".equals(mode)
+            || "probe-direct".equals(mode);
+    }
+
+    private static boolean usesActivityCreate(String mode) {
+        return !"probe-minimal".equals(mode);
+    }
+
+    private static boolean usesSurface(String mode) {
+        return (!isProbeMode(mode) && !"serve-direct".equals(mode))
+            || "probe-baseline".equals(mode)
+            || "probe-detach-surface".equals(mode);
+    }
+
+    private static boolean usesStartResume(String mode) {
+        return (!isProbeMode(mode) && !"serve-direct".equals(mode))
+            || "probe-baseline".equals(mode)
+            || "probe-detach-surface".equals(mode)
+            || "probe-null-surface".equals(mode)
+            || "probe-no-surface".equals(mode);
+    }
+
+    private static void serveJson(String root, int port) throws Exception {
+        InetAddress guestInterfaces = InetAddress.getByName("0.0.0.0");
+        try (ServerSocket server = new ServerSocket(port, 16, guestInterfaces)) {
+            System.out.println(
+                "{\"schema_version\":1,\"stage\":\"json_server\","
+                    + "\"event\":\"ready\",\"address\":\"0.0.0.0\","
+                    + "\"port\":" + port + "}"
+            );
+            System.out.flush();
+            boolean running = true;
+            while (running) {
+                try (Socket socket = server.accept();
+                     BufferedReader reader = new BufferedReader(new InputStreamReader(
+                         socket.getInputStream(), StandardCharsets.UTF_8
+                     ));
+                      BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(
+                          socket.getOutputStream(), StandardCharsets.UTF_8
+                      ))) {
+                    socket.setTcpNoDelay(true);
+                    while (running) {
+                        String line = reader.readLine();
+                        if (line == null) {
+                            break;
+                        }
+                        JSONObject response = new JSONObject();
+                        String rawResponse = null;
+                        boolean binaryResponse=false;
+                        long handlerWall=0,handlerCpu=0;
+                        try {
+                        if (line.length() > 32 * 1024 * 1024) {
+                            throw new IllegalArgumentException("invalid JSON line length");
+                        }
+                        long requestParseStartedNanos = System.nanoTime();
+                        long requestParseCpu=PROFILE_TIMING?nativeThreadCpuNanos():0;
+                        JSONObject request = new JSONObject(line);
+                        binaryResponse="msgpack-v1".equals(request.optString("response_wire",""));
+                        long requestParsedNanos = System.nanoTime();
+                        if(PROFILE_TIMING) {
+                            profileAdd(0,requestParsedNanos-requestParseStartedNanos,nativeThreadCpuNanos()-requestParseCpu);
+                            handlerWall=System.nanoTime();handlerCpu=nativeThreadCpuNanos();
+                        }
+                        String op = request.getString("op");
+                        response.put("schema_version", 1);
+                        response.put("ok", true);
+                        response.put("op", op);
+                        if ("profile_stats".equals(op)) {
+                            response.put("native",new JSONObject(nativeTimingStats()));response.put("java",profileSnapshot());
+                        } else if ("resident_batch".equals(op)) {
+                            JSONArray entries=request.getJSONArray("entries");
+                            if(entries.length()<1 || entries.length()>4) throw new IllegalArgumentException("batch size");
+                            boolean[] seen=new boolean[4];
+                            for(int i=0;i<entries.length();i++) {
+                                JSONObject entry=entries.getJSONObject(i);int slot=entry.getInt("slot");
+                                if(slot<0 || slot>=4 || seen[slot]) throw new IllegalArgumentException("duplicate/invalid slot");
+                                seen[slot]=true;
+                                int steps=entry.optInt("steps",4);
+                                if(steps<0 || steps>4) throw new IllegalArgumentException("four tick maximum");
+                                entry.getJSONArray("actions");
+                            }
+                            JSONArray results=new JSONArray();String lib=root+"/libg.so";
+                            boolean raw=request.optBoolean("raw_response",false);
+                            boolean trainOnly="train-v1".equals(request.optString("observation_schema",""));
+                            StringBuilder rawResults=new StringBuilder("{\"schema_version\":1,\"ok\":true,\"op\":\"resident_batch\",\"results\":[");
+                            for(int i=0;i<entries.length();i++) {
+                                JSONObject entry=entries.getJSONObject(i);int slot=entry.getInt("slot");
+                                JSONObject value=new JSONObject();value.put("slot",slot);
+                                nativeResident(lib,slot,1,null,0);
+                                JSONObject receipt;
+                                try { receipt=executeJointActions(root,entry.getJSONArray("actions")); }
+                                finally { nativeResident(lib,slot,3,null,0); }
+                                String stepJson=nativeResident(lib,slot,2,null,entry.optInt("steps",4));
+                                nativeResident(lib,slot,1,null,0);
+                                String stateJson;
+                                try { stateJson=trainOnly?nativeObserveTrain(lib):nativeObserve(lib); }
+                                finally { nativeResident(lib,slot,3,null,0); }
+                                if(raw) {
+                                    if(i>0)rawResults.append(',');
+                                    rawResults.append("{\"slot\":").append(slot).append(",\"joint_action\":").append(receipt.toString())
+                                        .append(",\"step\":").append(stepJson).append(",\"state\":").append(stateJson).append('}');
+                                } else {
+                                    value.put("joint_action",receipt);value.put("step",new JSONObject(stepJson));
+                                    value.put("state",new JSONObject(stateJson));results.put(value);
+                                }
+                            }
+                            if(raw)rawResponse=rawResults.append("]}").toString();
+                            else response.put("results",results);
+                        } else if ("resident".equals(op)) {
+                            int slot=request.getInt("slot");
+                            String mode=request.getString("mode");
+                            String lib=root+"/libg.so";
+                            if ("create".equals(mode)) {
+                                response.put("result",new JSONObject(nativeResident(lib,slot,0,request.getJSONObject("replay").toString(),0)));
+                            } else if ("step".equals(mode)) {
+                                response.put("result",new JSONObject(nativeResident(lib,slot,2,null,request.getInt("steps"))));
+                            } else {
+                                nativeResident(lib,slot,1,null,0);
+                                try {
+                                    if ("observe".equals(mode)) response.put("state",new JSONObject(nativeObserve(lib)));
+                                    else if ("observe_train".equals(mode)) response.put("state",new JSONObject(nativeObserveTrain(lib)));
+                                    else if ("probe_grid".equals(mode)) response.put("result",new JSONObject(nativeProbeGrid(lib,request.getInt("side"),request.getInt("deck_index"),request.getInt("account_hi"),request.getInt("account_lo"))));
+                                    else if ("act".equals(mode)) response.put("result",executeJointActions(root,request.getJSONArray("actions")));
+                                    else throw new IllegalArgumentException("resident mode");
+                                } finally { nativeResident(lib,slot,3,null,0); }
+                            }
+                        } else if ("resident-code".equals(op)) {
+                            response.put("result",new JSONObject(nativeResidentCode(root+"/libg.so",request.getInt("rva"),request.optInt("size",512))));
+                        } else if ("memory_read_stats".equals(op)) {
+                            response.put("result", new JSONObject(nativeMemoryReadStats()));
+                        } else if ("runtime_identity_v1".equals(op)) {
+                            JSONObject identity = new JSONObject();
+                            identity.put("libg_sha256", sha256File(new File(root, "libg.so")));
+                            identity.put("host_sha256", sha256File(new File(root, "lifecycle-probe.jar")));
+                            identity.put("resident_train_schema_v1", true);
+                            identity.put("response_msgpack_v1", true);
+                            response.put("identity", identity);
+                        } else if ("status".equals(op)) {
+                            response.put(
+                                "state", new JSONObject(nativeProbeRuntime(root + "/libg.so"))
+                            );
+                        } else if ("restart_replay".equals(op)
+                            || "reset".equals(op)) {
+                            String replay = request.getJSONObject(
+                                "replay"
+                            ).toString();
+                            response.put(
+                                "result", restartBattleLifecycle(root, replay)
+                            );
+                            response.put(
+                                "state", new JSONObject(
+                                    nativeObserve(root + "/libg.so")
+                                )
+                            );
+                        } else if ("load_replay".equals(op)) {
+                            if (terminalEpisodeLatched) {
+                                throw new IllegalStateException(
+                                    "native terminal is latched; recycle the host process before reset"
+                                );
+                            }
+                            JSONObject previousState = new JSONObject(
+                                nativeProbeRuntime(root + "/libg.so")
+                            );
+                            String previousReplay = previousState.optString(
+                                "replay_data", null
+                            );
+                            JSONObject readyState;
+                            try {
+                                String replay = request.getJSONObject("replay").toString();
+                                boolean adoptBootstrap = bootstrapReplayAvailable
+                                    && (replay.equals(bootstrapReplayCanonical)
+                                        || request.getJSONObject("replay").optInt(
+                                            "rndSeed", Integer.MAX_VALUE
+                                        ) == bootstrapReplaySeed)
+                                    && previousState.optInt(
+                                        "current_state_type", -1
+                                    ) == 4;
+                                bootstrapReplayAvailable = false;
+                                if (adoptBootstrap) {
+                                    JSONObject adopted = new JSONObject();
+                                    adopted.put("called", false);
+                                    adopted.put("adopted_bootstrap", true);
+                                    response.put("result", adopted);
+                                    // The bootstrap is already paused and was
+                                    // advanced by the controlled native core.
+                                    // Resuming here creates a one-frame race in
+                                    // which the presentation state can discard
+                                    // the headless battle before nOnPause lands.
+                                    readyState = previousState;
+                                } else {
+                                    response.put(
+                                        "result", new JSONObject(
+                                            nativeLoadReplay(root + "/libg.so", replay)
+                                        )
+                                    );
+                                    GameApp.nOnResume();
+                                    readyState = waitForBattle(
+                                        root, 3000L, previousReplay, 0
+                                    );
+                                }
+                            } finally {
+                                GameApp.nOnPause();
+                                Thread.sleep(100L);
+                            }
+                            if (readyState.optInt("tick", -1) < 5) {
+                                JSONObject controlledWarmup = new JSONObject(
+                                    nativeStep(root + "/libg.so", 10)
+                                );
+                                if (controlledWarmup.optInt("tick_after", -1) < 5) {
+                                    throw new IllegalStateException(
+                                        "controlled replay warmup failed: "
+                                            + controlledWarmup.toString()
+                                    );
+                                }
+                                readyState = new JSONObject(
+                                    nativeProbeRuntime(root + "/libg.so")
+                                );
+                            }
+                            response.put(
+                                "state", readyState
+                            );
+                        } else if ("step".equals(op)) {
+                            int steps = request.optInt("steps", 1);
+                            JSONObject stepResult = new JSONObject(
+                                nativeStep(root + "/libg.so", steps)
+                            );
+                            response.put("result", stepResult);
+                            terminalEpisodeLatched = stepResult
+                                .getJSONObject("episode")
+                                .optBoolean("terminated", false);
+                        } else if ("step_trace".equals(op)) {
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, false
+                            );
+                            response.put("result", traceResult);
+                            terminalEpisodeLatched = traceResult.optBoolean(
+                                "terminal", false
+                            );
+                        } else if ("step_train_trace_v1".equals(op)) {
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, true
+                            );
+                            response.put("result", traceResult);
+                            terminalEpisodeLatched = traceResult.optBoolean(
+                                "terminal", false
+                            );
+                        } else if ("joint_transition_trace".equals(op)) {
+                            JSONObject result = new JSONObject();
+                            result.put(
+                                "joint_action",
+                                executeJointActions(
+                                    root, request.getJSONArray("actions")
+                                )
+                            );
+                            JSONObject traceResult = executeStepTrace(
+                                root, request, false
+                            );
+                            result.put("trace", traceResult);
+                            result.put("episode", finalTraceEpisode(traceResult));
+                            response.put("result", result);
+                            terminalEpisodeLatched = traceResult.optBoolean(
+                                "terminal", false
+                            );
+                        } else if ("observe".equals(op)) {
+                            response.put(
+                                "state", new JSONObject(
+                                    nativeObserve(root + "/libg.so")
+                                )
+                            );
+                        } else if ("observe_train_v1".equals(op)) {
+                            response.put(
+                                "state", new JSONObject(
+                                    nativeObserveTrain(root + "/libg.so")
+                                )
+                            );
+                        } else if ("probe_grid".equals(op)) {
+                            JSONObject action = request.getJSONObject("action");
+                            int side = action.getInt("side");
+                            response.put(
+                                "result",
+                                new JSONObject(
+                                    nativeProbeGrid(
+                                        root + "/libg.so", side,
+                                        action.getInt("deck_index"),
+                                        action.optInt("account_hi", side + 1),
+                                        action.optInt("account_lo", side + 1)
+                                    )
+                                )
+                            );
+                        } else if ("joint_act".equals(op)) {
+                            response.put(
+                                "result",
+                                executeJointActions(
+                                    root, request.getJSONArray("actions")
+                                )
+                            );
+                        } else if ("joint_training_transition_v1".equals(op)) {
+                            boolean profileNative = request.optBoolean(
+                                "profile_native", false
+                            );
+                            long transitionStartedNanos = System.nanoTime();
+                            JSONObject result = new JSONObject();
+                            long actionStartedNanos = System.nanoTime();
+                            result.put(
+                                "joint_action",
+                                executeJointActions(
+                                    root, request.getJSONArray("actions")
+                                )
+                            );
+                            long actionFinishedNanos = System.nanoTime();
+                            int steps = request.optInt("steps", 1);
+                            long stepJniStartedNanos = System.nanoTime();
+                            String stepJson = nativeStep(root + "/libg.so", steps);
+                            long stepJniFinishedNanos = System.nanoTime();
+                            JSONObject stepResult = new JSONObject(stepJson);
+                            long stepParsedNanos = System.nanoTime();
+                            JSONObject episode = stepResult.getJSONObject("episode");
+                            result.put("episode", episode);
+                            terminalEpisodeLatched = episode.optBoolean(
+                                "terminated", false
+                            );
+                            long observeJniNanos = 0L;
+                            long observeJsonParseNanos = 0L;
+                            if (!terminalEpisodeLatched
+                                && !episode.optBoolean("truncated", false)) {
+                                long observeJniStartedNanos = System.nanoTime();
+                                String stateJson = nativeObserveTrain(
+                                    root + "/libg.so"
+                                );
+                                long observeJniFinishedNanos = System.nanoTime();
+                                result.put("state", new JSONObject(stateJson));
+                                long observeParsedNanos = System.nanoTime();
+                                observeJniNanos = (
+                                    observeJniFinishedNanos - observeJniStartedNanos
+                                );
+                                observeJsonParseNanos = (
+                                    observeParsedNanos - observeJniFinishedNanos
+                                );
+                            }
+                            if (profileNative) {
+                                result.put("timing_v1", trainingTiming(
+                                    requestParsedNanos - requestParseStartedNanos,
+                                    actionFinishedNanos - actionStartedNanos,
+                                    stepJniFinishedNanos - stepJniStartedNanos,
+                                    stepParsedNanos - stepJniFinishedNanos,
+                                    observeJniNanos,
+                                    observeJsonParseNanos,
+                                    System.nanoTime() - transitionStartedNanos
+                                ));
+                            }
+                            response.put("result", result);
+                        } else if ("joint_transition".equals(op)) {
+                            JSONObject result = new JSONObject();
+                            result.put(
+                                "joint_action",
+                                executeJointActions(
+                                    root, request.getJSONArray("actions")
+                                )
+                            );
+                            int steps = request.optInt("steps", 1);
+                            JSONObject stepResult = new JSONObject(
+                                nativeStep(root + "/libg.so", steps)
+                            );
+                            result.put("step", stepResult);
+                            JSONObject episode = stepResult.getJSONObject("episode");
+                            terminalEpisodeLatched = episode.optBoolean(
+                                "terminated", false
+                            );
+                            if (!terminalEpisodeLatched
+                                && !episode.optBoolean("truncated", false)) {
+                                result.put(
+                                    "state",
+                                    new JSONObject(nativeObserve(root + "/libg.so"))
+                                );
+                            }
+                            response.put("result", result);
+                        } else if ("act".equals(op)) {
+                            JSONObject action = request.getJSONObject("action");
+                            response.put("result", executeAction(root, action));
+                        } else if ("ability".equals(op)) {
+                            JSONObject action = request.getJSONObject("action");
+                            action.put("type", "ability");
+                            response.put("result", executeAction(root, action));
+                        } else if ("shutdown".equals(op)) {
+                            running = false;
+                        } else if (!"ping".equals(op)) {
+                            throw new IllegalArgumentException("unknown op: " + op);
+                        }
+                        } catch (Throwable error) {
+                        rawResponse = null;
+                        response = new JSONObject();
+                        response.put("schema_version", 1);
+                        response.put("ok", false);
+                        response.put("error_type", error.getClass().getName());
+                        response.put("error", String.valueOf(error.getMessage()));
+                    }
+                    JSONObject profiledResult = response.optJSONObject("result");
+                    if(PROFILE_TIMING && handlerWall!=0)profileAdd(1,System.nanoTime()-handlerWall,nativeThreadCpuNanos()-handlerCpu);
+                    JSONObject timing = profiledResult == null
+                        ? null : profiledResult.optJSONObject("timing_v1");
+                    if (timing != null) {
+                        long serializationStartedNanos = System.nanoTime();
+                        response.toString();
+                        timing.put(
+                            "response_json_serialize_probe_ns",
+                            System.nanoTime() - serializationStartedNanos
+                        );
+                    }
+                    long serializeWall=PROFILE_TIMING?System.nanoTime():0,serializeCpu=PROFILE_TIMING?nativeThreadCpuNanos():0;
+                    String serializedResponse=rawResponse == null ? response.toString() : rawResponse;
+                    if(PROFILE_TIMING)profileAdd(2,System.nanoTime()-serializeWall,nativeThreadCpuNanos()-serializeCpu);
+                    long writeWall=PROFILE_TIMING?System.nanoTime():0,writeCpu=PROFILE_TIMING?nativeThreadCpuNanos():0;
+                    if(binaryResponse) {
+                        byte[] payload=BinaryWire.encode(serializedResponse);
+                        java.io.DataOutputStream binary=new java.io.DataOutputStream(socket.getOutputStream());
+                        binary.write(new byte[]{'C','R','B','1'});binary.writeInt(payload.length);binary.write(payload);binary.flush();
+                    } else {
+                        writer.write(serializedResponse);writer.newLine();writer.flush();
+                    }
+                    if(PROFILE_TIMING)profileAdd(3,System.nanoTime()-writeWall,nativeThreadCpuNanos()-writeCpu);
+                    }
+                }
+            }
+        }
+    }
+
+    private static JSONObject executeStepTrace(
+        String root, JSONObject request, boolean compactTraining
+    ) throws Exception {
+        int traceSchemaVersion = request.optInt("trace_schema_version", -1);
+        if (traceSchemaVersion != TRACE_SCHEMA_VERSION) {
+            throw new IllegalArgumentException(
+                "step_trace requires trace_schema_version=1"
+            );
+        }
+        int steps = request.getInt("steps");
+        if (steps < 1 || steps > MAX_TRACE_STEPS) {
+            throw new IllegalArgumentException(
+                "step_trace steps must be in 1..64"
+            );
+        }
+        int maxResponseBytes = request.optInt(
+            "max_response_bytes", MAX_TRACE_RESPONSE_BYTES
+        );
+        if (maxResponseBytes < MIN_TRACE_RESPONSE_BYTES
+            || maxResponseBytes > MAX_TRACE_RESPONSE_BYTES) {
+            throw new IllegalArgumentException(
+                "step_trace max_response_bytes must be in 65536..33554432"
+            );
+        }
+        String traceJson = compactTraining
+            ? nativeStepTrainTrace(
+                root + "/libg.so", steps, traceSchemaVersion,
+                maxResponseBytes
+            )
+            : nativeStepTrace(
+                root + "/libg.so", steps, traceSchemaVersion,
+                maxResponseBytes
+            );
+        if (traceJson.getBytes(StandardCharsets.UTF_8).length
+            > maxResponseBytes) {
+            throw new IllegalStateException(
+                "native step_trace exceeded response limit"
+            );
+        }
+        JSONObject traceResult = new JSONObject(traceJson);
+        JSONArray frames = traceResult.getJSONArray("frames");
+        int stepped = traceResult.getInt("stepped");
+        JSONObject initialFrame = traceResult.getJSONObject("initial_frame");
+        if (traceResult.getInt("schema_version") != 1
+            || traceResult.getInt("trace_schema_version")
+                != TRACE_SCHEMA_VERSION
+            || !(compactTraining
+                ? "libg_native_train_tick_trace_v1"
+                : "libg_native_tick_trace").equals(
+                    traceResult.getString("kind")
+                )
+            || !(compactTraining ? "compact-train-v1" : "full-v1").equals(
+                traceResult.getString("encoding")
+            )
+            || traceResult.getDouble("fixed_dt") != 0.05d
+            || traceResult.getInt("initial_tick")
+                != initialFrame.getJSONObject("state").getInt("tick")
+            || traceResult.getInt("requested_steps") != steps
+            || traceResult.getInt("max_response_bytes") != maxResponseBytes
+            || stepped < 0 || stepped > steps || frames.length() != stepped
+            || traceResult.getInt("final_frame_index") != stepped
+            || initialFrame.getInt("frame_index") != 0
+            || initialFrame.getInt("advanced_steps") != 0
+            || !initialFrame.has("observation_complete")
+            || !initialFrame.has("state")) {
+            throw new IllegalStateException(
+                "native step_trace contract mismatch"
+            );
+        }
+        for (int index = 0; index < frames.length(); ++index) {
+            JSONObject frame = frames.getJSONObject(index);
+            if (frame.getInt("frame_index") != index + 1
+                || frame.getInt("advanced_steps") != index + 1
+                || !frame.has("observation_complete")
+                || (!compactTraining && !frame.has("step"))
+                || (compactTraining && frame.has("step"))
+                || !frame.has("state")) {
+                throw new IllegalStateException(
+                    "native step_trace frame mismatch"
+                );
+            }
+        }
+        if (traceResult.optBoolean("terminal", false)
+            && !finalTraceEpisode(traceResult).optBoolean("terminated", false)) {
+            throw new IllegalStateException(
+                "native step_trace terminal frame mismatch"
+            );
+        }
+        JSONObject finalFrame = stepped == 0
+            ? initialFrame : frames.getJSONObject(stepped - 1);
+        if (traceResult.getInt("final_tick")
+            != finalFrame.getJSONObject("state").getInt("tick")) {
+            throw new IllegalStateException(
+                "native step_trace final tick mismatch"
+            );
+        }
+        return traceResult;
+    }
+
+    private static JSONObject finalTraceEpisode(JSONObject traceResult)
+        throws Exception {
+        int stepped = traceResult.getInt("stepped");
+        JSONObject finalFrame = stepped == 0
+            ? traceResult.getJSONObject("initial_frame")
+            : traceResult.getJSONArray("frames").getJSONObject(stepped - 1);
+        return finalFrame.getJSONObject("state").getJSONObject("episode");
+    }
+
+    private static JSONObject executeAction(
+        String root, JSONObject action
+    ) throws Exception {
+        int side = action.getInt("side");
+        String type = action.optString("type", "play");
+        if ("ability".equals(type)) {
+            return new JSONObject(
+                nativeUseAbility(
+                    root + "/libg.so",
+                    side,
+                    action.getInt("entity_id"),
+                    action.optInt("account_hi", side + 1),
+                    action.optInt("account_lo", side + 1)
+                )
+            );
+        }
+        if (!"play".equals(type)) {
+            throw new IllegalArgumentException("unknown action type: " + type);
+        }
+        return new JSONObject(
+            nativeAct(
+                root + "/libg.so",
+                side,
+                action.getInt("deck_index"),
+                action.getInt("x"),
+                action.getInt("y"),
+                action.optInt("account_hi", side + 1),
+                action.optInt("account_lo", side + 1),
+                action.optBoolean("dry_run", false)
+            )
+        );
+    }
+
+    private static JSONObject trainingTiming(
+        long requestParseNanos,
+        long jointActionNanos,
+        long stepJniNanos,
+        long stepJsonParseNanos,
+        long observeJniNanos,
+        long observeJsonParseNanos,
+        long transitionPreResponseNanos
+    ) throws Exception {
+        JSONObject timing = new JSONObject();
+        timing.put("request_parse_ns", requestParseNanos);
+        timing.put("joint_action_ns", jointActionNanos);
+        timing.put("step_jni_ns", stepJniNanos);
+        timing.put("step_json_parse_ns", stepJsonParseNanos);
+        timing.put("observe_jni_ns", observeJniNanos);
+        timing.put("observe_json_parse_ns", observeJsonParseNanos);
+        timing.put("transition_pre_response_ns", transitionPreResponseNanos);
+        return timing;
+    }
+
+    private static JSONObject executeJointActions(
+        String root, JSONArray requested
+    ) throws Exception {
+        if (requested.length() > 2) {
+            throw new IllegalArgumentException(
+                "joint action accepts at most one action per side"
+            );
+        }
+        boolean[] seen = {false, false};
+        for (int index = 0; index < requested.length(); ++index) {
+            int side = requested.getJSONObject(index).getInt("side");
+            if (side < 0 || side > 1 || seen[side]) {
+                throw new IllegalArgumentException(
+                    "joint action requires unique side 0 and/or 1"
+                );
+            }
+            seen[side] = true;
+        }
+        JSONArray applied = new JSONArray();
+        for (int side = 0; side <= 1; ++side) {
+            JSONObject selected = null;
+            for (int index = 0; index < requested.length(); ++index) {
+                JSONObject candidate = requested.getJSONObject(index);
+                if (candidate.getInt("side") == side) {
+                    if (selected != null) {
+                        throw new IllegalArgumentException(
+                            "duplicate joint action side: " + side
+                        );
+                    }
+                    selected = candidate;
+                }
+            }
+            if (selected != null) {
+                JSONObject item = new JSONObject();
+                item.put("side", side);
+                item.put("result", executeAction(root, selected));
+                applied.put(item);
+            }
+        }
+        JSONObject result = new JSONObject();
+        result.put("canonical_order", "side_0_then_side_1");
+        result.put("actions", applied);
+        return result;
+    }
+
+    private static String readUtf8(File path) throws IOException {
+        try (FileInputStream input = new FileInputStream(path);
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            byte[] chunk = new byte[16 * 1024];
+            for (int count; (count = input.read(chunk)) >= 0; ) {
+                output.write(chunk, 0, count);
+            }
+            return new String(output.toByteArray(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static long readBoundedEnv(
+        String name, long defaultValue, long minimum, long maximum
+    ) {
+        String raw = System.getenv(name);
+        if (raw == null || raw.isEmpty()) {
+            return defaultValue;
+        }
+        long value = Long.parseLong(raw);
+        if (value < minimum || value > maximum) {
+            throw new IllegalArgumentException(
+                name + " must be in " + minimum + ".." + maximum
+            );
+        }
+        return value;
+    }
+
+    private static JSONObject waitForBattle(
+        String root, long timeoutMillis, String previousReplay, int minimumTick
+    )
+        throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutMillis;
+        JSONObject last = null;
+        while (System.currentTimeMillis() < deadline) {
+            last = new JSONObject(nativeProbeRuntime(root + "/libg.so"));
+            if (last.optInt("current_state_type", -1) == 4
+                && last.optInt("pending_state_type", -1) == 0
+                && last.optInt("tick", -1) >= minimumTick
+                && !"0x0".equals(last.optString("battle", "0x0"))
+                && (previousReplay == null
+                    || !previousReplay.equals(
+                        last.optString("replay_data", "0x0")
+                    ))) {
+                return last;
+            }
+            Thread.sleep(2L);
+        }
+        throw new IllegalStateException(
+            "native battle did not become ready: " + String.valueOf(last)
+        );
+    }
+
+    private static void emitRuntimeProbe(String root, String event) {
+        System.out.println(
+            "{\"schema_version\":1,\"stage\":\"runtime_probe\","
+                + "\"event\":\"" + event + "\",\"value\":"
+                + nativeProbeRuntime(root + "/libg.so") + "}"
+        );
+        System.out.flush();
+    }
+
+    private static Object createPackageContext(
+        String runtimeRoot, String packageName
+    ) throws Exception {
+        Class<?> looperClass = Class.forName("android.os.Looper");
+        Method myLooper = looperClass.getMethod("myLooper");
+        if (myLooper.invoke(null) == null) {
+            looperClass.getMethod("prepareMainLooper").invoke(null);
+        }
+        if ("1".equals(System.getenv("CR_BINDERLESS_ANDROID"))) {
+            return new BinderlessContext(runtimeRoot, packageName);
+        }
+        Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+        Method systemMain = activityThreadClass.getDeclaredMethod("systemMain");
+        systemMain.setAccessible(true);
+        Object activityThread = systemMain.invoke(null);
+        Method getSystemContext = activityThreadClass.getDeclaredMethod("getSystemContext");
+        getSystemContext.setAccessible(true);
+        Object systemContext = getSystemContext.invoke(activityThread);
+        Class<?> contextClass = Class.forName("android.content.Context");
+        Method createPackageContext = contextClass.getMethod(
+            "createPackageContext", String.class, int.class
+        );
+        // CONTEXT_INCLUDE_CODE | CONTEXT_IGNORE_SECURITY. The process remains
+        // shell-owned and receives no access to the game's private data.
+        return createPackageContext.invoke(systemContext, packageName, 3);
+    }
+
+    private static void invokeCreateGameMain(
+        String root, Object assets, Object packageContext
+    ) throws Exception {
+        for (String name : new String[] {"data", "cache", "external"}) {
+            File directory = new File(root, name);
+            if (!directory.exists() && !directory.mkdirs()) {
+                throw new IllegalStateException("cannot create " + directory);
+            }
+        }
+        GameApp activity = new GameApp(
+            (android.content.Context) packageContext
+        );
+        String result = nativeCreateGameMain(
+            root + "/libg.so",
+            assets,
+            activity,
+            root + "/data",
+            root + "/cache",
+            root + "/external",
+            8L * 1024L * 1024L * 1024L,
+            1080,
+            2400,
+            420,
+            420.0f,
+            420.0f,
+            2,
+            root + "/external"
+        );
+        System.out.println(
+            "{\"schema_version\":1,\"stage\":\"create_game_main\","
+                + "\"ok\":true,\"result\":\""
+                + String.valueOf(result).replace("\\", "\\\\").replace("\"", "\\\"")
+                + "\"}"
+        );
+        System.out.flush();
+    }
+}
