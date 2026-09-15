@@ -60,6 +60,7 @@ class ShadowLegality:
         self.previous_offset = torch.zeros(batch.batch_size, dtype=torch.long, device=batch.elixir.device)
         self._placement = batch.placement.clone()
         self.conservative_geometry = torch.zeros_like(self.used_ability)
+        self.planned_count=torch.zeros(batch.batch_size,device=batch.elixir.device)
 
     def candidate_mask(self, step: int) -> Tensor:
         mask = self.batch.candidate_mask & ~self.used & (self.batch.costs <= self.remaining[:, None] + 1e-6)
@@ -76,15 +77,17 @@ class ShadowLegality:
         return torch.ones(self.batch.batch_size, len(OFFSET_TICKS), dtype=torch.bool, device=bins.device) if step == 0 else bins[None] >= self.previous_offset[:,None]
 
     def features(self, step: int) -> Tensor:
-        return torch.stack((self.remaining/10, self.used.float().mean(-1), self.used_ability.float(),
-                            self.previous_offset.float()/4, self.candidate_mask(step).float().mean(-1),
-                            self.conservative_geometry.float()), dim=-1)
+        legal=self.candidate_mask(step)
+        hand_used=(self.used[:,:,None] & (self.batch.hand_slots[:,:,None]==torch.arange(4,device=self.remaining.device)[None,None])).any(1).float().mean(-1)
+        return torch.stack((self.remaining/10,torch.full_like(self.remaining,step/2),self.used.float().mean(-1),legal.float().mean(-1),
+            self.planned_count/2,self.previous_offset.float()/4,hand_used,legal.any(-1).float(),self.conservative_geometry.float()),-1)
 
     def apply(self, active: Tensor, candidate: Tensor, target: Tensor, offset: Tensor) -> None:
         batch = self.batch
         rows = torch.arange(batch.batch_size, device=active.device)
         cost = batch.costs[rows, candidate]
         self.remaining = self.remaining - torch.where(active, cost, torch.zeros_like(cost))
+        self.planned_count=self.planned_count+active
         selected = torch.nn.functional.one_hot(candidate, batch.candidate_mask.shape[1]).bool() & active[:,None]
         chosen_slot = batch.hand_slots[rows, candidate]
         same_hand = (chosen_slot[:,None] >= 0) & (batch.hand_slots == chosen_slot[:,None]) & (batch.candidate_kinds == 0)

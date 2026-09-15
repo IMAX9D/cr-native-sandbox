@@ -23,6 +23,17 @@
 已单独归档：包含同并发对照、连续补位、CPU/GPU 分项测量和失败方案。
 这是冻结策略采集压测，不含 PPO 学习更新；暂不替换默认宿主，复现需准备匹配的资源和模型配套工程。
 
+## 最新 R0 elite-v3 源码
+
+当前R0默认网络为6层384维关系注意力、空间CNN和768维LSTM，既有验证配置约3685万参数。完整72项实体特征、6项生命周期伤害统计、严格IL/PPO内核及相关原生采集修复已整理入库。
+
+- [R0入口、安装与文件导航](training_r0/README.md)
+- [源码发布范围与当前验证状态](docs/R0_ELITE_RELEASE.zh-CN.md)
+- [模型框架简述](docs/CURRENT_MODEL_FRAMEWORK.zh-CN.md)
+- [v17归因修复及正式准入边界](docs/R0_ATTRIBUTION_V17_STATUS.zh-CN.md)
+
+主样本整局语义闭环已验证；正式数据准入、跨机制规模验证和全量训练尚未完成。仓库没有附带训练完成的新专家权重。旧训练入口继续保留，不能与R0权重或数据契约混用。
+
 ## 版本兼容性
 
 | 路线 | 已验证版本 | 状态 |
@@ -164,8 +175,8 @@ with NativeRoyaleEnv(port=37031) as env:
 [FirstLight方法适配 R0：批判性复审后的架构（2026-09-07）](docs/TRAINING_CHAIN_REDESIGN_20260907.zh-CN.md)。
 完整链路仍在实施中，不代表下列历史训练入口已完成模型、短序列异步和联赛迁移。
 
-首批独立代码现位于 `training_r0/`，已提供CPU合成smoke与分段PPO内核；
-真实原生采集/正式训练尚未接通，见 [R0实现范围](docs/TRAINING_R0_IMPLEMENTATION.zh-CN.md)。
+当前独立代码位于 `training_r0/`，已提供CPU合成smoke、分段PPO、严格IL及局部真实采集闭环；
+正式数据准入和规模训练状态见 [R0发布说明](docs/R0_ELITE_RELEASE.zh-CN.md)。
 
 仓库包含三层训练代码：
 

@@ -17,11 +17,24 @@ import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class JniHost {
     private JniHost() {}
+
+    private static String sha256File(File file) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[65536];
+        try (FileInputStream input = new FileInputStream(file)) {
+            int count;
+            while ((count = input.read(buffer)) != -1) digest.update(buffer, 0, count);
+        }
+        StringBuilder hex = new StringBuilder();
+        for (byte value : digest.digest()) hex.append(String.format("%02x", value & 255));
+        return hex.toString();
+    }
 
     private static final int TRACE_SCHEMA_VERSION = 1;
     private static final int MAX_TRACE_STEPS = 64;
@@ -74,6 +87,11 @@ public final class JniHost {
     );
     private static native String nativeObserve(String libgPath);
     private static native String nativeObserveTrain(String libgPath);
+    private static native String nativeObserveElite(String libgPath);
+    private static native String nativeEliteBegin(String libgPath);
+    private static native String nativeEliteEvents(long afterSequence);
+    private static native String nativeEliteLifecycleEvents(long afterSequence);
+    private static native String nativeEliteDetails(String libgPath);
     private static native String nativeAct(
         String libgPath, int side, int deckIndex, int x, int y,
         int accountHi, int accountLo, boolean dryRun
@@ -100,7 +118,7 @@ public final class JniHost {
         // invoking this class.  The cloud-native runner deliberately starts ART
         // without app_process so it does not require /dev/binder; register the
         // same table explicitly only for that opt-in runtime.
-        if (binderlessAndroid) {
+        if (binderlessAndroid && !"1".equals(System.getenv("CR_BINDERLESS_SKIP_FRAMEWORK_REGISTRATION"))) {
             System.out.println(nativeRegisterAndroidRuntime());
             System.out.flush();
         }
@@ -715,9 +733,44 @@ public final class JniHost {
         }
     }
 
+    private static JSONObject eliteFrame(String root,JSONObject request,long cursor) throws Exception {
+        if(cursor<0)throw new IllegalArgumentException("negative elite cursor");
+        JSONObject state=new JSONObject(nativeObserveElite(root+"/libg.so"));
+        JSONObject details=new JSONObject(nativeEliteDetails(root+"/libg.so"));
+        if(!details.optBoolean("valid",false) || state.getInt("tick")!=details.getInt("tick"))throw new IllegalStateException("elite snapshot is not coherent");
+        JSONObject frame=new JSONObject();frame.put("state",state);frame.put("details",details);
+        JSONObject telemetry=new JSONObject(nativeEliteEvents(cursor));
+        telemetry.put("lifecycle",new JSONObject(nativeEliteLifecycleEvents(request.optLong("after_lifecycle_sequence",0L))));
+        frame.put("telemetry",telemetry);
+        JSONArray masks=new JSONArray();
+        if(request.optBoolean("capture_masks",false) && state.getInt("tick")%5==0){
+            JSONArray accounts=request.getJSONArray("accounts");JSONArray players=state.getJSONArray("players");
+            for(int i=0;i<players.length();++i){
+                JSONObject player=players.getJSONObject(i);int side=player.getInt("side");JSONObject account=accounts.getJSONObject(side);
+                JSONArray hand=player.getJSONArray("hand_deck_indices");
+                for(int j=0;j<hand.length();++j){
+                    int deck=hand.getInt(j);if(deck<0)continue;
+                    JSONObject row=new JSONObject();row.put("side",side);row.put("deck_index",deck);
+                    row.put("result",new JSONObject(nativeProbeGrid(root+"/libg.so",side,deck,account.getInt("hi"),account.getInt("lo"))));
+                    masks.put(row);
+                }
+            }
+        }
+        frame.put("masks",masks);return frame;
+    }
+
     private static JSONObject restartBattleLifecycle(
         String root, String replay
     ) throws Exception {
+        return restartBattleLifecycle(root, replay, 10);
+    }
+
+    private static JSONObject restartBattleLifecycle(
+        String root, String replay, int minimumTick
+    ) throws Exception {
+        if (minimumTick != 0 && minimumTick != 10) {
+            throw new IllegalArgumentException("unsupported replay capture start tick");
+        }
         JSONObject current = new JSONObject(
             nativeProbeRuntime(root + "/libg.so")
         );
@@ -740,10 +793,10 @@ public final class JniHost {
         );
         JSONObject warmup = null;
         for (int attempt = 0;
-             attempt < 4 && readyState.optInt("tick", -1) < 10;
+             attempt < 4 && readyState.optInt("tick", -1) < minimumTick;
              ++attempt) {
             int remaining = Math.max(
-                1, 10 - readyState.optInt("tick", 0)
+                1, minimumTick - readyState.optInt("tick", 0)
             );
             warmup = new JSONObject(
                 nativeStep(root + "/libg.so", remaining)
@@ -752,7 +805,7 @@ public final class JniHost {
                 nativeProbeRuntime(root + "/libg.so")
             );
         }
-        if (readyState.optInt("tick", -1) < 10) {
+        if (readyState.optInt("tick", -1) < minimumTick) {
             throw new IllegalStateException(
                 "lifecycle restart warmup failed: "
                     + String.valueOf(warmup)
@@ -762,6 +815,10 @@ public final class JniHost {
         bootstrapReplayAvailable = false;
         JSONObject result = new JSONObject();
         result.put("lifecycle_restarted", true);
+        result.put("requested_minimum_tick", minimumTick);
+        if (minimumTick == 0 && readyState.optInt("tick", -1) != 0) {
+            throw new IllegalStateException("raw capture reset missed Tick 0");
+        }
         result.put("load", loaded);
         result.put("state", readyState);
         return result;
@@ -846,7 +903,16 @@ public final class JniHost {
                         response.put("schema_version", 1);
                         response.put("ok", true);
                         response.put("op", op);
-                        if ("memory_read_stats".equals(op)) {
+                        if ("runtime_identity_v1".equals(op)) {
+                            JSONObject identity = new JSONObject();
+                            identity.put("libg_sha256",sha256File(new File(root,"libg.so")));
+                            identity.put("host_sha256",sha256File(new File(root,"lifecycle-probe.jar")));
+                            identity.put("bridge_sha256",sha256File(new File(root,"libnative_host_bridge.so")));
+                            identity.put("bridge_filename","libnative_host_bridge.so");
+                            identity.put("elite_telemetry","x86-v1");
+                            identity.put("capture_from_tick_zero",true);
+                            response.put("identity",identity);
+                        } else if ("memory_read_stats".equals(op)) {
                             response.put("result", new JSONObject(nativeMemoryReadStats()));
                         } else if ("status".equals(op)) {
                             response.put(
@@ -858,7 +924,8 @@ public final class JniHost {
                                 "replay"
                             ).toString();
                             response.put(
-                                "result", restartBattleLifecycle(root, replay)
+                                "result", restartBattleLifecycle(root, replay,
+                                    request.optBoolean("capture_from_tick_zero", false) ? 0 : 10)
                             );
                             response.put(
                                 "state", new JSONObject(
@@ -980,6 +1047,33 @@ public final class JniHost {
                                     nativeObserve(root + "/libg.so")
                                 )
                             );
+                        } else if ("elite_begin_v1".equals(op)) {
+                            if (!"fa6704b83cb9c5b8eecb7b56c9671b834d636a3a6d9ac446e698e1262dc246ba".equals(sha256File(new File(root,"libg.so")))) {
+                                throw new IllegalStateException("elite telemetry runtime SHA mismatch");
+                            }
+                            response.put("telemetry",new JSONObject(nativeEliteBegin(root + "/libg.so")));
+                        } else if ("elite_observe_v1".equals(op)) {
+                            JSONObject frame = eliteFrame(root,request,request.optLong("after_sequence",0L));
+                            response.put("state",frame.getJSONObject("state"));
+                            response.put("details",frame.getJSONObject("details"));
+                            response.put("telemetry",frame.getJSONObject("telemetry"));
+                            response.put("masks",frame.getJSONArray("masks"));
+                        } else if ("elite_step_trace_v1".equals(op)) {
+                            int count=request.getInt("steps");
+                            if(count<1 || count>64 || request.optLong("after_sequence",0L)<0)throw new IllegalArgumentException("invalid elite trace bounds");
+                            if(request.optBoolean("capture_masks",false) && request.getJSONArray("accounts").length()!=2)throw new IllegalArgumentException("elite trace requires both accounts");
+                            long cursor=request.optLong("after_sequence",0L);
+                            JSONArray frames=new JSONArray();JSONObject lastStep=null;
+                            for(int index=0;index<count;++index){
+                                lastStep=new JSONObject(nativeStep(root+"/libg.so",1));
+                                JSONObject frame=eliteFrame(root,request,cursor);
+                                frame.put("step",lastStep);frames.put(frame);
+                                cursor=frame.getJSONObject("telemetry").getLong("last_sequence");
+                                request.put("after_lifecycle_sequence",frame.getJSONObject("telemetry").getJSONObject("lifecycle").getLong("last_sequence"));
+                                if(lastStep.getJSONObject("episode").optBoolean("terminated",false))break;
+                            }
+                            JSONObject result=new JSONObject();result.put("frames",frames);result.put("step",lastStep);
+                            response.put("result",result);
                         } else if ("observe_train_v1".equals(op)) {
                             response.put(
                                 "state", new JSONObject(

@@ -1,7 +1,8 @@
 param(
     [string]$NdkRoot = $(if ($env:CR_SANDBOX_NDK) { $env:CR_SANDBOX_NDK } else { throw "Missing CR_SANDBOX_NDK; copy and dot-source runtime.env.ps1 first" }),
     [int]$ApiLevel = 23,
-    [string]$ArtifactRoot = ""
+    [string]$ArtifactRoot = "",
+    [string[]]$Defines = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,6 +31,7 @@ New-Item -ItemType Directory -Path $ArtifactRoot -Force | Out-Null
     -Wextra `
     -Werror `
     "-I$JniHeaders" `
+    @($Defines | ForEach-Object { "-D$_" }) `
     $Source `
     -ldl `
     -o $Output
@@ -37,5 +39,6 @@ if ($LASTEXITCODE -ne 0) { throw "bridge build failed: $LASTEXITCODE" }
 [pscustomobject]@{
     output = $Output
     target = "x86_64-linux-android$ApiLevel"
+    defines = $Defines
     sha256 = (Get-FileHash -LiteralPath $Output -Algorithm SHA256).Hash.ToLowerInvariant()
 } | ConvertTo-Json

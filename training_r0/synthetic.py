@@ -42,13 +42,34 @@ def public_frame(builder: ObservationBuilder, *, tick=100, side=0, episode_uid='
     return replace(frame, source='synthetic_fixture_not_native_validation')
 
 
+def rich_public_frame(builder: ObservationBuilder, *, tick=100, side=0, episode_uid='synthetic-game'):
+    from .semantics import PublicSemantics,EntityDetail,PublicEffect,PublicRelation,OwnCommand
+    raw=native_frame(tick)
+    own=raw['entities'][side]
+    raw['entities'].append({**own,'category':5000003,'x':own['x']+300,'hp':own['hp']-200})
+    raw['entity_count']=3
+    target=raw['entities'][1-side]['category']
+    semantic=PublicSemantics(episode_uid,side,tick,
+        entities=(EntityDetail(own['category'],'troop','synthetic-group','deployment',radius_tiles=.4,
+                values=(('shield',200.),('velocity_x',1.5),('attack_cooldown_ms',500.))),
+            EntityDetail(5000003,'troop','synthetic-group','deployment',half_extent_tiles=(.5,.75)),
+            EntityDetail(target,'troop',radius_tiles=0.)),
+        effects=(PublicEffect(own['category'],'slow',tick-1,magnitude=.5,remaining_ms=1000.),),
+        relations=(PublicRelation(own['category'],target,'targets',tick-1),),
+        previous=(OwnCommand('confirmed',tick-5,tick-4,'play',DECK[0],(.2,.25),4.),),
+        pending=(OwnCommand('pending',tick,tick,'play',DECK[1],(.3,.25),2.),))
+    frame=builder.from_native(raw,episode_uid=episode_uid,actor_side=side,own_deck=DECK,candidates=candidates(side=side),semantics=semantic)
+    return replace(frame,source='synthetic_rich_fixture_not_native_validation')
+
+
 @torch.no_grad()
-def rollout(model, builder: ObservationBuilder, *, steps=6, sides=(0,)):
+def rollout(model, builder: ObservationBuilder, *, steps=6, sides=(0,), rich=False):
     from .rollout import BehaviorIdentity, LaneIdentity, RolloutSegment
     state = initial = model.initial_state(len(sides))
     observations,actions,logp,values = [],[],[],[]
     for step in range(steps):
-        observation = builder.batch([public_frame(builder,tick=100+step*5,side=side) for side in sides])
+        make_frame=rich_public_frame if rich else public_frame
+        observation = builder.batch([make_frame(builder,tick=100+step*5,side=side) for side in sides])
         output = model(observation,state)
         observations.append(observation)
         actions.append(output.actions)

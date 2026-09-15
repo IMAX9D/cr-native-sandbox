@@ -41,3 +41,14 @@ id_ed25519*
 .ruff_cache/
 __pycache__/
 *.py[cod]
+
+# Local capture, data processing and private configuration
+*.npz
+*.npy
+*.sqlite3*
+*.private.*
+*.local.json
+*.local.toml
+*.partial*
+/output/
+/outputs/

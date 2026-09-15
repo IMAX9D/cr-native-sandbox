@@ -1,0 +1,5 @@
+# Hash-bound R0 resources and compiler sources must not change on checkout.
+training_r0/*.py text eol=lf
+training_r0/data/*.json text eol=lf
+data_pipeline/*.py text eol=lf
+android_probe/native/elite*.h text eol=lf

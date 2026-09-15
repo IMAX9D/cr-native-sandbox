@@ -12,10 +12,16 @@ from typing import Mapping, Sequence
 import torch
 from torch import Tensor
 
-from expert_v1.tick_store_v1.schema import ActorTick, actor_projection, normalize_native_state
+from expert_v1.tick_store_v1.schema import ActorTick
+from .native_projection import actor_projection,normalize_native_state
 from .catalog import CardVocabulary
 from .config import CANDIDATE_FEATURES, CANDIDATE_FEATURE_NAMES, CELLS, ENTITY_FEATURES, ENTITY_FEATURE_NAMES, EVENT_FEATURES, EVENT_FEATURE_NAMES, HEIGHT, OBSERVATION_SCHEMA, PUBLIC_SCALARS, PUBLIC_SCALAR_NAMES, WIDTH, ModelConfig, digest
 from .history import ConfirmedEvent, EventHistory
+from .semantics import PublicSemantics, SemanticCatalog, SEMANTIC_CONTRACT
+from .semantic_tensorizer import SemanticBatch, encode_semantics
+from .feature_contract import ABILITY_FEATURES
+from .semantics import reference_values
+from .native_graph import native_definitions
 
 
 @dataclass(frozen=True)
@@ -35,6 +41,9 @@ class Candidate:
     is_building: bool = False
     footprint_half_tiles: tuple[float, float] | None = None
     placement_offset_tiles: tuple[float, float] = (0.0, 0.0)
+    effective_card_id: int | None = None
+    ability_name: str | None = None
+    ability_features: tuple[tuple[str,float],...] = ()
 
     def __post_init__(self):
         if type(self.card_id) is not int or self.card_id <= 0:
@@ -61,6 +70,8 @@ class Candidate:
             raise ValueError('invalid building footprint')
         if len(self.placement_offset_tiles) != 2 or self.footprint_half_tiles is not None and len(self.footprint_half_tiles) != 2:
             raise ValueError('geometry requires x/y pairs')
+        reference_values(self.ability_features,ABILITY_FEATURES)
+        if self.effective_card_id is not None and (type(self.effective_card_id) is not int or self.effective_card_id<=0):raise ValueError('invalid effective candidate card')
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class PublicFrame:
     commands_allowed: bool
     native_entity_count: int
     source: str = 'native_observe_train_v1'
+    semantics: PublicSemantics | None = None
 
 
 @dataclass(frozen=True)
@@ -116,28 +128,34 @@ class PublicBatch:
     sides: tuple[int, ...]
     ticks: tuple[int, ...]
     schema_hash: str
+    semantic: SemanticBatch
 
     @property
     def batch_size(self) -> int:
         return self.scalars.shape[0]
 
     def to(self, device: torch.device | str) -> 'PublicBatch':
-        return PublicBatch(**{field.name: getattr(self, field.name).to(device) if isinstance(getattr(self, field.name), Tensor) else getattr(self, field.name) for field in fields(self)})
+        return PublicBatch(**{field.name: getattr(self, field.name).to(device) if isinstance(getattr(self, field.name), (Tensor,SemanticBatch)) else getattr(self, field.name) for field in fields(self)})
 
 
 class ObservationBuilder:
-    def __init__(self, vocabulary: CardVocabulary, config: ModelConfig):
+    def __init__(self, vocabulary: CardVocabulary, config: ModelConfig, semantic_catalog: SemanticCatalog | None = None):
         self.vocabulary = vocabulary
         self.config = config
+        self.semantic_catalog = semantic_catalog or SemanticCatalog.from_native(vocabulary)
+        if any(vocabulary.token(p.card_id)==1 for p in self.semantic_catalog.profiles):
+            raise ValueError('semantic catalog outside frozen vocabulary')
         self.schema_hash = digest({'schema': OBSERVATION_SCHEMA, 'vocabulary': vocabulary.sha256,
                                    'features': [ENTITY_FEATURE_NAMES, CANDIDATE_FEATURE_NAMES, EVENT_FEATURE_NAMES, PUBLIC_SCALAR_NAMES],
-                                   'orientation':'native_actor_projection_17999_31999',
+                                   'orientation':'native_actor_projection_17999_31999_projectile_extent_v2',
                                    'candidate_rules':'conservative_shadow.v1', 'unknown_form_code':4,
-                                   'height': HEIGHT, 'width': WIDTH})
+                                   'height': HEIGHT, 'width': WIDTH,
+                                   'semantic_contract':SEMANTIC_CONTRACT,'semantic_catalog':self.semantic_catalog.sha256,
+                                   'native_definition_graph':native_definitions()[1]})
 
     def from_native(self, raw: Mapping, *, episode_uid: str, actor_side: int,
                     own_deck: Sequence[int | Mapping], candidates: Sequence[Candidate],
-                    history: EventHistory | None = None) -> PublicFrame:
+                    history: EventHistory | None = None, semantics: PublicSemantics | None = None) -> PublicFrame:
         if not episode_uid or raw.get('kind') != 'libg_native_train_state_v1' or raw.get('coherent') is not True:
             raise ValueError('R0 requires an identified coherent observe_train_v1 frame')
         if 'entities' not in raw or type(raw.get('entity_count')) is not int or raw['entity_count'] != len(raw['entities']):
@@ -177,7 +195,8 @@ class ObservationBuilder:
                     raise ValueError('ability availability/cost differs from native own state')
         return PublicFrame(episode_uid, view, tuple(deck), tuple(forms), tuple(candidates),
                            history.snapshot(view.tick) if history is not None else (),
-                           bool(normalized.episode.commands_allowed) and not bool(view.episode.terminated), len(normalized.entities))
+                           bool(normalized.episode.commands_allowed) and not bool(view.episode.terminated), len(normalized.entities),
+                           semantics=semantics)
 
     def batch(self, frames: Sequence[PublicFrame]) -> PublicBatch:
         if not frames:
@@ -233,20 +252,20 @@ class ObservationBuilder:
             rows += [(tower, 1 if tower.role == 0 else 2, tower.side, None, -1) for tower in view.towers]
             for j, (entity, kind, relation, card_id, level) in enumerate(rows):
                 x, y = entity.x/18000, entity.y/32000
-                known_hp = entity.max_hp > 0 and 0 <= entity.hp <= entity.max_hp
-                if entity.max_hp > 0 and entity.hp > entity.max_hp:
-                    raise ValueError('entity HP exceeds declared maximum')
+                known_hp = entity.max_hp > 0 and entity.hp >= 0
                 hp = entity.hp/entity.max_hp if known_hp else 0.0
-                if not 0 <= x <= 1 or not 0 <= y <= 1:
-                    raise ValueError('projected position outside arena')
+                in_board=0<=x<=1 and 0<=y<=1
+                if not math.isfinite(x) or not math.isfinite(y) or (not in_board and not 4000000<=entity.key<5000000):
+                    raise ValueError('unverified projected position outside arena')
                 tensors['entity_tokens'][i,j] = vocab.token(card_id)
                 tensors['entity_relations'][i,j] = relation
                 tensors['entity_mask'][i,j] = True
                 tensors['entity_positions'][i,j] = torch.tensor([x,y])
                 tensors['entity_features'][i,j] = torch.tensor([x,y,hp,float(known_hp),max(0,level)/16,float(level>=0),float(kind==0),float(kind==1),float(kind==2),float(getattr(entity,'own_ability_available',0))])
-                col, row = min(WIDTH-1,int(x*WIDTH)), min(HEIGHT-1,int(y*HEIGHT))
-                tensors['grid'][i,relation,row,col] += 1
-                tensors['grid'][i,relation+2,row,col] += hp
+                if in_board:
+                    col, row = min(WIDTH-1,int(x*WIDTH)), min(HEIGHT-1,int(y*HEIGHT))
+                    tensors['grid'][i,relation,row,col] += 1
+                    tensors['grid'][i,relation+2,row,col] += hp
             own_entities = {item.key: item for item in view.entities if item.relation == 0}
             for j, item in enumerate(frame.candidates):
                 source = own_entities.get(item.source_entity)
@@ -281,5 +300,6 @@ class ObservationBuilder:
                 tensors['event_relations'][i,j] = int(event.side != view.actor_side)
                 tensors['event_mask'][i,j] = True
                 tensors['event_features'][i,j] = torch.tensor([(view.tick-event.observed_tick)/1200,float(event.card_id is not None),float(event.kind!='unknown'),x/18000 if target_known else 0,y/32000 if target_known else 0,float(target_known),1.0])
-        return PublicBatch(**tensors, episode_uids=tuple(frame.episode_uid for frame in frames),
+        semantic=encode_semantics(frames,vocab,self.config,tensors)
+        return PublicBatch(**tensors, semantic=semantic, episode_uids=tuple(frame.episode_uid for frame in frames),
                            sides=tuple(frame.view.actor_side for frame in frames), ticks=tuple(frame.view.tick for frame in frames), schema_hash=self.schema_hash)

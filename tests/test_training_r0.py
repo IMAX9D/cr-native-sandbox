@@ -33,7 +33,7 @@ def cpu_threads():
 def components():
     torch.manual_seed(71)
     vocabulary = CardVocabulary.from_native()
-    config = ModelConfig(width=32,layers=1,heads=4,hidden=64,spatial_channels=16)
+    config = ModelConfig(width=32,layers=1,heads=4,hidden=64,spatial_channels=16,native_graph_layers=1,allow_incomplete_capture=True)
     builder = ObservationBuilder(vocabulary,config)
     model = R0Policy(vocabulary,config)
     return builder,model

@@ -19,7 +19,7 @@ ENTITY_FEATURES = len(ENTITY_FEATURE_NAMES)
 CANDIDATE_FEATURES = len(CANDIDATE_FEATURE_NAMES)
 EVENT_FEATURES = len(EVENT_FEATURE_NAMES)
 PUBLIC_SCALARS = len(PUBLIC_SCALAR_NAMES)
-OBSERVATION_SCHEMA = 'r0-public-observation.v1'
+OBSERVATION_SCHEMA = 'r0-public-observation.elite-v3'
 ACTION_SCHEMA = 'r0-two-micro-actions.v1'
 
 
@@ -40,20 +40,45 @@ class Temperatures:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    width: int = 256
-    layers: int = 4
-    heads: int = 8
-    hidden: int = 512
-    spatial_channels: int = 64
+    width: int = 384
+    layers: int = 6
+    heads: int = 12
+    hidden: int = 768
+    spatial_channels: int = 128
     max_entities: int = 256  # Includes public towers; never silently truncate.
     max_candidates: int = 6
     max_history: int = 32
+    max_groups: int = 256
+    max_effects: int = 256
+    max_edges: int = 1024
+    max_pending: int = 8
+    max_revealed_cards: int = 16
+    max_towers: int = 6
+    learned_scatter_channels: int = 64
+    local_pool_slots: int = 8
+    spatial_blocks: int = 4
+    use_mechanics: bool = True
+    use_effects: bool = True
+    use_groups: bool = True
+    use_relation_edges: bool = True
+    use_command_memory: bool = True
+    native_graph_layers: int = 4
+    allow_incomplete_capture: bool = False  # Only explicit diagnostics may omit capture streams.
 
     def __post_init__(self):
-        if any(type(value) is not int or value <= 0 for value in asdict(self).values()):
+        values = asdict(self)
+        boolean=lambda name:name.startswith('use_') or name=='allow_incomplete_capture'
+        if any(type(value) is not bool for name,value in values.items() if boolean(name)):
+            raise ValueError('ablation switches must be explicit booleans')
+        if any(type(value) is not int or value <= 0 for name,value in values.items() if not boolean(name)):
             raise ValueError('model dimensions must be positive integers')
-        if self.width % self.heads or self.max_candidates < 1:
+        if self.width % self.heads or self.hidden % self.heads or self.width<2 or self.max_candidates < 1:
             raise ValueError('width must be divisible by attention heads')
+
+    @classmethod
+    def reference(cls,*,allow_incomplete_capture=False):
+        return cls(width=256,layers=4,heads=8,hidden=512,spatial_channels=64,learned_scatter_channels=32,
+            local_pool_slots=4,spatial_blocks=3,native_graph_layers=3,allow_incomplete_capture=allow_incomplete_capture)
 
 
 @dataclass(frozen=True)

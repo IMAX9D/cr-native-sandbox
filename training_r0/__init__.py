@@ -4,5 +4,6 @@ This package does not launch native workers, cloud services or training on impor
 """
 
 from .config import ModelConfig, Temperatures, TrainingConfig
+from .semantics import PublicSemantics, SemanticCatalog
 
-__all__ = ["ModelConfig", "Temperatures", "TrainingConfig"]
+__all__ = ["ModelConfig", "Temperatures", "TrainingConfig", "PublicSemantics", "SemanticCatalog"]

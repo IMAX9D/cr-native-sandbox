@@ -1,6 +1,11 @@
-# R0 第一批代码：离线策略内核与接口
+# R0 离线策略内核与接口
 
-日期：2026-09-07。模块：`training_r0/`。状态：**可运行的CPU离线内核；不是已经接通的正式训练系统**。
+> 历史实现/交接记录：后续进展以 [v17状态](R0_ATTRIBUTION_V17_STATUS.zh-CN.md) 和 [当前发布说明](R0_ELITE_RELEASE.zh-CN.md) 为准。
+
+
+更新：2026-09-12。模块：`training_r0/`。状态：**elite-v3 完整字段、大容量网络与离线内核；正式训练仍未接通**。
+
+用户要求不作简化、进一步复杂化后，默认模型已升级；当前结构、数据覆盖、大容量配置与生产准入见 [elite-v3 说明](TRAINING_R0_ELITE_V3.zh-CN.md)。rich-v2 说明仅保留历史记录。
 
 该目录是按[当前R0设计](TRAINING_CHAIN_REDESIGN_20260907.zh-CN.md)新写的本地适配代码，不依赖不完整FirstLight源码切片，也不加载旧177M权重。未复制ARM64地址/私有资源，未改旧训练入口。
 
@@ -10,6 +15,8 @@
 | --- | --- |
 | `config.py` | 固定20Hz/5Tick决策、250ms内5个偏移、模型尺寸、40秒采集与48步BPTT配置 |
 | `catalog.py` | 复用本地版本化卡牌表；PAD与UNKNOWN分开，词表有hash |
+| `semantics.py` / `semantic_tensorizer.py` | 版本绑定的标称属性、机制操作、公开动态/效果/关系、分组、敌方揭示牌与己方命令输入 |
+| `components.py` | 语义卡牌编码、局部组注意力、显式关系、双线性/范围散射与残差空间网络 |
 | `history.py` | 真实确认事件、可见时刻、命令去重、UNKNOWN动作与标签有效位；不从监督占位符伪造WAIT |
 | `observation.py` | 接收coherent observe_train_v1；复用公开投影；当前手牌/技能来源校验、未知实体保留、动态padding但不静默截断 |
 | `model.py` | 关系注意力、空间scatter/CNN、LSTM、当前局面skip、候选指针、FiLM位置、联合两微动作解码与共享value |
@@ -20,7 +27,7 @@
 | `rewards.py` | 明确的本地胜负＋对称塔血势函数控制；不发等待/出牌/溢出额外奖励 |
 | `synthetic.py` / `smoke.py` | 不联网、不起原生环境的合成数据和CPU smoke入口 |
 
-基础模型使用256宽、4层、8头、512维LSTM、64空间通道。本次实测**8,232,490个参数，包含共享value头**；词表212个条目，包含PAD/UNKNOWN及本地卡牌/形态ID。它不是原作者模型的精确参数量，也还没有补齐原作者所有静态机制/效果编码器。
+默认 elite 配置为384宽、6层、12头、768维LSTM、128空间隐藏通道；保留256宽的参考尺寸配置。两者都使用完整字段和原生定义图。词表212个条目。8.232M、11.102M 分别属于历史简化 v1/rich-v2；当前参数量以 elite-v3 的运行记录为准。
 
 ## 关键接口约束
 
@@ -63,19 +70,19 @@ Mirror要求first-only约束；第二条动作不能超费、重复候选/手牌
 在主工程目录、已具备torch/numpy/pytest的环境中：
 
 ```powershell
-python -m training_r0.smoke --profile base --steps 4
-python -m training_r0.smoke --profile tiny --steps 160
-python -m pytest -q tests/test_training_r0.py tests/test_expert_selfplay_native_observation.py tests/test_expert_selfplay_contracts.py
+python -m training_r0.smoke --profile elite --steps 2 --rich
+python -m training_r0.smoke --profile tiny --steps 160 --rich
+python -m pytest -q tests/test_training_r0.py tests/test_training_r0_rich.py tests/test_training_r0_elite.py tests/test_expert_selfplay_native_observation.py tests/test_expert_selfplay_contracts.py
 ```
 
 本机测试使用已有 `D:\AI_data\runtime\venv\Scripts\python.exe`，没有安装/升级训练依赖。当前包发现规则 `training*` 会包含 `training_r0`；上述命令在仓库根目录直接可用。
 
-本轮回归包括：25项新测试与35项相关旧测试，共60项通过。基础模型CPU smoke完成前向、采样、联合logp重算与一次梯度更新；长序列tiny smoke用于验证160决策/48步BPTT调度。两者都只用合成观察和合成奖励，**不是IL效果、原生动作成功率或实际对战能力的证明**。
+elite-v3 回归包含完整字段、原生定义图、完整解码、生命周期伤害、数据准入与既有合同。大容量模型完成合成前向、采样、联合 logp 重算与一次梯度更新；tiny 验证160决策/48步BPTT。两者都只用合成观察和合成奖励，**不是 IL 效果、原生动作成功率或实际对战能力的证明**。
 
 ## 下一步尚未完成
 
 1. 接真实native候选/mask提供器、命令计划执行与回执，取得同offset等证书。
-2. 将静态卡牌机制、公开事件和己方未决命令等补入统一schema，重新冻结版本，禁止静默加字段。
+2. 丰富输入 schema 已冻结；补全真实公开动态字段、效果/关系/分组与己方命令提供器，扩充经版本验证的机制目录。
 3. 接回放编译器、可信前缀及全IL损失与持久化数据索引。
 4. 接40秒真实采集段、短局新lane、checkpoint/RNG/采样器恢复与训练快照管理。
 5. 最后做真实GPU吞吐、对手池、独立评估与长跑；此时才讨论正式一键训练。

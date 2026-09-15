@@ -490,14 +490,18 @@ def _schema_five_terminal_hp(
 
 def _schema_five_metadata(
     value: Mapping[str, Any], native_ingest_contract: Any | None,
+    processing_contract: Any | None = None,
 ) -> dict[str, Any]:
     """Validate the complete authoritative crawler/native contract boundary."""
-    contract = (
+    if processing_contract is not None and native_ingest_contract is not None:
+        raise ReplayPlanError('choose authoritative ingestion or explicit processing contract, not both')
+    processing = processing_contract is not None
+    contract = processing_contract if processing else (
         _default_native_ingest_contract()
         if native_ingest_contract is None
         else native_ingest_contract
     )
-    stamp = value.get("authoritative_native_contract")
+    stamp = value.get("processing_native_contract" if processing else "authoritative_native_contract")
     if not isinstance(stamp, Mapping):
         raise ReplayPlanError("schema-v5 authoritative native contract is missing")
     expected_game_version = str(contract.value.get("game_version") or "")
@@ -508,10 +512,10 @@ def _schema_five_metadata(
         raise ReplayPlanError("schema-v5 authoritative contract SHA-256 mismatch")
     if str(stamp.get("contract_file_sha256") or "") != str(contract.file_sha256):
         raise ReplayPlanError("schema-v5 authoritative contract file SHA-256 mismatch")
-    eligibility = value.get("authoritative_eligibility")
+    eligibility = value.get("processing_eligibility" if processing else "authoritative_eligibility")
     if not isinstance(eligibility, Mapping) or (
         eligibility.get("status") != "accepted"
-        or eligibility.get("gate") != "native_static_v2"
+        or eligibility.get("gate") != ("processing_static_v1" if processing else "native_static_v2")
     ):
         raise ReplayPlanError("schema-v5 authoritative eligibility stamp is invalid")
 
@@ -525,7 +529,7 @@ def _schema_five_metadata(
         or not isinstance(rounds, list)
         or len(rounds) != 1
         or not isinstance(deck_metadata, Mapping)
-        or deck_metadata.get("authoritative_complete") is not True
+        or deck_metadata.get("processing_complete" if processing else "authoritative_complete") is not True
         or deck_metadata.get("source") != "battle_list_html"
         or value.get("deck_crosscheck_complete") is not True
     ):
@@ -603,7 +607,7 @@ def _schema_five_metadata(
         "contract_game_version": expected_game_version,
         "contract_sha256": expected_contract_sha,
         "contract_file_sha256": str(contract.file_sha256),
-        "contract_provenance": "schema5_authoritative_native_contract_verified",
+        "contract_provenance": "schema5_processing_contract_not_historical_runtime_proof" if processing else "schema5_authoritative_native_contract_verified",
     }
 
 
@@ -706,6 +710,7 @@ def compile_battle(
     *,
     terminal_crowns: Sequence[int] | None = None,
     native_ingest_contract: Any | None = None,
+    processing_contract: Any | None = None,
 ) -> BattlePlan:
     battle_tag = str(value.get("battle_tag") or "")
     if not battle_tag:
@@ -723,7 +728,7 @@ def compile_battle(
         crowns = (int(terminal_crowns[0]), int(terminal_crowns[1]))
     source_schema = int(value.get("schema_version") or 1)
     schema_five = (
-        _schema_five_metadata(value, native_ingest_contract)
+        _schema_five_metadata(value, native_ingest_contract, processing_contract)
         if source_schema == 5
         else None
     )
@@ -905,7 +910,7 @@ def compile_battle(
                 action.base_token for action in actions if action.side == side
             }
             expected_bases = {spec.base_token for spec in side_decks[side]}
-            if observed_bases != expected_bases:
+            if observed_bases != expected_bases and processing_contract is None:
                 raise ReplayPlanError(
                     f"schema-v5 {source_side} does not expose the complete eight-card cycle"
                 )
@@ -1129,6 +1134,8 @@ def compile_battle(
         # to make this claim, even when all deployment actions are accepted.
         original_state_exact=False,
         state_provenance=(
+            "native_generated_schema5_processing_compatible_not_historical_exact"
+            if source_schema == 5 and processing_contract is not None else
             "native_generated_schema5_authoritative_metadata_anchored"
             if source_schema == 5 else "native_generated_unanchored"
         ),

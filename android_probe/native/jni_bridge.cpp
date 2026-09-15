@@ -697,7 +697,10 @@ std::string episode_json() {
                                : (std::strcmp(g_episode.termination_reason,
                                              "native_tiebreak_exact_draw") == 0
                                       ? "\"native_tiebreak_exact_draw\""
-                                      : "\"native_battle_state_transition\"")))),
+                                      : (std::strcmp(g_episode.termination_reason,
+                                                     "native_king_destroyed_and_gate_closed") == 0
+                                             ? "\"native_king_destroyed_and_gate_closed\""
+                                             : "\"native_battle_state_transition\""))))),
       g_episode.initialized ? "true" : "false");
   result.append(header);
   for (size_t index = 0; index < g_episode.tower_count; ++index) {
@@ -754,6 +757,10 @@ void throw_state(JNIEnv* env, const std::string& message) {
     env->ThrowNew(type, message.c_str());
   }
 }
+
+#include "elite_origin.h"
+#include "elite_telemetry.h"
+#include "elite_lifecycle_telemetry.h"
 
 }  // namespace
 
@@ -1053,6 +1060,7 @@ Java_royale_nativehost_JniHost_nativeAct(
   // feedback=false (D8CACC). Reuse those exact arguments so the command
   // performs the authoritative hand/elixir mutation and deployment.
   constexpr int32_t kCommandExecutionFlags = 3;
+  elite_origin::CommandScope capture_command(side,deck_index,elite_telemetry::enabled && !dry_run);
   const int32_t result_code = dry_run
       ? (placement_code == 0 ? 0 : placement_code < 0 ? 12
                                                    : placement_code + 14)
@@ -1148,7 +1156,9 @@ Java_royale_nativehost_JniHost_nativeAct(
       static_cast<unsigned long long>(kDoSpellCommandCtorRva),
       static_cast<unsigned long long>(kDoSpellCommandExecuteRva));
   dlclose(handle);
-  return env->NewStringUTF(payload);
+  std::string capture_payload(payload);capture_payload.pop_back();
+  capture_payload+=",\"native_command_sequence\":"+std::to_string(capture_command.id)+"}";
+  return env->NewStringUTF(capture_payload.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1318,6 +1328,8 @@ Java_royale_nativehost_JniHost_nativeUseAbility(
   *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(command) + 0x18) =
       account_lo;
   constexpr int32_t kCommandExecutionFlags = 3;
+  elite_origin::CommandScope capture_command(side,-1,elite_telemetry::enabled);
+  elite_origin::ActionScope capture_owner(reinterpret_cast<void*>(character));
   const int32_t result_code = execute(
       command, reinterpret_cast<void*>(battle), kCommandExecutionFlags, 0);
 
@@ -1374,7 +1386,9 @@ Java_royale_nativehost_JniHost_nativeUseAbility(
       static_cast<unsigned long long>(kAbilityCommandCtorRva),
       static_cast<unsigned long long>(kAbilityCommandExecuteRva));
   dlclose(handle);
-  return env->NewStringUTF(payload);
+  std::string capture_payload(payload);capture_payload.pop_back();
+  capture_payload+=",\"native_command_sequence\":"+std::to_string(capture_command.id)+"}";
+  return env->NewStringUTF(capture_payload.c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -1556,7 +1570,7 @@ Java_royale_nativehost_JniHost_nativeProbeGrid(
 }
 
 static jstring observe_state_json(
-    JNIEnv* env, jstring libg_path, bool compact_training) {
+    JNIEnv* env, jstring libg_path, bool compact_training, bool elite=false) {
   const char* path_chars = env->GetStringUTFChars(libg_path, nullptr);
   if (path_chars == nullptr) {
     return nullptr;
@@ -1729,16 +1743,16 @@ static jstring observe_state_json(
     const int32_t direction_x = raw_i32(0xF8);
     const int32_t direction_y = raw_i32(0xFC);
     const int32_t level = raw_i32(0x120) + 1;
-    if (category >= 4000000 && category < 5000000) {
+    if (category >= (elite ? 3000000 : 4000000) && category < 5000000) {
       if (compact_training) {
         continue;
       }
       const uint64_t vtable = raw_u64(0x00);
       const uint64_t vtable_rva = vtable >= base ? vtable - base : 0;
       if (vtable_rva == 0 || vtable_rva >= 0x3000000 ||
-          (side != 0 && side != 1) ||
+          (!elite && ((side != 0 && side != 1) ||
           (vtable_rva != kProjectileVtableRva &&
-           (x < 0 || x > 18000 || y < 0 || y > 32000))) {
+           (x < 0 || x > 18000 || y < 0 || y > 32000))))) {
         continue;
       }
       observed_effects.push_back({
@@ -1751,10 +1765,10 @@ static jstring observe_state_json(
     const bool supported_card_table =
         card_id == -1 || card_table == 13 || card_table == 26 ||
         card_table == 27 || card_table == 28 || card_table == 203;
-    if (category < 5000000 || category >= 6000000 || kind < 10 ||
+    if (category < 5000000 || category >= 6000000 || (!elite && (kind < 10 ||
         kind > 20 || (side != 0 && side != 1) || x < 0 || x > 18000 ||
         y < 0 || y > 32000 || level < 1 || level > 17 ||
-        !supported_card_table) {
+        !supported_card_table))) {
       continue;
     }
     int32_t hp = -1, max_hp = -1;
@@ -1799,7 +1813,7 @@ static jstring observe_state_json(
         components[2] != 0) {
       int32_t hp_pair[2] = {-1, -1};
       if (memory.read_bytes(components[2] + 0x10, hp_pair, sizeof(hp_pair)) &&
-          hp_pair[0] >= 0 && hp_pair[1] >= hp_pair[0] &&
+          hp_pair[0] >= 0 && hp_pair[0] <= 1000000 && hp_pair[1] >= 0 &&
           hp_pair[1] <= 100000) {
         hp = hp_pair[0];
         max_hp = hp_pair[1];
@@ -2119,9 +2133,19 @@ static jstring observe_state_json(
   result.append("],\"effect_count\":");
   result.append(std::to_string(observed_effects.size()));
   size_t projectile_count = 0;
+  size_t area_effect_count = 0;
   for (const ObservedEffect& effect : observed_effects) {
     if (effect.vtable_rva == kProjectileVtableRva) {
       ++projectile_count;
+    } else if (elite && effect.category >= 3000000 && effect.category < 4000000 &&
+               effect.vtable_rva == 0x19691f8) {
+      // Pinned AreaEffectObject runtime class: require all three independent
+      // identities, rather than treating every non-projectile as classified.
+      uint64_t effect_data = 0;
+      int32_t effect_data_id = 0;
+      if (memory.read(effect.id + 0x48, &effect_data) && effect_data &&
+          memory.read(effect_data + 0x40, &effect_data_id) &&
+          !elite_telemetry::data_name(memory, effect_data).empty()) ++area_effect_count;
     }
   }
   result.append(",\"projectiles\":[");
@@ -2178,11 +2202,13 @@ static jstring observe_state_json(
   hash_value(static_cast<uint64_t>(projectile_count));
   result.append("],\"projectile_count\":");
   result.append(std::to_string(projectile_count));
+  result.append(",\"area_effect_count\":");
+  result.append(std::to_string(area_effect_count));
   result.append(",\"unclassified_effect_count\":");
-  result.append(std::to_string(observed_effects.size() - projectile_count));
+  result.append(std::to_string(observed_effects.size() - projectile_count - area_effect_count));
   result.append(",\"effects_classified\":");
   result.append(
-      observed_effects.size() == projectile_count ? "true" : "false");
+      observed_effects.size() == projectile_count + area_effect_count ? "true" : "false");
   } else {
     result.append("]");
   }
@@ -2394,7 +2420,7 @@ static jstring observe_state_json(
         static_cast<unsigned long long>(state_hash));
     result.append(",\"state_hash\":");
     result.append(hash_json);
-    result.append(",\"state_hash_scope\":\"public-observe-v6\"");
+    result.append(elite ? ",\"state_hash_scope\":\"public-observe-elite-v1\"" : ",\"state_hash_scope\":\"public-observe-v6\"");
     result.append(",\"state_hash_certificate\":false");
   }
   result.append(",\"episode\":");
@@ -2414,6 +2440,46 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_royale_nativehost_JniHost_nativeObserveTrain(
     JNIEnv* env, jclass, jstring libg_path) {
   return observe_state_json(env, libg_path, true);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeObserveElite(JNIEnv* env,jclass,jstring libg_path){
+  return observe_state_json(env,libg_path,false,true);
+}
+
+static uintptr_t elite_runtime_base(JNIEnv* env,jstring libg_path){
+  const char* path=env->GetStringUTFChars(libg_path,nullptr);if(!path)return 0;
+  void* handle=dlopen(path,RTLD_NOW|RTLD_LOCAL|RTLD_NOLOAD);env->ReleaseStringUTFChars(libg_path,path);
+  if(!handle){throw_state(env,"elite telemetry runtime not loaded");return 0;}
+  void* exported=dlsym(handle,"JNI_OnLoad");Dl_info info{};
+  const bool valid=exported && dladdr(exported,&info)!=0 && info.dli_fbase && reinterpret_cast<uintptr_t>(exported)-reinterpret_cast<uintptr_t>(info.dli_fbase)==kExpectedJniOnLoadRva;
+  dlclose(handle);if(!valid){throw_state(env,"elite telemetry runtime version mismatch");return 0;}
+  return reinterpret_cast<uintptr_t>(info.dli_fbase);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeEliteBegin(JNIEnv* env,jclass,jstring path){
+  const uintptr_t base=elite_runtime_base(env,path);if(!base)return nullptr;std::string error;
+  if(!elite_telemetry::begin(base,error)){throw_state(env,error.c_str());return nullptr;}
+  if(!elite_phase::begin(base,error)){elite_telemetry::enabled=false;throw_state(env,error.c_str());return nullptr;}
+  if(!elite_lifecycle::begin(base,error)){elite_telemetry::enabled=false;throw_state(env,error.c_str());return nullptr;}
+  return env->NewStringUTF(elite_telemetry::events_json(0).c_str());
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeEliteEvents(JNIEnv* env,jclass,jlong after){
+  if(after<0){throw_state(env,"negative telemetry cursor");return nullptr;}
+  return env->NewStringUTF(elite_telemetry::events_json(static_cast<uint64_t>(after)).c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeEliteLifecycleEvents(JNIEnv* env,jclass,jlong after){
+  if(after<0){throw_state(env,"negative lifecycle cursor");return nullptr;}
+  return env->NewStringUTF(elite_lifecycle::events_json(static_cast<uint64_t>(after)).c_str());
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_royale_nativehost_JniHost_nativeEliteDetails(JNIEnv* env,jclass,jstring path){
+  const uintptr_t base=elite_runtime_base(env,path);if(!base)return nullptr;
+  return env->NewStringUTF(elite_telemetry::details_json(base).c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -2533,6 +2599,17 @@ Java_royale_nativehost_JniHost_nativeStep(
       break;
     }
     capture_episode_state(memory, base, battle);
+    if (g_episode.initialized && g_episode.command_gate_code != 0 &&
+        (episode_crowns(0) == 3 || episode_crowns(1) == 3)) {
+      // King destruction plus the native closed command gate is the gameplay
+      // terminal boundary. Presentation cleanup can keep ticking and destroy
+      // surviving towers afterwards; it must not become policy WAIT labels or
+      // be credited as unit damage.
+      battle_active = false;
+      g_episode.terminated = true;
+      g_episode.termination_reason = "native_king_destroyed_and_gate_closed";
+      break;
+    }
     if (g_episode.logic_state == 1 &&
         (g_episode.logic_substate == 6 || g_episode.logic_substate == 15)) {
       battle_active = false;

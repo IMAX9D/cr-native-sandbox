@@ -28,6 +28,10 @@ training = [
   "tensorboard>=2.16",
 ]
 test = ["pytest>=8"]
+data-processing = ["numpy>=1.26", "zstandard>=0.23"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "third_party/FirstLight_CR/LICENSE", "third_party/FirstLight_CR/NOTICE"]
 
 [tool.setuptools.packages.find]
 include = [
@@ -36,8 +40,11 @@ include = [
   "selfplay_v2*",
   "expert_v1*",
   "expert_selfplay_v1*",
+  "data_pipeline*",
 ]
 
 [tool.setuptools.package-data]
 native_core = ["data/*.json"]
 training = ["*.html"]
+
+training_r0 = ["data/*.json"]
